@@ -145,10 +145,19 @@ function videoPluginResult(result: unknown): VideoGenerationResult {
 
 const SDGF_ASSET_BRIDGE = "http://127.0.0.1:8776/api/asset/upload";
 
+// 聚鑫只收裸 HTTPS URL；重试链会从 metadata 恢复出 `@url:`...`` token 格式的引用——剥出内层 URL。
+function stripReferenceToken(value: string): string {
+    const m = value.match(/@url:\s*`?(https:\/\/[^`\s]+)`?/) || value.match(/^@?url:?\s*`?(https:\/\/[^`\s]+)`?$/);
+    return m ? m[1] : value;
+}
+
 async function sdgfImageUrls(references: ReferenceImage[], options?: RequestOptions): Promise<string[]> {
     const urls: string[] = [];
     for (const image of references) {
-        const dataUrl = await imageToDataUrl(image);
+        // 已是公网 URL（含 token 包裹的）直接剥用，不再重新上传
+        const direct = typeof (image as { url?: unknown }).url === "string" ? stripReferenceToken((image as { url: string }).url) : "";
+        const dataUrl = direct && /^https:\/\//.test(direct) ? direct : await imageToDataUrl(image);
+        if (direct && /^https:\/\//.test(direct)) { urls.push(direct); continue; }
         const blob = await (await fetch(dataUrl)).blob();
         if (!blob.size) throw new Error("参考图字节为空：" + (image.name || "未命名"));
         const ext = (blob.type.split("/")[1] || "png").replace("jpeg", "jpg");
