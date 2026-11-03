@@ -53,6 +53,8 @@ export type CanvasNodeMetadata = {
     errorDetails?: string;
     fontSize?: number;
     taskId?: string;
+    jobId?: string;
+    intent?: string;
     generationMode?: CanvasGenerationMode;
     generationType?: CanvasImageGenerationType;
     model?: string;
