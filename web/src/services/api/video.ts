@@ -203,7 +203,13 @@ async function createSdgfVideoTask(config: AiConfig, model: string, prompt: stri
     try {
         created = (await axios.post(aiApiUrl(config, "/videos"), body, { headers: aiHeaders(config, "application/json"), signal: options?.signal, timeout: 90000 })).data;
     } catch (error) {
-        throw new Error(readAxiosError(error, "SD GF 创建请求失败（状态不明时勿重复提交，先到站内控制台核对）"));
+        // 排障透出：响应体全文（含聚鑫 Request ID）+ 请求体快照（prompt 截断），一次重试即可定位
+        let detail = readAxiosError(error, "SD GF 创建请求失败（状态不明时勿重复提交，先到站内控制台核对）");
+        if (axios.isAxiosError(error) && error.response?.data !== undefined) {
+            try { detail += ` | 响应体: ${JSON.stringify(error.response.data).slice(0, 400)}`; } catch { /* 不可序列化则略 */ }
+        }
+        const snapshot = { ...body, prompt: typeof body.prompt === "string" ? body.prompt.slice(0, 80) + `…(共${body.prompt.length}字)` : body.prompt };
+        throw new Error(`${detail} | 请求体: ${JSON.stringify(snapshot)}`);
     }
     const record = (created || {}) as Record<string, unknown>;
     const id = record.id || record.task_id;
