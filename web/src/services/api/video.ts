@@ -233,7 +233,9 @@ async function pollSdgfVideoTask(config: AiConfig, task: VideoGenerationTask, op
         const raw = (await axios.get<Record<string, unknown>>(aiApiUrl(config, `/videos/${task.id}`), { headers: aiHeaders(config), signal: options?.signal })).data;
         const status = String(raw?.status || "");
         const metadata = (raw?.metadata || {}) as Record<string, unknown>;
-        const url = typeof metadata.url === "string" ? metadata.url : "";
+        // 聚鑫实测：metadata.url 可能是相对路径（/v1/videos/{id}/content）——只有完整 http(s) 才直连，否则走鉴权 content 端点
+        const rawUrl = typeof metadata.url === "string" ? metadata.url : "";
+        const url = /^https?:\/\//.test(rawUrl) ? rawUrl : "";
         if (status === "completed") {
             if (url) return { status: "completed", result: await videoResultFromUrl(url, options) };
             const content = await axios.get<Blob>(aiApiUrl(config, `/videos/${task.id}/content`), { headers: aiHeaders(config), responseType: "blob", signal: options?.signal });
