@@ -645,24 +645,8 @@ function InfiniteCanvasPage() {
                 setConnecting(null);
                 return;
             }
-            const sourceNode = nodesRef.current.find((n) => n.id === pending.connection.nodeId);
-            let metadata = type === CanvasNodeType.Config ? { model: effectiveConfig.imageModel || effectiveConfig.model, size: effectiveConfig.size, count: getGenerationCount(effectiveConfig.canvasImageCount || effectiveConfig.count) } : undefined;
+            const metadata = type === CanvasNodeType.Config ? { model: effectiveConfig.imageModel || effectiveConfig.model, size: effectiveConfig.size, count: getGenerationCount(effectiveConfig.canvasImageCount || effectiveConfig.count) } : undefined;
             const newNode = createCanvasNode(type, pending.position, metadata);
-            // 拉线路径：拉片 →（拉线）→ 文本 = 输出结果节点，预填拉片正文
-            if (type === CanvasNodeType.Text && sourceNode?.type === CanvasNodeType.Lapian && sourceNode.metadata?.taskId) {
-                const tid = String(sourceNode.metadata.taskId);
-                const newNodeId = newNode.id;
-                setNodes((prev) => prev.map((n) => (n.id === newNodeId ? { ...n, metadata: { ...n.metadata, content: "拉取拉片结果中…" } } : n)));
-                void fetch(`http://127.0.0.1:8776/api/lapian/${encodeURIComponent(tid)}`)
-                    .then((r) => r.json())
-                    .then((d) => {
-                        const md = d && !d.error ? String(d.markdown || "") : `拉取失败：${d?.error || "未知错误"}`;
-                        setNodes((prev) => prev.map((n) => (n.id === newNodeId ? { ...n, metadata: { ...n.metadata, content: md } } : n)));
-                    })
-                    .catch((e: Error) => {
-                        setNodes((prev) => prev.map((n) => (n.id === newNodeId ? { ...n, metadata: { ...n.metadata, content: `拉取失败：${e.message}` } } : n)));
-                    });
-            }
             const connection = normalizeConnection(pending.connection.nodeId, newNode.id, [...nodesRef.current, newNode], pending.connection.handleType);
             if (!connection) {
                 message.warning(t("canvas.projectPage.configConnection"));
