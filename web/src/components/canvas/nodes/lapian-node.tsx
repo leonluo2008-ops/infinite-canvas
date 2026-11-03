@@ -14,7 +14,7 @@ const MAX_NET_ERRORS = 3;
 
 type Phase = "loading" | "done" | "error" | "lost";
 
-export function LapianNodeContent({ node }: { node: CanvasNodeData; theme: (typeof canvasThemes)[keyof typeof canvasThemes] }) {
+export function LapianNodeContent({ node, onContentChange }: { node: CanvasNodeData; theme: (typeof canvasThemes)[keyof typeof canvasThemes]; onContentChange?: (nodeId: string, content: string) => void }) {
     const taskId = String(node.metadata?.taskId || "");
     const jobId = String(node.metadata?.jobId || "");
     const intent = String(node.metadata?.intent || "");
@@ -37,7 +37,7 @@ export function LapianNodeContent({ node }: { node: CanvasNodeData; theme: (type
                 if (r.status === 404) {
                     // bridge 重启过：job 查不到。任务可能已完成——按 taskId 重查。
                     const lp = await fetch(`${BRIDGE}/api/lapian/${encodeURIComponent(taskId)}`).then((x) => x.json());
-                    if (lp && !lp.error) { setMarkdown(lp.markdown || ""); setPhase("done"); return; }
+                    if (lp && !lp.error) { setMarkdown(lp.markdown || ""); setPhase("done"); onContentChange?.(node.id, lp.markdown || ""); return; }
                     setPhase("lost"); setMessage("任务状态查不到（服务可能重启过）。可按任务号重查，或重新拉片。");
                     return;
                 }
@@ -45,7 +45,7 @@ export function LapianNodeContent({ node }: { node: CanvasNodeData; theme: (type
                 netErrRef.current = 0;
                 if (d.status === "done") {
                     const lp = await fetch(`${BRIDGE}/api/lapian/${encodeURIComponent(taskId)}`).then((x) => x.json());
-                    if (lp && !lp.error) { setMarkdown(lp.markdown || ""); setPhase("done"); return; }
+                    if (lp && !lp.error) { setMarkdown(lp.markdown || ""); setPhase("done"); onContentChange?.(node.id, lp.markdown || ""); return; }
                     setPhase("error"); setMessage(lp?.error || "拉片投影失败");
                     return;
                 }
@@ -76,7 +76,7 @@ export function LapianNodeContent({ node }: { node: CanvasNodeData; theme: (type
         setPhase("loading"); setElapsed(0); startedRef.current = Date.now();
         try {
             const lp = await fetch(`${BRIDGE}/api/lapian/${encodeURIComponent(taskId)}`).then((x) => x.json());
-            if (lp && !lp.error) { setMarkdown(lp.markdown || ""); setPhase("done"); return; }
+            if (lp && !lp.error) { setMarkdown(lp.markdown || ""); setPhase("done"); onContentChange?.(node.id, lp.markdown || ""); return; }
             setPhase("error"); setMessage(lp?.error || "重查失败");
         } catch (e) {
             setPhase("error"); setMessage(`重查失败：${(e as Error).message}`);
