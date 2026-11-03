@@ -209,6 +209,13 @@ async function createSdgfVideoTask(config: AiConfig, model: string, prompt: stri
         aspect_ratio: sdgfAspectRatio(config.size || "16:9"),
         mode: sdgfMode(config.videoMode, images.length),
     };
+    // S2 待实测（docs/任务-SDGF渠道指令完整适配-20261104.md）：enableSound 是聚鑫通用章字段（旧 SD2），
+    // 第十四章 GF 合同未列。实测通过（创建 200 且成片音轨符合开关语义）后置 true 启用。
+    // 实测必须由所有者授权——生成视频红线。
+    const SDGF_SEND_SOUND_PARAM = false;
+    if (SDGF_SEND_SOUND_PARAM) {
+        body.enableSound = boolConfig(config.videoGenerateAudio, true);
+    }
     if (images.length) body.images = images;
     let created: unknown;
     try {
