@@ -473,6 +473,7 @@ function normalizeChannels(config: AiConfig) {
 
 export function defaultBaseUrlForApiFormat(apiFormat: ApiCallFormat) {
     if (apiFormat === "gemini") return GEMINI_BASE_URL;
+    if (apiFormat === "sdgf") return "https://sdapi.jxinai.com";
     return OPENAI_BASE_URL;
 }
 
