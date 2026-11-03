@@ -154,10 +154,12 @@ function stripReferenceToken(value: string): string {
 async function sdgfImageUrls(references: ReferenceImage[], options?: RequestOptions): Promise<string[]> {
     const urls: string[] = [];
     for (const image of references) {
-        // 已是公网 URL（含 token 包裹的）直接剥用，不再重新上传
-        const direct = typeof (image as { url?: unknown }).url === "string" ? stripReferenceToken((image as { url: string }).url) : "";
-        const dataUrl = direct && /^https:\/\//.test(direct) ? direct : await imageToDataUrl(image);
-        if (direct && /^https:\/\//.test(direct)) { urls.push(direct); continue; }
+        // 已是公网 URL（含 @url:`...` token 包裹的，可能在 url 或 dataUrl 字段）直接剥用，不再重新上传
+        const rawUrl = typeof (image as { url?: unknown }).url === "string" ? String((image as { url: string }).url) : "";
+        const rawData = typeof image.dataUrl === "string" ? image.dataUrl : "";
+        const stripped = stripReferenceToken(rawUrl || rawData);
+        if (/^https:\/\//.test(stripped)) { urls.push(stripped); continue; }
+        const dataUrl = await imageToDataUrl(image);
         const blob = await (await fetch(dataUrl)).blob();
         if (!blob.size) throw new Error("参考图字节为空：" + (image.name || "未命名"));
         const ext = (blob.type.split("/")[1] || "png").replace("jpeg", "jpg");
