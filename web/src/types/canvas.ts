@@ -55,6 +55,7 @@ export type CanvasNodeMetadata = {
     taskId?: string;
     jobId?: string;
     intent?: string;
+    lapPhase?: string;
     generationMode?: CanvasGenerationMode;
     generationType?: CanvasImageGenerationType;
     model?: string;

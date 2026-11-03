@@ -261,6 +261,7 @@ function InfiniteCanvasPage() {
     const [lapianIntent, setLapianIntent] = useState("");
     const [lapianBusy, setLapianBusy] = useState(false);
     const [lapianError, setLapianError] = useState("");
+    const [lapianPendingPosition, setLapianPendingPosition] = useState<Position | null>(null);
     const [maskEditNodeId, setMaskEditNodeId] = useState<string | null>(null);
     const [splitNodeId, setSplitNodeId] = useState<string | null>(null);
     const [upscaleNodeId, setUpscaleNodeId] = useState<string | null>(null);
@@ -634,9 +635,34 @@ function InfiniteCanvasPage() {
     );
 
     const createConnectedNode = useCallback(
-        (type: CanvasNodeType.Image | CanvasNodeType.Text | CanvasNodeType.Config | CanvasNodeType.Video | CanvasNodeType.Audio, pending: PendingConnectionCreate) => {
-            const metadata = type === CanvasNodeType.Config ? { model: effectiveConfig.imageModel || effectiveConfig.model, size: effectiveConfig.size, count: getGenerationCount(effectiveConfig.canvasImageCount || effectiveConfig.count) } : undefined;
+        (type: CanvasNodeType.Image | CanvasNodeType.Text | CanvasNodeType.Config | CanvasNodeType.Video | CanvasNodeType.Audio | CanvasNodeType.Lapian, pending: PendingConnectionCreate) => {
+            // 拉线路径：视频 →（拉线）→ 拉片。不直接建节点：先弹意图弹层，执行后才建（独立任务语义）。
+            if (type === CanvasNodeType.Lapian) {
+                setLapianIntent("");
+                setLapianNodeId(pending.connection.nodeId);
+                setLapianPendingPosition(pending.position);
+                setPendingConnectionCreate(null);
+                setConnecting(null);
+                return;
+            }
+            const sourceNode = nodesRef.current.find((n) => n.id === pending.connection.nodeId);
+            let metadata = type === CanvasNodeType.Config ? { model: effectiveConfig.imageModel || effectiveConfig.model, size: effectiveConfig.size, count: getGenerationCount(effectiveConfig.canvasImageCount || effectiveConfig.count) } : undefined;
             const newNode = createCanvasNode(type, pending.position, metadata);
+            // 拉线路径：拉片 →（拉线）→ 文本 = 输出结果节点，预填拉片正文
+            if (type === CanvasNodeType.Text && sourceNode?.type === CanvasNodeType.Lapian && sourceNode.metadata?.taskId) {
+                const tid = String(sourceNode.metadata.taskId);
+                const newNodeId = newNode.id;
+                setNodes((prev) => prev.map((n) => (n.id === newNodeId ? { ...n, metadata: { ...n.metadata, content: "拉取拉片结果中…" } } : n)));
+                void fetch(`http://127.0.0.1:8776/api/lapian/${encodeURIComponent(tid)}`)
+                    .then((r) => r.json())
+                    .then((d) => {
+                        const md = d && !d.error ? String(d.markdown || "") : `拉取失败：${d?.error || "未知错误"}`;
+                        setNodes((prev) => prev.map((n) => (n.id === newNodeId ? { ...n, metadata: { ...n.metadata, content: md } } : n)));
+                    })
+                    .catch((e: Error) => {
+                        setNodes((prev) => prev.map((n) => (n.id === newNodeId ? { ...n, metadata: { ...n.metadata, content: `拉取失败：${e.message}` } } : n)));
+                    });
+            }
             const connection = normalizeConnection(pending.connection.nodeId, newNode.id, [...nodesRef.current, newNode], pending.connection.handleType);
             if (!connection) {
                 message.warning(t("canvas.projectPage.configConnection"));
@@ -836,7 +862,7 @@ function InfiniteCanvasPage() {
         applyAgentOps,
     });
     const handleLapianExecute = useCallback(
-        async (videoNode: CanvasNodeData, intent: string) => {
+        async (videoNode: CanvasNodeData, intent: string, dropPosition?: Position) => {
             const LOG = (msg: string) => { (window as unknown as { __lapianLog?: string[] }).__lapianLog = [...((window as unknown as { __lapianLog?: string[] }).__lapianLog || []), `${new Date().toLocaleTimeString()} ${msg}`]; };
             LOG(`start node=${videoNode.id}`);
             const key = videoNode.metadata?.storageKey;
@@ -870,10 +896,10 @@ function InfiniteCanvasPage() {
                         id: lapId,
                         type: CanvasNodeType.Lapian,
                         title: `拉片 · ${up.id}`,
-                        position: { x: videoNode.position.x, y: videoNode.position.y + (videoNode.height || 236) + 48 },  // 放视频正下方：放右侧会出视口被 visibleNodes 过滤掉
+                        position: dropPosition ?? { x: videoNode.position.x, y: videoNode.position.y + (videoNode.height || 236) + 48 },  // 拉线落点优先；默认视频正下方
                         width: size.width,
                         height: size.height,
-                        metadata: { taskId: up.id, jobId: String(run.job || ""), intent, status: "loading" },
+                        metadata: { taskId: up.id, jobId: String(run.job || ""), intent, lapPhase: "loading" },  // 不用 status（二开仓通用 loading/error 分支会拦截内容渲染）
                     },
                 ]);
                 setConnections((prev) => [...prev, { id: nanoid(), fromNodeId: videoNode.id, toNodeId: lapId }]);
@@ -3363,7 +3389,7 @@ function InfiniteCanvasPage() {
                             <rect width="100%" height="100%" fill={theme.canvas.selectionFill} stroke={theme.canvas.selectionStroke} strokeOpacity={0.55} strokeWidth={1 / viewport.k} strokeDasharray={`${6 / viewport.k} ${4 / viewport.k}`} />
                         </svg>
                     ) : null}
-                    {pendingConnectionCreate ? <ConnectionCreateMenu pending={pendingConnectionCreate} scale={viewport.k} onCreate={(type) => createConnectedNode(type, pendingConnectionCreate)} onClose={cancelPendingConnectionCreate} /> : null}
+                    {pendingConnectionCreate ? <ConnectionCreateMenu pending={pendingConnectionCreate} scale={viewport.k} onCreate={(type) => createConnectedNode(type, pendingConnectionCreate)} onClose={cancelPendingConnectionCreate} sourceNodeType={nodesRef.current.find((n) => n.id === pendingConnectionCreate.connection.nodeId)?.type as CanvasNodeType | undefined} /> : null}
                     {nodeCreatePosition ? (
                         <NodeCreateMenu
                             position={nodeCreatePosition}
@@ -3519,7 +3545,7 @@ function InfiniteCanvasPage() {
                             />
                             {lapianError ? <div className="mb-3 rounded-lg border border-red-500/40 bg-red-500/10 p-2 text-xs leading-relaxed text-red-300" data-lapian-error-text>{lapianError}</div> : null}
                             <div className="flex justify-end gap-2">
-                                <button type="button" className="rounded-lg px-3 py-1.5 text-sm text-stone-400 hover:bg-white/5" onClick={() => setLapianNodeId(null)}>取消</button>
+                                <button type="button" className="rounded-lg px-3 py-1.5 text-sm text-stone-400 hover:bg-white/5" onClick={() => { setLapianNodeId(null); setLapianPendingPosition(null); }}>取消</button>
                                 <button
                                     type="button"
                                     className="rounded-lg bg-amber-500/90 px-3 py-1.5 text-sm font-medium text-stone-950 hover:bg-amber-400 disabled:opacity-40"
@@ -3527,7 +3553,7 @@ function InfiniteCanvasPage() {
                                     data-lapian-execute
                                     onClick={() => {
                                         setLapianError("");
-                                        void handleLapianExecute(lapianPopoverNode, lapianIntent.trim()).then(() => setLapianNodeId(null)).catch((e: Error) => setLapianError(e.message));
+                                        void handleLapianExecute(lapianPopoverNode, lapianIntent.trim(), lapianPendingPosition ?? undefined).then(() => { setLapianNodeId(null); setLapianPendingPosition(null); }).catch((e: Error) => setLapianError(e.message));
                                     }}
                                 >
                                     {lapianBusy ? "上传中…" : "执行拉片"}
