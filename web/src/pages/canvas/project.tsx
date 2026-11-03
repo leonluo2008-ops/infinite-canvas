@@ -645,7 +645,12 @@ function InfiniteCanvasPage() {
                 setConnecting(null);
                 return;
             }
-            const metadata = type === CanvasNodeType.Config ? { model: effectiveConfig.imageModel || effectiveConfig.model, size: effectiveConfig.size, count: getGenerationCount(effectiveConfig.canvasImageCount || effectiveConfig.count) } : undefined;
+            const sourceNode = nodesRef.current.find((n) => n.id === pending.connection.nodeId);
+            let metadata: CanvasNodeMetadata | undefined = type === CanvasNodeType.Config ? { model: effectiveConfig.imageModel || effectiveConfig.model, size: effectiveConfig.size, count: getGenerationCount(effectiveConfig.canvasImageCount || effectiveConfig.count) } : undefined;
+            // T7 拉线路径：拉片 →（拉线）→ 生成视频 = Config 视频模式（复用 Config 通道，零新类型）
+            if (type === CanvasNodeType.Config && sourceNode?.type === CanvasNodeType.Lapian) {
+                metadata = { ...metadata, generationMode: "video", model: effectiveConfig.videoModel || effectiveConfig.model };
+            }
             const newNode = createCanvasNode(type, pending.position, metadata);
             const connection = normalizeConnection(pending.connection.nodeId, newNode.id, [...nodesRef.current, newNode], pending.connection.handleType);
             if (!connection) {

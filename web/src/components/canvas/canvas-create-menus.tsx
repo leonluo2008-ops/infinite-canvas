@@ -49,6 +49,7 @@ export function ConnectionCreateMenu({
                 <ConnectionCreateOption theme={theme} icon={<ImageIcon className="size-4" />} title={t("canvas.createMenu.image")} onClick={() => onCreate(CanvasNodeType.Image)} />
                 <ConnectionCreateOption theme={theme} icon={<Video className="size-4" />} title={t("canvas.createMenu.video")} onClick={() => onCreate(CanvasNodeType.Video)} />
                 {sourceNodeType === CanvasNodeType.Video ? <ConnectionCreateOption theme={theme} icon={<Clapperboard className="size-4" />} title="拉片" description="拆解这个视频，出结构拉片" onClick={() => onCreate(CanvasNodeType.Lapian)} /> : null}
+                {sourceNodeType === CanvasNodeType.Lapian ? <ConnectionCreateOption theme={theme} icon={<Video className="size-4" />} title="生成视频" description="用拉片结果作提示词生成视频" onClick={() => onCreate(CanvasNodeType.Config)} /> : null}
                 <ConnectionCreateOption theme={theme} icon={<Music2 className="size-4" />} title={t("canvas.createMenu.audio")} onClick={() => onCreate(CanvasNodeType.Audio)} />
                 <ConnectionCreateOption theme={theme} icon={<Settings2 className="size-4" />} title={t("canvas.createMenu.config")} description={t("canvas.createMenu.configDescription")} onClick={() => onCreate(CanvasNodeType.Config)} />
             </div>
