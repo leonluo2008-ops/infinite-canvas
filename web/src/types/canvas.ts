@@ -16,6 +16,7 @@ export enum CanvasNodeType {
     Video = "video",
     Audio = "audio",
     Group = "group",
+    Lapian = "lapian",   // 拉片节点（wan-repro M3）：即梦结构拉片展示
 }
 
 // Node types are open strings: built-ins use CanvasNodeType and plugins use "<pluginId>:<name>".
@@ -51,6 +52,10 @@ export type CanvasNodeMetadata = {
     status?: CanvasNodeStatus;
     errorDetails?: string;
     fontSize?: number;
+    taskId?: string;
+    jobId?: string;
+    intent?: string;
+    lapPhase?: string;
     generationMode?: CanvasGenerationMode;
     generationType?: CanvasImageGenerationType;
     model?: string;

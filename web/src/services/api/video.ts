@@ -19,7 +19,7 @@ type VideoMediaOptions = RequestOptions & { videos?: ReferenceVideo[]; audios?: 
 const apiText = (key: string, options?: Record<string, unknown>) => i18n.t(`apiErrors.${key}`, options);
 
 export type VideoGenerationResult = { blob?: Blob; url?: string; mimeType?: string };
-export type VideoGenerationTask = { id: string; provider: "openai" | "gemini" | "plugin"; model: string };
+export type VideoGenerationTask = { id: string; provider: "openai" | "gemini" | "plugin" | "sdgf"; model: string };
 type GeminiInlineData = { bytesBase64Encoded: string; mimeType: string };
 type GeminiVideoOperation = {
     name?: string;
@@ -75,6 +75,7 @@ export async function createVideoGenerationTask(config: AiConfig, prompt: string
     const script = resolveModelScript(config, selectedModel);
     if (script) return createPluginVideoTask(requestConfig, selectedModel, script, prompt, references, options);
     assertVideoConfig(requestConfig, requestConfig.model);
+    if (requestConfig.apiFormat === "sdgf") return createSdgfVideoTask(requestConfig, selectedModel, prompt, references, options);
     if (requestConfig.apiFormat === "gemini") return createGeminiVideoTask(requestConfig, selectedModel, prompt, references, options);
     return createOpenAIVideoTask(requestConfig, selectedModel, prompt, references, options);
 }
@@ -87,6 +88,7 @@ export async function pollVideoGenerationTask(config: AiConfig, task: VideoGener
     const requestConfig = resolveModelRequestConfig(config, task.model);
     assertVideoConfig(requestConfig, requestConfig.model);
     if (task.provider === "gemini") return pollGeminiVideoTask(requestConfig, task, options);
+    if (task.provider === "sdgf") return pollSdgfVideoTask(requestConfig, task, options);
     return pollOpenAIVideoTask(requestConfig, task, options);
 }
 
@@ -132,6 +134,129 @@ function videoPluginResult(result: unknown): VideoGenerationResult {
         if (url) return { url, mimeType: "video/mp4" };
     }
     throw new Error(apiText("scriptNoVideo"));
+}
+
+// ---- SD GF（聚鑫统一视频 API）--------------------------------------------------
+// 合同：POST /v1/videos（JSON：model/prompt/duration/aspect_ratio/mode/images）
+//       GET /v1/videos/{id}（queued/in_progress/completed/failed + metadata.url）
+//       GET /v1/videos/{id}/content（鉴权代理下载）
+// 参考图只收公网 HTTPS URL：本地字节先经 bridge 图床路由换 URL（存储凭据不出服务端）。
+// 分辨率由精确模型名定档——本分支不发送 size/resolution。
+
+const SDGF_ASSET_BRIDGE = "http://127.0.0.1:8776/api/asset/upload";
+
+// 聚鑫只收裸 HTTPS URL；重试链会从 metadata 恢复出 `@url:`...`` token 格式的引用——剥出内层 URL。
+function stripReferenceToken(value: string): string {
+    const m = value.match(/@url:\s*`?(https:\/\/[^`\s]+)`?/) || value.match(/^@?url:?\s*`?(https:\/\/[^`\s]+)`?$/);
+    return m ? m[1] : value;
+}
+
+async function sdgfImageUrls(references: ReferenceImage[], options?: RequestOptions): Promise<string[]> {
+    const urls: string[] = [];
+    for (const image of references) {
+        // 已是公网 URL（含 @url:`...` token 包裹的，可能在 url 或 dataUrl 字段）直接剥用，不再重新上传
+        const rawUrl = typeof (image as { url?: unknown }).url === "string" ? String((image as { url: string }).url) : "";
+        const rawData = typeof image.dataUrl === "string" ? image.dataUrl : "";
+        const stripped = stripReferenceToken(rawUrl || rawData);
+        if (/^https:\/\//.test(stripped)) { urls.push(stripped); continue; }
+        const dataUrl = await imageToDataUrl(image);
+        const blob = await (await fetch(dataUrl)).blob();
+        if (!blob.size) throw new Error("参考图字节为空：" + (image.name || "未命名"));
+        const ext = (blob.type.split("/")[1] || "png").replace("jpeg", "jpg");
+        const name = encodeURIComponent(image.name || `ref-${urls.length + 1}.${ext}`);
+        const res = await axios.post<{ url?: string; error?: string }>(SDGF_ASSET_BRIDGE, blob, { headers: { "X-Filename": name, "Content-Type": "application/octet-stream" }, signal: options?.signal });
+        const url = res.data?.url;
+        if (typeof url !== "string" || !/^https:\/\//.test(url)) throw new Error(`参考图上云失败：${res.data?.error || JSON.stringify(res.data).slice(0, 120)}`);
+        urls.push(url);
+    }
+    return urls;
+}
+
+function sdgfDuration(seconds: string): number {
+    // GF 合同 4–30 整数；读原值显式拒绝（clampVideoSeconds 会把 40 吞成 30，禁用它）
+    const raw = Math.round(Number(seconds));
+    if (!Number.isFinite(raw)) throw new Error(`SD GF 时长不是数字：${seconds}`);
+    if (raw < 4 || raw > 30) throw new Error(`SD GF 时长须 4–30 秒（收到 ${seconds}）`);
+    return raw;
+}
+
+function sdgfAspectRatio(size: string): string {
+    const ratio = inferVideoRatio(size || "16:9");
+    const mapped = ratio === "auto" ? "adaptive" : ratio;
+    if (!["16:9", "9:16", "1:1", "4:3", "3:4", "adaptive"].includes(mapped)) throw new Error(`SD GF 不支持比例 ${mapped}（支持 16:9/9:16/1:1/4:3/3:4/adaptive）`);
+    return mapped;
+}
+
+function sdgfMode(videoMode: string | undefined, imageCount: number): string {
+    // 站方中文 mode 枚举（本期子集：站方 2026-10-22 拒音视频参考，视频编辑不可用）
+    const mode = resolveVideoMode(videoMode, imageCount); // "reference" | "frames"
+    if (mode === "reference") {
+        if (imageCount < 1) throw new Error("参考生视频至少需要 1 张参考图（SD GF 无 0 图参考模式）");
+        return "参考生视频";
+    }
+    if (imageCount === 0) return "文生视频";
+    if (imageCount === 1) return "首帧生视频";
+    if (imageCount === 2) return "首尾帧";
+    return "参考生视频";
+}
+
+async function createSdgfVideoTask(config: AiConfig, model: string, prompt: string, references: ReferenceImage[], options?: VideoMediaOptions): Promise<VideoGenerationTask> {
+    const images = await sdgfImageUrls(references, options);
+    const body: Record<string, unknown> = {
+        model: modelOptionName(model),
+        prompt,
+        duration: sdgfDuration(config.videoSeconds),
+        aspect_ratio: sdgfAspectRatio(config.size || "16:9"),
+        mode: sdgfMode(config.videoMode, images.length),
+    };
+    // S2 待实测（docs/任务-SDGF渠道指令完整适配-20261104.md）：enableSound 是聚鑫通用章字段（旧 SD2），
+    // 第十四章 GF 合同未列。实测通过（创建 200 且成片音轨符合开关语义）后置 true 启用。
+    // 实测必须由所有者授权——生成视频红线。
+    const SDGF_SEND_SOUND_PARAM = false;
+    if (SDGF_SEND_SOUND_PARAM) {
+        body.enableSound = boolConfig(config.videoGenerateAudio, true);
+    }
+    if (images.length) body.images = images;
+    let created: unknown;
+    try {
+        created = (await axios.post(aiApiUrl(config, "/videos"), body, { headers: aiHeaders(config, "application/json"), signal: options?.signal, timeout: 90000 })).data;
+    } catch (error) {
+        // 排障透出：响应体全文（含聚鑫 Request ID）+ 请求体快照（prompt 截断），一次重试即可定位
+        let detail = readAxiosError(error, "SD GF 创建请求失败（状态不明时勿重复提交，先到站内控制台核对）");
+        if (axios.isAxiosError(error) && error.response?.data !== undefined) {
+            try { detail += ` | 响应体: ${JSON.stringify(error.response.data).slice(0, 400)}`; } catch { /* 不可序列化则略 */ }
+        }
+        const snapshot = { ...body, prompt: typeof body.prompt === "string" ? body.prompt.slice(0, 80) + `…(共${body.prompt.length}字)` : body.prompt };
+        throw new Error(`${detail} | 请求体: ${JSON.stringify(snapshot)}`);
+    }
+    const record = (created || {}) as Record<string, unknown>;
+    const id = record.id || record.task_id;
+    if (typeof id !== "string" || !id) throw new Error("SD GF 未返回任务 ID（提交状态不明——到站内控制台核对，勿重复提交）");
+    return { id, provider: "sdgf", model };
+}
+
+async function pollSdgfVideoTask(config: AiConfig, task: VideoGenerationTask, options?: RequestOptions): Promise<VideoGenerationTaskState> {
+    try {
+        const raw = (await axios.get<Record<string, unknown>>(aiApiUrl(config, `/videos/${task.id}`), { headers: aiHeaders(config), signal: options?.signal })).data;
+        const status = String(raw?.status || "");
+        const metadata = (raw?.metadata || {}) as Record<string, unknown>;
+        // 聚鑫实测：metadata.url 可能是相对路径（/v1/videos/{id}/content）——只有完整 http(s) 才直连，否则走鉴权 content 端点
+        const rawUrl = typeof metadata.url === "string" ? metadata.url : "";
+        const url = /^https?:\/\//.test(rawUrl) ? rawUrl : "";
+        if (status === "completed") {
+            if (url) return { status: "completed", result: await videoResultFromUrl(url, options) };
+            const content = await axios.get<Blob>(aiApiUrl(config, `/videos/${task.id}/content`), { headers: aiHeaders(config), responseType: "blob", signal: options?.signal });
+            await assertVideoBlob(content.data);
+            return { status: "completed", result: { blob: content.data } };
+        }
+        if (status === "failed" || status === "cancelled") {
+            const err = (raw?.error || {}) as { message?: string };
+            return { status: "failed", error: readApiErrorMessage(err.message) || "SD GF 生成失败" };
+        }
+        return { status: "pending" };
+    } catch (error) {
+        throw new Error(readAxiosError(error, "SD GF 任务查询失败（沿用同一任务 ID 重查，勿重新创建）"));
+    }
 }
 
 export async function storeGeneratedVideo(result: VideoGenerationResult): Promise<UploadedFile> {

@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { ChangeEvent as ReactChangeEvent, DragEvent as ReactDragEvent, MouseEvent as ReactMouseEvent, PointerEvent as ReactPointerEvent } from "react";
 import { useNavigate, useParams, useSearchParams } from "react-router-dom";
-import { Group, Video } from "lucide-react";
+import { Group, Video, Clapperboard } from "lucide-react";
 import { saveAs } from "file-saver";
 import { useTranslation } from "react-i18next";
 
@@ -10,7 +10,7 @@ import { requestAudioGeneration, storeGeneratedAudio } from "@/services/api/audi
 import { createVideoGenerationTask, isVideoTaskFailed, storeGeneratedVideo, waitForVideoGenerationTask } from "@/services/api/video";
 import { defaultConfig, useConfigStore, useEffectiveConfig } from "@/stores/use-config-store";
 import { ensureImagePreview, uploadImage } from "@/services/image-storage";
-import { uploadMediaFile, type UploadedFile } from "@/services/file-storage";
+import { getMediaBlob, uploadMediaFile, type UploadedFile } from "@/services/file-storage";
 import { nanoid } from "nanoid";
 import { getDataUrlByteSize, readImageMeta } from "@/lib/image-utils";
 import { imageReferenceLabel } from "@/lib/image-reference-prompt";
@@ -91,6 +91,7 @@ import {
     type SelectionBox,
     type ViewportTransform,
 } from "@/types/canvas";
+import type { CanvasNodeToolbarItem } from "@/types/canvas-plugin";
 import type { ReferenceImage } from "@/types/image";
 import type { ReferenceAudio, ReferenceVideo } from "@/types/media";
 
@@ -255,6 +256,11 @@ function InfiniteCanvasPage() {
     const [infoNodeId, setInfoNodeId] = useState<string | null>(null);
     const [pluginManagerOpen, setPluginManagerOpen] = useState(false);
     const [cropNodeId, setCropNodeId] = useState<string | null>(null);
+    const [lapianNodeId, setLapianNodeId] = useState<string | null>(null);
+    const [lapianIntent, setLapianIntent] = useState("");
+    const [lapianBusy, setLapianBusy] = useState(false);
+    const [lapianError, setLapianError] = useState("");
+    const [lapianPendingPosition, setLapianPendingPosition] = useState<Position | null>(null);
     const [maskEditNodeId, setMaskEditNodeId] = useState<string | null>(null);
     const [splitNodeId, setSplitNodeId] = useState<string | null>(null);
     const [upscaleNodeId, setUpscaleNodeId] = useState<string | null>(null);
@@ -628,9 +634,31 @@ function InfiniteCanvasPage() {
     );
 
     const createConnectedNode = useCallback(
-        (type: CanvasNodeType.Image | CanvasNodeType.Text | CanvasNodeType.Config | CanvasNodeType.Video | CanvasNodeType.Audio, pending: PendingConnectionCreate) => {
-            const metadata = type === CanvasNodeType.Config ? { model: effectiveConfig.imageModel || effectiveConfig.model, size: effectiveConfig.size, count: getGenerationCount(effectiveConfig.canvasImageCount || effectiveConfig.count) } : undefined;
+        (type: CanvasNodeType.Image | CanvasNodeType.Text | CanvasNodeType.Config | CanvasNodeType.Video | CanvasNodeType.Audio | CanvasNodeType.Lapian, pending: PendingConnectionCreate) => {
+            // 拉线路径：视频 →（拉线）→ 拉片。不直接建节点：先弹意图弹层，执行后才建（独立任务语义）。
+            if (type === CanvasNodeType.Lapian) {
+                setLapianIntent("");
+                setLapianNodeId(pending.connection.nodeId);
+                setLapianPendingPosition(pending.position);
+                setPendingConnectionCreate(null);
+                setConnecting(null);
+                return;
+            }
+            const sourceNode = nodesRef.current.find((n) => n.id === pending.connection.nodeId);
+            let metadata: CanvasNodeMetadata | undefined = type === CanvasNodeType.Config ? { model: effectiveConfig.imageModel || effectiveConfig.model, size: effectiveConfig.size, count: getGenerationCount(effectiveConfig.canvasImageCount || effectiveConfig.count) } : undefined;
+            // T7/T8 拉线路径：拉片 →（拉线）→ 生成视频 = Config 视频模式 + 投影预填（复用 Config 通道）
+            const lapianGenSource = type === CanvasNodeType.Config && sourceNode?.type === CanvasNodeType.Lapian && sourceNode.metadata?.taskId ? sourceNode : null;
+            if (lapianGenSource) {
+                metadata = { ...metadata, generationMode: "video", model: effectiveConfig.videoModel || effectiveConfig.model, prompt: "正在生成提示词预填…" };
+            }
             const newNode = createCanvasNode(type, pending.position, metadata);
+            if (lapianGenSource) {
+                const presetNode = lapianGenSource;
+                void lapianPromptPreset(presetNode).then((preset) => {
+                    const text = preset || String(presetNode.metadata?.content || "").split("\n# 附注")[0].trim();
+                    setNodes((prev) => prev.map((n) => (n.id === newNode.id ? { ...n, metadata: { ...n.metadata, prompt: text } } : n)));
+                });
+            }
             const connection = normalizeConnection(pending.connection.nodeId, newNode.id, [...nodesRef.current, newNode], pending.connection.handleType);
             if (!connection) {
                 message.warning(t("canvas.projectPage.configConnection"));
@@ -829,6 +857,138 @@ function InfiniteCanvasPage() {
         setDialogNodeId,
         applyAgentOps,
     });
+    const handleLapianExecute = useCallback(
+        async (videoNode: CanvasNodeData, intent: string, dropPosition?: Position) => {
+            const LOG = (msg: string) => { (window as unknown as { __lapianLog?: string[] }).__lapianLog = [...((window as unknown as { __lapianLog?: string[] }).__lapianLog || []), `${new Date().toLocaleTimeString()} ${msg}`]; };
+            LOG(`start node=${videoNode.id}`);
+            const key = videoNode.metadata?.storageKey;
+            if (!key) throw new Error("这个视频节点没有本地字节（可能是外部链接）——重新把视频文件拖进画布再试");
+            setLapianBusy(true);
+            try {
+                LOG("getting blob");
+                const blob = await getMediaBlob(key);
+                LOG(`blob=${blob ? blob.size : "null"}`);
+                if (!blob) throw new Error("视频字节取不回（浏览器存储里没有这个文件）——重新拖入视频");
+                const filename = encodeURIComponent(videoNode.title || "canvas-video.mp4");
+                const up = await fetch(`http://127.0.0.1:8776/api/video/upload`, {
+                    method: "POST",
+                    headers: { "X-Filename": filename, "Content-Type": "application/octet-stream" },
+                    body: blob,
+                }).then((r) => r.json());
+                LOG(`upload=${JSON.stringify(up).slice(0, 120)}`);
+                if (up.error) throw new Error(up.error);
+                const run = await fetch(`http://127.0.0.1:8776/api/lapian/run`, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ id: up.id, intent }),
+                }).then((r) => r.json());
+                LOG(`run=${JSON.stringify(run).slice(0, 120)}`);
+                if (run.error) throw new Error(run.error);
+                const size = { width: 400, height: 560 };
+                const lapId = `lapian-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+                setNodes((prev) => [
+                    ...prev,
+                    {
+                        id: lapId,
+                        type: CanvasNodeType.Lapian,
+                        title: `拉片 · ${up.id}`,
+                        position: dropPosition ?? { x: videoNode.position.x, y: videoNode.position.y + (videoNode.height || 236) + 48 },  // 拉线落点优先；默认视频正下方
+                        width: size.width,
+                        height: size.height,
+                        metadata: { taskId: up.id, jobId: String(run.job || ""), intent, lapPhase: "loading" },  // 不用 status（二开仓通用 loading/error 分支会拦截内容渲染）
+                    },
+                ]);
+                setConnections((prev) => [...prev, { id: nanoid(), fromNodeId: videoNode.id, toNodeId: lapId }]);
+                setSelectedNodeIds(new Set([lapId]));
+                setSelectedConnectionId(null);
+                LOG(`done lapId=${lapId}`);
+                focusNodeRef.current(lapId);   // 平移视口把新节点带进可见区（visibleNodes 按视口过滤）
+            } catch (e) {
+                LOG(`ERROR ${(e as Error).message}`);
+                throw e;
+            } finally {
+                setLapianBusy(false);
+            }
+        },
+        [],
+    );
+
+    const lapianPopoverNode = lapianNodeId ? nodes.find((n) => n.id === lapianNodeId) : null;
+    // T8/T9：拉片 → 提交正文。默认规范 timeline-narrative（有先例成片）。
+    // 剥离「# 附注」节（v4 审计 B-03：附注随提示词提交会在聚鑫链复发——唯一转换点在这里）。
+    const lapianPromptPreset = useCallback(
+        async (lapianNode: CanvasNodeData): Promise<string> => {
+            const taskId = String(lapianNode.metadata?.taskId || "");
+            if (!taskId) return "";
+            try {
+                const d = await fetch(`http://127.0.0.1:8776/api/render/${encodeURIComponent(taskId)}/timeline-narrative`).then((r) => r.json());
+                if (!d || d.error) return "";
+                const text = String(d.text || "");
+                const cut = text.indexOf("\n# 附注");
+                return (cut >= 0 ? text.slice(0, cut) : text).trim();
+            } catch {
+                return "";
+            }
+        },
+        [],
+    );
+
+    // T7：拉片 → 生成视频（工具栏路径）。Config(视频模式)+连线+开面板+投影预填（剥附注）。
+    const generateVideoFromLapianNode = useCallback(
+        (node: CanvasNodeData) => {
+            const sourceNode = nodesRef.current.find((item) => item.id === node.id);
+            if (!sourceNode) return;
+            if (!sourceNode.metadata?.content) {
+                message.warning("拉片还没出结果——等它跑完再生成视频");
+                return;
+            }
+            const nodeSize = getNodeSpec(CanvasNodeType.Config);
+            const configNode = createCanvasNode(
+                CanvasNodeType.Config,
+                {
+                    x: sourceNode.position.x + sourceNode.width + 96 + nodeSize.width / 2,
+                    y: sourceNode.position.y + sourceNode.height / 2,
+                },
+                { generationMode: "video", model: effectiveConfig.videoModel || effectiveConfig.model, prompt: "正在生成提示词预填…" },
+            );
+            setNodes((prev) => [...prev, configNode]);
+            setConnections((prev) => [...prev, { id: nanoid(), fromNodeId: sourceNode.id, toNodeId: configNode.id }]);
+            setSelectedNodeIds(new Set([configNode.id]));
+            setSelectedConnectionId(null);
+            setDialogNodeId(configNode.id);
+            focusNodeRef.current(configNode.id);
+            void lapianPromptPreset(sourceNode).then((preset) => {
+                const text = preset || String(sourceNode.metadata?.content || "").split("\n# 附注")[0].trim();
+                setNodes((prev) => prev.map((n) => (n.id === configNode.id ? { ...n, metadata: { ...n.metadata, prompt: text } } : n)));
+            });
+        },
+        [effectiveConfig.model, effectiveConfig.videoModel, lapianPromptPreset, message],
+    );
+
+    const lapianToolItems = useCallback(
+        (node: CanvasNodeData): CanvasNodeToolbarItem[] => {
+            if (node.type !== CanvasNodeType.Video || !node.metadata?.storageKey) return [];
+            const mime = String(node.metadata?.mimeType || "");
+            const name = String(node.title || "");
+            const isMp4 = mime.includes("mp4") || /\.mp4$/i.test(name);
+            if (!isMp4) return [];
+            return [{
+                id: "wan-lapian",
+                title: "拉片：拆解这个视频，出即梦结构拉片",
+                label: "拉片",
+                icon: <Clapperboard className="size-4" />,
+                onClick: () => { setLapianIntent(""); setLapianNodeId(node.id); },
+            }, {
+                id: "wan-gen-video",
+                title: "生成视频：用拉片结果作提示词",
+                label: "生成视频",
+                icon: <Video className="size-4" />,
+                onClick: () => generateVideoFromLapianNode(node),
+            }];
+        },
+        [generateVideoFromLapianNode],
+    );
+
     const createNode = useCallback(
         (type: CanvasNodeTypeId, position?: Position) => {
             const targetPosition = position || getCanvasCenter();
@@ -3282,7 +3442,7 @@ function InfiniteCanvasPage() {
                             <rect width="100%" height="100%" fill={theme.canvas.selectionFill} stroke={theme.canvas.selectionStroke} strokeOpacity={0.55} strokeWidth={1 / viewport.k} strokeDasharray={`${6 / viewport.k} ${4 / viewport.k}`} />
                         </svg>
                     ) : null}
-                    {pendingConnectionCreate ? <ConnectionCreateMenu pending={pendingConnectionCreate} scale={viewport.k} onCreate={(type) => createConnectedNode(type, pendingConnectionCreate)} onClose={cancelPendingConnectionCreate} /> : null}
+                    {pendingConnectionCreate ? <ConnectionCreateMenu pending={pendingConnectionCreate} scale={viewport.k} onCreate={(type) => createConnectedNode(type, pendingConnectionCreate)} onClose={cancelPendingConnectionCreate} sourceNodeType={nodesRef.current.find((n) => n.id === pendingConnectionCreate.connection.nodeId)?.type as CanvasNodeType | undefined} /> : null}
                     {nodeCreatePosition ? (
                         <NodeCreateMenu
                             position={nodeCreatePosition}
@@ -3322,7 +3482,7 @@ function InfiniteCanvasPage() {
                 <CanvasNodeHoverToolbar
                     node={isNodeDragging || isNodeResizing || nodeImageSettingsOpen || Boolean(referencePickerNodeId) || expandedBatchNodeIds.has(toolbarNode?.id || "") ? null : toolbarNode}
                     viewport={viewport}
-                    extraTools={toolbarNode ? buildNodeToolbarItems(toolbarNode) : undefined}
+                    extraTools={toolbarNode ? [...(buildNodeToolbarItems(toolbarNode) || []), ...lapianToolItems(toolbarNode)] : undefined}
                     onKeep={keepNodeToolbar}
                     onLeave={hideNodeToolbar}
                     onInfo={(node) => setInfoNodeId(node.id)}
@@ -3423,6 +3583,38 @@ function InfiniteCanvasPage() {
                 <CanvasPluginManagerModal open={pluginManagerOpen} onClose={() => setPluginManagerOpen(false)} />
 
                 {cropNode?.metadata?.content ? <CanvasNodeCropDialog dataUrl={cropNode.metadata.content} open={Boolean(cropNode)} onClose={() => setCropNodeId(null)} onConfirm={(crop) => void cropImageNode(cropNode!, crop)} /> : null}
+
+                {lapianPopoverNode ? (
+                    <div className="fixed inset-0 z-[200] grid place-items-center bg-black/45" onPointerDown={(e) => { if (e.target === e.currentTarget) setLapianNodeId(null); }} data-lapian-popover>
+                        <div className="w-[440px] rounded-2xl border border-white/10 bg-stone-900 p-4 shadow-2xl" onPointerDown={(e) => e.stopPropagation()}>
+                            <div className="mb-1 text-sm font-medium text-stone-100">拉片 · {lapianPopoverNode.title}</div>
+                            <div className="mb-3 text-xs leading-relaxed text-stone-400">拆解这个视频，出即梦结构拉片（全局 DNA + 拉片段 + 衔接状态）。约 1–2 分钟，用已授权的拆解通道。</div>
+                            <textarea
+                                className="mb-3 h-20 w-full resize-none rounded-xl border border-stone-700 bg-stone-950 p-2 text-sm text-stone-100 outline-none focus:border-stone-500"
+                                placeholder="拉片需求（可选），如：重点保留产品出现的镜头与海滩场景"
+                                value={lapianIntent}
+                                onChange={(e) => setLapianIntent(e.target.value)}
+                                data-lapian-intent
+                            />
+                            {lapianError ? <div className="mb-3 rounded-lg border border-red-500/40 bg-red-500/10 p-2 text-xs leading-relaxed text-red-300" data-lapian-error-text>{lapianError}</div> : null}
+                            <div className="flex justify-end gap-2">
+                                <button type="button" className="rounded-lg px-3 py-1.5 text-sm text-stone-400 hover:bg-white/5" onClick={() => { setLapianNodeId(null); setLapianPendingPosition(null); }}>取消</button>
+                                <button
+                                    type="button"
+                                    className="rounded-lg bg-amber-500/90 px-3 py-1.5 text-sm font-medium text-stone-950 hover:bg-amber-400 disabled:opacity-40"
+                                    disabled={lapianBusy}
+                                    data-lapian-execute
+                                    onClick={() => {
+                                        setLapianError("");
+                                        void handleLapianExecute(lapianPopoverNode, lapianIntent.trim(), lapianPendingPosition ?? undefined).then(() => { setLapianNodeId(null); setLapianPendingPosition(null); }).catch((e: Error) => setLapianError(e.message));
+                                    }}
+                                >
+                                    {lapianBusy ? "上传中…" : "执行拉片"}
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                ) : null}
 
                 {maskEditNode?.metadata?.content ? (
                     <CanvasNodeMaskEditDialog dataUrl={maskEditNode.metadata.content} open={Boolean(maskEditNode)} onClose={() => setMaskEditNodeId(null)} onConfirm={(payload) => void maskEditImageNode(maskEditNode!, payload)} />
