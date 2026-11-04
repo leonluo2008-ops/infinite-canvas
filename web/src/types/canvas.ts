@@ -70,6 +70,29 @@ export type CanvasNodeMetadata = {
     attachedImageId?: string;
     /** 资产位已挂图的短说明（2–6 字，清单口径）。 */
     attachedImageDesc?: string;
+    /**
+     * 资产位（T3-J2）：资产位节点是官方 Image 节点，图=原片截帧，title=资产位名。
+     * 原片描述/时间区间/挂图 id/短说明没有别的地方放，全部收在这里（审计 §5 拍板）。
+     */
+    assetSlot?: {
+        desc: string;
+        /** 原片出现区间原文（`00:00-02.03、04.07-06.00`）；没有就空串。 */
+        span: string;
+        /** 截帧地址（bridge /api/asset-frame）；截帧失败时没有这个字段，节点降级成 Text。 */
+        frameUrl?: string;
+        /** 截帧时刻（秒）。 */
+        frameAt?: number;
+        /** 没解析出出现区间时按首帧截的，标出来不冒充精确。 */
+        approxFrame?: boolean;
+        /** 挂图 id 镜像（真源仍是扁平 attachedImageId）。 */
+        attachedImageId?: string;
+        /** 短说明镜像（真源仍是扁平 attachedImageDesc）。 */
+        caption?: string;
+    };
+    /** 挂图对照节点（T3-J3）：资产位右侧那张「替换后」的图，源图节点 id。 */
+    assetGraftOfImageId?: string;
+    /** 挂图对照节点归属的资产位 id。 */
+    assetGraftForSlotId?: string;
     /** 意图节点标记（T3-G3a）：不是终稿，不给【生成视频】。 */
     lapianIntent?: boolean;
     /** 拉片派生节点的来源拉片 id（T3-G1）：挂图/摘图时据此重算清单行。 */

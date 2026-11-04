@@ -321,6 +321,10 @@ export default {
             intentTitle: "Change intent (optional)",
             assetManifestPrefix: "Reference images: ",
             assetsInManifest: "Wrote {{count}} attached asset slots into the reference list",
+            editText: "Edit text",
+            editTextTitle: "Edit this text in place: the downstream video node reads the edited text without rerunning the chain",
+            paramsFilled: "Prefilled video parameters from the final prompt: {{params}}",
+            paramSeconds: "{{value}}s",
         },
         lapianAsset: {
             slotPrefix: "Asset slot",
@@ -348,6 +352,8 @@ export default {
             noTask: "This breakdown node has no task id, so its assets cannot be read. Run the breakdown again.",
             loadFailed: "Failed to read assets: {{error}}",
             noPreview: "No preview",
+            graftTitle: "Replacement·{{name}}",
+            frameFailed: "{{count}} asset slots got no source frame and fell back to text cards (the rest are unaffected)",
         },
         reverseComposer: "Reference image: @[node:{{imageId}}]\nTask: @[node:{{textId}}]",
         editors: {

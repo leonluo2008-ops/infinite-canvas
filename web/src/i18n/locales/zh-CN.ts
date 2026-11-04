@@ -321,6 +321,10 @@ export default {
             intentTitle: "改造意图（可留空）",
             assetManifestPrefix: "本次参考图：",
             assetsInManifest: "已把 {{count}} 张已挂图资产位写进参考图清单",
+            editText: "编辑文本",
+            editTextTitle: "就地编辑这段正文：改完下游【生成视频】直接读新文本，不用重跑全流程",
+            paramsFilled: "已按终稿预填视频参数：{{params}}",
+            paramSeconds: "{{value}} 秒",
         },
         lapianAsset: {
             slotPrefix: "资产位",
@@ -348,6 +352,8 @@ export default {
             noTask: "这个拉片节点没有任务号，读不到资产（重新拉片即可）",
             loadFailed: "读取资产失败：{{error}}",
             noPreview: "无预览",
+            graftTitle: "挂图·{{name}}",
+            frameFailed: "{{count}} 个资产位没取到原片截帧，已降级为文字卡（不阻塞其它资产位）",
         },
         reverseComposer: "参考图片：@[node:{{imageId}}]\n任务说明：@[node:{{textId}}]",
         editors: {

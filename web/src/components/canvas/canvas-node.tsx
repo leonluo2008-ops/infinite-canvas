@@ -47,6 +47,8 @@ type CanvasNodeProps = {
     onResize: (nodeId: string, width: number, height: number, position?: Position) => void;
     onResizeEnd: (nodeId: string) => void;
     onContentChange: (nodeId: string, content: string) => void;
+    /** T3-J4b：外部请求进入正文编辑态（工具栏【编辑】）。序号变化即触发，同一节点连点也能重进。 */
+    editRequestSeq?: number;
     onTitleChange: (nodeId: string, title: string) => void;
     onToggleBatch?: (nodeId: string) => void;
     onSetBatchPrimary?: (nodeId: string, itemId: string) => void;
@@ -112,6 +114,7 @@ export const CanvasNode = React.memo(function CanvasNode({
     onResize,
     onResizeEnd,
     onContentChange,
+    editRequestSeq,
     onTitleChange,
     onToggleBatch,
     onSetBatchPrimary,
@@ -205,6 +208,13 @@ export const CanvasNode = React.memo(function CanvasNode({
         textarea?.focus();
         textarea?.setSelectionRange(textarea.value.length, textarea.value.length);
     }, [isEditingContent]);
+
+    // T3-J4b：工具栏【编辑】请求进入正文编辑态。只认序号变化——同一节点连点两次也能重新进入。
+    useEffect(() => {
+        if (editRequestSeq == null) return;
+        if (data.type !== CanvasNodeType.Text) return;
+        setIsEditingContent(true);
+    }, [data.type, editRequestSeq]);
 
     useEffect(() => {
         if (!isEditingContent) return;

@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { ChangeEvent as ReactChangeEvent, DragEvent as ReactDragEvent, MouseEvent as ReactMouseEvent, PointerEvent as ReactPointerEvent } from "react";
 import { useNavigate, useParams, useSearchParams } from "react-router-dom";
-import { Group, Video, Clapperboard, FileText, FolderPlus, LayoutTemplate, Boxes, ImagePlus } from "lucide-react";
+import { Group, Video, Clapperboard, FileText, FolderPlus, LayoutTemplate, Boxes, ImagePlus, Pencil } from "lucide-react";
 import { saveAs } from "file-saver";
 import { useTranslation } from "react-i18next";
 
@@ -53,7 +53,9 @@ import { buildNodeMentionReferences, getGenerationResourceNodes, getGroupResourc
 import { exportCanvasProjects } from "@/lib/canvas/canvas-export";
 import { applyNodeConfigPatch, audioMetadata, buildAudioGenerationMetadata, buildImageGenerationMetadata, createCanvasNode, imageMetadata, videoMetadata } from "@/lib/canvas/canvas-node-factory";
 import { DEFAULT_LAPIAN_PROMPT_TEMPLATE_ID, LAPIAN_INTENT_PLACEHOLDER, getLapianPromptTemplate, type LapianPromptTemplateId } from "@/lib/canvas/lapian-prompt-templates";
-import { buildLapianAssetManifest, buildLapianAssetSlots, collectLapianAssetReferences, parseLapianAssetBlocks, truncateAssetCaption, upsertLapianAssetManifest, type LapianAssetLabels, type LapianBlock } from "@/lib/canvas/lapian-assets";
+import { attachedImageIdOf, buildLapianAssetManifest, buildLapianAssetSlots, collectLapianAssetReferences, parseLapianAssetBlocks, truncateAssetCaption, upsertLapianAssetManifest, type LapianAssetLabels, type LapianBlock } from "@/lib/canvas/lapian-assets";
+import { DERIVED_GAP, nudgeIntoFree, placeGridRightOf, placeRightOf, placeRowRightOf, rectOfNode } from "@/lib/canvas/derived-layout";
+import { extractVideoParams } from "@/lib/canvas/video-params";
 import { applyGroupSelection, applyUngroupSelection, canGroupSelectedNodes, canUngroupSelectedNodes, collectGroupMemberNodes, findContainingGroupId, findGroupDropTarget, focusViewportForNode, getConnectionTargetAnchor, getGroupWrapRect, normalizeConnection, snapNodesIntoGroup } from "@/lib/canvas/canvas-node-geometry";
 import {
     audioExtension,
@@ -126,6 +128,10 @@ type CanvasGenerationRequest = {
     runningNodeId: string;
     controller: AbortController;
 };
+
+// T3-J2：bridge 侧抽帧端点（与拉片/渲染同一台 ui-server）。
+const LAPIAN_BRIDGE = "http://127.0.0.1:8776";
+type LapianAssetFrame = { url: string; t: number; width: number; height: number; approx: boolean };
 
 const VIDEO_NODE_MAX_WIDTH = 420;
 const VIDEO_NODE_MAX_HEIGHT = 420;
@@ -269,6 +275,8 @@ function InfiniteCanvasPage() {
     const [assetGroupConfigNodeId, setAssetGroupConfigNodeId] = useState<string | null>(null);
     const [lapianAttachSlotId, setLapianAttachSlotId] = useState<string | null>(null);
     const [lapianAssetBusy, setLapianAssetBusy] = useState(false);
+    // T3-J4b：终稿就地编辑的显式入口（工具栏【编辑】）。序号递增，同一节点连点两次也能重新进入编辑态。
+    const [editTextRequest, setEditTextRequest] = useState<{ nodeId: string; seq: number } | null>(null);
     const [lapianPendingPosition, setLapianPendingPosition] = useState<Position | null>(null);
     const [maskEditNodeId, setMaskEditNodeId] = useState<string | null>(null);
     const [splitNodeId, setSplitNodeId] = useState<string | null>(null);
@@ -961,9 +969,31 @@ function InfiniteCanvasPage() {
     const lapianAttachImages = useMemo<LapianAssetAttachImage[]>(() => {
         if (!lapianAttachSlot) return [];
         return nodes
-            .filter((node) => node.type === CanvasNodeType.Image && Boolean(node.metadata?.content))
+            // 挂图对照节点（J3）是派生副本，不进可选清单——否则用户可以拿副本再挂一次，越挂越乱。
+            .filter((node) => node.type === CanvasNodeType.Image && Boolean(node.metadata?.content) && !node.metadata?.assetGraftForSlotId)
             .map((node) => ({ id: node.id, title: node.title || t("canvas.nodeTypes.image"), previewUrl: node.metadata?.content }));
     }, [lapianAttachSlot, nodes, t]);
+    // T3-J2：资产位截帧。bridge 侧查任务源视频、按 IR「出现于」区间中点 ffmpeg 抽一帧；
+    // 前端只拿 URL（不传视频、不碰 ffmpeg）。失败返回 null → 调用方降级成纯文字卡。
+    const fetchLapianAssetFrame = useCallback(async (taskId: string, name: string): Promise<LapianAssetFrame | null> => {
+        if (!taskId || !name) return null;
+        try {
+            const query = new URLSearchParams({ name, meta: "1" });
+            const response = await fetch(`${LAPIAN_BRIDGE}/api/asset-frame/${encodeURIComponent(taskId)}?${query.toString()}`);
+            const payload = (await response.json()) as { ok?: boolean; url?: string; t?: number; width?: number; height?: number; approx?: boolean };
+            if (!response.ok || !payload?.ok || !payload.url) return null;
+            return {
+                url: `${LAPIAN_BRIDGE}${payload.url}`,
+                t: Number(payload.t) || 0,
+                width: Number(payload.width) || 0,
+                height: Number(payload.height) || 0,
+                approx: Boolean(payload.approx),
+            };
+        } catch {
+            return null;
+        }
+    }, []);
+
     // T8/T9：拉片 → 提交正文。默认规范 timeline-narrative（有先例成片）。
     // 剥离「# 附注」节（v4 审计 B-03：附注随提示词提交会在聚鑫链复发——唯一转换点在这里）。
     const lapianPromptPreset = useCallback(
@@ -1026,14 +1056,23 @@ function InfiniteCanvasPage() {
                 return;
             }
             const template = getLapianPromptTemplate(DEFAULT_LAPIAN_PROMPT_TEMPLATE_ID);
-            const gap = 96;
+            const gap = DERIVED_GAP;
             const textSpec = NODE_DEFAULT_SIZE[CanvasNodeType.Text];
             const configSpec = NODE_DEFAULT_SIZE[CanvasNodeType.Config];
-            const centerY = node.position.y + node.height / 2;
+            // J1：整排（指令 → 配置）一起排在拉片节点右侧，并让开已派生的资产位网格；
+            // 意图节点挂在指令节点正下方（纵向不参与整排避让，压到东西就往右让开）。
+            const occupied = nodesRef.current.map(rectOfNode);
+            const [textRect, configRect] = placeRowRightOf(rectOfNode(node), [textSpec, configSpec], occupied, { gap });
+            const centerY = textRect.y + textRect.height / 2;
+            const intentRect = nudgeIntoFree(
+                { x: textRect.x, y: textRect.y + textRect.height + 32, width: textSpec.width, height: textSpec.height },
+                [...occupied, textRect, configRect],
+                32,
+            );
             const instructionNode = {
                 ...createCanvasNode(
                     CanvasNodeType.Text,
-                    { x: node.position.x + node.width + gap + textSpec.width / 2, y: centerY },
+                    { x: textRect.x + textRect.width / 2, y: centerY },
                     { content: template.instruction, prompt: template.instruction, status: NODE_STATUS_SUCCESS, fontSize: 14, promptTemplate: template.id },
                 ),
                 title: t("canvas.lapianPrompt.instructionTitle", { name: t(template.labelKey) }),
@@ -1041,7 +1080,7 @@ function InfiniteCanvasPage() {
             const intentNode = {
                 ...createCanvasNode(
                     CanvasNodeType.Text,
-                    { x: instructionNode.position.x + instructionNode.width / 2, y: instructionNode.position.y + instructionNode.height + 32 + textSpec.height / 2 },
+                    { x: intentRect.x + intentRect.width / 2, y: intentRect.y + intentRect.height / 2 },
                     { content: LAPIAN_INTENT_PLACEHOLDER, prompt: LAPIAN_INTENT_PLACEHOLDER, status: NODE_STATUS_SUCCESS, fontSize: 14, lapianIntent: true },
                 ),
                 title: t("canvas.lapianPrompt.intentTitle"),
@@ -1052,7 +1091,7 @@ function InfiniteCanvasPage() {
             const configNode = {
                 ...createCanvasNode(
                     CanvasNodeType.Config,
-                    { x: instructionNode.position.x + instructionNode.width + gap + configSpec.width / 2, y: centerY },
+                    { x: configRect.x + configRect.width / 2, y: configRect.y + configRect.height / 2 },
                     {
                         generationMode: "text",
                         model: effectiveConfig.textModel || effectiveConfig.model || defaultConfig.textModel,
@@ -1084,8 +1123,9 @@ function InfiniteCanvasPage() {
         [effectiveConfig.model, effectiveConfig.textModel, lapianAssetLabels, message, t],
     );
 
-    // T3-H1：拉片 → 资产位（快捷栏按钮触发，不自动）。读 /api/lapian 的资产 blocks，
-    // 每个资产派生一个 Text 节点（资产位·类型·名 + 原片对应物 + 挂图提示）。
+    // T3-H1/J1/J2：拉片 → 资产位（快捷栏按钮触发，不自动）。
+    // 每个资产位 = 官方 Image 节点（图=原片截帧，title=资产位名），原片描述/时间区间/挂图字段进 metadata.assetSlot；
+    // 截帧失败降级成 Text 纯文字卡（不阻塞整批）。布局：整块横向网格排在拉片节点**右侧**，并补拉片→资产位连线。
     // 幂等：按「类型|名」去重，重复点只补缺失；IR 没有任何资产 → 不出节点，只 toast。
     const createLapianAssetSlots = useCallback(
         async (node: CanvasNodeData) => {
@@ -1117,78 +1157,145 @@ function InfiniteCanvasPage() {
                     message.success(t("canvas.lapianAsset.allExist", { count: slots.length }));
                     return;
                 }
-                const textSpec = NODE_DEFAULT_SIZE[CanvasNodeType.Text];
-                const columns = 3;
-                const gutter = 24;
+                // 截帧与落位无依赖，并行拿：一帧一张，失败的就是 null（下面降级）。
+                const frames = await Promise.all(missing.map((slot) => fetchLapianAssetFrame(taskId, slot.name)));
+                const cell = NODE_DEFAULT_SIZE[CanvasNodeType.Image];
+                const rects = placeGridRightOf(rectOfNode(node), missing.length, cell, nodesRef.current.map(rectOfNode), {
+                    columns: Math.max(1, Math.min(3, Math.ceil(Math.sqrt(missing.length)))),
+                    gap: DERIVED_GAP,
+                });
                 const created = missing.map((slot, offset) => {
-                    const index = existingNodes.length + offset;
-                    const column = index % columns;
-                    const row = Math.floor(index / columns);
-                    const center = {
-                        x: node.position.x + textSpec.width / 2 + column * (textSpec.width + gutter),
-                        y: node.position.y + node.height + 40 + textSpec.height / 2 + row * (textSpec.height + gutter),
+                    const frame = frames[offset];
+                    const rect = rects[offset];
+                    const center = { x: rect.x + cell.width / 2, y: rect.y + cell.height / 2 };
+                    const slotMeta = {
+                        status: NODE_STATUS_SUCCESS,
+                        assetSlotSourceId: node.id,
+                        assetSlotOrder: slot.order,
+                        assetSlotName: slot.name,
+                        assetSlotType: slot.type,
+                        assetSlot: {
+                            desc: slot.desc,
+                            span: slot.span,
+                            frameUrl: frame?.url,
+                            frameAt: frame?.t,
+                            approxFrame: frame?.approx,
+                        },
                     };
-                    return {
-                        ...createCanvasNode(CanvasNodeType.Text, center, {
-                            content: slot.body,
-                            prompt: slot.body,
-                            status: NODE_STATUS_SUCCESS,
-                            fontSize: 12,
-                            assetSlotSourceId: node.id,
-                            assetSlotOrder: slot.order,
-                            assetSlotName: slot.name,
-                            assetSlotType: slot.type,
-                        }),
-                        title: slot.title,
-                    };
+                    if (frame) {
+                        const image = createCanvasNode(CanvasNodeType.Image, center, {
+                            ...slotMeta,
+                            content: frame.url,
+                            naturalWidth: frame.width,
+                            naturalHeight: frame.height,
+                            mimeType: "image/jpeg",
+                        });
+                        return { ...image, title: slot.title };
+                    }
+                    // 截帧失败：纯文字卡（原片描述 + 挂图提示），不阻塞其它资产位。
+                    const text = createCanvasNode(CanvasNodeType.Text, center, {
+                        ...slotMeta,
+                        content: slot.body,
+                        prompt: slot.body,
+                        fontSize: 12,
+                    });
+                    return { ...text, title: slot.title };
                 });
                 setNodes((prev) => [...prev, ...created]);
+                // 归属连线（路B#7）：拉片 → 每个资产位，贝塞尔线就是「这些是从这条片子拆出来的」。
+                setConnections((prev) => [...prev, ...created.map((item) => ({ id: nanoid(), fromNodeId: node.id, toNodeId: item.id }))]);
                 setContextMenu(null);
                 focusNodeRef.current(created[0].id);
-                message.success(t("canvas.lapianAsset.created", { count: created.length }));
+                const failed = created.filter((item) => item.type === CanvasNodeType.Text).length;
+                if (failed) message.warning(t("canvas.lapianAsset.frameFailed", { count: failed }));
+                else message.success(t("canvas.lapianAsset.created", { count: created.length }));
             } catch (error) {
                 message.error(t("canvas.lapianAsset.loadFailed", { error: (error as Error).message }));
             } finally {
                 setLapianAssetBusy(false);
             }
         },
-        [lapianAssetBusy, lapianAssetLabels, message, t],
+        [fetchLapianAssetFrame, lapianAssetBusy, lapianAssetLabels, message, t],
     );
 
-    // T3-H2：资产位挂图（决策 4：不依赖连线）。写 metadata.attachedImageId + 短说明；
+    // T3-H2/J3：资产位挂图（决策 4：不依赖连线）。写 metadata.attachedImageId + 短说明；
+    // J3 直观化：资产位右侧维护一张「挂图」对照 Image 节点（资产位→对照图连线），换挂就换图、摘图就删节点。
+    // 对照节点只是可视化副本：清单/请求仍只认 attachedImageId 指向的源图，删掉对照图不影响数据层。
     // 顺手把已派生配置节点的清单行重算一遍，并补「图 → 配置」连线（无连线 = 图不进请求）。
     const attachLapianAssetImage = useCallback(
         (slotId: string, imageId: string, caption: string) => {
-            const slot = nodesRef.current.find((item) => item.id === slotId);
+            const nodesNow = nodesRef.current;
+            const slot = nodesNow.find((item) => item.id === slotId);
             if (!slot) return;
             const lapianId = String(slot.metadata?.assetSlotSourceId || "");
+            const source = imageId ? nodesNow.find((item) => item.id === imageId && item.type === CanvasNodeType.Image && Boolean(item.metadata?.content)) : undefined;
+            const captionText = truncateAssetCaption(caption) || String(slot.metadata?.assetSlotName || "");
+            const existingGraft = nodesNow.find((item) => item.metadata?.assetGraftForSlotId === slotId) ?? null;
+            const graftTitle = t("canvas.lapianAsset.graftTitle", { name: captionText });
+            let graftId: string | null = null;
+            let graftNode: CanvasNodeData | null = null;
+            if (imageId && source) {
+                const spec = NODE_DEFAULT_SIZE[CanvasNodeType.Image];
+                const rect = existingGraft ? { x: existingGraft.position.x, y: existingGraft.position.y, width: existingGraft.width, height: existingGraft.height } : placeRightOf(rectOfNode(slot), spec, nodesNow.map(rectOfNode), { gap: 48 });
+                const base: CanvasNodeData = existingGraft ?? createCanvasNode(CanvasNodeType.Image, { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 }, {});
+                graftNode = {
+                    ...base,
+                    title: graftTitle,
+                    metadata: {
+                        ...base.metadata,
+                        content: source.metadata?.content,
+                        storageKey: source.metadata?.storageKey,
+                        naturalWidth: source.metadata?.naturalWidth,
+                        naturalHeight: source.metadata?.naturalHeight,
+                        bytes: source.metadata?.bytes,
+                        mimeType: source.metadata?.mimeType,
+                        status: NODE_STATUS_SUCCESS,
+                        assetGraftForSlotId: slotId,
+                        assetGraftOfImageId: source.id,
+                    },
+                };
+                graftId = graftNode.id;
+            }
             setNodes((prev) => {
-                const patched = prev.map((item) =>
-                    item.id === slotId
-                        ? { ...item, metadata: { ...item.metadata, attachedImageId: imageId || undefined, attachedImageDesc: imageId ? caption || undefined : undefined } }
-                        : item,
-                );
-                if (!lapianId) return patched;
-                const manifest = buildLapianAssetManifest(collectLapianAssetReferences(lapianId, patched, lapianAssetLabels.unnamed), lapianAssetLabels.manifestPrefix);
-                return patched.map((item) =>
+                const patched = prev.map((item) => {
+                    if (item.id === slotId) {
+                        return {
+                            ...item,
+                            metadata: {
+                                ...item.metadata,
+                                attachedImageId: imageId || undefined,
+                                attachedImageDesc: imageId ? caption || undefined : undefined,
+                                assetSlot: item.metadata?.assetSlot
+                                    ? { ...item.metadata.assetSlot, attachedImageId: imageId || undefined, caption: imageId ? caption || undefined : undefined }
+                                    : item.metadata?.assetSlot,
+                            },
+                        };
+                    }
+                    return item;
+                });
+                // 对照节点：换挂就地换图；摘图删掉；没有就补在资产位右侧。
+                let next = existingGraft ? patched.filter((item) => item.id !== existingGraft.id) : patched;
+                if (graftNode) next = [...next, graftNode];
+                if (!lapianId) return next;
+                const manifest = buildLapianAssetManifest(collectLapianAssetReferences(lapianId, next, lapianAssetLabels.unnamed), lapianAssetLabels.manifestPrefix);
+                return next.map((item) =>
                     item.type === CanvasNodeType.Config && item.metadata?.lapianSourceId === lapianId
                         ? { ...item, metadata: { ...item.metadata, composerContent: upsertLapianAssetManifest(String(item.metadata?.composerContent || ""), manifest, lapianAssetLabels.manifestPrefix) } }
                         : item,
                 );
             });
-            if (imageId && lapianId) {
-                const configIds = nodesRef.current.filter((item) => item.type === CanvasNodeType.Config && item.metadata?.lapianSourceId === lapianId).map((item) => item.id);
-                if (configIds.length) {
-                    setConnections((prev) => [
-                        ...prev,
-                        ...configIds
-                            .filter((configId) => !prev.some((connection) => connection.fromNodeId === imageId && connection.toNodeId === configId))
-                            .map((configId) => ({ id: nanoid(), fromNodeId: imageId, toNodeId: configId })),
-                    ]);
+            setConnections((prev) => {
+                // 摘图/换挂前先清掉旧对照节点的线（断线不留悬空）。
+                let next = existingGraft ? prev.filter((connection) => connection.fromNodeId !== slotId && connection.toNodeId !== existingGraft.id) : prev;
+                if (graftId) next = [...next, { id: nanoid(), fromNodeId: slotId, toNodeId: graftId }];
+                if (imageId && lapianId) {
+                    const configIds = nodesNow.filter((item) => item.type === CanvasNodeType.Config && item.metadata?.lapianSourceId === lapianId).map((item) => item.id);
+                    next = [...next, ...configIds.filter((configId) => !next.some((connection) => connection.fromNodeId === imageId && connection.toNodeId === configId)).map((configId) => ({ id: nanoid(), fromNodeId: imageId, toNodeId: configId }))];
                 }
-            }
+                return next;
+            });
             setLapianAttachSlotId(null);
-            message.success(imageId ? t("canvas.lapianAsset.attached", { name: truncateAssetCaption(caption) || String(slot.metadata?.assetSlotName || "") }) : t("canvas.lapianAsset.detached"));
+            message.success(imageId ? t("canvas.lapianAsset.attached", { name: captionText }) : t("canvas.lapianAsset.detached"));
         },
         [lapianAssetLabels, message, t],
     );
@@ -1287,15 +1394,27 @@ function InfiniteCanvasPage() {
                 }
             }
             const configSpec = NODE_DEFAULT_SIZE[CanvasNodeType.Config];
+            // J1：视频配置排在终稿右侧（按终稿实际宽高算 + 全画布避让），不再压住终稿。
+            const configRect = placeRightOf(rectOfNode(node), configSpec, nodesNow.map(rectOfNode), { gap: DERIVED_GAP });
+            // J5：从终稿正文的白名单正则里预填参数——抽不到就保持默认（审计决策 3）。
+            const paramFill = extractVideoParams(String(node.metadata?.content || ""), {
+                imageCount: inheritedImages.length,
+                resolution: effectiveConfig.vquality,
+            });
+            const filledParams = [paramFill.seconds ? t("canvas.lapianPrompt.paramSeconds", { value: paramFill.seconds }) : "", paramFill.ratio || "", paramFill.resolution ? `${paramFill.resolution}p` : ""].filter(Boolean);
             const configNode = {
                 ...createCanvasNode(
                     CanvasNodeType.Config,
-                    { x: node.position.x + node.width + 96 + configSpec.width / 2, y: node.position.y + node.height / 2 },
+                    { x: configRect.x + configRect.width / 2, y: configRect.y + configRect.height / 2 },
                     {
                         generationMode: "video",
                         model: effectiveConfig.videoModel || effectiveConfig.model,
                         // 有参考图时默认参考生视频；没有参考则沿用全局视频模式。
-                        videoMode: inheritedImages.length ? "reference" : effectiveConfig.videoMode,
+                        videoMode: paramFill.videoMode ?? (inheritedImages.length ? "reference" : effectiveConfig.videoMode),
+                        // 只写抽到的字段：没提到画幅/画质/时长就不动默认值。
+                        ...(paramFill.seconds ? { seconds: paramFill.seconds } : {}),
+                        ...(paramFill.size ? { size: paramFill.size } : {}),
+                        ...(paramFill.resolution ? { vquality: paramFill.resolution } : {}),
                         composerContent: inheritedImages.length
                             ? t("canvas.lapianPrompt.videoComposerWithRefs", { images: inheritedImages.map((image) => `@[node:${image.id}]`).join("、"), textId: node.id })
                             : t("canvas.lapianPrompt.videoComposerText", { textId: node.id }),
@@ -1310,9 +1429,10 @@ function InfiniteCanvasPage() {
             setDialogNodeId(configNode.id);
             setContextMenu(null);
             focusNodeRef.current(configNode.id);
+            if (filledParams.length) message.success(t("canvas.lapianPrompt.paramsFilled", { params: filledParams.join(" · ") }));
             if (inheritedImages.length) message.success(t("canvas.lapianPrompt.referencesInherited", { count: inheritedImages.length }));
         },
-        [effectiveConfig.model, effectiveConfig.videoMode, effectiveConfig.videoModel, message, t],
+        [effectiveConfig.model, effectiveConfig.videoMode, effectiveConfig.videoModel, effectiveConfig.vquality, message, t],
     );
 
     const lapianToolItems = useCallback(
@@ -1332,15 +1452,17 @@ function InfiniteCanvasPage() {
                     onClick: () => void createLapianAssetSlots(node),
                 }];
             }
-            // T3-H2：资产位自带的【挂图】按钮（决策 4：不依赖连线，写 metadata）。
-            if (node.type === CanvasNodeType.Text && node.metadata?.assetSlotSourceId) {
+            // T3-H2/J2：资产位自带的【挂图】按钮（决策 4：不依赖连线，写 metadata）。
+            // 资产位节点型是官方 Image（J2），截帧失败降级时才是 Text——两种都要能挂图。
+            if ((node.type === CanvasNodeType.Text || node.type === CanvasNodeType.Image) && node.metadata?.assetSlotSourceId) {
+                const attachedId = attachedImageIdOf(node);
                 const attachedName = truncateAssetCaption(String(node.metadata?.attachedImageDesc || "")) || String(node.metadata?.assetSlotName || "");
                 return [{
                     id: "wan-lapian-attach",
                     title: t("canvas.lapianAsset.attachTitle"),
-                    label: node.metadata?.attachedImageId ? t("canvas.lapianAsset.attachedLabel", { name: attachedName }) : t("canvas.lapianAsset.attach"),
+                    label: attachedId ? t("canvas.lapianAsset.attachedLabel", { name: attachedName }) : t("canvas.lapianAsset.attach"),
                     icon: <ImagePlus className="size-4" />,
-                    active: Boolean(node.metadata?.attachedImageId),
+                    active: Boolean(attachedId),
                     onClick: () => setLapianAttachSlotId(node.id),
                 }];
             }
@@ -1400,6 +1522,28 @@ function InfiniteCanvasPage() {
         [createVideoFromFinalPrompt, t],
     );
 
+    // T3-J4b：终稿就地编辑的显式入口。所有有正文的 Text 节点都给【编辑】——
+    // 双击仍然有效（canvas-node 的 Text 分支），但真机上双击会被面板/遮挡吃掉命中的场景，
+    // 不能让「改一句话」依赖一次点得准的双击。
+    const requestTextEdit = useCallback((nodeId: string) => {
+        setSelectedNodeIds(new Set([nodeId]));
+        setDialogNodeId(null);
+        setEditTextRequest((current) => ({ nodeId, seq: (current?.seq ?? 0) + 1 }));
+    }, []);
+    const textEditToolItems = useCallback(
+        (node: CanvasNodeData): CanvasNodeToolbarItem[] => {
+            if (node.type !== CanvasNodeType.Text || !node.metadata?.content?.trim()) return [];
+            return [{
+                id: "wan-edit-text",
+                title: t("canvas.lapianPrompt.editTextTitle"),
+                label: t("canvas.lapianPrompt.editText"),
+                icon: <Pencil className="size-4" />,
+                onClick: () => requestTextEdit(node.id),
+            }];
+        },
+        [requestTextEdit, t],
+    );
+
     const createNode = useCallback(
         (type: CanvasNodeTypeId, position?: Position) => {
             const targetPosition = position || getCanvasCenter();
@@ -1436,12 +1580,25 @@ function InfiniteCanvasPage() {
         (ids: Set<string>) => {
             if (!ids.size) return;
             const allIds = new Set(ids);
+            // J3 级联：删资产位 → 它的挂图对照节点一起走；删源图 → 指向它的对照节点也别留着当幽灵。
+            nodesRef.current.forEach((node) => {
+                if (!node.metadata?.assetGraftForSlotId) return;
+                if (allIds.has(node.metadata.assetGraftForSlotId) || (node.metadata.assetGraftOfImageId && allIds.has(node.metadata.assetGraftOfImageId))) allIds.add(node.id);
+            });
             setNodes((prev) => {
                 const next = prev.filter((node) => !allIds.has(node.id));
-                return next.map((node) => {
+                const kept = next.map((node) => {
                     const groupId = node.metadata?.groupId;
                     if (groupId && allIds.has(groupId)) return { ...node, metadata: { ...node.metadata, groupId: undefined } };
                     return node;
+                });
+                // J3 反向同步：删掉的图/资产位要从参考图清单里消失——所有拉片配置节点重算清单行。
+                return kept.map((node) => {
+                    const lapianId = String(node.metadata?.lapianSourceId || "");
+                    if (node.type !== CanvasNodeType.Config || !lapianId) return node;
+                    const manifest = buildLapianAssetManifest(collectLapianAssetReferences(lapianId, kept, lapianAssetLabels.unnamed), lapianAssetLabels.manifestPrefix);
+                    const composer = upsertLapianAssetManifest(String(node.metadata?.composerContent || ""), manifest, lapianAssetLabels.manifestPrefix);
+                    return composer === node.metadata?.composerContent ? node : { ...node, metadata: { ...node.metadata, composerContent: composer } };
                 });
             });
             setConnections((prev) => prev.filter((conn) => !allIds.has(conn.fromNodeId) && !allIds.has(conn.toNodeId)));
@@ -1461,7 +1618,7 @@ function InfiniteCanvasPage() {
             setContextMenu((current) => (current?.type === "node" && allIds.has(current.nodeId) ? null : current));
             cleanupCanvasFiles({ projectId, nodes: nodesRef.current.filter((node) => !allIds.has(node.id)), chatSessions });
         },
-        [chatSessions, cleanupCanvasFiles, projectId],
+        [chatSessions, cleanupCanvasFiles, lapianAssetLabels, projectId],
     );
 
     const groupSelection = useCallback(() => {
@@ -3193,16 +3350,17 @@ function InfiniteCanvasPage() {
                 const textCount = getGenerationCount(String(sourceNode?.metadata?.textCount || 1));
                 const parentConfig = NODE_DEFAULT_SIZE[isConfigNode ? CanvasNodeType.Config : CanvasNodeType.Text];
                 const textConfig = NODE_DEFAULT_SIZE[CanvasNodeType.Text];
-                const parentPosition = sourceNode?.position || { x: 0, y: 0 };
                 const isEmptyTextNode = sourceNode?.type === CanvasNodeType.Text && !sourceTextContent;
                 const reuseTextNode = sourceNode?.type === CanvasNodeType.Text && (overwriteExisting || isEmptyTextNode);
                 const rootId = reuseTextNode ? nodeId : nanoid();
                 const textIds = Array.from({ length: textCount }, () => nanoid());
+                // J1：终稿按父节点**实际**宽高往右排，并与全画布 AABB 避让——不再用默认宽度硬算而压住配置卡。
+                const resultRect = reuseTextNode ? null : placeRightOf(rectOfNode(sourceNode ?? { position: { x: 0, y: 0 }, width: parentConfig.width, height: parentConfig.height }), textConfig, nodesRef.current.map(rectOfNode), { gap: DERIVED_GAP });
                 const rootNode: CanvasNodeData = {
                     id: rootId,
                     type: CanvasNodeType.Text,
                     title: effectivePrompt.slice(0, 32) || "Generated Text",
-                    position: reuseTextNode ? sourceNode.position : { x: parentPosition.x + parentConfig.width + 96, y: parentPosition.y + parentConfig.height / 2 - textConfig.height / 2 },
+                    position: reuseTextNode ? sourceNode.position : { x: resultRect!.x, y: resultRect!.y },
                     width: reuseTextNode ? sourceNode.width : textConfig.width,
                     height: reuseTextNode ? sourceNode.height : textConfig.height,
                     metadata: {
@@ -3225,7 +3383,10 @@ function InfiniteCanvasPage() {
                 if (!reuseTextNode) setConnections((prev) => [...prev, { id: nanoid(), fromNodeId: nodeId, toNodeId: rootId }]);
                 setSelectedNodeIds(new Set([nodeId]));
                 setSelectedConnectionId(null);
+                // J1：生成中仍然把配置面板打开（要有停止键），但先把视口带到终稿那张卡上——
+                // 面板是挂在配置节点下方的，视口不挪就会把新卡压在面板边上。
                 setDialogNodeId(nodeId);
+                if (!reuseTextNode) focusNodeRef.current(rootId);
 
                 const controller = rootId === nodeId ? runController : startGenerationRequest(rootId, nodeId, nodeId, runController);
                 const results = await Promise.all(
@@ -3304,6 +3465,13 @@ function InfiniteCanvasPage() {
                         return node.id === nodeId && isConfigNode ? { ...node, metadata: { ...node.metadata, status: firstText ? NODE_STATUS_SUCCESS : NODE_STATUS_ERROR, errorDetails: firstText ? undefined : t("canvas.projectPage.generationFailed") } } : node;
                     }),
                 );
+                // J4b/J1：终稿出来了就把焦点交给它——选中（z-50 在最上层）+ 关掉配置面板。
+                // 只读/被面板压住都是「双击落不到 Text 容器」的成因，这里从源头上把遮挡去掉。
+                if (rootId !== nodeId && firstText) {
+                    setSelectedNodeIds(new Set([rootId]));
+                    setDialogNodeId((current) => (current === nodeId ? null : current));
+                    focusNodeRef.current(rootId);
+                }
             } catch (error) {
                 if (isGenerationCanceled(error)) return;
                 const errorDetails = error instanceof Error ? error.message : t("canvas.projectPage.generationFailed");
@@ -3826,6 +3994,7 @@ function InfiniteCanvasPage() {
                             onResize={handleNodeResize}
                             onResizeEnd={handleNodeResizeEnd}
                             onContentChange={handleNodeContentChange}
+                            editRequestSeq={editTextRequest?.nodeId === node.id ? editTextRequest.seq : undefined}
                             onTitleChange={handleNodeTitleChange}
                             onToggleBatch={toggleBatchExpanded}
                             onSetBatchPrimary={setBatchPrimary}
@@ -3893,7 +4062,7 @@ function InfiniteCanvasPage() {
                 <CanvasNodeHoverToolbar
                     node={isNodeDragging || isNodeResizing || nodeImageSettingsOpen || Boolean(referencePickerNodeId) || expandedBatchNodeIds.has(toolbarNode?.id || "") ? null : toolbarNode}
                     viewport={viewport}
-                    extraTools={toolbarNode ? [...(buildNodeToolbarItems(toolbarNode) || []), ...lapianToolItems(toolbarNode), ...finalPromptToolItems(toolbarNode)] : undefined}
+                    extraTools={toolbarNode ? [...(buildNodeToolbarItems(toolbarNode) || []), ...lapianToolItems(toolbarNode), ...textEditToolItems(toolbarNode), ...finalPromptToolItems(toolbarNode)] : undefined}
                     onKeep={keepNodeToolbar}
                     onLeave={hideNodeToolbar}
                     onInfo={(node) => setInfoNodeId(node.id)}

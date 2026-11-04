@@ -42,9 +42,16 @@ export type LapianAssetSlot = {
     name: string;
     /** 节点标题：资产位·〈类型〉·〈名〉。 */
     title: string;
-    /** 节点正文：原片对应物 + 挂图提示。 */
+    /** 节点正文：原片对应物 + 挂图提示（截帧失败时整段落到纯文字卡上）。 */
     body: string;
+    /** 原片对应物原文（IR 条目），进 metadata.assetSlot.desc。 */
+    desc: string;
+    /** 原片出现区间原文（`00:00-02.03、04.07-06.00`），进 metadata.assetSlot.span；没有就是空串。 */
+    span: string;
 };
+
+/** IR 资产行里的「出现于：…」区间原文；截帧时刻由 bridge 侧解析，这里只留给人看。 */
+const SPAN_TEXT = /出现于[：:]\s*([^）)\n]+)/;
 
 export type LapianAssetLabels = {
     /** 「资产位」 */
@@ -179,6 +186,8 @@ export function buildLapianAssetSlots(items: LapianAssetItem[], labels: LapianAs
         name: item.name,
         title: `${labels.slotPrefix}·${item.type}·${item.name.length > 12 ? item.name.slice(0, 12) : item.name}`,
         body: `${labels.original}：${item.desc}\n${labels.attachButton}：${labels.attachHint}`,
+        desc: item.desc,
+        span: SPAN_TEXT.exec(item.desc)?.[1]?.trim() || "",
     }));
 }
 
@@ -213,17 +222,26 @@ export function resolveAssetCaption(input: { userInput?: string; slotName?: stri
 }
 
 /**
+ * 资产位当前挂的图 id：扁平字段是唯一真源，`metadata.assetSlot.attachedImageId` 只是审计口径的镜像。
+ * （T3-J2 起资产位节点是官方 Image 节点，挂图字段仍写在 metadata，节点型不影响这里。）
+ */
+export function attachedImageIdOf(slot: CanvasNodeData): string {
+    return String(slot.metadata?.attachedImageId || slot.metadata?.assetSlot?.attachedImageId || "");
+}
+
+/**
  * 收集已挂图的资产位（按资产位序排 → 连续编号）。
  * 只认「资产位节点 + attachedImageId 指向的画布图片节点仍存在且有内容」；图被删就不出项（无幽灵节点）。
+ * 反向同步（路B#9）：用户在画布上删掉那张 Image → 这里校验不到 → 该项自动从清单消失，不需要额外的同步事件。
  */
 export function collectLapianAssetReferences(lapianNodeId: string, nodes: CanvasNodeData[], unnamed: string): LapianAssetReference[] {
     if (!lapianNodeId) return [];
     const slots = nodes
-        .filter((node) => node.metadata?.assetSlotSourceId === lapianNodeId && Boolean(node.metadata?.attachedImageId))
+        .filter((node) => node.metadata?.assetSlotSourceId === lapianNodeId && Boolean(attachedImageIdOf(node)))
         .sort((left, right) => (left.metadata?.assetSlotOrder ?? 0) - (right.metadata?.assetSlotOrder ?? 0));
     const references: LapianAssetReference[] = [];
     for (const slot of slots) {
-        const imageId = String(slot.metadata?.attachedImageId || "");
+        const imageId = attachedImageIdOf(slot);
         const image = nodes.find((node) => node.id === imageId && node.type === CanvasNodeType.Image && Boolean(node.metadata?.content));
         if (!image) continue;
         references.push({
