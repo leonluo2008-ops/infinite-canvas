@@ -3183,7 +3183,8 @@ function InfiniteCanvasPage() {
                                               title: prompt.slice(0, 32) || "Prompt",
                                               width: parentConfig.width,
                                               height: parentConfig.height,
-                                              metadata: { ...node.metadata, content: prompt, prompt, status: NODE_STATUS_SUCCESS, fontSize: 14, errorDetails: undefined },
+                                              // T3-J fix：终稿继承 Config 的 promptTemplate 被门禁误杀，结果节点显式清洗链路标记
+                                              metadata: { ...node.metadata, content: prompt, prompt, status: NODE_STATUS_SUCCESS, fontSize: 14, errorDetails: undefined, promptTemplate: undefined, lapianIntent: undefined, assetSlotSourceId: undefined },
                                           }
                                 : node,
                         ),
