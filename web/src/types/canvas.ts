@@ -58,6 +58,22 @@ export type CanvasNodeMetadata = {
     lapPhase?: string;
     /** 转换指令节点用的模板 id（lib/canvas/lapian-prompt-templates.ts）；有值即说明这是拉片链的指令节点。 */
     promptTemplate?: string;
+    /** 资产位节点（T3-H1）：来源拉片节点 id。 */
+    assetSlotSourceId?: string;
+    /** 资产位序（IR 资产序，0-based）：图号按此排序，稳定不变。 */
+    assetSlotOrder?: number;
+    /** 资产位名（IR 资产名）：短说明 fallback 第二级。 */
+    assetSlotName?: string;
+    /** 资产位类型（核心主体 / 人物/动物 / 块内子类名）。 */
+    assetSlotType?: string;
+    /** 资产位已挂图：画布图片节点 id（不靠连线，T3-H2 决策 4）。 */
+    attachedImageId?: string;
+    /** 资产位已挂图的短说明（2–6 字，清单口径）。 */
+    attachedImageDesc?: string;
+    /** 意图节点标记（T3-G3a）：不是终稿，不给【生成视频】。 */
+    lapianIntent?: boolean;
+    /** 拉片派生节点的来源拉片 id（T3-G1）：挂图/摘图时据此重算清单行。 */
+    lapianSourceId?: string;
     generationMode?: CanvasGenerationMode;
     generationType?: CanvasImageGenerationType;
     model?: string;

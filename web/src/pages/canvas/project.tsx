@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { ChangeEvent as ReactChangeEvent, DragEvent as ReactDragEvent, MouseEvent as ReactMouseEvent, PointerEvent as ReactPointerEvent } from "react";
 import { useNavigate, useParams, useSearchParams } from "react-router-dom";
-import { Group, Video, Clapperboard, FileText, FolderPlus, LayoutTemplate } from "lucide-react";
+import { Group, Video, Clapperboard, FileText, FolderPlus, LayoutTemplate, Boxes, ImagePlus } from "lucide-react";
 import { saveAs } from "file-saver";
 import { useTranslation } from "react-i18next";
 
@@ -35,6 +35,7 @@ import { buildNodeGenerationContext, buildNodeGenerationInputs, buildNodeRespons
 import { CanvasNodeHoverToolbar, CanvasNodeInfoModal } from "@/components/canvas/canvas-node-hover-toolbar";
 import { CanvasSelectionToolbar } from "@/components/canvas/canvas-selection-toolbar";
 import { LapianAssetGroupModal, type LapianAssetGroupOption } from "@/components/canvas/lapian-asset-group-modal";
+import { LapianAssetAttachModal, type LapianAssetAttachImage } from "@/components/canvas/lapian-asset-attach-modal";
 import { LapianPromptTemplateModal } from "@/components/canvas/lapian-prompt-template-modal";
 import { InfiniteCanvas } from "@/components/canvas/infinite-canvas";
 import { Minimap } from "@/components/canvas/canvas-mini-map";
@@ -51,7 +52,8 @@ import { usePluginHost } from "@/pages/canvas/hooks/use-plugin-host";
 import { buildNodeMentionReferences, getGenerationResourceNodes, getGroupResourceNodes, isCanvasReferenceNode, type CanvasResourceReference } from "@/lib/canvas/canvas-resource-references";
 import { exportCanvasProjects } from "@/lib/canvas/canvas-export";
 import { applyNodeConfigPatch, audioMetadata, buildAudioGenerationMetadata, buildImageGenerationMetadata, createCanvasNode, imageMetadata, videoMetadata } from "@/lib/canvas/canvas-node-factory";
-import { DEFAULT_LAPIAN_PROMPT_TEMPLATE_ID, getLapianPromptTemplate, type LapianPromptTemplateId } from "@/lib/canvas/lapian-prompt-templates";
+import { DEFAULT_LAPIAN_PROMPT_TEMPLATE_ID, LAPIAN_INTENT_PLACEHOLDER, getLapianPromptTemplate, type LapianPromptTemplateId } from "@/lib/canvas/lapian-prompt-templates";
+import { buildLapianAssetManifest, buildLapianAssetSlots, collectLapianAssetReferences, parseLapianAssetBlocks, truncateAssetCaption, upsertLapianAssetManifest, type LapianAssetLabels, type LapianBlock } from "@/lib/canvas/lapian-assets";
 import { applyGroupSelection, applyUngroupSelection, canGroupSelectedNodes, canUngroupSelectedNodes, collectGroupMemberNodes, findContainingGroupId, findGroupDropTarget, focusViewportForNode, getConnectionTargetAnchor, getGroupWrapRect, normalizeConnection, snapNodesIntoGroup } from "@/lib/canvas/canvas-node-geometry";
 import {
     audioExtension,
@@ -265,6 +267,8 @@ function InfiniteCanvasPage() {
     const [lapianError, setLapianError] = useState("");
     const [lapianTemplateNodeId, setLapianTemplateNodeId] = useState<string | null>(null);
     const [assetGroupConfigNodeId, setAssetGroupConfigNodeId] = useState<string | null>(null);
+    const [lapianAttachSlotId, setLapianAttachSlotId] = useState<string | null>(null);
+    const [lapianAssetBusy, setLapianAssetBusy] = useState(false);
     const [lapianPendingPosition, setLapianPendingPosition] = useState<Position | null>(null);
     const [maskEditNodeId, setMaskEditNodeId] = useState<string | null>(null);
     const [splitNodeId, setSplitNodeId] = useState<string | null>(null);
@@ -939,6 +943,27 @@ function InfiniteCanvasPage() {
             }))
             .filter((group) => group.resources.length > 0);
     }, [assetGroupConfigNodeId, connections, nodes, t]);
+
+    // T3-G1/G2/H1：资产位与清单共用的文案包（纯函数层不读 i18n，标签在这里装配）。
+    const lapianAssetLabels = useMemo<LapianAssetLabels>(
+        () => ({
+            slotPrefix: t("canvas.lapianAsset.slotPrefix"),
+            original: t("canvas.lapianAsset.original"),
+            attachButton: t("canvas.lapianAsset.attach"),
+            attachHint: t("canvas.lapianAsset.attachHint"),
+            unnamed: t("canvas.lapianAsset.unnamed"),
+            manifestPrefix: t("canvas.lapianPrompt.assetManifestPrefix"),
+        }),
+        [t],
+    );
+    // T3-H2 弹窗数据：画布上所有有内容的图片节点（挂图=替换，不走连线）。
+    const lapianAttachSlot = lapianAttachSlotId ? nodes.find((node) => node.id === lapianAttachSlotId) ?? null : null;
+    const lapianAttachImages = useMemo<LapianAssetAttachImage[]>(() => {
+        if (!lapianAttachSlot) return [];
+        return nodes
+            .filter((node) => node.type === CanvasNodeType.Image && Boolean(node.metadata?.content))
+            .map((node) => ({ id: node.id, title: node.title || t("canvas.nodeTypes.image"), previewUrl: node.metadata?.content }));
+    }, [lapianAttachSlot, nodes, t]);
     // T8/T9：拉片 → 提交正文。默认规范 timeline-narrative（有先例成片）。
     // 剥离「# 附注」节（v4 审计 B-03：附注随提示词提交会在聚鑫链复发——唯一转换点在这里）。
     const lapianPromptPreset = useCallback(
@@ -991,6 +1016,9 @@ function InfiniteCanvasPage() {
     );
 
     // T3-B：拉片 → 提示词。照抄 createImageReversePromptNodes，只改四处：源类型 / 指令正文 / 组装串 / 连线。
+    // T3-G3a：多派生一个意图文本节点（独立节点连线，走原生 token 通道），预填占位、可留空。
+    // T3-G1：组装串末尾注入「本次参考图：@[node:图片]=短说明…」——图号=已挂资产位的资产位序连续编号，
+    //         清单里的 token 同时就是请求里的 images 顺序，所以正文图号与 images 数组天然一对一。
     const createLapianPromptNodes = useCallback(
         (node: CanvasNodeData) => {
             if (node.type !== CanvasNodeType.Lapian || !node.metadata?.content?.trim()) {
@@ -1010,6 +1038,17 @@ function InfiniteCanvasPage() {
                 ),
                 title: t("canvas.lapianPrompt.instructionTitle", { name: t(template.labelKey) }),
             };
+            const intentNode = {
+                ...createCanvasNode(
+                    CanvasNodeType.Text,
+                    { x: instructionNode.position.x + instructionNode.width / 2, y: instructionNode.position.y + instructionNode.height + 32 + textSpec.height / 2 },
+                    { content: LAPIAN_INTENT_PLACEHOLDER, prompt: LAPIAN_INTENT_PLACEHOLDER, status: NODE_STATUS_SUCCESS, fontSize: 14, lapianIntent: true },
+                ),
+                title: t("canvas.lapianPrompt.intentTitle"),
+            };
+            const assetReferences = collectLapianAssetReferences(node.id, nodesRef.current, lapianAssetLabels.unnamed);
+            const assetManifest = buildLapianAssetManifest(assetReferences, lapianAssetLabels.manifestPrefix);
+            const composerBase = t("canvas.lapianPrompt.composer", { lapianId: node.id, instructionId: instructionNode.id, intentId: intentNode.id });
             const configNode = {
                 ...createCanvasNode(
                     CanvasNodeType.Config,
@@ -1018,22 +1057,140 @@ function InfiniteCanvasPage() {
                         generationMode: "text",
                         model: effectiveConfig.textModel || effectiveConfig.model || defaultConfig.textModel,
                         count: 1,
-                        composerContent: t("canvas.lapianPrompt.composer", { lapianId: node.id, instructionId: instructionNode.id }),
+                        composerContent: assetManifest ? `${composerBase}\n\n${assetManifest}` : composerBase,
+                        lapianSourceId: node.id,
                     },
                 ),
                 title: t("canvas.lapianPrompt.configTitle"),
             };
 
-            setNodes((prev) => [...prev, instructionNode, configNode]);
-            // 连线顺序：拉片在前、指令在后（连线只决定候选集，谁被引用由组装串 token 决定）。
-            setConnections((prev) => [...prev, { id: nanoid(), fromNodeId: node.id, toNodeId: configNode.id }, { id: nanoid(), fromNodeId: instructionNode.id, toNodeId: configNode.id }]);
+            setNodes((prev) => [...prev, instructionNode, intentNode, configNode]);
+            // 连线顺序：拉片在前、指令与意图在后（连线只决定候选集，谁被引用由组装串 token 决定）。
+            // 已挂资产位的图也必须连进来：组装串只从连线候选集里取资源，缺连线图不会进请求。
+            setConnections((prev) => [
+                ...prev,
+                { id: nanoid(), fromNodeId: node.id, toNodeId: configNode.id },
+                { id: nanoid(), fromNodeId: instructionNode.id, toNodeId: configNode.id },
+                { id: nanoid(), fromNodeId: intentNode.id, toNodeId: configNode.id },
+                ...assetReferences.map((reference) => ({ id: nanoid(), fromNodeId: reference.imageId, toNodeId: configNode.id })),
+            ]);
             setSelectedNodeIds(new Set([configNode.id]));
             setSelectedConnectionId(null);
             setDialogNodeId(configNode.id);
             setContextMenu(null);
             focusNodeRef.current(configNode.id);
+            if (assetReferences.length) message.success(t("canvas.lapianPrompt.assetsInManifest", { count: assetReferences.length }));
         },
-        [effectiveConfig.model, effectiveConfig.textModel, message, t],
+        [effectiveConfig.model, effectiveConfig.textModel, lapianAssetLabels, message, t],
+    );
+
+    // T3-H1：拉片 → 资产位（快捷栏按钮触发，不自动）。读 /api/lapian 的资产 blocks，
+    // 每个资产派生一个 Text 节点（资产位·类型·名 + 原片对应物 + 挂图提示）。
+    // 幂等：按「类型|名」去重，重复点只补缺失；IR 没有任何资产 → 不出节点，只 toast。
+    const createLapianAssetSlots = useCallback(
+        async (node: CanvasNodeData) => {
+            if (node.type !== CanvasNodeType.Lapian) return;
+            const taskId = String(node.metadata?.taskId || "");
+            if (!taskId) {
+                message.warning(t("canvas.lapianAsset.noTask"));
+                return;
+            }
+            if (lapianAssetBusy) return;
+            setLapianAssetBusy(true);
+            try {
+                const payload = (await fetch(`http://127.0.0.1:8776/api/lapian/${encodeURIComponent(taskId)}`).then((response) => response.json())) as { blocks?: LapianBlock[]; error?: string };
+                if (!payload || payload.error) {
+                    message.error(t("canvas.lapianAsset.loadFailed", { error: payload?.error || "" }));
+                    return;
+                }
+                const items = parseLapianAssetBlocks(payload.blocks);
+                if (!items.length) {
+                    // 决策 5：空资产（抽象动画/空镜）→ 不弹资产位。
+                    message.info(t("canvas.lapianAsset.empty"));
+                    return;
+                }
+                const slots = buildLapianAssetSlots(items, lapianAssetLabels);
+                const existingNodes = nodesRef.current.filter((item) => item.metadata?.assetSlotSourceId === node.id);
+                const existingKeys = new Set(existingNodes.map((item) => `${item.metadata?.assetSlotType}|${item.metadata?.assetSlotName}`));
+                const missing = slots.filter((slot) => !existingKeys.has(slot.key));
+                if (!missing.length) {
+                    message.success(t("canvas.lapianAsset.allExist", { count: slots.length }));
+                    return;
+                }
+                const textSpec = NODE_DEFAULT_SIZE[CanvasNodeType.Text];
+                const columns = 3;
+                const gutter = 24;
+                const created = missing.map((slot, offset) => {
+                    const index = existingNodes.length + offset;
+                    const column = index % columns;
+                    const row = Math.floor(index / columns);
+                    const center = {
+                        x: node.position.x + textSpec.width / 2 + column * (textSpec.width + gutter),
+                        y: node.position.y + node.height + 40 + textSpec.height / 2 + row * (textSpec.height + gutter),
+                    };
+                    return {
+                        ...createCanvasNode(CanvasNodeType.Text, center, {
+                            content: slot.body,
+                            prompt: slot.body,
+                            status: NODE_STATUS_SUCCESS,
+                            fontSize: 12,
+                            assetSlotSourceId: node.id,
+                            assetSlotOrder: slot.order,
+                            assetSlotName: slot.name,
+                            assetSlotType: slot.type,
+                        }),
+                        title: slot.title,
+                    };
+                });
+                setNodes((prev) => [...prev, ...created]);
+                setContextMenu(null);
+                focusNodeRef.current(created[0].id);
+                message.success(t("canvas.lapianAsset.created", { count: created.length }));
+            } catch (error) {
+                message.error(t("canvas.lapianAsset.loadFailed", { error: (error as Error).message }));
+            } finally {
+                setLapianAssetBusy(false);
+            }
+        },
+        [lapianAssetBusy, lapianAssetLabels, message, t],
+    );
+
+    // T3-H2：资产位挂图（决策 4：不依赖连线）。写 metadata.attachedImageId + 短说明；
+    // 顺手把已派生配置节点的清单行重算一遍，并补「图 → 配置」连线（无连线 = 图不进请求）。
+    const attachLapianAssetImage = useCallback(
+        (slotId: string, imageId: string, caption: string) => {
+            const slot = nodesRef.current.find((item) => item.id === slotId);
+            if (!slot) return;
+            const lapianId = String(slot.metadata?.assetSlotSourceId || "");
+            setNodes((prev) => {
+                const patched = prev.map((item) =>
+                    item.id === slotId
+                        ? { ...item, metadata: { ...item.metadata, attachedImageId: imageId || undefined, attachedImageDesc: imageId ? caption || undefined : undefined } }
+                        : item,
+                );
+                if (!lapianId) return patched;
+                const manifest = buildLapianAssetManifest(collectLapianAssetReferences(lapianId, patched, lapianAssetLabels.unnamed), lapianAssetLabels.manifestPrefix);
+                return patched.map((item) =>
+                    item.type === CanvasNodeType.Config && item.metadata?.lapianSourceId === lapianId
+                        ? { ...item, metadata: { ...item.metadata, composerContent: upsertLapianAssetManifest(String(item.metadata?.composerContent || ""), manifest, lapianAssetLabels.manifestPrefix) } }
+                        : item,
+                );
+            });
+            if (imageId && lapianId) {
+                const configIds = nodesRef.current.filter((item) => item.type === CanvasNodeType.Config && item.metadata?.lapianSourceId === lapianId).map((item) => item.id);
+                if (configIds.length) {
+                    setConnections((prev) => [
+                        ...prev,
+                        ...configIds
+                            .filter((configId) => !prev.some((connection) => connection.fromNodeId === imageId && connection.toNodeId === configId))
+                            .map((configId) => ({ id: nanoid(), fromNodeId: imageId, toNodeId: configId })),
+                    ]);
+                }
+            }
+            setLapianAttachSlotId(null);
+            message.success(imageId ? t("canvas.lapianAsset.attached", { name: truncateAssetCaption(caption) || String(slot.metadata?.assetSlotName || "") }) : t("canvas.lapianAsset.detached"));
+        },
+        [lapianAssetLabels, message, t],
     );
 
     // T3-C：切模板只重写指令节点正文（不重建节点、不动连线）；配置节点组装串不变，重新生成即得新骨架终稿。
@@ -1167,6 +1324,24 @@ function InfiniteCanvasPage() {
                     label: t("canvas.lapianPrompt.create"),
                     icon: <FileText className="size-4" />,
                     onClick: () => createLapianPromptNodes(node),
+                }, {
+                    id: "wan-lapian-assets",
+                    title: t("canvas.lapianAsset.deriveTitle"),
+                    label: t("canvas.lapianAsset.derive"),
+                    icon: <Boxes className="size-4" />,
+                    onClick: () => void createLapianAssetSlots(node),
+                }];
+            }
+            // T3-H2：资产位自带的【挂图】按钮（决策 4：不依赖连线，写 metadata）。
+            if (node.type === CanvasNodeType.Text && node.metadata?.assetSlotSourceId) {
+                const attachedName = truncateAssetCaption(String(node.metadata?.attachedImageDesc || "")) || String(node.metadata?.assetSlotName || "");
+                return [{
+                    id: "wan-lapian-attach",
+                    title: t("canvas.lapianAsset.attachTitle"),
+                    label: node.metadata?.attachedImageId ? t("canvas.lapianAsset.attachedLabel", { name: attachedName }) : t("canvas.lapianAsset.attach"),
+                    icon: <ImagePlus className="size-4" />,
+                    active: Boolean(node.metadata?.attachedImageId),
+                    onClick: () => setLapianAttachSlotId(node.id),
                 }];
             }
             if (node.type === CanvasNodeType.Text && node.metadata?.promptTemplate) {
@@ -1206,13 +1381,14 @@ function InfiniteCanvasPage() {
                 onClick: () => generateVideoFromLapianNode(node),
             }];
         },
-        [createLapianPromptNodes, generateVideoFromLapianNode, t],
+        [createLapianAssetSlots, createLapianPromptNodes, generateVideoFromLapianNode, t],
     );
 
-    // T3-E 入口：终稿（普通文本节点）才有【生成视频】；带 promptTemplate 的是转换指令节点，不算终稿。
+    // T3-E 入口：终稿（普通文本节点）才有【生成视频】；带 promptTemplate 的是转换指令节点，
+    // 资产位与意图节点也不是终稿，都不给这个按钮。
     const finalPromptToolItems = useCallback(
         (node: CanvasNodeData): CanvasNodeToolbarItem[] => {
-            if (node.type !== CanvasNodeType.Text || node.metadata?.promptTemplate || !node.metadata?.content?.trim()) return [];
+            if (node.type !== CanvasNodeType.Text || node.metadata?.promptTemplate || node.metadata?.assetSlotSourceId || node.metadata?.lapianIntent || !node.metadata?.content?.trim()) return [];
             return [{
                 id: "wan-gen-video-final",
                 title: t("canvas.lapianPrompt.generateVideoTitle"),
@@ -3830,6 +4006,18 @@ function InfiniteCanvasPage() {
                     onCancel={() => setAssetGroupConfigNodeId(null)}
                     onConfirm={(groupId) => {
                         if (assetGroupConfigNode) mountAssetGroupToConfig(assetGroupConfigNode.id, groupId);
+                    }}
+                />
+
+                <LapianAssetAttachModal
+                    open={Boolean(lapianAttachSlot)}
+                    slotTitle={String(lapianAttachSlot?.metadata?.assetSlotName || lapianAttachSlot?.title || "")}
+                    images={lapianAttachImages}
+                    currentImageId={lapianAttachSlot?.metadata?.attachedImageId}
+                    currentCaption={lapianAttachSlot?.metadata?.attachedImageDesc}
+                    onCancel={() => setLapianAttachSlotId(null)}
+                    onConfirm={(imageId, caption) => {
+                        if (lapianAttachSlot) attachLapianAssetImage(lapianAttachSlot.id, imageId, caption);
                     }}
                 />
 
