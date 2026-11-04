@@ -1,8 +1,10 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 
 import { loadConfig, type HermesProviderConfig } from "../config.js";
+import type { AgentAttachment } from "./types.js";
 import { createAgentLogWriter } from "../utils/agent-runtime.js";
 import { logger } from "../utils/logger.js";
 import { errorMessage, type JsonRecord } from "../utils/value.js";
@@ -17,6 +19,10 @@ import { createProviderThreadId, registerAgentProvider, type AgentProvider, type
  *
  * MCP 工具面**不在代码里注入**（这点与 Codex 的 `config.mcp_servers` 不同），由部署面预配：
  * `hermes mcp add infinite-canvas -- node <entry> mcp`。这里只认已经注册好的 `mcp__*` 工具名。
+ *
+ * 图片附件：`AgentAttachment.dataUrl` 先落成本地临时文件，再按 CLI 是否接 `--image` 二选一投递——
+ * 接就用 `--image <path>` 原生附图，不接（stream-json 走网关的发行方式）就把路径写进提示词交给
+ * `vision_analyze`。两条路都在本轮结束后删掉临时目录。
  */
 
 /** 文本增量合并窗口，与 `codex-client.ts` 的 40ms 节流一致。 */
@@ -24,6 +30,8 @@ const STREAM_UPDATE_INTERVAL_MS = 40;
 /** 工具输出写入事件前的截断长度，避免一次画布快照把 SSE 撑爆。 */
 const TOOL_OUTPUT_CAP = 20_000;
 const DEFAULT_COMMAND = "hermes";
+/** 附件临时目录前缀；一轮结束整目录删除，与 codex.ts 一样放系统临时目录。 */
+const ATTACHMENT_DIR_PREFIX = "infinite-canvas-hermes-";
 
 /** Hermes 的 token 计数（`result.tokens`）。 */
 export type HermesTokens = { input: number; output: number; total: number; cacheRead: number; cacheWrite: number };
@@ -135,14 +143,125 @@ export function resolveHermesCommand(configured?: string) {
 }
 
 /** 组装 `hermes chat` 参数；prompt 作为独立 argv 传入，不经过 shell 解释。 */
-export function hermesChatArgs(input: { prompt: string; sessionId?: string; config?: HermesProviderConfig }) {
+export function hermesChatArgs(input: { prompt: string; sessionId?: string; config?: HermesProviderConfig; images?: string[] }) {
     const config = input.config || {};
     const args = ["chat", "-q", input.prompt, "--oneshot", "--format", "stream-json"];
     if (input.sessionId) args.push("--resume", input.sessionId);
     if (config.model) args.push("--model", config.model);
     if (config.toolsets) args.push("--toolsets", config.toolsets);
     if (config.reasoning) args.push("--reasoning", config.reasoning);
+    // 一张图一个 `--image`；无附件时不加参数，行为与接入附件前完全一致。
+    for (const image of input.images || []) args.push("--image", image);
     return args;
+}
+
+/** 已落盘的附件：目录用于整目录清理，`files` 是交给 CLI 或提示词的绝对路径。 */
+export type HermesAttachmentFiles = { dir: string; files: string[] };
+
+/**
+ * 把 dataUrl 图片落成本地临时文件。
+ *
+ * Hermes 的图片入口只认本地路径（`--image <path>`），不收 base64；
+ * 非图片附件（未来可能有 pdf 等）直接跳过，与 codex 的 `writeAttachmentFiles` 同口径。
+ */
+export async function writeHermesAttachmentFiles(attachments: AgentAttachment[]): Promise<HermesAttachmentFiles> {
+    const images = attachments.filter((item) => item.dataUrl?.startsWith("data:image/"));
+    if (!images.length) return { dir: "", files: [] };
+    const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), ATTACHMENT_DIR_PREFIX));
+    const files: string[] = [];
+    for (const [index, item] of images.entries()) {
+        const [, meta = "", data = ""] = item.dataUrl?.match(/^data:([^;]+);base64,(.+)$/) || [];
+        if (!data) throw new Error(`图片附件无效：${item.name || "未命名图片"}`);
+        const file = path.join(dir, `image-${index + 1}.${imageExt(meta || item.type)}`);
+        await fs.promises.writeFile(file, Buffer.from(data, "base64"));
+        files.push(file);
+    }
+    return { dir, files };
+}
+
+/** 删除本轮附件目录；turn 结束（进程已读不到文件）后调用，失败不影响终态。 */
+export async function removeHermesAttachmentFiles(dir: string) {
+    if (!dir) return;
+    await fs.promises.rm(dir, { recursive: true, force: true }).catch(() => undefined);
+}
+
+/** 根据图片 MIME 或文件名猜扩展名；Hermes 只按扩展名判类型。 */
+function imageExt(type = "") {
+    const text = type.toLowerCase();
+    if (text.includes("png")) return "png";
+    if (text.includes("webp")) return "webp";
+    if (text.includes("gif")) return "gif";
+    return "jpg";
+}
+
+/**
+ * `--image` 被当前 Hermes 发行方式拒收时的提示词替代写法。
+ *
+ * 新版 Hermes 的 `--format stream-json` 一律交给网关传输，网关会拒绝 `--image`
+ * （`Unsupported gateway CLI options: --image`），但 CLI 仍有 `vision_analyze` 工具能直接读本地文件。
+ * 把路径写进提示词，图片内容照样进模型，代价是多一次工具调用。
+ */
+export function appendHermesAttachmentRefs(prompt: string, files: string[]) {
+    if (!files.length) return prompt;
+    const list = files.map((file, index) => `${index + 1}. ${file}`).join("\n");
+    return `${prompt}\n\n本轮附带 ${files.length} 张图片，已存到本机（临时文件，本轮结束后删除）：\n${list}\n先用 vision_analyze 逐张看图（image_url 直接传上面的路径），再动手做用户要的事；用户说「这张图」「这几张图」时指的就是它们。`;
+}
+
+/** 判断探测输出是否属于「网关不支持 --image」；纯函数，便于单测。 */
+export function hermesImageFlagRejected(output: string) {
+    return /Unsupported gateway CLI options/i.test(output);
+}
+
+/** `--image` 是否可用；null 表示尚未探测。每个进程只探一次。 */
+let imageFlagSupport: boolean | null = null;
+
+/**
+ * 真跑一次 CLI 看它接不接 `--image`，返回原始输出。
+ *
+ * `--help` 会列出 `--image`，但网关形态的执行路径会在参数校验阶段拒绝它，所以只能实测。
+ * 探测用「不存在的图片路径」：可用时 CLI 在读图阶段就报 `Image file not found`，
+ * 不可用时在参数校验阶段报 `Unsupported gateway CLI options`——两种情况都在起模型之前退出，不花钱。
+ */
+function probeImageFlag(command: string, cwd: string) {
+    return new Promise<string>((resolve) => {
+        const missing = path.join(os.tmpdir(), `infinite-canvas-hermes-probe-${process.pid}.png`);
+        let output = "";
+        let settled = false;
+        let timer: ReturnType<typeof setTimeout> | null = null;
+        const finish = () => {
+            if (settled) return;
+            settled = true;
+            if (timer) clearTimeout(timer);
+            resolve(output);
+        };
+        try {
+            const child = spawn(command, ["chat", "-q", "probe", "--oneshot", "--format", "stream-json", "--image", missing], {
+                cwd,
+                stdio: ["ignore", "pipe", "pipe"],
+                windowsHide: true,
+                shell: process.platform === "win32" && /\.(cmd|bat)$/i.test(command),
+            });
+            timer = setTimeout(() => {
+                child.kill();
+                finish();
+            }, 30_000);
+            child.stdout?.on("data", (chunk) => (output += chunk.toString()));
+            child.stderr?.on("data", (chunk) => (output += chunk.toString()));
+            child.on("error", finish);
+            child.on("close", finish);
+        } catch {
+            // 探不动就当可用：真的起不来时，turn 自己的错误更具体。
+            resolve("");
+        }
+    });
+}
+
+/** 探测并缓存 `--image` 支持情况；探测本身不打断事件循环（画布 SSE 还在往外写）。 */
+async function detectImageFlagSupport(command: string, cwd: string) {
+    if (imageFlagSupport !== null) return imageFlagSupport;
+    const output = await probeImageFlag(command, cwd);
+    imageFlagSupport = !hermesImageFlagRejected(output);
+    return imageFlagSupport;
 }
 
 /** 一轮 Hermes 子进程的事件搬运与终态管理。 */
@@ -368,24 +487,49 @@ async function startHermesTurn(input: AgentProviderTurnInput): Promise<AgentProv
     const turnId = `hermes-turn-${Date.now().toString(36)}-${Math.random().toString(16).slice(2, 8)}`;
     const config = hermesConfig();
     const command = resolveHermesCommand(config.command);
+    const cwd = input.cwd || process.cwd();
     const resumeId = hermesSessions.get(threadId) || "";
-    const args = hermesChatArgs({ prompt: input.prompt, sessionId: resumeId, config: { ...config, ...(input.model ? { model: input.model } : {}) } });
-    logger.info("Hermes turn starting", { threadId, turnId, command, model: input.model || config.model || "default", promptLength: input.prompt.length, resumed: Boolean(resumeId) });
+    // 附件先落盘：`--image` 与提示词引用都需要真实文件路径，dataUrl 本身进不去 CLI。
+    let attachmentDir = "";
+    let files: string[] = [];
+    let images: string[] = [];
+    try {
+        const written = await writeHermesAttachmentFiles(input.attachments || []);
+        attachmentDir = written.dir;
+        files = written.files;
+    } catch (error) {
+        const message = errorMessage(error);
+        input.emit("agent_error", { message });
+        return { provider: "hermes", threadId, turnId, status: "failed" };
+    }
+    if (files.length) {
+        // 网关形态的 Hermes 不认 `--image`（stream-json 一律走网关），改把路径写进提示词喂给 vision_analyze。
+        if (await detectImageFlagSupport(command, cwd)) images = files;
+        else input.emit("agent_log", { text: `当前 Hermes 不接 --image，已把 ${files.length} 张图片的本地路径写进提示词供 vision_analyze 读取` });
+        input.emit("agent_log", { text: `已附带 ${files.length} 张图片` });
+    }
+    const prompt = files.length && !images.length ? appendHermesAttachmentRefs(input.prompt, files) : input.prompt;
+    const args = hermesChatArgs({ prompt, sessionId: resumeId, config: { ...config, ...(input.model ? { model: input.model } : {}) }, images });
+    logger.info("Hermes turn starting", { threadId, turnId, command, model: input.model || config.model || "default", promptLength: prompt.length, attachmentCount: files.length, imageFlag: images.length > 0, resumed: Boolean(resumeId) });
     input.onThread?.(threadId);
     let child: ChildProcess;
     try {
-        child = spawn(command, args, { cwd: input.cwd || process.cwd(), stdio: ["ignore", "pipe", "pipe"], windowsHide: true, shell: process.platform === "win32" && /\.(cmd|bat)$/i.test(command) });
+        child = spawn(command, args, { cwd, stdio: ["ignore", "pipe", "pipe"], windowsHide: true, shell: process.platform === "win32" && /\.(cmd|bat)$/i.test(command) });
     } catch (error) {
         const message = `无法启动 Hermes：${errorMessage(error)}`;
+        await removeHermesAttachmentFiles(attachmentDir);
         input.emit("agent_error", { message });
         return { provider: "hermes", threadId, turnId, status: "failed" };
     }
     const run = new HermesTurnRun(child, input, threadId, turnId);
     activeRun = run;
+    // 进程退出后才删临时目录：图片要活到本轮的 vision_analyze 读完。
+    child.once("close", () => void removeHermesAttachmentFiles(attachmentDir));
     try {
         return await run.start();
     } finally {
         if (activeRun === run) activeRun = null;
+        await removeHermesAttachmentFiles(attachmentDir);
     }
 }
 
@@ -393,7 +537,7 @@ async function startHermesTurn(input: AgentProviderTurnInput): Promise<AgentProv
 export const hermesProvider: AgentProvider = {
     id: "hermes",
     label: "Hermes",
-    capabilities: { session: false, threads: false, models: false, attachments: false, approvals: false, interrupt: true, resume: true },
+    capabilities: { session: false, threads: false, models: false, attachments: true, approvals: false, interrupt: true, resume: true },
 
     /** Hermes 没有常驻会话，这里只分配画布侧 id，进程留到 turn 时再起。 */
     async startSession(input: AgentProviderSessionInput): Promise<AgentProviderSession> {

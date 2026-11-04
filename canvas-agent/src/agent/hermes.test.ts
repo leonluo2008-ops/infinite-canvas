@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import path from "node:path";
 import test from "node:test";
 
-import { hermesChatArgs, normalizeHermesToolName, parseHermesStreamLine } from "./hermes.js";
+import { appendHermesAttachmentRefs, hermesChatArgs, hermesImageFlagRejected, normalizeHermesToolName, parseHermesStreamLine, removeHermesAttachmentFiles, writeHermesAttachmentFiles } from "./hermes.js";
 import { loadAgentProvider } from "./provider.js";
 
 test("hermes stream-json 的 init/text/tool/result 四类行都有归一结果", () => {
@@ -64,11 +66,59 @@ test("provider 注册表能按 id 加载三家实现，未知 id 返回 null", a
     assert.equal(await loadAgentProvider("nope"), null);
 });
 
-test("hermes 的能力申报：无原生线程、无 model/list、可中断、可续跑", async () => {
+test("hermes 的能力申报：无原生线程、无 model/list、收图片附件、可中断、可续跑", async () => {
     const provider = await loadAgentProvider("hermes");
     assert.ok(provider);
-    assert.deepEqual(provider.capabilities, { session: false, threads: false, models: false, attachments: false, approvals: false, interrupt: true, resume: true });
+    assert.deepEqual(provider.capabilities, { session: false, threads: false, models: false, attachments: true, approvals: false, interrupt: true, resume: true });
     const models = await provider.listModels();
     assert.equal(models.models.length, 1);
     assert.equal(models.models[0].isDefault, true);
+});
+
+test("一张图一个 --image，无附件时不追加任何参数", () => {
+    assert.deepEqual(hermesChatArgs({ prompt: "看这两张", images: ["C:/tmp/a.png", "C:/tmp/b.jpg"] }), [
+        "chat", "-q", "看这两张", "--oneshot", "--format", "stream-json", "--image", "C:/tmp/a.png", "--image", "C:/tmp/b.jpg",
+    ]);
+    const bare = hermesChatArgs({ prompt: "无图", sessionId: "local-abc", config: { model: "m" } });
+    assert.equal(bare.includes("--image"), false);
+    assert.deepEqual(bare, ["chat", "-q", "无图", "--oneshot", "--format", "stream-json", "--resume", "local-abc", "--model", "m"]);
+});
+
+test("dataUrl 落成本地临时文件：按 MIME 给扩展名，非图片附件跳过，收尾整目录删除", async () => {
+    const png = Buffer.from("png-bytes").toString("base64");
+    const jpeg = Buffer.from("jpeg-bytes").toString("base64");
+    const written = await writeHermesAttachmentFiles([
+        { name: "a", type: "image/png", dataUrl: `data:image/png;base64,${png}` },
+        { name: "b", type: "image/jpeg", dataUrl: `data:image/jpeg;base64,${jpeg}` },
+        { name: "note", type: "text/plain", dataUrl: "data:text/plain;base64,aGk=" },
+        { name: "no-data" },
+    ]);
+    try {
+        assert.equal(written.files.length, 2);
+        assert.match(written.files[0], /image-1\.png$/);
+        assert.match(written.files[1], /image-2\.jpg$/);
+        assert.equal(fs.readFileSync(written.files[0], "utf8"), "png-bytes");
+        assert.equal(fs.readFileSync(written.files[1], "utf8"), "jpeg-bytes");
+        assert.ok(fs.existsSync(written.dir));
+    } finally {
+        await removeHermesAttachmentFiles(written.dir);
+    }
+    assert.equal(fs.existsSync(written.dir), false);
+    assert.deepEqual(await writeHermesAttachmentFiles([]), { dir: "", files: [] });
+});
+
+test("没有 --image 通道时把本地路径写进提示词，交给 vision_analyze", () => {
+    assert.equal(appendHermesAttachmentRefs("原prompt", []), "原prompt");
+    const text = appendHermesAttachmentRefs("画一张图", [path.join("C:", "tmp", "image-1.png"), path.join("C:", "tmp", "image-2.jpg")]);
+    assert.ok(text.startsWith("画一张图"));
+    assert.match(text, /附带 2 张图片/);
+    assert.ok(text.includes(path.join("C:", "tmp", "image-1.png")));
+    assert.ok(text.includes(path.join("C:", "tmp", "image-2.jpg")));
+    assert.match(text, /vision_analyze/);
+});
+
+test("网关拒绝 --image 的报错要能被认出来，否则不能当成可用", () => {
+    assert.equal(hermesImageFlagRejected("Error: Unsupported gateway CLI options: --image. No local fallback or policy changes were made."), true);
+    assert.equal(hermesImageFlagRejected("Image file not found: /tmp/x.png"), false);
+    assert.equal(hermesImageFlagRejected(""), false);
 });
