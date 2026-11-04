@@ -69,6 +69,8 @@ import { AgentSkillsView } from "./agent-skills-view";
 
 const MAX_ATTACHMENTS = 6;
 const MAX_ATTACHMENT_PAYLOAD_BYTES = 28 * 1024 * 1024;
+/** 单图上限：图片以 dataUrl 进附件（Hermes 走 --image），超过 8MB 网关侧会被拒，前端先拦。 */
+const MAX_IMAGE_ATTACHMENT_BYTES = 8 * 1024 * 1024;
 const MESSAGE_PREVIEW_LONG_EDGE = 192;
 const MESSAGE_PREVIEW_MAX_LENGTH = 500_000;
 const DEFAULT_AGENT_URL = "http://127.0.0.1:17371";
@@ -720,10 +722,12 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
         }
         const messageId = createId();
         const userText = text || rt(files.length ? "imagesSent" : "canvasReferencesSent", { count: files.length || canvasReferences.length });
-        const messageReferences: AgentCanvasReference[] = await Promise.all(canvasReferences.map(async ({ nodeId, label, title, kind, previewUrl, text }) => {
+        const messageReferences: AgentCanvasReference[] = await Promise.all(canvasReferences.map(async ({ nodeId, label, title, kind, previewUrl, text, localPath }) => {
             const image = referenceImages.find((item) => item.id === `canvas:${nodeId}`);
-            return { nodeId, label, title, kind, previewUrl: image ? (await createMessageAttachmentMetadata(image)).url : previewUrl, text };
+            return { nodeId, label, title, kind, previewUrl: image ? (await createMessageAttachmentMetadata(image)).url : previewUrl, ...(localPath ? { localPath } : {}), text };
         }));
+        /** 视频/音频的体积不适合传 base64，Agent 侧靠这份实体清单（localPath 优先，其次 previewUrl）注入提示词。 */
+        const mediaReferences = messageReferences.filter((item) => item.kind === "video" || item.kind === "audio");
         const messageSkill = selectedSkill ? { name: selectedSkill.name, path: selectedSkill.path, displayName: selectedSkill.interface?.displayName || undefined } : undefined;
         loadThreadsSequenceRef.current += 1;
         const currentBeforeSend = useAgentStore.getState();
@@ -758,6 +762,7 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
                     effort: provider === "codex" ? reasoningEffort : undefined,
                     skill: selectedSkill ? { name: selectedSkill.name, path: selectedSkill.path } : undefined,
                     attachments: requestFiles.map(({ id, name, type, size, width, height, dataUrl }) => ({ id, name, type, size, width, height, dataUrl })),
+                    references: mediaReferences,
                     messageMetadata,
                 }),
             });
@@ -823,10 +828,18 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
     const addAttachments = async (files: FileList | File[] | null) => {
         if (!files) return;
         const images = Array.from(files).filter((file) => file.type.startsWith("image/"));
+        const oversized = images.filter((file) => file.size > MAX_IMAGE_ATTACHMENT_BYTES);
+        if (oversized.length) {
+            message.warning(oversized.length === 1
+                ? rt("imageAttachmentTooLarge", { name: oversized[0].name, size: formatBytes(oversized[0].size), limit: formatBytes(MAX_IMAGE_ATTACHMENT_BYTES) })
+                : rt("imageAttachmentsTooLarge", { count: oversized.length, limit: formatBytes(MAX_IMAGE_ATTACHMENT_BYTES) }));
+        }
+        const accepted = images.filter((file) => file.size <= MAX_IMAGE_ATTACHMENT_BYTES);
+        if (!accepted.length) return;
         const prev = useAgentStore.getState().attachments;
         try {
             const next = await Promise.all(
-                images.slice(0, Math.max(0, MAX_ATTACHMENTS - prev.length)).map(async (file) => {
+                accepted.slice(0, Math.max(0, MAX_ATTACHMENTS - prev.length)).map(async (file) => {
                     const dataUrl = await readDataUrl(file);
                     const meta = await readImageMeta(dataUrl);
                     const url = URL.createObjectURL(file);

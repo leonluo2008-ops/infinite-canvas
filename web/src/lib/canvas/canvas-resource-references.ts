@@ -15,6 +15,8 @@ export type CanvasResourceReference = {
     title: string;
     previewUrl?: string;
     text?: string;
+    /** 素材在服务端的本地实体路径（bridge 上传落盘才有）；当前 bridge 上传响应不含该字段，留空由后端按 previewUrl 反解。 */
+    localPath?: string;
     active: boolean;
 };
 

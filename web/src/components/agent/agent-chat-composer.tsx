@@ -1,5 +1,5 @@
-import { useRef, useState, type ReactNode } from "react";
-import { Button, Dropdown, Tooltip } from "antd";
+import { useRef, useState, type ChangeEvent, type ReactNode } from "react";
+import { App, Button, Dropdown, Tooltip } from "antd";
 import { ArrowUp, Check, ChevronUp, Cpu, Gauge, Hand, ImagePlus, LoaderCircle, RefreshCw, ShieldAlert, ShieldCheck, ShieldOff, Square, X } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
@@ -63,9 +63,27 @@ export function AgentChatComposer({
     left?: ReactNode;
 }) {
     const { t } = useTranslation();
+    const { message } = App.useApp();
     const fileInputRef = useRef<HTMLInputElement>(null);
+    const [mentionRequest, setMentionRequest] = useState(0);
     const canvasReferences = useAgentStore((state) => state.canvasReferences);
     const canSubmit = !disabled && !sending && Boolean(prompt.trim() || attachments.length || canvasReferences.length);
+    /**
+     * 图片走附件（dataUrl → --image）；视频/音频体积太大不走附件，
+     * 提示改走 @画布素材引用，并直接把引用菜单打开（不用用户自己记得敲 @）。
+     */
+    const pickFiles = (event: ChangeEvent<HTMLInputElement>) => {
+        const picked = event.target.files ? Array.from(event.target.files) : [];
+        event.target.value = "";
+        if (!picked.length) return;
+        const images = picked.filter((file) => file.type.startsWith("image/"));
+        const media = picked.filter((file) => !file.type.startsWith("image/"));
+        if (media.length) {
+            message.warning(t("agent.composer.mediaUseMention"));
+            setMentionRequest((value) => value + 1);
+        }
+        if (images.length && onAddFiles) void onAddFiles(images);
+    };
     return (
         <div className="px-2 pb-2 pt-2" onWheelCapture={(event) => event.stopPropagation()}>
             <div className="rounded-[24px] border px-3 pb-3 pt-3 shadow-lg" style={{ background: theme.toolbar.panel, borderColor: theme.node.stroke }}>
@@ -83,17 +101,14 @@ export function AgentChatComposer({
                         ))}
                     </div>
                 ) : null}
-                <AgentChatPromptInput value={prompt} disabled={disabled || sending} placeholder={placeholder} theme={theme} onChange={onPromptChange} onSubmit={() => { if (canSubmit) void onSubmit(); }} onAddFiles={onAddFiles} />
+                <AgentChatPromptInput value={prompt} disabled={disabled || sending} placeholder={placeholder} theme={theme} mentionRequest={mentionRequest} onChange={onPromptChange} onSubmit={() => { if (canSubmit) void onSubmit(); }} onAddFiles={onAddFiles} />
                 <div className="@container mt-2 flex items-center justify-between gap-2">
                     <div className="flex min-w-0 items-center gap-1">
                         {onAddFiles ? (
                             <>
-                                <input ref={fileInputRef} hidden type="file" accept="image/*" multiple onChange={(event) => {
-                                    void onAddFiles(event.target.files);
-                                    event.target.value = "";
-                                }} />
-                                <Tooltip title={t("agent.composer.uploadImage")}>
-                                    <Button type="text" shape="circle" className="!h-9 !w-9 !min-w-9" disabled={disabled || sending} style={{ color: theme.node.muted }} icon={<ImagePlus className="size-4" />} onClick={() => fileInputRef.current?.click()} aria-label={t("agent.composer.uploadImage")} />
+                                <input ref={fileInputRef} hidden type="file" accept="image/*,video/*,audio/*" multiple onChange={pickFiles} />
+                                <Tooltip title={t("agent.composer.uploadAttachment")}>
+                                    <Button type="text" shape="circle" className="!h-9 !w-9 !min-w-9" disabled={disabled || sending} style={{ color: theme.node.muted }} icon={<ImagePlus className="size-4" />} onClick={() => fileInputRef.current?.click()} aria-label={t("agent.composer.uploadAttachment")} />
                                 </Tooltip>
                             </>
                         ) : null}

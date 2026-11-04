@@ -12,11 +12,11 @@ import { useAgentStore, type AgentCanvasReference, type AgentSkillReference } fr
 import { AgentCanvasReferencePreview, canvasReferenceIcon, canvasReferenceKindLabel } from "./agent-canvas-reference-preview";
 import { agentInlineTokenClass, agentInlineTokenMediaClass, agentReferenceMarker, agentSkillMarker, parseAgentInlineTokens } from "./agent-chat-inline-tokens";
 
-type ComposerCommand = { type: "skill" | "resource"; query: string; length: number };
+type ComposerCommand = { type: "skill" | "resource"; query: string; length: number; forced?: boolean };
 type ComposerCandidate = { type: "skill"; skill: AgentSkillSummary } | { type: "resource"; reference: CanvasResourceReference };
 type ReferenceHover = { reference: AgentCanvasReference; left: number; top: number; width: number; height: number };
 
-export function AgentChatPromptInput({ value, disabled, placeholder, theme, onChange, onSubmit, onAddFiles }: {
+export function AgentChatPromptInput({ value, disabled, placeholder, theme, onChange, onSubmit, onAddFiles, mentionRequest }: {
     value: string;
     disabled?: boolean;
     placeholder: string;
@@ -24,6 +24,8 @@ export function AgentChatPromptInput({ value, disabled, placeholder, theme, onCh
     onChange: (value: string) => void;
     onSubmit: () => void;
     onAddFiles?: (files: FileList | File[] | null) => void | Promise<void>;
+    /** 计数变化即打开画布素材引用菜单（视频/音频附件改走 @引用的入口）。 */
+    mentionRequest?: number;
 }) {
     const containerRef = useRef<HTMLDivElement>(null);
     const editorRef = useRef<HTMLDivElement>(null);
@@ -45,6 +47,13 @@ export function AgentChatPromptInput({ value, disabled, placeholder, theme, onCh
     } : undefined, [selectedSkill]);
     const tokens = useMemo(() => parseAgentInlineTokens(value, canvasReferences, messageSkill), [canvasReferences, messageSkill, value]);
     const selectedReferenceIds = useMemo(() => new Set(canvasReferences.map((item) => item.nodeId)), [canvasReferences]);
+    /** 引用菜单的候选项来源：当前画布快照里的可引用素材，先选中项。 */
+    const collectResourceCandidates = () => {
+        const snapshot = useAgentStore.getState().canvasContext?.snapshot;
+        const references = buildCanvasResourceReferences(snapshot?.nodes || []);
+        const selectedIds = new Set(snapshot?.selectedNodeIds || []);
+        return [...references.filter((item) => selectedIds.has(item.nodeId)), ...references.filter((item) => !selectedIds.has(item.nodeId))];
+    };
     const candidates = useMemo<ComposerCandidate[]>(() => {
         if (!command) return [];
         const query = command.query.trim().toLowerCase();
@@ -70,6 +79,15 @@ export function AgentChatPromptInput({ value, disabled, placeholder, theme, onCh
         lastEmittedRef.current = value;
     }, [theme, tokens, value]);
 
+    /** 视频/音频被选中时由 composer 计数触发：不插 @ 字符，直接摊开素材引用菜单。 */
+    useEffect(() => {
+        if (!mentionRequest) return;
+        setResourceCandidates(collectResourceCandidates());
+        setCommand({ type: "resource", query: "", length: 0, forced: true });
+        setActiveIndex(0);
+        editorRef.current?.focus();
+    }, [mentionRequest]);
+
     const emit = (next: string) => {
         lastEmittedRef.current = next;
         onChange(next);
@@ -93,10 +111,7 @@ export function AgentChatPromptInput({ value, disabled, placeholder, theme, onCh
             if (agent.connected && !skillState.loaded && !skillState.loading) void skillState.loadSkills(agent.url.trim().replace(/\/$/, ""), agent.token);
             return;
         }
-        const snapshot = useAgentStore.getState().canvasContext?.snapshot;
-        const references = buildCanvasResourceReferences(snapshot?.nodes || []);
-        const selectedIds = new Set(snapshot?.selectedNodeIds || []);
-        setResourceCandidates([...references.filter((item) => selectedIds.has(item.nodeId)), ...references.filter((item) => !selectedIds.has(item.nodeId))]);
+        setResourceCandidates(collectResourceCandidates());
     };
 
     const syncFromEditor = () => {
@@ -112,7 +127,7 @@ export function AgentChatPromptInput({ value, disabled, placeholder, theme, onCh
         const editor = editorRef.current;
         if (!editor || !command) return;
         if (candidate.type === "skill") editor.querySelector<HTMLElement>("[data-agent-token-kind='skill']")?.remove();
-        removeTextBeforeCaret(command.length);
+        if (!command.forced) removeTextBeforeCaret(command.length);
 
         if (candidate.type === "skill") {
             const base = serializeEditor(editor);
@@ -144,8 +159,17 @@ export function AgentChatPromptInput({ value, disabled, placeholder, theme, onCh
             return true;
         }
         if (event.key === "Enter" || event.key === "Tab") {
+            if (!candidates.length) {
+                // 没有候选：强制打开的菜单（选视频/音频触发）关掉、让 Enter 正常发送；手敲 @ 则留在输入态
+                if (!command.forced) {
+                    event.preventDefault();
+                    return true;
+                }
+                closeCommand();
+                return false;
+            }
             event.preventDefault();
-            if (candidates.length) insertCandidate(candidates[Math.min(activeIndex, candidates.length - 1)]);
+            insertCandidate(candidates[Math.min(activeIndex, candidates.length - 1)]);
             return true;
         }
         if (event.key === "Escape") {
