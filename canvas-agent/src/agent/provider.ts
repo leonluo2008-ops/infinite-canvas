@@ -1,5 +1,5 @@
 import type { JsonRecord } from "../utils/value.js";
-import type { AgentAttachment, AgentEmit, AgentPermissionMode } from "./types.js";
+import type { AgentAttachment, AgentCanvasReference, AgentEmit, AgentPermissionMode } from "./types.js";
 
 /**
  * 对话 Agent 的 provider 抽象层。
@@ -90,6 +90,13 @@ export type AgentProviderTurnInput = {
     threadId?: string;
     prompt: string;
     attachments?: AgentAttachment[];
+    /**
+     * 本轮 @ 引用的画布素材。
+     *
+     * 图片的内容由前端转成附件走 `attachments`；视频/音频体积大，只在这里传实体
+     * （`localPath` 优先，其次 `previewUrl`），由 provider 决定怎么让模型读到。
+     */
+    references?: AgentCanvasReference[];
     cwd?: string;
     model?: string;
     effort?: AgentReasoningEffort;

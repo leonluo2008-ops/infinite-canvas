@@ -3,12 +3,13 @@ import { readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import express, { type NextFunction, type Request, type Response } from "express";
 
+import { guardTurnAttachments } from "../agent/attachments.js";
 import { runClaudeTurn } from "../agent/claude.js";
 import { archiveCodexThread, CodexSkillLookupError, configureCodexSkill, generateCodexSkillDraft, interruptCodexTurn, isRecoverableThreadError, listCodexModels, listCodexSkills, listCodexThreads, readCodexThread, resolveCodexApproval, resolveCodexSkill, resumeCodexThread, runCodexTurn, startCodexThread, summarizeCodexThread } from "../agent/codex.js";
 import type { CodexReasoningEffort, CodexSkillSelector } from "../agent/codex-protocol.js";
 import { messageMetadataStore } from "../agent/message-metadata.js";
 import { agentProviderIds, createProviderThreadId, loadAgentProvider } from "../agent/provider.js";
-import type { AgentAttachment, AgentEmit, AgentPermissionMode } from "../agent/types.js";
+import type { AgentAttachment, AgentCanvasReference, AgentEmit, AgentPermissionMode } from "../agent/types.js";
 import { AGENT_PROTOCOL_VERSION, CanvasSession } from "../canvas/session.js";
 import { DEFAULT_PORT, ensureSiteWorkspace, loadConfig, saveConfig, updateSiteWorkspace, type CanvasAgentConfig } from "../config.js";
 import { logger } from "../utils/logger.js";
@@ -418,6 +419,10 @@ export function startHttpServer() {
         if (!clientId || !session.hasClient(clientId)) return res.status(409).json({ ok: false, error: "发起任务的网页已断开，请重新连接后再试" });
         const attachments = Array.isArray(req.body?.attachments) ? (req.body.attachments as AgentAttachment[]) : [];
         if (attachments.length && !provider.capabilities.attachments) return res.status(400).json({ ok: false, error: `${provider.label} 暂不支持图片附件` });
+        // 附件通道只收 8MB 以内的图片；视频/音频改走 @画布素材引用（按路径注入，不搬 base64）。
+        const attachmentGuard = guardTurnAttachments(attachments);
+        if (!attachmentGuard.ok) return res.status(400).json({ ok: false, error: attachmentGuard.error });
+        const references = Array.isArray(req.body?.references) ? (req.body.references as AgentCanvasReference[]) : [];
         const workspace = ensureSiteWorkspace(config);
         const requestedThreadId = String(req.body?.threadId || "");
         let threadId = requestedThreadId || createProviderThreadId(provider.id);
@@ -426,7 +431,7 @@ export function startHttpServer() {
         const messageText = String(req.body?.messageText || prompt || `发送了 ${attachments.length} 张图片`);
         const messageMetadata = await messageMetadataStore.recordPending(messageId, req.body?.messageMetadata);
         let turnId = "";
-        logger.info(`${provider.label} turn accepted`, { provider: provider.id, threadId, model: model || "default", promptLength: prompt.length, attachmentCount: attachments.length });
+        logger.info(`${provider.label} turn accepted`, { provider: provider.id, threadId, model: model || "default", promptLength: prompt.length, attachmentCount: attachments.length, referenceCount: references.length });
         if (threadId !== (workspace.activeThreadId || "")) setActiveThread(threadId, { emptyThread: true, sourceClientId: clientId });
         session.bindClient(clientId);
         session.markConversationRunning(threadId);
@@ -447,6 +452,7 @@ export function startHttpServer() {
             threadId,
             prompt,
             attachments,
+            references,
             cwd: workspace.workspacePath,
             model,
             effort: reasoningEffort(req.body?.effort),

@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 
 import { loadConfig, type HermesProviderConfig } from "../config.js";
-import type { AgentAttachment } from "./types.js";
+import type { AgentAttachment, AgentCanvasReference } from "./types.js";
 import { createAgentLogWriter } from "../utils/agent-runtime.js";
 import { logger } from "../utils/logger.js";
 import { errorMessage, type JsonRecord } from "../utils/value.js";
@@ -23,6 +23,9 @@ import { createProviderThreadId, registerAgentProvider, type AgentProvider, type
  * 图片附件：`AgentAttachment.dataUrl` 先落成本地临时文件，再按 CLI 是否接 `--image` 二选一投递——
  * 接就用 `--image <path>` 原生附图，不接（stream-json 走网关的发行方式）就把路径写进提示词交给
  * `vision_analyze`。两条路都在本轮结束后删掉临时目录。
+ *
+ * 画布素材引用：`@`引用里的视频/音频不走附件（体积大、CLI 不收），按实体路径写进提示词，
+ * 由 Hermes 自己的工具链读（video_vision MCP / 音频转写），与它本体处理多模态的方式一致。
  */
 
 /** 文本增量合并窗口，与 `codex-client.ts` 的 40ms 节流一致。 */
@@ -210,6 +213,36 @@ export function appendHermesAttachmentRefs(prompt: string, files: string[]) {
 /** 判断探测输出是否属于「网关不支持 --image」；纯函数，便于单测。 */
 export function hermesImageFlagRejected(output: string) {
     return /Unsupported gateway CLI options/i.test(output);
+}
+
+/** 提示词里要注入的多模态素材：只有 video/audio 需要路径注入，图片走附件、文本已在正文。 */
+export function hermesMediaReferences(references: AgentCanvasReference[] = []) {
+    return references.filter((item) => item && (item.kind === "video" || item.kind === "audio"));
+}
+
+/**
+ * 把 @ 引用的视频/音频素材写进提示词（契约：localPath 优先，无则 previewUrl）。
+ *
+ * 与 `appendHermesAttachmentRefs` 同一套措辞：先报清单，再给「用哪个工具读」的指导。
+ * 素材不进上下文（模型看不见文件），所以必须点名工具，否则模型会对着一串路径空谈。
+ */
+export function appendHermesCanvasReferences(prompt: string, references: AgentCanvasReference[] = []) {
+    const media = hermesMediaReferences(references);
+    if (!media.length) return prompt;
+    const lines = media.map((item, index) => {
+        const label = item.label?.trim() || "@素材";
+        const title = item.title?.trim();
+        const localPath = item.localPath?.trim() || "";
+        const previewUrl = item.previewUrl?.trim() || "";
+        const where = localPath ? `本地路径：${localPath}` : previewUrl ? `远程地址：${previewUrl}` : "路径缺失（先向用户确认素材文件）";
+        return `${index + 1}. ${label}${title ? `「${title}」` : ""} · ${item.kind} · ${where}`;
+    }).join("\n");
+    return `${prompt}\n\n本轮引用画布素材（用户用 @ 从画布选中的素材，不是聊天附件）：\n${lines}\n这些素材没有作为附件传进来，要用工具自己读：\n- 视频：用 video_vision MCP 分析（analyze_video 提交任务、get_result 取结果）；只有本地路径时先确认该工具能否直读，读不了就抽关键帧或转存成可访问的地址再分析。\n- 音频：先用音频工具转写（whisper 等）再据此回答，需要时补看时长与音轨。\n用户说「这个视频」「这段音频」「这个素材」时，指的就是上面这些。`;
+}
+
+/** 本轮提示词的完整组装：附件路径 + 画布素材引用；纯函数，便于单测。 */
+export function buildHermesPrompt(input: { prompt: string; attachmentFiles?: string[]; references?: AgentCanvasReference[] }) {
+    return appendHermesCanvasReferences(appendHermesAttachmentRefs(input.prompt, input.attachmentFiles || []), input.references || []);
 }
 
 /** `--image` 是否可用；null 表示尚未探测。每个进程只探一次。 */
@@ -508,9 +541,12 @@ async function startHermesTurn(input: AgentProviderTurnInput): Promise<AgentProv
         else input.emit("agent_log", { text: `当前 Hermes 不接 --image，已把 ${files.length} 张图片的本地路径写进提示词供 vision_analyze 读取` });
         input.emit("agent_log", { text: `已附带 ${files.length} 张图片` });
     }
-    const prompt = files.length && !images.length ? appendHermesAttachmentRefs(input.prompt, files) : input.prompt;
+    const references = input.references || [];
+    const mediaReferences = hermesMediaReferences(references);
+    if (mediaReferences.length) input.emit("agent_log", { text: `已按 @素材引用注入 ${mediaReferences.length} 个视频/音频素材（路径交给 video_vision / 音频工具读取）` });
+    const prompt = buildHermesPrompt({ prompt: input.prompt, attachmentFiles: images.length ? [] : files, references });
     const args = hermesChatArgs({ prompt, sessionId: resumeId, config: { ...config, ...(input.model ? { model: input.model } : {}) }, images });
-    logger.info("Hermes turn starting", { threadId, turnId, command, model: input.model || config.model || "default", promptLength: prompt.length, attachmentCount: files.length, imageFlag: images.length > 0, resumed: Boolean(resumeId) });
+    logger.info("Hermes turn starting", { threadId, turnId, command, model: input.model || config.model || "default", promptLength: prompt.length, attachmentCount: files.length, referenceCount: mediaReferences.length, imageFlag: images.length > 0, resumed: Boolean(resumeId) });
     input.onThread?.(threadId);
     let child: ChildProcess;
     try {
