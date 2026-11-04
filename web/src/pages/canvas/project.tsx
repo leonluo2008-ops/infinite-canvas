@@ -129,8 +129,8 @@ type CanvasGenerationRequest = {
     controller: AbortController;
 };
 
-// T3-J2：bridge 侧抽帧端点（与拉片/渲染同一台 ui-server）。
-const LAPIAN_BRIDGE = "http://127.0.0.1:8776";
+// T3-J2：bridge 侧抽帧端点（与拉片/渲染同一台 ui-server）。空串=同域相对路径：本地 dev 由 vite proxy 转发，公网由隧道同域转发。
+const LAPIAN_BRIDGE = "";
 type LapianAssetFrame = { url: string; t: number; width: number; height: number; approx: boolean };
 
 const VIDEO_NODE_MAX_WIDTH = 420;
@@ -887,14 +887,14 @@ function InfiniteCanvasPage() {
                 LOG(`blob=${blob ? blob.size : "null"}`);
                 if (!blob) throw new Error("视频字节取不回（浏览器存储里没有这个文件）——重新拖入视频");
                 const filename = encodeURIComponent(videoNode.title || "canvas-video.mp4");
-                const up = await fetch(`http://127.0.0.1:8776/api/video/upload`, {
+                const up = await fetch(`/api/video/upload`, {
                     method: "POST",
                     headers: { "X-Filename": filename, "Content-Type": "application/octet-stream" },
                     body: blob,
                 }).then((r) => r.json());
                 LOG(`upload=${JSON.stringify(up).slice(0, 120)}`);
                 if (up.error) throw new Error(up.error);
-                const run = await fetch(`http://127.0.0.1:8776/api/lapian/run`, {
+                const run = await fetch(`/api/lapian/run`, {
                     method: "POST",
                     headers: { "Content-Type": "application/json" },
                     body: JSON.stringify({ id: up.id, intent }),
@@ -1001,7 +1001,7 @@ function InfiniteCanvasPage() {
             const taskId = String(lapianNode.metadata?.taskId || "");
             if (!taskId) return "";
             try {
-                const d = await fetch(`http://127.0.0.1:8776/api/render/${encodeURIComponent(taskId)}/timeline-narrative`).then((r) => r.json());
+                const d = await fetch(`/api/render/${encodeURIComponent(taskId)}/timeline-narrative`).then((r) => r.json());
                 if (!d || d.error) return "";
                 const text = String(d.text || "");
                 const cut = text.indexOf("\n# 附注");
@@ -1138,7 +1138,7 @@ function InfiniteCanvasPage() {
             if (lapianAssetBusy) return;
             setLapianAssetBusy(true);
             try {
-                const payload = (await fetch(`http://127.0.0.1:8776/api/lapian/${encodeURIComponent(taskId)}`).then((response) => response.json())) as { blocks?: LapianBlock[]; error?: string };
+                const payload = (await fetch(`/api/lapian/${encodeURIComponent(taskId)}`).then((response) => response.json())) as { blocks?: LapianBlock[]; error?: string };
                 if (!payload || payload.error) {
                     message.error(t("canvas.lapianAsset.loadFailed", { error: payload?.error || "" }));
                     return;

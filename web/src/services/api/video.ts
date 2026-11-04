@@ -143,7 +143,7 @@ function videoPluginResult(result: unknown): VideoGenerationResult {
 // 参考图只收公网 HTTPS URL：本地字节先经 bridge 图床路由换 URL（存储凭据不出服务端）。
 // 分辨率由精确模型名定档——本分支不发送 size/resolution。
 
-const SDGF_ASSET_BRIDGE = "http://127.0.0.1:8776/api/asset/upload";
+const SDGF_ASSET_BRIDGE = "/api/asset/upload";
 
 // 聚鑫只收裸 HTTPS URL；重试链会从 metadata 恢复出 `@url:`...`` token 格式的引用——剥出内层 URL。
 function stripReferenceToken(value: string): string {

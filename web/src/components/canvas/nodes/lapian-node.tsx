@@ -7,7 +7,7 @@ import { useEffect, useRef, useState } from "react";
 import { canvasThemes } from "@/lib/canvas-theme";
 import type { CanvasNodeData } from "@/types/canvas";
 
-const BRIDGE = "http://127.0.0.1:8776";
+const BRIDGE = ""; // 同域相对路径：本地 dev 由 vite proxy 转发，公网由隧道同域转发
 const POLL_MS = 2000;
 const POLL_TIMEOUT_MS = 180000;
 const MAX_NET_ERRORS = 3;

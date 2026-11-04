@@ -40,6 +40,14 @@ function localPluginsManifest(): Plugin {
 
 export default defineConfig({
     base: process.env.VITE_BASE || "/",
+    server: {
+        // 公网同域部署（Cloudflare 隧道 wanrepro.aistar.work → vite :3000）：
+        // 前端对 bridge（宿主 ui-server :8776）的请求一律走同域相对路径，由这里代理转发。
+        proxy: {
+            "/api": "http://127.0.0.1:8776",
+        },
+        allowedHosts: ["wanrepro.aistar.work", "localhost", "127.0.0.1"],
+    },
     plugins: [react(), localPluginsManifest()],
     resolve: {
         alias: {
