@@ -56,6 +56,8 @@ export type CanvasNodeMetadata = {
     jobId?: string;
     intent?: string;
     lapPhase?: string;
+    /** 转换指令节点用的模板 id（lib/canvas/lapian-prompt-templates.ts）；有值即说明这是拉片链的指令节点。 */
+    promptTemplate?: string;
     generationMode?: CanvasGenerationMode;
     generationType?: CanvasImageGenerationType;
     model?: string;

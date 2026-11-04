@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { ChangeEvent as ReactChangeEvent, DragEvent as ReactDragEvent, MouseEvent as ReactMouseEvent, PointerEvent as ReactPointerEvent } from "react";
 import { useNavigate, useParams, useSearchParams } from "react-router-dom";
-import { Group, Video, Clapperboard } from "lucide-react";
+import { Group, Video, Clapperboard, FileText, FolderPlus, LayoutTemplate } from "lucide-react";
 import { saveAs } from "file-saver";
 import { useTranslation } from "react-i18next";
 
@@ -34,6 +34,8 @@ import { CanvasNodeUpscaleDialog, type CanvasImageUpscaleParams } from "@/compon
 import { buildNodeGenerationContext, buildNodeGenerationInputs, buildNodeResponseMessages, hydrateNodeGenerationContext, type NodeGenerationInput } from "@/components/canvas/canvas-node-generation";
 import { CanvasNodeHoverToolbar, CanvasNodeInfoModal } from "@/components/canvas/canvas-node-hover-toolbar";
 import { CanvasSelectionToolbar } from "@/components/canvas/canvas-selection-toolbar";
+import { LapianAssetGroupModal, type LapianAssetGroupOption } from "@/components/canvas/lapian-asset-group-modal";
+import { LapianPromptTemplateModal } from "@/components/canvas/lapian-prompt-template-modal";
 import { InfiniteCanvas } from "@/components/canvas/infinite-canvas";
 import { Minimap } from "@/components/canvas/canvas-mini-map";
 import { CanvasNode } from "@/components/canvas/canvas-node";
@@ -46,9 +48,10 @@ import { useAgentStore } from "@/stores/use-agent-store";
 import { useCanvasStore } from "@/stores/canvas/use-canvas-store";
 import { useAgentBridge } from "@/pages/canvas/hooks/use-agent-bridge";
 import { usePluginHost } from "@/pages/canvas/hooks/use-plugin-host";
-import { buildNodeMentionReferences, getGroupResourceNodes, isCanvasReferenceNode, type CanvasResourceReference } from "@/lib/canvas/canvas-resource-references";
+import { buildNodeMentionReferences, getGenerationResourceNodes, getGroupResourceNodes, isCanvasReferenceNode, type CanvasResourceReference } from "@/lib/canvas/canvas-resource-references";
 import { exportCanvasProjects } from "@/lib/canvas/canvas-export";
 import { applyNodeConfigPatch, audioMetadata, buildAudioGenerationMetadata, buildImageGenerationMetadata, createCanvasNode, imageMetadata, videoMetadata } from "@/lib/canvas/canvas-node-factory";
+import { DEFAULT_LAPIAN_PROMPT_TEMPLATE_ID, getLapianPromptTemplate, type LapianPromptTemplateId } from "@/lib/canvas/lapian-prompt-templates";
 import { applyGroupSelection, applyUngroupSelection, canGroupSelectedNodes, canUngroupSelectedNodes, collectGroupMemberNodes, findContainingGroupId, findGroupDropTarget, focusViewportForNode, getConnectionTargetAnchor, getGroupWrapRect, normalizeConnection, snapNodesIntoGroup } from "@/lib/canvas/canvas-node-geometry";
 import {
     audioExtension,
@@ -260,6 +263,8 @@ function InfiniteCanvasPage() {
     const [lapianIntent, setLapianIntent] = useState("");
     const [lapianBusy, setLapianBusy] = useState(false);
     const [lapianError, setLapianError] = useState("");
+    const [lapianTemplateNodeId, setLapianTemplateNodeId] = useState<string | null>(null);
+    const [assetGroupConfigNodeId, setAssetGroupConfigNodeId] = useState<string | null>(null);
     const [lapianPendingPosition, setLapianPendingPosition] = useState<Position | null>(null);
     const [maskEditNodeId, setMaskEditNodeId] = useState<string | null>(null);
     const [splitNodeId, setSplitNodeId] = useState<string | null>(null);
@@ -914,6 +919,26 @@ function InfiniteCanvasPage() {
     );
 
     const lapianPopoverNode = lapianNodeId ? nodes.find((n) => n.id === lapianNodeId) : null;
+    const lapianTemplateNode = lapianTemplateNodeId ? nodes.find((n) => n.id === lapianTemplateNodeId) ?? null : null;
+    const assetGroupConfigNode = assetGroupConfigNodeId ? nodes.find((n) => n.id === assetGroupConfigNodeId) ?? null : null;
+    // T3-D 弹窗数据：画布 Group + 组内资源，用的是生成期同一个 getGroupResourceNodes——界面与请求展开口径一致。
+    const lapianAssetGroupOptions = useMemo<LapianAssetGroupOption[]>(() => {
+        if (!assetGroupConfigNodeId) return [];
+        return nodes
+            .filter((node) => node.type === CanvasNodeType.Group)
+            .map((group) => ({
+                id: group.id,
+                title: group.title || t("canvas.nodeTypes.group"),
+                mounted: connections.some((connection) => connection.fromNodeId === group.id && connection.toNodeId === assetGroupConfigNodeId),
+                resources: getGroupResourceNodes(group.id, nodes).map((resource) => ({
+                    id: resource.id,
+                    title: resource.title,
+                    kind: String(resource.type),
+                    previewUrl: resource.type === CanvasNodeType.Image ? resource.metadata?.content : undefined,
+                })),
+            }))
+            .filter((group) => group.resources.length > 0);
+    }, [assetGroupConfigNodeId, connections, nodes, t]);
     // T8/T9：拉片 → 提交正文。默认规范 timeline-narrative（有先例成片）。
     // 剥离「# 附注」节（v4 审计 B-03：附注随提示词提交会在聚鑫链复发——唯一转换点在这里）。
     const lapianPromptPreset = useCallback(
@@ -965,8 +990,203 @@ function InfiniteCanvasPage() {
         [effectiveConfig.model, effectiveConfig.videoModel, lapianPromptPreset, message],
     );
 
+    // T3-B：拉片 → 提示词。照抄 createImageReversePromptNodes，只改四处：源类型 / 指令正文 / 组装串 / 连线。
+    const createLapianPromptNodes = useCallback(
+        (node: CanvasNodeData) => {
+            if (node.type !== CanvasNodeType.Lapian || !node.metadata?.content?.trim()) {
+                message.warning(t("canvas.lapianPrompt.emptyLapian"));
+                return;
+            }
+            const template = getLapianPromptTemplate(DEFAULT_LAPIAN_PROMPT_TEMPLATE_ID);
+            const gap = 96;
+            const textSpec = NODE_DEFAULT_SIZE[CanvasNodeType.Text];
+            const configSpec = NODE_DEFAULT_SIZE[CanvasNodeType.Config];
+            const centerY = node.position.y + node.height / 2;
+            const instructionNode = {
+                ...createCanvasNode(
+                    CanvasNodeType.Text,
+                    { x: node.position.x + node.width + gap + textSpec.width / 2, y: centerY },
+                    { content: template.instruction, prompt: template.instruction, status: NODE_STATUS_SUCCESS, fontSize: 14, promptTemplate: template.id },
+                ),
+                title: t("canvas.lapianPrompt.instructionTitle", { name: t(template.labelKey) }),
+            };
+            const configNode = {
+                ...createCanvasNode(
+                    CanvasNodeType.Config,
+                    { x: instructionNode.position.x + instructionNode.width + gap + configSpec.width / 2, y: centerY },
+                    {
+                        generationMode: "text",
+                        model: effectiveConfig.textModel || effectiveConfig.model || defaultConfig.textModel,
+                        count: 1,
+                        composerContent: t("canvas.lapianPrompt.composer", { lapianId: node.id, instructionId: instructionNode.id }),
+                    },
+                ),
+                title: t("canvas.lapianPrompt.configTitle"),
+            };
+
+            setNodes((prev) => [...prev, instructionNode, configNode]);
+            // 连线顺序：拉片在前、指令在后（连线只决定候选集，谁被引用由组装串 token 决定）。
+            setConnections((prev) => [...prev, { id: nanoid(), fromNodeId: node.id, toNodeId: configNode.id }, { id: nanoid(), fromNodeId: instructionNode.id, toNodeId: configNode.id }]);
+            setSelectedNodeIds(new Set([configNode.id]));
+            setSelectedConnectionId(null);
+            setDialogNodeId(configNode.id);
+            setContextMenu(null);
+            focusNodeRef.current(configNode.id);
+        },
+        [effectiveConfig.model, effectiveConfig.textModel, message, t],
+    );
+
+    // T3-C：切模板只重写指令节点正文（不重建节点、不动连线）；配置节点组装串不变，重新生成即得新骨架终稿。
+    const applyLapianTemplate = useCallback(
+        (templateId: LapianPromptTemplateId) => {
+            const nodeId = lapianTemplateNodeId;
+            if (!nodeId) return;
+            const template = getLapianPromptTemplate(templateId);
+            setNodes((prev) =>
+                prev.map((node) =>
+                    node.id === nodeId
+                        ? {
+                              ...node,
+                              title: t("canvas.lapianPrompt.instructionTitle", { name: t(template.labelKey) }),
+                              metadata: { ...node.metadata, content: template.instruction, prompt: template.instruction, promptTemplate: template.id },
+                          }
+                        : node,
+                ),
+            );
+            setLapianTemplateNodeId(null);
+            message.success(t("canvas.lapianPrompt.templateApplied", { name: t(template.labelKey) }));
+        },
+        [lapianTemplateNodeId, message, t],
+    );
+
+    // T3-D：一键挂载 = 连线（候选集）+ 组装串 token（真的发送）双写。只写连线图片不进请求（路A-A1）。
+    const mountAssetGroupToConfig = useCallback(
+        (configNodeId: string, groupId: string) => {
+            const resources = getGroupResourceNodes(groupId, nodesRef.current);
+            if (!resources.length) {
+                message.warning(t("canvas.lapianPrompt.mountGroupEmpty"));
+                return;
+            }
+            const token = `@[node:${groupId}]`;
+            setConnections((prev) => (prev.some((connection) => connection.fromNodeId === groupId && connection.toNodeId === configNodeId) ? prev : [...prev, { id: nanoid(), fromNodeId: groupId, toNodeId: configNodeId }]));
+            setNodes((prev) =>
+                prev.map((node) => {
+                    if (node.id !== configNodeId) return node;
+                    const current = String(node.metadata?.composerContent ?? node.metadata?.prompt ?? "");
+                    if (current.includes(token)) return node;
+                    const next = current.trim() ? `${current.replace(/\s+$/, "")}\n\n${token}` : token;
+                    return { ...node, metadata: { ...node.metadata, composerContent: next } };
+                }),
+            );
+            setAssetGroupConfigNodeId(null);
+            message.success(t("canvas.lapianPrompt.groupMounted", { count: resources.length }));
+        },
+        [message, t],
+    );
+
+    // T3-E：终稿 → 生成视频。照抄 generateVideoFromLapianNode（去掉 bridge 投影），补参考继承（路A-A2）。
+    const createVideoFromFinalPrompt = useCallback(
+        (node: CanvasNodeData) => {
+            if (node.type !== CanvasNodeType.Text || !node.metadata?.content?.trim()) {
+                message.warning(t("canvas.lapianPrompt.emptyFinal"));
+                return;
+            }
+            const nodesNow = nodesRef.current;
+            const connectionsNow = connectionsRef.current;
+            // 参考继承（路A-A2）：定位终稿的生成父 Config，继承它「实际被 token 选中」的有序图片资源。
+            // 父 Config 的组装串 token 序就是终稿 @图片N 的编号序——照抄该序，图号语义才不会错位。
+            const parentConfigs = connectionsNow
+                .filter((connection) => connection.toNodeId === node.id)
+                .map((connection) => nodesNow.find((item) => item.id === connection.fromNodeId))
+                .filter((item): item is CanvasNodeData => item?.type === CanvasNodeType.Config);
+            const parents = [...new Map(parentConfigs.map((item) => [item.id, item])).values()];
+            if (parents.length > 1) {
+                // 多父不猜：让用户先明确保留哪一个转换配置。
+                message.warning(t("canvas.lapianPrompt.ambiguousParents"));
+                return;
+            }
+            const inheritedImages: CanvasNodeData[] = [];
+            const pushImages = (candidates: CanvasNodeData[]) => {
+                for (const candidate of candidates) {
+                    if (candidate.type !== CanvasNodeType.Image || !candidate.metadata?.content) continue;
+                    if (inheritedImages.some((item) => item.id === candidate.id)) continue;
+                    inheritedImages.push(candidate);
+                }
+            };
+            const parentConfig = parents[0];
+            if (parentConfig) {
+                const selectedTokens = [...String(parentConfig.metadata?.composerContent || "").matchAll(/@\[node:([^\]]+)\]/g)].map((match) => match[1]);
+                if (selectedTokens.length) {
+                    for (const token of selectedTokens) {
+                        const tokenNode = nodesNow.find((item) => item.id === token);
+                        if (!tokenNode) continue;
+                        pushImages(tokenNode.type === CanvasNodeType.Group ? getGroupResourceNodes(tokenNode.id, nodesNow) : [tokenNode]);
+                    }
+                } else {
+                    // 父配置没有组装串（纯提示词）：按连线序取图片输入。
+                    for (const input of getGenerationResourceNodes(parentConfig.id, nodesNow, connectionsNow)) {
+                        pushImages(input.type === CanvasNodeType.Group ? getGroupResourceNodes(input.id, nodesNow) : [input]);
+                    }
+                }
+            }
+            const configSpec = NODE_DEFAULT_SIZE[CanvasNodeType.Config];
+            const configNode = {
+                ...createCanvasNode(
+                    CanvasNodeType.Config,
+                    { x: node.position.x + node.width + 96 + configSpec.width / 2, y: node.position.y + node.height / 2 },
+                    {
+                        generationMode: "video",
+                        model: effectiveConfig.videoModel || effectiveConfig.model,
+                        // 有参考图时默认参考生视频；没有参考则沿用全局视频模式。
+                        videoMode: inheritedImages.length ? "reference" : effectiveConfig.videoMode,
+                        composerContent: inheritedImages.length
+                            ? t("canvas.lapianPrompt.videoComposerWithRefs", { images: inheritedImages.map((image) => `@[node:${image.id}]`).join("、"), textId: node.id })
+                            : t("canvas.lapianPrompt.videoComposerText", { textId: node.id }),
+                    },
+                ),
+                title: t("canvas.lapianPrompt.videoConfigTitle"),
+            };
+            setNodes((prev) => [...prev, configNode]);
+            setConnections((prev) => [...prev, { id: nanoid(), fromNodeId: node.id, toNodeId: configNode.id }, ...inheritedImages.map((image) => ({ id: nanoid(), fromNodeId: image.id, toNodeId: configNode.id }))]);
+            setSelectedNodeIds(new Set([configNode.id]));
+            setSelectedConnectionId(null);
+            setDialogNodeId(configNode.id);
+            setContextMenu(null);
+            focusNodeRef.current(configNode.id);
+            if (inheritedImages.length) message.success(t("canvas.lapianPrompt.referencesInherited", { count: inheritedImages.length }));
+        },
+        [effectiveConfig.model, effectiveConfig.videoMode, effectiveConfig.videoModel, message, t],
+    );
+
     const lapianToolItems = useCallback(
         (node: CanvasNodeData): CanvasNodeToolbarItem[] => {
+            if (node.type === CanvasNodeType.Lapian) {
+                return [{
+                    id: "wan-lapian-prompt",
+                    title: t("canvas.lapianPrompt.createTitle"),
+                    label: t("canvas.lapianPrompt.create"),
+                    icon: <FileText className="size-4" />,
+                    onClick: () => createLapianPromptNodes(node),
+                }];
+            }
+            if (node.type === CanvasNodeType.Text && node.metadata?.promptTemplate) {
+                return [{
+                    id: "wan-lapian-template",
+                    title: t("canvas.lapianPrompt.templateTitle"),
+                    label: t("canvas.lapianPrompt.template"),
+                    icon: <LayoutTemplate className="size-4" />,
+                    onClick: () => setLapianTemplateNodeId(node.id),
+                }];
+            }
+            if (node.type === CanvasNodeType.Config) {
+                return [{
+                    id: "wan-mount-asset-group",
+                    title: t("canvas.lapianPrompt.mountGroupTitle"),
+                    label: t("canvas.lapianPrompt.mountGroup"),
+                    icon: <FolderPlus className="size-4" />,
+                    onClick: () => setAssetGroupConfigNodeId(node.id),
+                }];
+            }
             if (node.type !== CanvasNodeType.Video || !node.metadata?.storageKey) return [];
             const mime = String(node.metadata?.mimeType || "");
             const name = String(node.title || "");
@@ -986,7 +1206,22 @@ function InfiniteCanvasPage() {
                 onClick: () => generateVideoFromLapianNode(node),
             }];
         },
-        [generateVideoFromLapianNode],
+        [createLapianPromptNodes, generateVideoFromLapianNode, t],
+    );
+
+    // T3-E 入口：终稿（普通文本节点）才有【生成视频】；带 promptTemplate 的是转换指令节点，不算终稿。
+    const finalPromptToolItems = useCallback(
+        (node: CanvasNodeData): CanvasNodeToolbarItem[] => {
+            if (node.type !== CanvasNodeType.Text || node.metadata?.promptTemplate || !node.metadata?.content?.trim()) return [];
+            return [{
+                id: "wan-gen-video-final",
+                title: t("canvas.lapianPrompt.generateVideoTitle"),
+                label: t("canvas.lapianPrompt.generateVideo"),
+                icon: <Video className="size-4" />,
+                onClick: () => createVideoFromFinalPrompt(node),
+            }];
+        },
+        [createVideoFromFinalPrompt, t],
     );
 
     const createNode = useCallback(
@@ -3482,7 +3717,7 @@ function InfiniteCanvasPage() {
                 <CanvasNodeHoverToolbar
                     node={isNodeDragging || isNodeResizing || nodeImageSettingsOpen || Boolean(referencePickerNodeId) || expandedBatchNodeIds.has(toolbarNode?.id || "") ? null : toolbarNode}
                     viewport={viewport}
-                    extraTools={toolbarNode ? [...(buildNodeToolbarItems(toolbarNode) || []), ...lapianToolItems(toolbarNode)] : undefined}
+                    extraTools={toolbarNode ? [...(buildNodeToolbarItems(toolbarNode) || []), ...lapianToolItems(toolbarNode), ...finalPromptToolItems(toolbarNode)] : undefined}
                     onKeep={keepNodeToolbar}
                     onLeave={hideNodeToolbar}
                     onInfo={(node) => setInfoNodeId(node.id)}
@@ -3581,6 +3816,22 @@ function InfiniteCanvasPage() {
 
                 <CanvasNodeInfoModal node={infoNode} open={Boolean(infoNode)} onClose={() => setInfoNodeId(null)} />
                 <CanvasPluginManagerModal open={pluginManagerOpen} onClose={() => setPluginManagerOpen(false)} />
+
+                <LapianPromptTemplateModal
+                    open={Boolean(lapianTemplateNode)}
+                    templateId={lapianTemplateNode?.metadata?.promptTemplate}
+                    onCancel={() => setLapianTemplateNodeId(null)}
+                    onConfirm={applyLapianTemplate}
+                />
+
+                <LapianAssetGroupModal
+                    open={Boolean(assetGroupConfigNode)}
+                    groups={lapianAssetGroupOptions}
+                    onCancel={() => setAssetGroupConfigNodeId(null)}
+                    onConfirm={(groupId) => {
+                        if (assetGroupConfigNode) mountAssetGroupToConfig(assetGroupConfigNode.id, groupId);
+                    }}
+                />
 
                 {cropNode?.metadata?.content ? <CanvasNodeCropDialog dataUrl={cropNode.metadata.content} open={Boolean(cropNode)} onClose={() => setCropNodeId(null)} onConfirm={(crop) => void cropImageNode(cropNode!, crop)} /> : null}
 
