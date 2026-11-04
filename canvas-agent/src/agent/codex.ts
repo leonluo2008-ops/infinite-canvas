@@ -11,6 +11,7 @@ import { codexEventHistory } from "./codex-event-history.js";
 import { settledTurnIds, summarizeCodexThread, threadMessages } from "./codex-history.js";
 import { messageMetadataStore } from "./message-metadata.js";
 import type { CodexReasoningEffort, CodexSkillMetadata, CodexSkillSelector, CodexSkillsListEntry } from "./codex-protocol.js";
+import { registerAgentProvider, type AgentProvider, type AgentProviderModel, type AgentProviderSession, type AgentProviderSessionInput, type AgentProviderTurnInput, type AgentProviderTurnOutcome } from "./provider.js";
 import type { AgentAttachment, AgentEmit, AgentPermissionMode } from "./types.js";
 
 type CodexRunOptions = { threadId?: string; cwd?: string; permissionMode?: AgentPermissionMode; model?: string; effort?: CodexReasoningEffort; skill?: CodexSkillSelector; messageText?: string; appEmit?: AgentEmit; onStart?: () => void; onThread?: (threadId: string) => void; onTurn?: (turnId: string) => void; onFinish?: () => void };
@@ -506,3 +507,68 @@ function imageExt(type = "") {
     if (type.includes("webp")) return "webp";
     return "jpg";
 }
+
+/**
+ * Codex 作为 provider 抽象的第一实现。
+ *
+ * 只把已有的线程/队列/中断函数摆到接口上，不复制任何 turn 逻辑：
+ * 事件仍由 `CodexAppClient` 广播，这里只补齐接口需要的返回值与失败判定。
+ */
+export const codexProvider: AgentProvider = {
+    id: "codex",
+    label: "Codex",
+    capabilities: { session: true, threads: true, models: true, attachments: true, approvals: true, interrupt: true, resume: true },
+
+    /** 新建线程（不跑 turn），用于草稿对话预热。 */
+    async startSession(input: AgentProviderSessionInput): Promise<AgentProviderSession> {
+        const thread = await startCodexThread(input.emit, input.cwd, input.permissionMode || "request");
+        return { provider: "codex", threadId: String(field(thread, "id") || ""), ...(input.model ? { model: input.model } : {}) };
+    },
+
+    /** 恢复线程并带上历史，供切换对话时回放。 */
+    async resume(input: AgentProviderSessionInput & { threadId: string }): Promise<AgentProviderSession> {
+        const result = await resumeCodexThread(input.emit, input.threadId, input.cwd, input.permissionMode || "request");
+        return { provider: "codex", threadId: String(field(result.thread, "id") || input.threadId), resumed: true, resumable: true };
+    },
+
+    /** 执行一轮；`runCodexTurn` 内部吞掉已上报的错误，这里用 turn.completed 的终态反推结果。 */
+    async turn(input: AgentProviderTurnInput): Promise<AgentProviderTurnOutcome> {
+        let threadId = input.threadId || "";
+        let turnId = "";
+        let status: AgentProviderTurnOutcome["status"] = "completed";
+        const emit: AgentEmit = (type, payload) => {
+            if (type === "agent_event" && field(payload, "type") === "turn.completed" && field(payload, "status") === "failed") status = "failed";
+            input.emit(type, payload);
+        };
+        await runCodexTurn(input.prompt, emit, input.attachments || [], {
+            threadId,
+            cwd: input.cwd,
+            permissionMode: input.permissionMode,
+            model: input.model,
+            effort: input.effort,
+            onThread: (actualThreadId) => {
+                threadId = actualThreadId;
+                input.onThread?.(actualThreadId);
+            },
+            onTurn: (actualTurnId) => {
+                turnId = actualTurnId;
+                input.onTurn?.(actualTurnId);
+            },
+        });
+        return { provider: "codex", threadId, turnId, status };
+    },
+
+    /** 中断当前线程的 turn。 */
+    async interrupt(options?: { threadId?: string }) {
+        return await interruptCodexTurn(options?.threadId);
+    },
+
+    /** 复用 Codex 自己的 model/list，字段原样交给前端。 */
+    async listModels(options?: { emit?: AgentEmit }): Promise<{ models: AgentProviderModel[]; raw?: unknown }> {
+        const raw = await listCodexModels(options?.emit || (() => undefined));
+        const data = field(raw, "data");
+        return { models: Array.isArray(data) ? data as AgentProviderModel[] : [], raw };
+    },
+};
+
+registerAgentProvider(codexProvider);

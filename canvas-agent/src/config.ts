@@ -11,7 +11,14 @@ export const AGENT_PROMPT = fs.readFileSync(new URL("../agent-instructions.md", 
 const initializedWorkspaces = new Set<string>();
 
 export type SiteWorkspaceConfig = { workspacePath: string; activeThreadId?: string; pinnedThreadIds?: string[] };
-export type CanvasAgentConfig = { url: string; token: string; origins?: string[]; workspace?: SiteWorkspaceConfig };
+
+/**
+ * Hermes provider 的服务端配置（`~/.infinite-canvas/canvas-agent.json` 的 `hermes` 段）。
+ * endpoint/key 属于 Hermes 自己的 profile，不落在这里；这里只管命令行姿态。
+ */
+export type HermesProviderConfig = { command?: string; model?: string; toolsets?: string; reasoning?: string };
+
+export type CanvasAgentConfig = { url: string; token: string; origins?: string[]; workspace?: SiteWorkspaceConfig; hermes?: HermesProviderConfig };
 
 /** 读取本地 Canvas Agent 配置，不存在时生成默认配置。 */
 export function loadConfig(create = false): CanvasAgentConfig {

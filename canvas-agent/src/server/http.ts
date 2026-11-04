@@ -7,7 +7,8 @@ import { runClaudeTurn } from "../agent/claude.js";
 import { archiveCodexThread, CodexSkillLookupError, configureCodexSkill, generateCodexSkillDraft, interruptCodexTurn, isRecoverableThreadError, listCodexModels, listCodexSkills, listCodexThreads, readCodexThread, resolveCodexApproval, resolveCodexSkill, resumeCodexThread, runCodexTurn, startCodexThread, summarizeCodexThread } from "../agent/codex.js";
 import type { CodexReasoningEffort, CodexSkillSelector } from "../agent/codex-protocol.js";
 import { messageMetadataStore } from "../agent/message-metadata.js";
-import type { AgentAttachment, AgentPermissionMode } from "../agent/types.js";
+import { agentProviderIds, createProviderThreadId, loadAgentProvider } from "../agent/provider.js";
+import type { AgentAttachment, AgentEmit, AgentPermissionMode } from "../agent/types.js";
 import { AGENT_PROTOCOL_VERSION, CanvasSession } from "../canvas/session.js";
 import { DEFAULT_PORT, ensureSiteWorkspace, loadConfig, saveConfig, updateSiteWorkspace, type CanvasAgentConfig } from "../config.js";
 import { logger } from "../utils/logger.js";
@@ -289,7 +290,8 @@ export function startHttpServer() {
         const nextWorkspace = setActiveThread(workspace.activeThreadId === threadId ? "" : workspace.activeThreadId || "", { sourceClientId: String(req.body?.clientId || "") });
         res.json({ ok: true, workspace: nextWorkspace, conversation: session.conversationStateSnapshot });
     }));
-    app.post("/agent/codex/turn", codexMutation(async (req, res) => {
+    /** Codex 的对话入口；`/agent/:provider/turn` 的 codex 分支也复用它。 */
+    const handleCodexTurn = codexMutation(async (req, res) => {
         const attachments = Array.isArray(req.body?.attachments) ? (req.body.attachments as AgentAttachment[]) : [];
         const workspace = ensureSiteWorkspace(config);
         const prompt = String(req.body?.prompt || "");
@@ -397,7 +399,112 @@ export function startHttpServer() {
             session.finishConversationRun(threadId);
             throw error;
         }
+    });
+    app.post("/agent/codex/turn", handleCodexTurn);
+
+    /**
+     * 通用对话入口：`/agent/:provider/turn`。
+     *
+     * `codex` 直接复用上面的处理器（`/agent/codex/turn` 保留为别名），其余 provider 走
+     * `AgentProvider.turn`，只共用 chat_message / agent_event / agent_done 这套消息体系。
+     * 会话身份（threadId）在画布侧生成并由前端回传，provider 自己的 session id 不暴露给浏览器。
+     */
+    const handleProviderTurn = (providerId: string) => codexMutation(async (req, res) => {
+        const provider = await loadAgentProvider(providerId);
+        if (!provider) return res.status(404).json({ ok: false, error: `未知的 Agent：${providerId}（已支持：${agentProviderIds().join(" / ")}）` });
+        const prompt = String(req.body?.prompt || "");
+        if (!prompt.trim()) return res.status(400).json({ ok: false, error: "请输入任务内容" });
+        const clientId = String(req.body?.clientId || "");
+        if (!clientId || !session.hasClient(clientId)) return res.status(409).json({ ok: false, error: "发起任务的网页已断开，请重新连接后再试" });
+        const attachments = Array.isArray(req.body?.attachments) ? (req.body.attachments as AgentAttachment[]) : [];
+        if (attachments.length && !provider.capabilities.attachments) return res.status(400).json({ ok: false, error: `${provider.label} 暂不支持图片附件` });
+        const workspace = ensureSiteWorkspace(config);
+        const requestedThreadId = String(req.body?.threadId || "");
+        let threadId = requestedThreadId || createProviderThreadId(provider.id);
+        const model = String(req.body?.model || "") || undefined;
+        const messageId = String(req.body?.messageId || Date.now());
+        const messageText = String(req.body?.messageText || prompt || `发送了 ${attachments.length} 张图片`);
+        const messageMetadata = await messageMetadataStore.recordPending(messageId, req.body?.messageMetadata);
+        let turnId = "";
+        logger.info(`${provider.label} turn accepted`, { provider: provider.id, threadId, model: model || "default", promptLength: prompt.length, attachmentCount: attachments.length });
+        if (threadId !== (workspace.activeThreadId || "")) setActiveThread(threadId, { emptyThread: true, sourceClientId: clientId });
+        session.bindClient(clientId);
+        session.markConversationRunning(threadId);
+        session.setCodexState({ busy: true, threadId, turnId: "" });
+        /** 日志与错误固定落到本轮 thread/turn；时间线事件仍走 app 级 emit 以保留重放。 */
+        const lifecycleEmit = (type: string, payload: unknown) => {
+            const value = payload && typeof payload === "object" && !Array.isArray(payload) ? payload as Record<string, unknown> : { value: payload };
+            const eventThreadId = String(value.threadId || value.thread_id || threadId);
+            const eventTurnId = String(value.turnId || value.turn_id || turnId);
+            session.emitThread(type, eventThreadId, { ...value, threadId: eventThreadId, thread_id: eventThreadId, ...(eventTurnId ? { turnId: eventTurnId, turn_id: eventTurnId } : {}), sourceClientId: clientId });
+        };
+        const providerEmit: AgentEmit = (type, payload) => type === "agent_event" ? emit(type, payload) : lifecycleEmit(type, payload);
+        session.emitThread("chat_message", threadId, {
+            sourceClientId: clientId,
+            message: { id: `${threadId}:pending:synthetic:user`, itemId: "synthetic:user", clientMessageId: messageId, threadId, turnId: "", role: "user", text: messageText, ...messageMetadata },
+        });
+        void provider.turn({
+            threadId,
+            prompt,
+            attachments,
+            cwd: workspace.workspacePath,
+            model,
+            effort: reasoningEffort(req.body?.effort),
+            permissionMode: permissionMode(req.body?.permissionMode),
+            emit: providerEmit,
+            onThread: (actualThreadId) => {
+                void messageMetadataStore.bindThread(messageId, actualThreadId).catch((error) => logger.warn("Failed to bind message metadata to thread", { clientMessageId: messageId, threadId: actualThreadId, error }));
+                if (actualThreadId && actualThreadId !== threadId) {
+                    threadId = actualThreadId;
+                    setActiveThread(threadId, { emptyThread: true, sourceClientId: clientId });
+                }
+            },
+            onTurn: (actualTurnId) => {
+                turnId = actualTurnId;
+                void messageMetadataStore.bindTurn(messageId, threadId, turnId).catch((error) => logger.warn("Failed to bind message metadata to turn", { clientMessageId: messageId, threadId, turnId, error }));
+                session.emitThread("chat_message", threadId, {
+                    turnId,
+                    sourceClientId: clientId,
+                    message: { id: `${threadId}:${turnId}:synthetic:user`, itemId: "synthetic:user", clientMessageId: messageId, threadId, turnId, role: "user", text: messageText, ...messageMetadata },
+                });
+                session.setCodexState({ busy: true, threadId, turnId });
+            },
+        }).catch((error) => lifecycleEmit("agent_error", { message: error instanceof Error ? error.message : String(error) })).finally(() => {
+            logger.info(`${provider.label} turn finished`, { provider: provider.id, threadId, turnId });
+            if (!turnId) void messageMetadataStore.remove(messageId, threadId).catch((error) => logger.warn("Failed to remove unbound message metadata", { clientMessageId: messageId, error }));
+            session.clearTurnAttachments(clientId);
+            session.releaseClient(clientId);
+            session.setCodexState({ busy: false, threadId, turnId });
+            session.finishConversationRun(threadId);
+        });
+        res.json({ ok: true, threadId });
+    });
+    app.post("/agent/:provider/turn", (req, res, next) => {
+        const providerId = routeParam(req.params.provider);
+        return providerId === "codex" ? handleCodexTurn(req, res, next) : handleProviderTurn(providerId)(req, res, next);
+    });
+    /** 已注册 provider 与其能力表，供前端决定是否展示附件/历史/模型入口。 */
+    app.get("/agent/providers", route(async (_req, res) => {
+        const data = await Promise.all(agentProviderIds().map(async (id) => {
+            const provider = await loadAgentProvider(id);
+            return provider ? { id: provider.id, label: provider.label, capabilities: provider.capabilities } : null;
+        }));
+        res.json({ ok: true, data: data.filter(Boolean) });
     }));
+    app.get("/agent/:provider/models", route(async (req, res) => {
+        const provider = await loadAgentProvider(routeParam(req.params.provider));
+        if (!provider) return void res.status(404).json({ ok: false, error: `未知的 Agent：${routeParam(req.params.provider)}` });
+        const { models } = await provider.listModels({ emit });
+        res.json({ ok: true, data: models });
+    }));
+    /** 非 Codex 的中断入口；codex 交给下面更具体的 `/agent/codex/interrupt`（要处理 skill 草稿分支）。 */
+    const handleProviderInterrupt = route(async (req, res) => {
+        const provider = await loadAgentProvider(routeParam(req.params.provider));
+        if (!provider) return void res.status(404).json({ ok: false, error: `未知的 Agent：${routeParam(req.params.provider)}` });
+        const ok = provider.capabilities.interrupt ? await provider.interrupt({ threadId: String(req.body?.threadId || "") || undefined }) : false;
+        res.status(ok ? 200 : 409).json({ ok, ...(ok ? {} : { error: "当前没有可停止的任务" }) });
+    });
+    app.post("/agent/:provider/interrupt", (req, res, next) => routeParam(req.params.provider) === "codex" ? next() : void handleProviderInterrupt(req, res, next));
 
     /** 将 Codex 写操作串行化，避免多窗口在异步请求期间交叉修改会话。 */
     function codexMutation(handler: (req: Request, res: Response) => unknown | Promise<unknown>) {
@@ -421,7 +528,7 @@ export function startHttpServer() {
         res.status(ok ? 200 : 409).json({ ok, ...(ok ? {} : { error: "当前没有可停止的任务" }) });
     }));
     app.post("/agent/claude/turn", (req, res) => {
-        runClaudeTurn(String(req.body?.prompt || ""), emit);
+        void runClaudeTurn(String(req.body?.prompt || ""), emit);
         res.json({ ok: true });
     });
     app.use((_req, res) => res.status(404).json({ ok: false, error: "not found" }));
@@ -439,6 +546,8 @@ export function startHttpServer() {
         console.log("Codex MCP is not installed by this command.");
         console.log("Optional MCP add: codex mcp add infinite-canvas -- npx -y @basketikun/canvas-agent@latest mcp");
         console.log("Remove manually added MCP: codex mcp remove infinite-canvas");
+        console.log("Optional MCP add (Hermes): hermes mcp add infinite-canvas --command npx --args -y @basketikun/canvas-agent@latest mcp");
+        console.log("Hermes provider options (model/toolsets/reasoning/command) live under the \"hermes\" key of the canvas-agent config file.");
         if (logger.enabled) console.log(`Debug log: ${logger.filePath}`);
         logger.info("Canvas Agent started", { url: config.url, workspace: ensureSiteWorkspace(config).workspacePath, debugLog: logger.filePath });
         const activeThreadId = initialWorkspace.activeThreadId || "";
