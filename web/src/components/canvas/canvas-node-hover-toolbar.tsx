@@ -108,7 +108,8 @@ export function CanvasNodeHoverToolbar({
 
     const activeNode = node;
     const left = viewport.x + (node.position.x + node.width / 2) * viewport.k;
-    const top = viewport.y + node.position.y * viewport.k - 14;
+    // T3-J6：工具栏锚点从节点顶-14 上移到节点顶-72，与节点名称（top-[-28px]，占 -28~-8）错开，避免遮双击重命名区。
+    const top = viewport.y + node.position.y * viewport.k - 72;
     const isImage = node.type === CanvasNodeType.Image;
     const isVideo = node.type === CanvasNodeType.Video;
     const isAudio = node.type === CanvasNodeType.Audio;
