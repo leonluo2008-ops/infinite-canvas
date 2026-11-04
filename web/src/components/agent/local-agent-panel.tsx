@@ -21,7 +21,7 @@ import { useShallow } from "zustand/react/shallow";
 import { useAgentStore, type AgentAttachment, type AgentBootstrapStatus, type AgentCanvasContext, type AgentCanvasReference, type AgentChatItem, type AgentConversationState, type AgentModel, type AgentPendingApproval, type AgentPendingToolCall, type AgentPermissionMode, type AgentReasoningEffort, type AgentThreadSummary } from "@/stores/use-agent-store";
 import { type CanvasAgentOp, type CanvasAgentSnapshot } from "@/lib/canvas/canvas-agent-ops";
 import { isSiteTool, runSiteTool } from "@/lib/agent/agent-site-tools";
-import { acknowledgeCodexHistory, activateAgentClient, AgentApiError, discoverAgentConfig, fetchAgentJson, interruptCodexTurn, postCodexApproval, postState, postToolResult } from "@/services/api/canvas-agent";
+import { acknowledgeCodexHistory, activateAgentClient, AgentApiError, discoverAgentConfig, fetchAgentJson, interruptAgentTurn, interruptCodexTurn, postCodexApproval, postState, postToolResult } from "@/services/api/canvas-agent";
 import { AgentChatTimeline, AgentTaskProgress, AgentUsageBar } from "./agent-chat";
 import { AgentChatComposer } from "./agent-chat-composer";
 import { AgentConnectView } from "./agent-connect-view";
@@ -77,6 +77,14 @@ const HISTORY_RETRY_DELAYS_MS = [0, 150, 350, 700, 1200];
 const AGENT_REASONING_EFFORTS = new Set<AgentReasoningEffort>(["minimal", "low", "medium", "high", "xhigh", "max", "ultra"]);
 const rt = (key: string, options?: Record<string, unknown>) => i18n.t(`agent.runtime.${key}`, options);
 
+/** 对话 Agent 由服务端 `/agent/:provider/*` 路由承载；下拉只切换路由，不改消息体系。 */
+type AgentProviderId = "codex" | "hermes";
+const AGENT_PROVIDERS: Array<{ id: AgentProviderId; label: string }> = [
+    { id: "codex", label: "Codex" },
+    { id: "hermes", label: "Hermes" },
+];
+const DEFAULT_AGENT_PROVIDER: AgentProviderId = "codex";
+
 type AgentWorkspace = { workspacePath: string; activeThreadId?: string };
 type AgentThreadsResponse = { ok?: boolean; workspace?: AgentWorkspace; conversation?: AgentConversationState; data?: AgentThreadSummary[] };
 type AgentThreadResponse = { ok?: boolean; workspace?: AgentWorkspace; conversation?: AgentConversationState; thread?: AgentThreadSummary; messages?: AgentChatItem[]; settledTurnIds?: string[]; historyReady?: boolean };
@@ -96,6 +104,42 @@ function authoritativeHistoryTurnKeys(threadId: string, settledTurnIds: string[]
 
 function agentErrorState(error: unknown) {
     return error instanceof AgentApiError ? (error.response as { state?: AgentConversationState }).state : undefined;
+}
+
+function readAgentProvider(): AgentProviderId {
+    try {
+        const saved = localStorage.getItem("canvas-agent-provider");
+        return AGENT_PROVIDERS.find((item) => item.id === saved)?.id || DEFAULT_AGENT_PROVIDER;
+    } catch {
+        return DEFAULT_AGENT_PROVIDER;
+    }
+}
+
+/** 模型/强度按 provider 分开记：codex 沿用旧键，其余 provider 各存一份，来回切换不互相覆盖。 */
+function agentModelStorageKey(provider: AgentProviderId) {
+    return provider === "codex" ? "canvas-agent-model" : `canvas-agent-model:${provider}`;
+}
+
+function agentEffortStorageKey(provider: AgentProviderId) {
+    return provider === "codex" ? "canvas-agent-reasoning-effort" : `canvas-agent-reasoning-effort:${provider}`;
+}
+
+function normalizeAgentModels(data: AgentModel[]) {
+    const names = new Set<string>();
+    return data.flatMap((item) => {
+        const name = item.displayName || item.model;
+        const efforts = item.supportedReasoningEfforts.filter(({ reasoningEffort }) => AGENT_REASONING_EFFORTS.has(reasoningEffort));
+        if (item.model === "codex-auto-review" || names.has(name) || !efforts.length) return [];
+        names.add(name);
+        const defaultReasoningEffort = efforts.some((effort) => effort.reasoningEffort === item.defaultReasoningEffort) ? item.defaultReasoningEffort : efforts[0].reasoningEffort;
+        return [{ ...item, supportedReasoningEfforts: efforts, defaultReasoningEffort }];
+    });
+}
+
+/** Hermes 不提供 model/list；接口拿不到时用占位项撑住下拉，不阻塞发送。 */
+function providerFallbackModel(): AgentModel {
+    const model = "hermes-default";
+    return { id: model, model, displayName: rt("defaultModel"), defaultReasoningEffort: "medium", supportedReasoningEfforts: [{ reasoningEffort: "medium" }], isDefault: true };
 }
 
 function conversationBootstrapView(conversation: AgentConversationState) {
@@ -184,6 +228,7 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
     const attachmentUrlsRef = useRef(new Set<string>());
     const clientIdRef = useRef("");
     const [clientReady, setClientReady] = useState(false);
+    const [provider, setProvider] = useState<AgentProviderId>(readAgentProvider);
     const loadThreadsSequenceRef = useRef(0);
     const threadMessagesRef = useRef(new Map<string, AgentChatItem[]>());
     const authoritativeHistoryTurnsRef = useRef(new Set<string>());
@@ -590,27 +635,38 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
 
     useEffect(() => {
         if (!connected) return;
-        void fetchAgentJson<AgentModelsResponse>(endpoint, token, "/agent/codex/models").then(({ data = [] }) => {
-            const names = new Set<string>();
-            const models = data.flatMap((item) => {
-                const name = item.displayName || item.model;
-                const efforts = item.supportedReasoningEfforts.filter(({ reasoningEffort }) => AGENT_REASONING_EFFORTS.has(reasoningEffort));
-                if (item.model === "codex-auto-review" || names.has(name) || !efforts.length) return [];
-                names.add(name);
-                const defaultReasoningEffort = efforts.some((effort) => effort.reasoningEffort === item.defaultReasoningEffort) ? item.defaultReasoningEffort : efforts[0].reasoningEffort;
-                return [{ ...item, supportedReasoningEfforts: efforts, defaultReasoningEffort }];
-            });
-            if (!models.length) return;
-            const savedModel = useAgentStore.getState().model;
-            const current = models.find((item) => item.model === savedModel) || models.find((item) => item.isDefault) || models[0];
-            const savedEffort = useAgentStore.getState().reasoningEffort;
+        let disposed = false;
+        /** 选中服务端给的默认/已保存模型；返回 false 表示这份列表不可用。 */
+        const applyModels = (data: AgentModel[]) => {
+            const nextModels = normalizeAgentModels(data);
+            if (!nextModels.length) return false;
+            const savedModel = localStorage.getItem(agentModelStorageKey(provider)) || "";
+            const current = nextModels.find((item) => item.model === savedModel) || nextModels.find((item) => item.isDefault) || nextModels[0];
+            const savedEffort = localStorage.getItem(agentEffortStorageKey(provider)) || "";
             const efforts = current.supportedReasoningEfforts.map((item) => item.reasoningEffort);
             const nextEffort = efforts.includes(savedEffort as AgentReasoningEffort) ? savedEffort as AgentReasoningEffort : current.defaultReasoningEffort || efforts[0];
-            localStorage.setItem("canvas-agent-model", current.model);
-            localStorage.setItem("canvas-agent-reasoning-effort", nextEffort);
-            setAgentState({ models, model: current.model, reasoningEffort: nextEffort });
-        }).catch((error) => addEventLog(rt("modelListFailed"), error));
-    }, [connected, endpoint, setAgentState, token]);
+            localStorage.setItem(agentModelStorageKey(provider), current.model);
+            localStorage.setItem(agentEffortStorageKey(provider), nextEffort);
+            setAgentState({ models: nextModels, model: current.model, reasoningEffort: nextEffort });
+            return true;
+        };
+        void (async () => {
+            try {
+                const { data = [] } = await fetchAgentJson<AgentModelsResponse>(endpoint, token, `/agent/${provider}/models`);
+                if (disposed) return;
+                if (applyModels(data)) return;
+                throw new Error(rt("modelListFailed"));
+            } catch (error) {
+                if (disposed) return;
+                addEventLog(rt("modelListFailed"), error);
+                /** Codex 保持原样；Hermes 的模型由服务端配置决定，占位一项即可，不挡住发送。 */
+                if (provider === "codex") return;
+                const fallback = providerFallbackModel();
+                setAgentState({ models: [fallback], model: fallback.model, reasoningEffort: fallback.defaultReasoningEffort });
+            }
+        })();
+        return () => { disposed = true; };
+    }, [connected, endpoint, provider, setAgentState, token]);
 
     useEffect(() => {
         if (!connected) return;
@@ -685,7 +741,7 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
             const modelName = models.find((item) => item.model === model)?.displayName || model || rt("defaultModel");
             const effortName = reasoningEffort ? i18n.t(`agent.composer.effort.${reasoningEffort}`) : rt("defaultEffort");
             addEventLog(rt("sendTask"), `${modelName} · ${effortName}${selectedSkill ? ` · Skill ${selectedSkill.name}` : ""}${files.length ? ` · ${rt("attachmentCount", { count: files.length })}` : ""}${canvasReferences.length ? ` · ${rt("canvasReferenceCount", { count: canvasReferences.length })}` : ""} · ${compactText(text) || rt(canvasReferences.length ? "canvasReferencesOnly" : "attachmentsOnly")}`);
-            const accepted = await fetchAgentJson<AgentTurnResponse>(endpoint, token, "/agent/codex/turn", {
+            const accepted = await fetchAgentJson<AgentTurnResponse>(endpoint, token, `/agent/${provider}/turn`, {
                 method: "POST",
                 headers: { "content-type": "application/json" },
                 body: JSON.stringify({
@@ -697,8 +753,9 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
                     conversationId: currentBeforeSend.conversation.conversationId,
                     expectedRevision: currentBeforeSend.conversation.revision,
                     permissionMode,
-                    model,
-                    effort: reasoningEffort,
+                    /** Hermes 的模型来自服务端配置（`--model` 由 provider 自己补），浏览器只回传 codex 的选择。 */
+                    model: provider === "codex" ? model : undefined,
+                    effort: provider === "codex" ? reasoningEffort : undefined,
                     skill: selectedSkill ? { name: selectedSkill.name, path: selectedSkill.path } : undefined,
                     attachments: requestFiles.map(({ id, name, type, size, width, height, dataUrl }) => ({ id, name, type, size, width, height, dataUrl })),
                     messageMetadata,
@@ -740,11 +797,22 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
         }
     };
 
+    const changeProvider = (next: string) => {
+        const nextProvider = AGENT_PROVIDERS.find((item) => item.id === next)?.id;
+        if (!nextProvider || nextProvider === provider) return;
+        localStorage.setItem("canvas-agent-provider", nextProvider);
+        setProvider(nextProvider);
+        /** 清空模型选择，交给新 provider 的 `/agent/:provider/models` 重新填。 */
+        setAgentState({ models: [], model: "", reasoningEffort: "" });
+    };
+
     const stopTurn = async () => {
         if (!connected || (!sending && !waiting)) return;
         setAgentState({ activity: rt("stopping") });
         try {
-            await interruptCodexTurn(endpoint, token, useAgentStore.getState().activeThreadId || undefined);
+            const threadId = useAgentStore.getState().activeThreadId || undefined;
+            if (provider === "codex") await interruptCodexTurn(endpoint, token, threadId);
+            else await interruptAgentTurn(endpoint, token, provider, threadId);
             addEventLog(rt("stopTask"), rt("taskStopped"));
         } catch (error) {
             setAgentState({ activity: rt("stopFailed") });
@@ -1420,6 +1488,10 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
                         onConfirmToolsChange={(confirmTools) => setAgentState({ confirmTools })}
                         permissionMode={permissionMode}
                         onPermissionModeChange={changePermissionMode}
+                        provider={provider}
+                        providers={AGENT_PROVIDERS}
+                        providerDisabled={!connected || sending || waiting || conversationBusy || loadingThreads}
+                        onProviderChange={changeProvider}
                         models={models}
                         model={model}
                         reasoningEffort={reasoningEffort}
@@ -1427,12 +1499,12 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
                             const selected = models.find((item) => item.model === model);
                             if (!selected) return;
                             const effort = selected.defaultReasoningEffort || selected.supportedReasoningEfforts[0]?.reasoningEffort;
-                            localStorage.setItem("canvas-agent-model", model);
-                            if (effort) localStorage.setItem("canvas-agent-reasoning-effort", effort);
+                            localStorage.setItem(agentModelStorageKey(provider), model);
+                            if (effort) localStorage.setItem(agentEffortStorageKey(provider), effort);
                             setAgentState({ model, ...(effort ? { reasoningEffort: effort } : {}) });
                         }}
                         onReasoningEffortChange={(reasoningEffort) => {
-                            localStorage.setItem("canvas-agent-reasoning-effort", reasoningEffort);
+                            localStorage.setItem(agentEffortStorageKey(provider), reasoningEffort);
                             setAgentState({ reasoningEffort });
                         }}
                         left={

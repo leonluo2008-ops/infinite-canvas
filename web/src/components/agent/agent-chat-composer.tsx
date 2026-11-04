@@ -25,6 +25,10 @@ export function AgentChatComposer({
     onConfirmToolsChange,
     permissionMode,
     onPermissionModeChange,
+    provider,
+    providers,
+    providerDisabled,
+    onProviderChange,
     models,
     model,
     reasoningEffort,
@@ -47,6 +51,10 @@ export function AgentChatComposer({
     onConfirmToolsChange?: (confirmTools: boolean) => void;
     permissionMode?: AgentPermissionMode;
     onPermissionModeChange?: (permissionMode: AgentPermissionMode) => void;
+    provider?: string;
+    providers?: Array<{ id: string; label: string }>;
+    providerDisabled?: boolean;
+    onProviderChange?: (provider: string) => void;
     models?: AgentModel[];
     model?: string;
     reasoningEffort?: AgentReasoningEffort | "";
@@ -91,6 +99,7 @@ export function AgentChatComposer({
                         ) : null}
                         {onConfirmToolsChange ? <ToolConfirmationMenu confirmTools={Boolean(confirmTools)} theme={theme} onChange={onConfirmToolsChange} /> : null}
                         {permissionMode && onPermissionModeChange ? <PermissionModeMenu permissionMode={permissionMode} theme={theme} onChange={onPermissionModeChange} /> : null}
+                        {provider && providers?.length && onProviderChange ? <AgentProviderMenu provider={provider} providers={providers} theme={theme} disabled={providerDisabled} onChange={onProviderChange} /> : null}
                         {models?.length && model && reasoningEffort && onModelChange && onReasoningEffortChange ? <AgentModelControls models={models} model={model} reasoningEffort={reasoningEffort} onModelChange={onModelChange} onReasoningEffortChange={onReasoningEffortChange} /> : null}
                         {left}
                     </div>
@@ -144,6 +153,35 @@ function AgentModelControls({ models, model, reasoningEffort, onModelChange, onR
                 </span>
             </Tooltip>
         </div>
+    );
+}
+
+function AgentProviderMenu({ provider, providers, theme, disabled, onChange }: { provider: string; providers: Array<{ id: string; label: string }>; theme: (typeof canvasThemes)[keyof typeof canvasThemes]; disabled?: boolean; onChange: (provider: string) => void }) {
+    const { t } = useTranslation();
+    const [open, setOpen] = useState(false);
+    const current = providers.find((item) => item.id === provider) || providers[0];
+    return (
+        <Tooltip title={t("agent.composer.providerLabel", { provider: current.label })} placement="top" open={open ? false : undefined}>
+            <span className="inline-flex shrink-0">
+                <Dropdown
+                    trigger={["click"]}
+                    placement="topLeft"
+                    open={open}
+                    onOpenChange={setOpen}
+                    disabled={disabled}
+                    menu={{
+                        selectable: true,
+                        selectedKeys: [provider],
+                        items: providers.map((item) => ({ key: item.id, label: <span className="text-sm font-medium">{item.label}</span>, onClick: () => onChange(item.id) })),
+                    }}
+                >
+                    <button type="button" className="flex h-9 min-w-9 shrink-0 items-center justify-center gap-0 rounded-full px-0 text-xs font-medium transition hover:bg-black/5 disabled:cursor-not-allowed disabled:opacity-50 @min-[660px]:w-auto @min-[660px]:min-w-0 @min-[660px]:justify-start @min-[660px]:gap-1.5 @min-[660px]:px-2.5 dark:hover:bg-white/10" style={{ color: theme.node.text }} aria-label={t("agent.composer.selectProvider", { provider: current.label })} disabled={disabled}>
+                        {current.label}
+                        <ChevronUp className="hidden size-3 opacity-50 @min-[660px]:block" />
+                    </button>
+                </Dropdown>
+            </span>
+        </Tooltip>
     );
 }
 

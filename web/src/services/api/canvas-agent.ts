@@ -72,6 +72,11 @@ export async function interruptCodexTurn(endpoint: string, token: string, thread
     await fetchAgentJson(endpoint, token, "/agent/codex/interrupt", jsonPost({ threadId }));
 }
 
+/** 通用中断入口：`/agent/:provider/interrupt`（codex 仍走 interruptCodexTurn）。 */
+export async function interruptAgentTurn(endpoint: string, token: string, provider: string, threadId?: string) {
+    await fetchAgentJson(endpoint, token, `/agent/${encodeURIComponent(provider)}/interrupt`, jsonPost({ threadId }));
+}
+
 export async function acknowledgeCodexHistory(endpoint: string, token: string, threadId: string, turnIds: string[]) {
     await fetchAgentJson(endpoint, token, "/agent/codex/history/ack", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ threadId, turnIds }) });
 }
