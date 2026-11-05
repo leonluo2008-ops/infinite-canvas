@@ -133,6 +133,86 @@ check("H1 资产位正文含原片描述", slots[0].body.includes("原片对应�
 check("H1 资产位正文含挂图提示", slots[0].body.includes("挂图："));
 
 // ---------------------------------------------------------------------------
+// 2b. M6-H1 槽源归并：九 资产层一对一；占位摘要/分镜引用/品牌置换位不产槽；降级归并
+// ---------------------------------------------------------------------------
+// pop-1--2 实读形态（bridge 投影）：九层 5 条 + 「核心主体资产」分号占位行 → 槽只出九层 5 条
+const POP12 = [
+    {
+        title: "核心主体资产",
+        lines: ["人物（出现于：00:00-00:03）；服装A（出现于：00:00-00:03）；道具A（出现于：00:01-00:03）；道具B（出现于：全片）；场景A（出现于：全片）（图号绑定〔未取证〕——无已备图实体，未发 @图片N）"],
+        dna: true,
+    },
+    {
+        title: "人物/动物固有资产",
+        lines: [
+            "- 人物（出现于：00:00-00:03）：20-25岁欧美女性，浅金色复古大波浪及肩卷发，精致瓜子脸，纤细高挑体型。\n- 服装A（出现于：00:00-00:03）：黑底白点深V挂脖无袖上衣 + 米白色高腰A字超短裙。\n- 道具A（出现于：00:01-00:03）：手持贴于右耳通话的黑色扁平长方形智能设备。\n- 道具B（出现于：全片）：核心产品——便携圆柱形香水喷雾管。\n- 场景A（出现于：全片）：欧美都市户外街景十字路口。",
+        ],
+        dna: false,
+    },
+];
+const pop12 = assets.parseLapianAssetBlocks(POP12);
+equal("M6-H1 九层一对一 = 5 槽", pop12.length, 5);
+equal("M6-H1 槽名 = 九层条目", pop12.map((item) => item.name), ["人物", "服装A", "道具A", "道具B", "场景A"]);
+equal("M6-H1 槽序连续", pop12.map((item) => item.order), [0, 1, 2, 3, 4]);
+
+// 分镜子块（「时段子块 ×N」）的逐镜实体引用不产槽
+const STORYBOARD = [
+    ...POP12,
+    { title: "时段子块 ×N", lines: ["0-1秒｜原片镜1\n- 画面主体与表演：人物A双腿与手持道具B；低机位特写\n- 镜头调度：移+摇，特写\n3-4秒｜原片镜3\n- 画面主体与表演：人物B、服装B；道具C冲向镜头"], dna: false },
+];
+equal("M6-H1 分镜逐镜引用不产槽", assets.parseLapianAssetBlocks(STORYBOARD).length, 5);
+
+// 「核心主体资产」@图片N 占位行不再单独产槽（九层在场时只认九层）
+const WITH_SUMMARY = [
+    { title: "核心主体资产", lines: ["@图片1 粉色细长款 PIVOINE"], dna: true },
+    { title: "人物/动物固有资产", lines: ["- 人物：30 岁女性。\n- 道具A：香水瓶。"], dna: false },
+];
+equal("M6-H1 占位摘要不产槽", assets.parseLapianAssetBlocks(WITH_SUMMARY).map((item) => item.name), ["人物", "道具A"]);
+
+// 品牌视觉（置换位）条目跳过（占位行不是备图槽）
+const WITH_BRAND = [
+    { title: "人物/动物固有资产", lines: ["- 人物：30 岁女性。\n- 品牌视觉（置换位）：客户品牌字样待填。\n- 道具A：香水瓶。"], dna: false },
+];
+equal("M6-H1 品牌视觉跳过", assets.parseLapianAssetBlocks(WITH_BRAND).map((item) => item.name), ["人物", "道具A"]);
+
+// 降级：九层缺失 → 旧逻辑（核心主体资产单行兜底仍在）
+equal("M6-H1 九层缺失降级旧逻辑", assets.parseLapianAssetBlocks(SINGLE).map((item) => item.name), ["香水瓶"]);
+
+// 降级归并：九层缺失（旧产物：九层块〔未取证〕，条目只在摘要块里）→ 旧逻辑 + 同尾缀「人物A+服装A」并回人物槽
+const OLD_IR = [
+    {
+        title: "核心主体资产",
+        lines: ["- 人物A（出现于：00:00-00:03）：20-25岁女性，金发。\n- 服装A（出现于：00:00-00:03）：黑底白波点上衣+A字裙。\n- 人物B（出现于：00:01-00:03）：亚洲男性。\n- 服装B（出现于：00:01-00:03）：深灰长袖衬衫。\n- 道具A（出现于：00:00-00:05）：玻璃喷雾管。\n- 场景A（出现于：全片）：城市街道。"],
+        dna: true,
+    },
+    { title: "人物/动物固有资产", lines: ["〔未取证〕（九 资产层缺失或为空）"], dna: false },
+];
+const oldIr = assets.parseLapianAssetBlocks(OLD_IR);
+equal("M6-H1 降级尾缀配对归并", oldIr.map((item) => item.name), ["人物A", "人物B", "道具A", "场景A"]);
+check("M6-H1 归并后人物槽描述含服装", oldIr[0].desc.includes("黑底白波点") && oldIr[1].desc.includes("深灰长袖"));
+equal("M6-H1 归并后槽序连续", oldIr.map((item) => item.order), [0, 1, 2, 3]);
+
+// 降级归并：唯一人物槽时无尾缀服装也并（旧 IR 一人一片形态）
+const SINGLE_PERSON = [
+    {
+        title: "核心主体资产",
+        lines: ["- 人物-复古时尚女性（出现于：00:00-00:04）：金发女郎。\n- 服装-复古女郎装（出现于：00:00-00:04）：红色连衣裙。\n- 道具-粉色便携香水：圆柱喷雾管。\n- 场景-纽约街头十字路口：斑马线。"],
+        dna: true,
+    },
+];
+equal(
+    "M6-H1 唯一人物槽并无尾缀服装",
+    assets.parseLapianAssetBlocks(SINGLE_PERSON).map((item) => item.name),
+    ["人物-复古时尚女性", "道具-粉色便携香水", "场景-纽约街头十字路口"],
+);
+
+// 多人物且服装无尾缀可配 → 不猜归属，保持独立槽
+const AMBIGUOUS = [
+    { title: "核心主体资产", lines: ["- 人物A：女性。\n- 人物B：男性。\n- 服装：礼服一套。"], dna: true },
+];
+equal("M6-H1 多人物不猜归属", assets.parseLapianAssetBlocks(AMBIGUOUS).map((item) => item.name), ["人物A", "人物B", "服装"]);
+
+// ---------------------------------------------------------------------------
 // 3. G2：短说明四级 fallback + 6 字截断 + 禁裸文件名
 // ---------------------------------------------------------------------------
 equal("G2 用户输入优先", assets.resolveAssetCaption({ userInput: "香水", slotName: "几何凹坑渐变香水瓶", imageTitle: "产品图", unnamed: "未命名参考图" }), "香水");

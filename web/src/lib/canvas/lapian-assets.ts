@@ -2,7 +2,7 @@
  * 拉片 → 资产位（T3-H1/H2）与参考图清单（T3-G1/G2）的纯函数层。
  *
  * 数据源是 bridge `/api/lapian/<taskId>` 的 blocks（实读 schema：`{title, lines[], dna}`，
- * 资产块两块：「核心主体资产」= 待确认清单里已备图的主体，「人物/动物固有资产」= 九 资产逐条）。
+ * 资产块两块：「核心主体资产」= 待确认清单摘要（图号绑定占位/已备图主体），「人物/动物固有资产」= 九 资产逐条）。
  * 这里只做三件事，全部无副作用、不读 i18n、不摸 React，便于探针直接转译真模块跑断言：
  *   1. parseLapianAssetBlocks：blocks → 资产条目（类型 / 名 / 原片描述 / IR 资产序）；
  *   2. collectLapianAssetReferences：画布节点 → 已挂图的资产位（按资产位序排、连续编号）；
@@ -12,6 +12,15 @@
  * - 图号 = 按资产位序（IR 资产序）排序后、已挂图资产的连续编号 1..N；未挂不出项、删图不出幽灵项。
  * - 清单行只放 `@[node:图片节点id]=短说明`：图号由生成期 token 展开时分配（图片1、图片2…），
  *   这样清单里的号与请求 images 数组的号由同一处代码产生，不会对不上。
+ *
+ * 槽源归并（M6-H1，所有者 2026-11-05 实测拍板）：
+ * - 语义：**形象（面部+着装）无重大变化 = 同一实体 = 一槽**——由拆解层（IR「九 资产」）保证，
+ *   画布不再二次拆分。槽 = 九 资产层条目一对一（人物 1 槽 / 服装 1 槽 / 道具 N / 场景 N）。
+ * - 主路径只认九 资产层投影块（「人物/动物固有资产」）；「核心主体资产」是占位摘要、
+ *   分镜子块（「时段子块 ×N」）的逐镜实体引用都不是槽源，一律不产槽。
+ * - 九层缺失或为空（旧产物/异常投影）才降级旧逻辑（扫全部带「资产」的块），
+ *   降级时同名实体归并：服装条目并回人物槽（尾缀配对「人物A+服装A」；全片只有一个人物槽时无尾缀也并）。
+ * - 品牌视觉（置换位）条目是待确认清单的占位行，不是备图槽，两条路径都跳过。
  */
 
 import { CanvasNodeType, type CanvasNodeData } from "@/types/canvas";
@@ -96,6 +105,14 @@ export function isLapianAssetBlock(title?: string): boolean {
     return String(title || "").includes("资产");
 }
 
+/**
+ * 九 资产层块判定（唯一槽源）：jimeng-lapian 投影块 12「人物/动物固有资产」（来源键 assets_in_seg = 九 资产逐条）。
+ * 「核心主体资产」（块 3）是待确认清单摘要占位、「时段子块 ×N」（块 15）是分镜逐镜实体引用——都不产槽。
+ */
+export function isLapianNineAssetBlock(title?: string): boolean {
+    return isLapianAssetBlock(title) && /人物|动物/.test(String(title || ""));
+}
+
 /** 块名 → 类型前缀：人物/动物 优先（「人物/动物固有资产」），其次核心主体，其余去掉「资产」二字。 */
 export function lapianAssetTypeOf(title: string): string {
     const text = String(title || "");
@@ -114,16 +131,38 @@ function assetNameOf(body: string): string {
 /**
  * blocks → 资产条目（已按块序、条目序排好并去重）。
  *
+ * 槽源归并（M6-H1）：主路径只取九 资产层块（`isLapianNineAssetBlock`）条目一对一；
+ * 九层缺失或为空才降级旧逻辑（扫全部带「资产」的块）并做同名实体归并（服装并回人物槽）。
+ * 品牌视觉（置换位）占位行两条路径都跳过。
+ */
+export function parseLapianAssetBlocks(blocks?: LapianBlock[] | null): LapianAssetItem[] {
+    const nine = finalizeAssetItems(
+        collectAssetItems(blocks, isLapianNineAssetBlock).filter((item) => !BRAND_PLACEHOLDER.test(`${item.type}|${item.name}`)),
+    );
+    if (nine.length) return nine;
+    const degraded = mergeClothingIntoPerson(
+        collectAssetItems(blocks, isLapianAssetBlock).filter((item) => !BRAND_PLACEHOLDER.test(`${item.type}|${item.name}`)),
+    );
+    return finalizeAssetItems(degraded);
+}
+
+/**
+ * blocks → 资产条目（未去重、未编号），只认 `blockMatches` 放行的块。
+ *
  * 解析规则全部来自实读样本：
  * - demo1/ai-2：「人物/动物固有资产」一块一行内含 `1. 名：描述\n2. …`（行内嵌换行）；
+ * - pop-1--2：`- 名（出现于…）：描述` 逐条一行一条；
  * - e2e：「- 底衬道具：」这类「子类标题 + 明细」两层结构，子类标题当类型前缀。
  * 兜底：整块只有一个不带记号、也不带分号逗号堆叠的短行（`产品：香水瓶`）→ 当成一条资产，
  * 免得写成一句话的 IR 被当成「无可替换资产」。
  */
-export function parseLapianAssetBlocks(blocks?: LapianBlock[] | null): LapianAssetItem[] {
+function collectAssetItems(
+    blocks: LapianBlock[] | null | undefined,
+    blockMatches: (title: string) => boolean,
+): Omit<LapianAssetItem, "order">[] {
     const items: Omit<LapianAssetItem, "order">[] = [];
     for (const block of blocks || []) {
-        if (!block || !isLapianAssetBlock(block.title)) continue;
+        if (!block || !blockMatches(String(block.title || ""))) continue;
         const blockType = lapianAssetTypeOf(String(block.title || ""));
         const lines = (block.lines || []).flatMap((line) => String(line ?? "").split("\n"));
         let pendingType = "";
@@ -167,6 +206,11 @@ export function parseLapianAssetBlocks(blocks?: LapianBlock[] | null): LapianAss
             if (name) items.push({ type: blockType, name, desc: line });
         }
     }
+    return items;
+}
+
+/** 条目去重（「类型|名」）并补连续 order。 */
+function finalizeAssetItems(items: Omit<LapianAssetItem, "order">[]): LapianAssetItem[] {
     const seen = new Set<string>();
     const unique = items.filter((item) => {
         const key = `${item.type}|${item.name}`;
@@ -175,6 +219,44 @@ export function parseLapianAssetBlocks(blocks?: LapianBlock[] | null): LapianAss
         return true;
     });
     return unique.map((item, index) => ({ ...item, order: index }));
+}
+
+/** 实体名尾缀：`人物A`/`服装A` 共享的 1-2 位字母数字尾缀；中文结尾（`人物-复古时尚女性`）无尾缀。 */
+const NAME_SUFFIX = /(?:^|[^A-Za-z0-9])([A-Za-z0-9]{1,2})$/;
+/** 人物类条目名（降级归并判据；「角色A/人物 女性」都算）。 */
+const PERSON_NAME = /人物|角色|主角|演员|男主|女主|模特/;
+/** 服装类条目名（降级归并判据）。 */
+const CLOTHING_NAME = /服装|服饰|着装|穿搭|造型|套装/;
+/** 品牌视觉（置换位）：待确认清单占位行（客户品牌字样待填），不是备图槽。 */
+const BRAND_PLACEHOLDER = /品牌视觉|置换位/;
+
+function entityNameSuffix(name: string): string {
+    const match = NAME_SUFFIX.exec(String(name || "").trim());
+    return match ? match[1].toUpperCase() : "";
+}
+
+/**
+ * 降级路径专用同名实体归并：服装条目并回人物槽（语义=同一人物形象，着装随人走）。
+ * 配对规则：尾缀相同（人物A+服装A）优先；无尾缀可配且全片只有一个人物槽时并入该槽；
+ * 多人物且配不上的一律不猜归属，保持独立槽。服装描述以「；」接在人物描述后，槽位沿用人物条位。
+ */
+function mergeClothingIntoPerson(items: Omit<LapianAssetItem, "order">[]): Omit<LapianAssetItem, "order">[] {
+    const isPerson = (name: string) => PERSON_NAME.test(name);
+    const isClothing = (name: string) => CLOTHING_NAME.test(name) && !isPerson(name);
+    const personIndexes = items.map((item, index) => (isPerson(item.name) ? index : -1)).filter((index) => index >= 0);
+    if (!personIndexes.length) return items;
+    const merged = items.map((item) => ({ ...item }));
+    const consumed = new Set<number>();
+    for (let index = 0; index < merged.length; index += 1) {
+        if (!isClothing(merged[index].name)) continue;
+        const suffix = entityNameSuffix(merged[index].name);
+        const target = suffix ? (personIndexes.find((personIndex) => entityNameSuffix(merged[personIndex].name) === suffix) ?? -1) : -1;
+        const into = target >= 0 ? target : personIndexes.length === 1 ? personIndexes[0] : -1;
+        if (into < 0 || into === index) continue;
+        merged[into].desc = `${merged[into].desc}；${merged[index].desc}`.trim();
+        consumed.add(index);
+    }
+    return merged.filter((_, index) => !consumed.has(index));
 }
 
 /** 资产条目 → 资产位描述（标题 / 正文 / 去重键）。 */
