@@ -336,7 +336,7 @@ async function createWanVideoTask(config: AiConfig, model: string, prompt: strin
         images,
         duration: wanDuration(config.videoSeconds),
         ratio: videoAspectRatio(config.size || "16:9"),
-        resolution: normalizeVideoResolution(config.vquality),
+        resolution: normalizeVideoResolution(config.vquality).replace(/p$/i, ""), // wan 契约：数字（"720"），不带 p 后缀（bridge WAN_RESOLUTIONS 键）
         audio: boolConfig(config.videoGenerateAudio, true),
         confirm: true,
     };

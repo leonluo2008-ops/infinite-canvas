@@ -212,7 +212,7 @@ equal("body.images 转 {name,dataUrl}（无名补 ref-N.png）", body.images, [
 ]);
 equal("body.duration 取自 videoSeconds（数字）", body.duration, 6);
 equal("body.ratio 取自 size", body.ratio, "16:9");
-equal("body.resolution 取自 vquality（720→720p）", body.resolution, "720p");
+equal("body.resolution 取自 vquality（720，剥 p 后缀——bridge WAN_RESOLUTIONS 键）", body.resolution, "720");
 equal("body.audio 缺省 true", body.audio, true);
 equal("body.confirm 恒 true（两段式确认由画布流程承担）", body.confirm, true);
 check("body 无 model/size/mode/aspect_ratio 等合同外字段", !["model", "size", "mode", "aspect_ratio", "watermark", "seconds"].some((key) => key in body), `多出字段 ${Object.keys(body).join(",")}`);
@@ -227,12 +227,12 @@ task = await mod.createVideoGenerationTask(wanConfig({ videoSeconds: "40", size:
 const body2 = log[0]?.body || {};
 check("videoSeconds 40 不被 SDGF 4–30 硬拒（clamp 到上限即可）", body2.duration === 30, `duration ${body2.duration}`);
 equal("size 9:16 → ratio 9:16", body2.ratio, "9:16");
-equal("vquality high → 720p", body2.resolution, "720p");
+equal("vquality high → 720（剥 p）", body2.resolution, "720");
 equal("audio=false 透传", body2.audio, false);
 log = installRoutes([{ method: "POST", match: "/api/wan/video/run", reply: () => ({ job: "job-3", taskId: "file-3" }) }]);
 await mod.createVideoGenerationTask(wanConfig({ size: "auto", vquality: "1080" }), "x", []);
 equal("size auto → ratio 兜底 16:9", log[0]?.body?.ratio, "16:9");
-equal("vquality 1080 → 1080p", log[0]?.body?.resolution, "1080p");
+equal("vquality 1080 → 1080（剥 p）", log[0]?.body?.resolution, "1080");
 log = installRoutes([{ method: "POST", match: "/api/wan/video/run", reply: () => ({ job: "job-4", taskId: "file-4" }) }]);
 await mod.createVideoGenerationTask(wanConfig(), "文生视频无参考图", []);
 equal("无参考图 images=[]（不报错）", log[0]?.body?.images, []);
