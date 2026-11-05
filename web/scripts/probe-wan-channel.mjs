@@ -233,6 +233,12 @@ log = installRoutes([{ method: "POST", match: "/api/wan/video/run", reply: () =>
 await mod.createVideoGenerationTask(wanConfig({ size: "auto", vquality: "1080" }), "x", []);
 equal("size auto → ratio 兜底 16:9", log[0]?.body?.ratio, "16:9");
 equal("vquality 1080 → 1080（剥 p）", log[0]?.body?.resolution, "1080");
+log = installRoutes([{ method: "POST", match: "/api/wan/video/run", reply: () => ({ job: "job-3b", taskId: "file-3b" }) }]);
+await mod.createVideoGenerationTask(wanConfig({ vquality: "low" }), "x", []);
+equal("vquality low → 480（新契约：bridge WAN_RESOLUTIONS 放行 480，不再 400）", log[0]?.body?.resolution, "480");
+log = installRoutes([{ method: "POST", match: "/api/wan/video/run", reply: () => ({ job: "job-3c", taskId: "file-3c" }) }]);
+await mod.createVideoGenerationTask(wanConfig({ vquality: "720P" }), "x", []);
+equal("vquality 手填 720P → 720（剥后缀，否则 bridge WAN_RESOLUTIONS 键不匹配）", log[0]?.body?.resolution, "720");
 log = installRoutes([{ method: "POST", match: "/api/wan/video/run", reply: () => ({ job: "job-4", taskId: "file-4" }) }]);
 await mod.createVideoGenerationTask(wanConfig(), "文生视频无参考图", []);
 equal("无参考图 images=[]（不报错）", log[0]?.body?.images, []);
