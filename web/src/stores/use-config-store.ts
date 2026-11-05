@@ -487,7 +487,11 @@ function normalizeChannels(config: AiConfig) {
 export function defaultBaseUrlForApiFormat(apiFormat: ApiCallFormat) {
     if (apiFormat === "gemini") return GEMINI_BASE_URL;
     if (apiFormat === "sdgf") return "https://sdapi.jxinai.com";
-    if (apiFormat === "wan") return "http://127.0.0.1:8779"; // 宿主 bridge（画布 vite proxy /api 同域转发，前端实际走相对路径）
+    if (apiFormat === "wan") {
+        // bridge 与页面同域部署（开发机 vite 代理 / 整合包 server.py / 公网隧道），预填当前域；
+        // 运行时回环地址一律走相对路径（withLocalProxy），这里只是展示值。
+        return typeof window !== "undefined" ? window.location.origin : "http://127.0.0.1:8779";
+    }
     return OPENAI_BASE_URL;
 }
 
