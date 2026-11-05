@@ -20,7 +20,12 @@
  *   分镜子块（「时段子块 ×N」）的逐镜实体引用都不是槽源，一律不产槽。
  * - 九层缺失或为空（旧产物/异常投影）才降级旧逻辑（扫全部带「资产」的块），
  *   降级时同名实体归并：服装条目并回人物槽（尾缀配对「人物A+服装A」；全片只有一个人物槽时无尾缀也并）。
- * - 品牌视觉（置换位）条目是待确认清单的占位行，不是备图槽，两条路径都跳过。
+ * - 品牌视觉（置换位）：M6-H5（所有者 2026-11-05 拍板）——有品牌露出的片子品牌位必须可挂图（挂客户品牌/产品图
+ *   是工具核心场景）。槽源是十层「图文与收束」投影块（块名「片尾收束」/「图文与收束」）的品牌露出条目
+ *   （包装字/品牌字/标语），**聚合 1 槽**挂在槽序列末尾（5 条包装字=1 个「品牌视觉·置换位」槽，不逐字拆）；
+ *   十层无品牌露出（旧格式无这一层/图文：无/收束无品牌露出）→ 不出品牌槽。资产块里的「品牌视觉（置换位）」
+ *   占位行仍不是九资产条目（跳过逻辑保留，防它以资产块类型冒出槽）；截帧查名用首条品牌条目（包装字A），
+ *   bridge 按名解出品牌露出区间取帧（聚合槽名在拆解.md 里没有对应行）。
  */
 
 import { CanvasNodeType, type CanvasNodeData } from "@/types/canvas";
@@ -41,6 +46,8 @@ export type LapianAssetItem = {
     desc: string;
     /** IR 资产序（0-based）：图号排序键，稳定不变。 */
     order: number;
+    /** 截帧查名（仅聚合品牌槽有，见 LapianAssetSlot.frameName）。 */
+    frameName?: string;
 };
 
 export type LapianAssetSlot = {
@@ -57,6 +64,12 @@ export type LapianAssetSlot = {
     desc: string;
     /** 原片出现区间原文（`00:00-02.03、04.07-06.00`），进 metadata.assetSlot.span；没有就是空串。 */
     span: string;
+    /**
+     * 截帧查名（M6-H5）：聚合品牌槽按槽名在拆解.md 里没有对应行（按名取帧会退首帧），
+     * 用首条带出现区间的品牌条目名（如「包装字A」）去 asset-frame 查，才能取到品牌露出帧。
+     * 普通槽没有这字段（按 slot.name 查）。
+     */
+    frameName?: string;
 };
 
 /** IR 资产行里的「出现于：…」区间原文；截帧时刻由 bridge 侧解析，这里只留给人看。 */
@@ -133,17 +146,86 @@ function assetNameOf(body: string): string {
  *
  * 槽源归并（M6-H1）：主路径只取九 资产层块（`isLapianNineAssetBlock`）条目一对一；
  * 九层缺失或为空才降级旧逻辑（扫全部带「资产」的块）并做同名实体归并（服装并回人物槽）。
- * 品牌视觉（置换位）占位行两条路径都跳过。
+ * 品牌槽（M6-H5）：十层「图文与收束」有品牌露出条目（包装字/品牌字/标语）→ 末尾聚合追加 1 个
+ * 「品牌视觉·置换位」槽（两条路径都追加）；无品牌露出 → 不追加。
  */
 export function parseLapianAssetBlocks(blocks?: LapianBlock[] | null): LapianAssetItem[] {
     const nine = finalizeAssetItems(
         collectAssetItems(blocks, isLapianNineAssetBlock).filter((item) => !BRAND_PLACEHOLDER.test(`${item.type}|${item.name}`)),
     );
-    if (nine.length) return nine;
-    const degraded = mergeClothingIntoPerson(
-        collectAssetItems(blocks, isLapianAssetBlock).filter((item) => !BRAND_PLACEHOLDER.test(`${item.type}|${item.name}`)),
-    );
-    return finalizeAssetItems(degraded);
+    const assets = nine.length
+        ? nine
+        : finalizeAssetItems(
+              mergeClothingIntoPerson(
+                  collectAssetItems(blocks, isLapianAssetBlock).filter((item) => !BRAND_PLACEHOLDER.test(`${item.type}|${item.name}`)),
+              ),
+          );
+    return appendLapianBrandItem(assets, blocks);
+}
+
+/** 品牌聚合槽（M6-H5 所有者拍板）：类型显示建议「品牌」，名称「品牌视觉·置换位」，挂在槽序列末尾。 */
+export const LAPIAN_BRAND_SLOT_TYPE = "品牌";
+export const LAPIAN_BRAND_SLOT_NAME = "品牌视觉·置换位";
+/** 品牌露出条目名（整名锚定）：包装字/品牌字/品牌视觉/标语——水印、字幕、角标是中性图文，不算品牌露出。 */
+const BRAND_ENTRY_NAME = /^(?:包装字[A-Za-z0-9]?|品牌字|品牌视觉|标语)$/;
+
+/** 品牌条目短名：条目正文冒号/括号前截名，再剥掉投影可能残留的 markdown 星号（`* **品牌字…`）。 */
+function brandEntryNameOf(body: string): string {
+    return assetNameOf(body)
+        .replace(/\*/g, "")
+        .trim();
+}
+
+/**
+ * 十层「图文与收束」投影块里的品牌露出条目行（整行原文，已剥条目记号）。
+ * 块判定：块名带「收束」（拆解层原名「十 图文与收束」，jimeng-lapian 投影块名「片尾收束」），
+ * 或块内出现包装字条目（旧投影块名不一时按内容兜底）；旧格式片这块是〔未取证〕占位行 → 无条目。
+ */
+function collectLapianBrandEntryLines(blocks?: LapianBlock[] | null): string[] {
+    const lines: string[] = [];
+    for (const block of blocks || []) {
+        if (!block) continue;
+        const bodies = (block.lines || [])
+            .flatMap((line) => String(line ?? "").split("\n"))
+            .map((raw) => raw.trim())
+            .filter((text) => text && !LACK_MARKER.test(text))
+            .map((text) => (ITEM_MARKER.exec(text)?.[1] ?? text).trim());
+        const brandLines = bodies.filter((body) => BRAND_ENTRY_NAME.test(brandEntryNameOf(body)));
+        // 块判定：块名带「收束」= 十层投影块；块名不依时，包装字条目是十层独有的内容指纹——
+        // 资产块里的「品牌视觉（置换位）」只是占位行（M6-H5 前语义残留）、别的块的散文里可能出现
+        // 品牌字样，都不足以认定十层。
+        const isTenLayerBlock = String(block.title || "").includes("收束") || brandLines.some((body) => brandEntryNameOf(body).startsWith("包装字"));
+        if (!isTenLayerBlock) continue;
+        lines.push(...brandLines);
+    }
+    return lines;
+}
+
+/**
+ * 截帧查名：bridge asset_span 按「名字出现在拆解.md 哪一行」解出现区间——聚合槽名
+ * 「品牌视觉·置换位」在拆解.md 里没有对应行，按槽名取帧会退到首帧（approx）。
+ * 改传首条**带出现区间**的品牌条目名（如「包装字A」），bridge 就能解出品牌露出区间取到品牌露出帧；
+ * 条目都不带区间时退回首条（仍走 bridge 首帧兜底）。没有品牌条目行 → undefined（不会发生，调用方已挡）。
+ */
+function brandFrameNameOf(brandLines: string[]): string | undefined {
+    const line = brandLines.find((entryLine) => SPAN_TEXT.test(entryLine)) ?? brandLines[0];
+    return line ? brandEntryNameOf(line) || undefined : undefined;
+}
+
+/** 十层有品牌露出 → 槽序列末尾聚合追加 1 个品牌槽（5 条包装字=1 槽，不逐字拆）；无 → 原样返回。 */
+function appendLapianBrandItem(items: LapianAssetItem[], blocks?: LapianBlock[] | null): LapianAssetItem[] {
+    const brandLines = collectLapianBrandEntryLines(blocks);
+    if (!brandLines.length) return items;
+    return [
+        ...items,
+        {
+            type: LAPIAN_BRAND_SLOT_TYPE,
+            name: LAPIAN_BRAND_SLOT_NAME,
+            desc: brandLines.join("\n"),
+            order: items.length,
+            frameName: brandFrameNameOf(brandLines),
+        },
+    ];
 }
 
 /**
@@ -227,7 +309,7 @@ const NAME_SUFFIX = /(?:^|[^A-Za-z0-9])([A-Za-z0-9]{1,2})$/;
 const PERSON_NAME = /人物|角色|主角|演员|男主|女主|模特/;
 /** 服装类条目名（降级归并判据）。 */
 const CLOTHING_NAME = /服装|服饰|着装|穿搭|造型|套装/;
-/** 品牌视觉（置换位）：待确认清单占位行（客户品牌字样待填），不是备图槽。 */
+/** 资产块里的「品牌视觉（置换位）」占位行：不是九资产条目——品牌槽由十层聚合产生（M6-H5），防它以资产块类型冒出槽。 */
 const BRAND_PLACEHOLDER = /品牌视觉|置换位/;
 
 function entityNameSuffix(name: string): string {
@@ -270,6 +352,7 @@ export function buildLapianAssetSlots(items: LapianAssetItem[], labels: LapianAs
         body: `${labels.original}：${item.desc}\n${labels.attachButton}：${labels.attachHint}`,
         desc: item.desc,
         span: SPAN_TEXT.exec(item.desc)?.[1]?.trim() || "",
+        frameName: item.frameName,
     }));
 }
 

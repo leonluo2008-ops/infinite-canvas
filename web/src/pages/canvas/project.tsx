@@ -1146,8 +1146,10 @@ function InfiniteCanvasPage() {
     // 截帧失败降级成 Text 纯文字卡（不阻塞整批）。布局：整块横向网格排在拉片节点**右侧**，并补拉片→资产位连线。
     // 幂等：按「类型|名」去重，重复点只补缺失；IR 没有任何资产 → 不出节点，只 toast。
     // M6-H1 槽源归并：槽 = IR「九 资产」层条目一对一——形象（面部+着装）无重大变化 = 同一实体 = 一槽，
-    // 由拆解层保证，画布不再二次拆分（分镜逐镜实体引用、「核心主体资产」占位摘要、品牌视觉置换位都不产槽；
+    // 由拆解层保证，画布不再二次拆分（分镜逐镜实体引用、「核心主体资产」占位摘要都不产槽；
     // 九层缺失才降级旧逻辑并同名归并）。既有槽不删（兼容），新衍生按新规则。
+    // M6-H5 品牌槽：十层「图文与收束」有品牌露出（包装字/品牌字/标语）→ 槽序列末尾聚合追加 1 个
+    // 「品牌视觉·置换位」（截帧按首条品牌条目名取品牌露出帧）；无品牌露出不出。
     const createLapianAssetSlots = useCallback(
         async (node: CanvasNodeData) => {
             if (node.type !== CanvasNodeType.Lapian) return;
@@ -1179,7 +1181,8 @@ function InfiniteCanvasPage() {
                     return;
                 }
                 // 截帧与落位无依赖，并行拿：一帧一张，失败的就是 null（下面降级）。
-                const frames = await Promise.all(missing.map((slot) => fetchLapianAssetFrame(taskId, slot.name)));
+                // frameName（M6-H5）：聚合品牌槽按槽名在拆解.md 里没有对应行，传首条品牌条目名才能取到品牌露出帧。
+                const frames = await Promise.all(missing.map((slot) => fetchLapianAssetFrame(taskId, slot.frameName || slot.name)));
                 const cell = NODE_DEFAULT_SIZE[CanvasNodeType.Image];
                 const rects = placeGridRightOf(rectOfNode(node), missing.length, cell, nodesRef.current.map(rectOfNode), {
                     columns: Math.max(1, Math.min(3, Math.ceil(Math.sqrt(missing.length)))),
