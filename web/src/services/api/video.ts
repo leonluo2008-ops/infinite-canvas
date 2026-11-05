@@ -9,6 +9,7 @@ import { getMediaBlob, resolveMediaUrl, uploadMediaFile, type UploadedFile } fro
 import { imageToDataUrl } from "@/services/image-storage";
 import { boolConfig, buildApiUrl, modelOptionName, resolveModelRequestConfig, resolveModelScript, withLocalProxy, type AiConfig } from "@/stores/use-config-store";
 import { runModelPlugin } from "./model-plugin";
+import { sdgfRatioFields, sdgfSoundFields } from "./sdgf-payload";
 import type { VideoTaskProvider } from "@/types/canvas";
 import type { ReferenceImage } from "@/types/image";
 import type { ReferenceAudio, ReferenceVideo } from "@/types/media";
@@ -215,20 +216,20 @@ function sdgfMode(videoMode: string | undefined, imageCount: number): string {
 
 async function createSdgfVideoTask(config: AiConfig, model: string, prompt: string, references: ReferenceImage[], options?: VideoMediaOptions): Promise<VideoGenerationTask> {
     const images = await sdgfImageUrls(references, options);
+    const modelName = modelOptionName(model);
+    // 比例：非满血 GF 名（ap/zh 等聚鑫别名）双写 aspect_ratio+metadata.ratio——V2 实测（720×1278 竖屏）；
+    // 满血 GF 名只发 aspect_ratio，保持十四章合同原样。声音：V3 实测顶层 enableSound:"on" 真有声。
+    // 实测依据见 docs/需求-SDGF新模型比例与无声问题-20261105.md §四/§五。
+    const ratioFields = sdgfRatioFields(modelName, sdgfAspectRatio(config.size || "16:9"));
     const body: Record<string, unknown> = {
-        model: modelOptionName(model),
+        model: modelName,
         prompt,
         duration: sdgfDuration(config.videoSeconds),
-        aspect_ratio: sdgfAspectRatio(config.size || "16:9"),
+        aspect_ratio: ratioFields.aspect_ratio,
+        ...(ratioFields.metadata ? { metadata: ratioFields.metadata } : {}),
         mode: sdgfMode(config.videoMode, images.length),
+        ...sdgfSoundFields(boolConfig(config.videoGenerateAudio, true)),
     };
-    // S2 待实测（docs/任务-SDGF渠道指令完整适配-20261104.md）：enableSound 是聚鑫通用章字段（旧 SD2），
-    // 第十四章 GF 合同未列。实测通过（创建 200 且成片音轨符合开关语义）后置 true 启用。
-    // 实测必须由所有者授权——生成视频红线。
-    const SDGF_SEND_SOUND_PARAM = false;
-    if (SDGF_SEND_SOUND_PARAM) {
-        body.enableSound = boolConfig(config.videoGenerateAudio, true);
-    }
     if (images.length) body.images = images;
     let created: unknown;
     try {
