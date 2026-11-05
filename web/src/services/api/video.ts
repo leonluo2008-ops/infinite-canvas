@@ -4,10 +4,12 @@ import { nanoid } from "nanoid";
 import i18n from "@/i18n";
 import { dataUrlToFile, readFileAsDataUrl } from "@/lib/image-utils";
 import { clampVideoSeconds, computeVideoSize, inferVideoRatio } from "@/lib/media-size";
+import { waitForVideoTaskOutput } from "@/lib/canvas/video-task-wait";
 import { getMediaBlob, resolveMediaUrl, uploadMediaFile, type UploadedFile } from "@/services/file-storage";
 import { imageToDataUrl } from "@/services/image-storage";
 import { boolConfig, buildApiUrl, modelOptionName, resolveModelRequestConfig, resolveModelScript, withLocalProxy, type AiConfig } from "@/stores/use-config-store";
 import { runModelPlugin } from "./model-plugin";
+import type { VideoTaskProvider } from "@/types/canvas";
 import type { ReferenceImage } from "@/types/image";
 import type { ReferenceAudio, ReferenceVideo } from "@/types/media";
 
@@ -19,7 +21,7 @@ type VideoMediaOptions = RequestOptions & { videos?: ReferenceVideo[]; audios?: 
 const apiText = (key: string, options?: Record<string, unknown>) => i18n.t(`apiErrors.${key}`, options);
 
 export type VideoGenerationResult = { blob?: Blob; url?: string; mimeType?: string };
-export type VideoGenerationTask = { id: string; provider: "openai" | "gemini" | "plugin" | "sdgf"; model: string };
+export type VideoGenerationTask = { id: string; provider: VideoTaskProvider; model: string };
 type GeminiInlineData = { bytesBase64Encoded: string; mimeType: string };
 type GeminiVideoOperation = {
     name?: string;
@@ -48,15 +50,20 @@ export async function requestVideoGeneration(config: AiConfig, prompt: string, r
 }
 
 export async function waitForVideoGenerationTask(config: AiConfig, task: VideoGenerationTask, options?: RequestOptions): Promise<VideoGenerationResult> {
-    for (let attempt = 0; attempt < 120; attempt += 1) {
-        if (options?.signal?.aborted) throw new DOMException("Aborted", "AbortError");
-        const state = await pollVideoGenerationTask(config, task, options);
-        if (state.status === "completed") return state.result;
-        if (state.status === "failed") throw videoTaskFailed(state.error);
-        if (attempt === 119) throw new Error(apiText("videoTimeout", { provider: "" }));
-        await delay(2500, options?.signal);
-    }
-    throw new Error(apiText("videoTimeout", { provider: "" }));
+    // 等待循环（含 SDGF 瞬态 failed 复核：连续 3 次间隔 8s 仍 failed 才判死，completed 立即返回）
+    // 在 lib/canvas/video-task-wait.ts 纯逻辑层，此处只注入网络与错误文案；openai/gemini/plugin 维持「failed 即死」。
+    return waitForVideoTaskOutput({
+        provider: task.provider,
+        poll: () => pollVideoGenerationTask(config, task, options),
+        delay: (ms) => delay(ms, options?.signal),
+        isAborted: () => Boolean(options?.signal?.aborted),
+        onTaskFailed: (error) => {
+            throw videoTaskFailed(error);
+        },
+        onTimeout: () => {
+            throw new Error(apiText("videoTimeout", { provider: "" }));
+        },
+    });
 }
 
 export function isVideoTaskFailed(error: unknown) {

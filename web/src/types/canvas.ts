@@ -23,6 +23,8 @@ export enum CanvasNodeType {
 export type CanvasNodeTypeId = CanvasNodeType | (string & {});
 
 export type CanvasNodeStatus = "idle" | "success" | "loading" | "error";
+/** 视频生成任务的后端协议四值（与 services/api/video.ts 任务 provider 对齐）；sdgf=聚鑫 SD GF 统一视频 API。 */
+export type VideoTaskProvider = "openai" | "gemini" | "plugin" | "sdgf";
 export type CanvasGenerationMode = "text" | "image" | "video" | "audio";
 export type CanvasImageGenerationType = "generation" | "edit";
 
@@ -132,7 +134,8 @@ export type CanvasNodeMetadata = {
     bytes?: number;
     durationMs?: number;
     videoTaskId?: string;
-    videoTaskProvider?: "openai" | "gemini";
+    // 原值透存不折叠——历史 bug：sdgf 被三元折叠成 openai，恢复轮询走错协议（M6-T6 假失败根因之一）。
+    videoTaskProvider?: VideoTaskProvider;
     groupId?: string;
     interactive?: boolean; // Plugin node interaction/move state; see CanvasNodeDefinition.interactionToggle.
 };
