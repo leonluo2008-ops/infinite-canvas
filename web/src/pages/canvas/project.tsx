@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { ChangeEvent as ReactChangeEvent, DragEvent as ReactDragEvent, MouseEvent as ReactMouseEvent, PointerEvent as ReactPointerEvent } from "react";
 import { useNavigate, useParams, useSearchParams } from "react-router-dom";
-import { Group, Video, Clapperboard, FileText, FolderPlus, LayoutTemplate, Boxes, ImagePlus, Pencil } from "lucide-react";
+import { Group, Video, Clapperboard, FileText, FolderPlus, LayoutTemplate, ListChecks, Boxes, ImagePlus, Pencil } from "lucide-react";
 import { saveAs } from "file-saver";
 import { useTranslation } from "react-i18next";
 
@@ -37,6 +37,7 @@ import { CanvasSelectionToolbar } from "@/components/canvas/canvas-selection-too
 import { LapianAssetGroupModal, type LapianAssetGroupOption } from "@/components/canvas/lapian-asset-group-modal";
 import { LapianAssetAttachModal, type LapianAssetAttachImage } from "@/components/canvas/lapian-asset-attach-modal";
 import { LapianPromptTemplateModal } from "@/components/canvas/lapian-prompt-template-modal";
+import { LapianOptionalModal, parseLapianOptional } from "@/components/canvas/lapian-optional-modal";
 import { InfiniteCanvas } from "@/components/canvas/infinite-canvas";
 import { Minimap } from "@/components/canvas/canvas-mini-map";
 import { CanvasNode } from "@/components/canvas/canvas-node";
@@ -272,6 +273,8 @@ function InfiniteCanvasPage() {
     const [lapianBusy, setLapianBusy] = useState(false);
     const [lapianError, setLapianError] = useState("");
     const [lapianTemplateNodeId, setLapianTemplateNodeId] = useState<string | null>(null);
+    // T6-B5 画布侧：拉片可选段勾选（勾了的段渲染提示词时真进正文）。
+    const [lapianOptionalNodeId, setLapianOptionalNodeId] = useState<string | null>(null);
     const [assetGroupConfigNodeId, setAssetGroupConfigNodeId] = useState<string | null>(null);
     const [lapianAttachSlotId, setLapianAttachSlotId] = useState<string | null>(null);
     const [lapianAssetBusy, setLapianAssetBusy] = useState(false);
@@ -932,6 +935,7 @@ function InfiniteCanvasPage() {
 
     const lapianPopoverNode = lapianNodeId ? nodes.find((n) => n.id === lapianNodeId) : null;
     const lapianTemplateNode = lapianTemplateNodeId ? nodes.find((n) => n.id === lapianTemplateNodeId) ?? null : null;
+    const lapianOptionalNode = lapianOptionalNodeId ? nodes.find((n) => n.id === lapianOptionalNodeId) ?? null : null;
     const assetGroupConfigNode = assetGroupConfigNodeId ? nodes.find((n) => n.id === assetGroupConfigNodeId) ?? null : null;
     // T3-D 弹窗数据：画布 Group + 组内资源，用的是生成期同一个 getGroupResourceNodes——界面与请求展开口径一致。
     const lapianAssetGroupOptions = useMemo<LapianAssetGroupOption[]>(() => {
@@ -996,13 +1000,20 @@ function InfiniteCanvasPage() {
 
     // T8/T9：拉片 → 提交正文。默认规范 timeline-narrative（有先例成片）。
     // 剥离「# 附注」节（v4 审计 B-03：附注随提示词提交会在聚鑫链复发——唯一转换点在这里）。
+    // T6-B5 画布侧：源拉片节点 metadata.lapianOptional（勾选的可选段字母）透传 `?optional=`，
+    // 勾了的段才进正文；空/缺省 = 现状行为。generateVideoFromLapianNode 等路径都经这里取数，透传一处收口。
     const lapianPromptPreset = useCallback(
         async (lapianNode: CanvasNodeData): Promise<string> => {
             const taskId = String(lapianNode.metadata?.taskId || "");
             if (!taskId) return "";
+            const optional = parseLapianOptional(String(lapianNode.metadata?.lapianOptional || "")).join(",");
             try {
-                const d = await fetch(`/api/render/${encodeURIComponent(taskId)}/timeline-narrative`).then((r) => r.json());
-                if (!d || d.error) return "";
+                const d = await fetch(`/api/render/${encodeURIComponent(taskId)}/timeline-narrative?optional=${encodeURIComponent(optional)}`).then((r) => r.json());
+                if (!d || d.error) {
+                    // 勾了可选段但渲染失败（如模板没有该可选段）→ 明确提示，再走正文回退，不做黑盒。
+                    if (optional) message.warning(t("canvas.lapianOptional.renderFailed", { error: String(d?.error || "") }));
+                    return "";
+                }
                 const text = String(d.text || "");
                 const cut = text.indexOf("\n# 附注");
                 return (cut >= 0 ? text.slice(0, cut) : text).trim();
@@ -1010,7 +1021,7 @@ function InfiniteCanvasPage() {
                 return "";
             }
         },
-        [],
+        [message, t],
     );
 
     // T7：拉片 → 生成视频（工具栏路径）。Config(视频模式)+连线+开面板+投影预填（剥附注）。
@@ -1323,6 +1334,20 @@ function InfiniteCanvasPage() {
         [lapianTemplateNodeId, message, t],
     );
 
+    // T6-B5 画布侧：可选段勾选落盘（只写源拉片节点 metadata.lapianOptional，不重建节点、不动连线）。
+    // 渲染请求侧（lapianPromptPreset）读它拼 ?optional= 透传；全不勾清成 undefined = 现状行为。
+    const applyLapianOptional = useCallback(
+        (nodeId: string, segments: string[]) => {
+            const ordered = parseLapianOptional(segments.join(","));
+            const stored = ordered.join(",") || undefined;
+            setNodes((prev) => prev.map((node) => (node.id === nodeId ? { ...node, metadata: { ...node.metadata, lapianOptional: stored } } : node)));
+            setLapianOptionalNodeId(null);
+            if (stored) message.success(t("canvas.lapianOptional.applied", { segments: stored }));
+            else message.success(t("canvas.lapianOptional.appliedNone"));
+        },
+        [message, t],
+    );
+
     // T3-D：一键挂载 = 连线（候选集）+ 组装串 token（真的发送）双写。只写连线图片不进请求（路A-A1）。
     const mountAssetGroupToConfig = useCallback(
         (configNodeId: string, groupId: string) => {
@@ -1438,12 +1463,21 @@ function InfiniteCanvasPage() {
     const lapianToolItems = useCallback(
         (node: CanvasNodeData): CanvasNodeToolbarItem[] => {
             if (node.type === CanvasNodeType.Lapian) {
+                // T6-B5 画布侧：【可选段】勾选入口——勾了的段渲染提示词时真进正文（lapianPromptPreset 透传 ?optional=）。
+                const optionalValue = parseLapianOptional(String(node.metadata?.lapianOptional || "")).join(",");
                 return [{
                     id: "wan-lapian-prompt",
                     title: t("canvas.lapianPrompt.createTitle"),
                     label: t("canvas.lapianPrompt.create"),
                     icon: <FileText className="size-4" />,
                     onClick: () => createLapianPromptNodes(node),
+                }, {
+                    id: "wan-lapian-optional",
+                    title: t("canvas.lapianOptional.buttonTitle"),
+                    label: optionalValue ? t("canvas.lapianOptional.buttonActive", { segments: optionalValue }) : t("canvas.lapianOptional.button"),
+                    icon: <ListChecks className="size-4" />,
+                    active: Boolean(optionalValue),
+                    onClick: () => setLapianOptionalNodeId(node.id),
                 }, {
                     id: "wan-lapian-assets",
                     title: t("canvas.lapianAsset.deriveTitle"),
@@ -4168,6 +4202,15 @@ function InfiniteCanvasPage() {
                     templateId={lapianTemplateNode?.metadata?.promptTemplate}
                     onCancel={() => setLapianTemplateNodeId(null)}
                     onConfirm={applyLapianTemplate}
+                />
+
+                <LapianOptionalModal
+                    open={Boolean(lapianOptionalNode)}
+                    value={lapianOptionalNode?.metadata?.lapianOptional}
+                    onCancel={() => setLapianOptionalNodeId(null)}
+                    onConfirm={(segments) => {
+                        if (lapianOptionalNode) applyLapianOptional(lapianOptionalNode.id, segments);
+                    }}
                 />
 
                 <LapianAssetGroupModal

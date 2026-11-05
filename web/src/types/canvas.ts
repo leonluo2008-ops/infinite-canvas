@@ -97,6 +97,8 @@ export type CanvasNodeMetadata = {
     lapianIntent?: boolean;
     /** 拉片派生节点的来源拉片 id（T3-G1）：挂图/摘图时据此重算清单行。 */
     lapianSourceId?: string;
+    /** 可选段（T6-B5 画布侧）：渲染提示词时要打开的可选段字母（如 "A,C"，逗号分隔）；空/缺省 = 全关（现状行为）。 */
+    lapianOptional?: string;
     generationMode?: CanvasGenerationMode;
     generationType?: CanvasImageGenerationType;
     model?: string;
