@@ -2,7 +2,36 @@
   <img src="web/public/logo.svg" width="96" alt="infinite-canvas logo">
 </p>
 
-<h1 align="center">无限画布 (infinite-canvas)</h1>
+<h1 align="center">wan-repro · 电商视频生产画布</h1>
+
+> 基于无限画布（infinite-canvas）二次开发的视频生产工具：参考视频 → 九层拆解 → 提示词 → 生成出片。本分支（`feat/sdgf-video-node`）为交付主线。
+
+## 快速开始
+
+| 操作 | 命令 |
+|---|---|
+| 开发启动 | 仓根双击 `启动开发.bat`（或 `cd web && npm run dev`） |
+| 打包整合包 | 仓根 `npm run bundle` → 同步 `E:/AI/wan-repro-bundle` |
+
+## SDGF 视频模型方言（自动适配，无需配置）
+
+同一聚鑫 SDGF 渠道（`sdapi.jxinai.com`）内按**所选模型**自动切换参数合同：
+
+| 模型 | 画幅生效位 | 声音生效位 | 时长 |
+|---|---|---|---|
+| `SD2.5-满血-GF-480P/720P/1080P` | 顶层 `aspect_ratio` | 顶层 `enableSound` | 4–30s |
+| `sd2.5-*`（ap/zh 系 2.5 代） | `metadata.ratio` | `metadata.enableSound` | 4–30s |
+| `sd2-*` / `sd2.0-*`（2.0 代） | `metadata.ratio` | `metadata.enableSound` | ≤15s（超出自动截断） |
+
+新增模型直接加进渠道即可自动分流；实测依据与合同细节见主仓 `docs/需求-SDGF新模型比例与无声问题-20261105.md` §四。
+
+## 文档
+
+需求 / 适配包 / 路线图 / 审计记录在主仓（文档资产仓）`docs/`；本仓只放代码。
+
+---
+
+# 上游项目：无限画布 (infinite-canvas)
 
 <p align="center">
   <a href="https://linux.do/"><img src="https://img.shields.io/badge/Linux.do-Community-2b6de8?style=flat-square" alt="Linux.do"></a>
