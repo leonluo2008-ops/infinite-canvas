@@ -6,11 +6,15 @@
  * Windows 单目录整合包——`web/`（画布前端）+ `wanrepro/`（引擎运行时）。规则真源：
  * wan-repro 仓 `docs/项目适配包.md` §12；通用方法论：skill `portable-windows-bundle`。
  *
- * 用法（本机，仓库根）：
+ * 用法（本机，仓库根或 web/ 下均可）：
  *   npm run bundle                      # 等价 node scripts/bundle.mjs
  *   npm run bundle:dry                  # 只算清单/体积，不写盘
  *   node scripts/bundle.mjs --out X:/somewhere --skip-web-build
  *   node scripts/bundle.mjs --runtime-from E:/path/to/runtime   # runtime 缺件时从别处补
+ *
+ * 入口唯一：根 package.json 与 web/package.json 的 `bundle` 都指向本文件；
+ * `wanrepro/scripts/build_bundle.py` 是历史上的 python 实现（merge 拷贝、无保留名单），
+ * 已停用，勿再扩改——两套打包器就是双轨漂移。
  *
  * 产物结构：
  *   <out>/app/{pipeline,prompts,templates,library,specs,ui,analyze.py,requirements.txt,web-dist}
@@ -43,7 +47,7 @@ const WEB = path.join(REPO, "web");
 // ---- 清单（改这里必须同步 self-check 项与 DEPLOY-GUIDE）--------------------
 const MANIFEST = {
   // 引擎运行时目录（以「运行时调用图」为准，不以目录观感为准）
-  dirs: ["pipeline", "prompts", "templates", "library", "specs", "ui"],
+  dirs: ["pipeline", "prompts", "templates", "library", "specs", "ui", "spec", "wanrepro"],
   // 根级散件：analyze.py 由 bridge `run_py(["analyze.py", …])` 相对 ROOT 调，漏了=首拆才炸
   files: ["analyze.py", "requirements.txt"],
   webDist: "web-dist",
@@ -393,7 +397,7 @@ function purgeBytecode() {
 }
 
 function scanSecrets() {
-  const roots = ["app/ui", "app/pipeline", "app/prompts", "app/templates", "app/specs", "app/library", "docs", "config", "app/config"];
+  const roots = ["app/ui", "app/pipeline", "app/prompts", "app/templates", "app/specs", "app/library", "app/spec", "app/wanrepro", "docs", "config", "app/config"];
   const patterns = [
     [/sk-[A-Za-z0-9]{20,}/, "疑似 API key（sk-…）"],
     [/Bearer\s+[A-Za-z0-9._\-]{20,}/, "疑似 Bearer token"],
