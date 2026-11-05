@@ -155,7 +155,7 @@ const wait = await loadWaitModule();
 // ---------------------------------------------------------------------------
 const storeSrc = readSrc("src/stores/use-config-store.ts");
 check("ApiCallFormat 含 wan", /export type ApiCallFormat = "openai" \| "gemini" \| "sdgf" \| "wan"/.test(storeSrc), "枚举缺 wan");
-check("defaultBaseUrlForApiFormat(wan) 预填 127.0.0.1:8779", storeSrc.includes(`if (apiFormat === "wan") return "http://127.0.0.1:8779"`), "默认 bridge 地址缺失");
+check("defaultBaseUrlForApiFormat(wan) 同域自适应（window.location.origin，node fallback 8779）", /if \(apiFormat === "wan"\) \{[\s\S]*?window\.location\.origin : "http:\/\/127\.0\.0\.1:8779"/.test(storeSrc), "默认 bridge 地址缺失");
 check("normalizeApiFormat 接受 wan（还原渠道不折叠回 openai）", /if \(apiFormat === "gemini" \|\| apiFormat === "sdgf" \|\| apiFormat === "wan"\) return apiFormat;/.test(storeSrc), "归一缺 wan");
 check("isAiConfigReady：wan 渠道 key 可留空（不校验空）", storeSrc.includes(`match.channel.apiFormat === "wan" || match.channel.apiKey.trim()`), "wan key 豁免缺失");
 
