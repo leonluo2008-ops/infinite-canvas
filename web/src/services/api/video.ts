@@ -9,7 +9,7 @@ import { getMediaBlob, resolveMediaUrl, uploadMediaFile, type UploadedFile } fro
 import { imageToDataUrl } from "@/services/image-storage";
 import { boolConfig, buildApiUrl, modelOptionName, resolveModelRequestConfig, resolveModelScript, withLocalProxy, type AiConfig } from "@/stores/use-config-store";
 import { runModelPlugin } from "./model-plugin";
-import { sdgfRatioFields, sdgfSoundFields } from "./sdgf-payload";
+import { sdgfClampDuration, sdgfRatioFields, sdgfSoundFields } from "./sdgf-payload";
 import type { VideoTaskProvider } from "@/types/canvas";
 import type { ReferenceImage } from "@/types/image";
 import type { ReferenceAudio, ReferenceVideo } from "@/types/media";
@@ -22,7 +22,7 @@ type VideoMediaOptions = RequestOptions & { videos?: ReferenceVideo[]; audios?: 
 const apiText = (key: string, options?: Record<string, unknown>) => i18n.t(`apiErrors.${key}`, options);
 
 export type VideoGenerationResult = { blob?: Blob; url?: string; mimeType?: string };
-export type VideoGenerationTask = { id: string; provider: VideoTaskProvider; model: string };
+export type VideoGenerationTask = { id: string; provider: VideoTaskProvider; model: string; durationClamped?: boolean };
 type GeminiInlineData = { bytesBase64Encoded: string; mimeType: string };
 type GeminiVideoOperation = {
     name?: string;
@@ -218,18 +218,27 @@ async function createSdgfVideoTask(config: AiConfig, model: string, prompt: stri
     const images = await sdgfImageUrls(references, options);
     const modelName = modelOptionName(model);
     // 比例：非满血 GF 名（ap/zh 等聚鑫别名）双写 aspect_ratio+metadata.ratio——V2 实测（720×1278 竖屏）；
-    // 满血 GF 名只发 aspect_ratio，保持十四章合同原样。声音：V3 实测顶层 enableSound:"on" 真有声。
+    // 满血 GF 名只发 aspect_ratio，保持十四章合同原样。
+    // 声音：满血 GF 顶层 enableSound:"on" 生效（V3）；ap 系顶层被静默忽略（V6），生效位是 metadata.enableSound（V7）。
+    // 时长按代际：SD2.0 系旧合同上限 15 秒，超出截断并提示；SD2.5 全系 4–30 原样（services 层不引 UI，用 console.warn + 任务字段）。
     // 实测依据见 docs/需求-SDGF新模型比例与无声问题-20261105.md §四/§五。
     const ratioFields = sdgfRatioFields(modelName, sdgfAspectRatio(config.size || "16:9"));
+    const soundFields = sdgfSoundFields(modelName, boolConfig(config.videoGenerateAudio, true));
+    const requestedDuration = sdgfDuration(config.videoSeconds);
+    const duration = sdgfClampDuration(modelName, requestedDuration);
+    const durationClamped = duration !== requestedDuration;
+    if (durationClamped) console.warn(`SD GF：${modelName} 该模型上限 ${duration} 秒，已按 ${duration} 秒提交（请求 ${requestedDuration} 秒）`);
     const body: Record<string, unknown> = {
         model: modelName,
         prompt,
-        duration: sdgfDuration(config.videoSeconds),
+        duration,
         aspect_ratio: ratioFields.aspect_ratio,
         ...(ratioFields.metadata ? { metadata: ratioFields.metadata } : {}),
         mode: sdgfMode(config.videoMode, images.length),
-        ...sdgfSoundFields(boolConfig(config.videoGenerateAudio, true)),
+        ...(soundFields.enableSound ? { enableSound: soundFields.enableSound } : {}),
     };
+    // ap 系声音的生效位在 metadata：与比例的 metadata 共用同一对象，合并而非覆盖
+    if (soundFields.metadata) body.metadata = { ...(ratioFields.metadata || {}), ...soundFields.metadata };
     if (images.length) body.images = images;
     let created: unknown;
     try {
@@ -246,7 +255,7 @@ async function createSdgfVideoTask(config: AiConfig, model: string, prompt: stri
     const record = (created || {}) as Record<string, unknown>;
     const id = record.id || record.task_id;
     if (typeof id !== "string" || !id) throw new Error("SD GF 未返回任务 ID（提交状态不明——到站内控制台核对，勿重复提交）");
-    return { id, provider: "sdgf", model };
+    return { id, provider: "sdgf", model, ...(durationClamped ? { durationClamped: true } : {}) };
 }
 
 async function pollSdgfVideoTask(config: AiConfig, task: VideoGenerationTask, options?: RequestOptions): Promise<VideoGenerationTaskState> {

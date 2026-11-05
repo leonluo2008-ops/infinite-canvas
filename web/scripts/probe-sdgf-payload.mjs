@@ -6,7 +6,12 @@
  *   ②满血 GF 名（SD2.5-满血-GF-{480,720,1080}P）→ 只有顶层 aspect_ratio，**不带 metadata 键**（十四章合同原样）；
  *   ③文档枚举外比例（4:3 / 3:4 / adaptive）不塞 metadata；
  *   ④声音总开关 SDGF_SEND_SOUND_PARAM=true，且「生成音频」关掉时不发 enableSound（站方默认 off）；
- *   ⑤video.ts 真接线（文本级），防退化成硬编码或把总开关改回 false。
+ *   ⑤video.ts 真接线（文本级），防退化成硬编码或把总开关改回 false；
+ *   ⑥ap 系声音生效位在 metadata.enableSound（V7），顶层不发 enableSound；
+ *   ⑦满血 GF 声音仍在顶层 enableSound，body 不带 metadata 键；
+ *   ⑧关音频 → 两族均不发任何声音字段；
+ *   ⑨旧合同时长上界按代际（SD2.0 系 ≤15 截断 / SD2.5 全系 4–30 原样）；
+ *   ⑩满血 GF 完整 body 字面 fixture 逐键逐序不漂移。
  *
  *   node scripts/probe-sdgf-payload.mjs
  * 任何一条不成立退出码 1。
@@ -76,19 +81,75 @@ for (const ratio of ["4:3", "3:4", "adaptive"]) {
     check(`ap · ${ratio} 顶层保留`, fields.aspect_ratio === ratio, JSON.stringify(fields));
 }
 
-console.log("④ 声音开关语义（总开关 + 面板「生成音频」）");
+console.log("④ 声音开关语义（总开关 + 面板「生成音频」，满血 GF 顶层位）");
 check("SDGF_SEND_SOUND_PARAM 已置 true", mod.SDGF_SEND_SOUND_PARAM === true, String(mod.SDGF_SEND_SOUND_PARAM));
-check("默认（开音频）→ enableSound:'on'", mod.sdgfSoundFields(true).enableSound === "on", JSON.stringify(mod.sdgfSoundFields(true)));
-check("关音频 → 不发 enableSound", !Object.hasOwn(mod.sdgfSoundFields(false), "enableSound"), JSON.stringify(mod.sdgfSoundFields(false)));
-check("总开关关闭 → 不发 enableSound", !Object.hasOwn(mod.sdgfSoundFields(true, false), "enableSound"), JSON.stringify(mod.sdgfSoundFields(true, false)));
-check("总开关关闭 → 即使面板开音频也不发", !Object.hasOwn(mod.sdgfSoundFields(true, false), "enableSound"));
+check("满血 GF 默认（开音频）→ 顶层 enableSound:'on'", mod.sdgfSoundFields(GF720, true).enableSound === "on", JSON.stringify(mod.sdgfSoundFields(GF720, true)));
+check("满血 GF 关音频 → 不发 enableSound", !Object.hasOwn(mod.sdgfSoundFields(GF720, false), "enableSound"), JSON.stringify(mod.sdgfSoundFields(GF720, false)));
+check("总开关关闭 → 不发 enableSound", !Object.hasOwn(mod.sdgfSoundFields(GF720, true, false), "enableSound"), JSON.stringify(mod.sdgfSoundFields(GF720, true, false)));
+check("总开关关闭 → 即使面板开音频也不发（ap 同）", Object.keys(mod.sdgfSoundFields(AP, true, false)).length === 0, JSON.stringify(mod.sdgfSoundFields(AP, true, false)));
 
 console.log("⑤ video.ts 真接线（文本级防退化）");
 const videoSrc = readFileSync(path.join(src, "services/api/video.ts"), "utf8");
 check("createSdgfVideoTask 用 sdgfRatioFields 算比例", /const ratioFields = sdgfRatioFields\(modelName,/.test(videoSrc));
 check("body 带 metadata 条件展开", /\.\.\.\(ratioFields\.metadata \? \{ metadata: ratioFields\.metadata \} : \{\}\)/.test(videoSrc));
-check("body 带声音字段展开", /\.\.\.sdgfSoundFields\(boolConfig\(config\.videoGenerateAudio, true\)\)/.test(videoSrc));
+check("声音字段按模型名分流调用", /const soundFields = sdgfSoundFields\(modelName, boolConfig\(config\.videoGenerateAudio, true\)\);/.test(videoSrc));
+check("body 展开顶层 enableSound（满血 GF 位）", /\.\.\.\(soundFields\.enableSound \? \{ enableSound: soundFields\.enableSound \} : \{\}\)/.test(videoSrc));
+check("声音 metadata 与比例 metadata 合并同一对象", /if \(soundFields\.metadata\) body\.metadata = \{ \.\.\.\(ratioFields\.metadata \|\| \{\}\), \.\.\.soundFields\.metadata \};/.test(videoSrc));
+check("duration 走 sdgfClampDuration", /const duration = sdgfClampDuration\(modelName, requestedDuration\);/.test(videoSrc) && /\n\s+duration,\r?\n/.test(videoSrc));
 check("总开关不再被改回 false", !/const SDGF_SEND_SOUND_PARAM = false/.test(videoSrc));
+
+// body 级断言：与 video.ts createSdgfVideoTask 同构的最小组装器（接线本身由 ⑤ 的文本断言兜住）
+function buildBody(model, { prompt = "probe prompt", seconds = 8, ratio = "16:9", generateAudio = true, mode = "文生视频" } = {}) {
+    const ratioFields = mod.sdgfRatioFields(model, ratio);
+    const soundFields = mod.sdgfSoundFields(model, generateAudio);
+    const body = {
+        model,
+        prompt,
+        duration: mod.sdgfClampDuration(model, seconds),
+        aspect_ratio: ratioFields.aspect_ratio,
+        ...(ratioFields.metadata ? { metadata: ratioFields.metadata } : {}),
+        mode,
+        ...(soundFields.enableSound ? { enableSound: soundFields.enableSound } : {}),
+    };
+    if (soundFields.metadata) body.metadata = { ...(ratioFields.metadata || {}), ...soundFields.metadata };
+    return body;
+}
+
+console.log("⑥ ap 系：声音生效位在 metadata.enableSound（V7），顶层不发");
+const apBody = buildBody(AP, { ratio: "9:16", generateAudio: true });
+check("ap · metadata.enableSound === 'on'", apBody.metadata?.enableSound === "on", JSON.stringify(apBody));
+check("ap · 顶层无 enableSound 键", !Object.hasOwn(apBody, "enableSound"), JSON.stringify(apBody));
+check("ap · metadata 同时带 ratio 与 enableSound（同一对象不互相覆盖）", apBody.metadata?.ratio === "9:16" && apBody.metadata?.enableSound === "on", JSON.stringify(apBody.metadata));
+
+console.log("⑦ 满血 GF：声音仍在顶层，body 不带 metadata 键（合同原样）");
+const gfBody = buildBody(GF720, { ratio: "9:16", generateAudio: true });
+check("GF · 顶层 enableSound === 'on'", gfBody.enableSound === "on", JSON.stringify(gfBody));
+check("GF · body 无 metadata 键", !Object.hasOwn(gfBody, "metadata"), JSON.stringify(gfBody));
+
+console.log("⑧ 关音频：两族均不发任何声音字段");
+for (const model of [AP, GF720]) {
+    const body = buildBody(model, { ratio: "9:16", generateAudio: false });
+    check(`${model} · 顶层无 enableSound`, !Object.hasOwn(body, "enableSound"), JSON.stringify(body));
+    check(`${model} · metadata 无 enableSound`, !Object.hasOwn(body.metadata || {}, "enableSound"), JSON.stringify(body.metadata));
+}
+
+console.log("⑨ 旧合同时长上界按代际（SD2.0 系 ≤15 截断 / SD2.5 全系 4–30 原样）");
+check("SDGF_LEGACY_MAX_SECONDS === 15", mod.SDGF_LEGACY_MAX_SECONDS === 15, String(mod.SDGF_LEGACY_MAX_SECONDS));
+check("sd2.5-720p-ap · 20 → 20（2.5 系不截断）", mod.sdgfClampDuration(AP, 20) === 20, String(mod.sdgfClampDuration(AP, 20)));
+check("sd2.5-720p-ap · 30 → 30", mod.sdgfClampDuration(AP, 30) === 30, String(mod.sdgfClampDuration(AP, 30)));
+check("sd2.5-720p-ap · 12 → 12", mod.sdgfClampDuration(AP, 12) === 12, String(mod.sdgfClampDuration(AP, 12)));
+check("sd2.0-720p-zh · 20 → 15（2.0 旧合同截断）", mod.sdgfClampDuration(ZH, 20) === 15, String(mod.sdgfClampDuration(ZH, 20)));
+check("sd2-720p-ds-v933 · 20 → 15", mod.sdgfClampDuration("sd2-720p-ds-v933", 20) === 15, String(mod.sdgfClampDuration("sd2-720p-ds-v933", 20)));
+check("sd2-720p-ds-v933 · 12 → 12", mod.sdgfClampDuration("sd2-720p-ds-v933", 12) === 12, String(mod.sdgfClampDuration("sd2-720p-ds-v933", 12)));
+check("SD2.5-满血-GF-720P · 20 → 20", mod.sdgfClampDuration(GF720, 20) === 20, String(mod.sdgfClampDuration(GF720, 20)));
+check("SD2.5-满血-GF-720P · 30 → 30", mod.sdgfClampDuration(GF720, 30) === 30, String(mod.sdgfClampDuration(GF720, 30)));
+
+console.log("⑩ 满血 GF 完整 body 字面 fixture 不漂移（改动前后逐键一致）");
+const GF_FIXTURE = { model: GF720, prompt: "probe prompt", duration: 20, aspect_ratio: "9:16", mode: "文生视频", enableSound: "on" };
+const gfFixtureBody = buildBody(GF720, { seconds: 20, ratio: "9:16" });
+check("GF fixture 键集合一致", JSON.stringify(Object.keys(gfFixtureBody).sort()) === JSON.stringify(Object.keys(GF_FIXTURE).sort()), JSON.stringify(Object.keys(gfFixtureBody)));
+check("GF fixture 逐键取值一致", JSON.stringify(gfFixtureBody) === JSON.stringify(GF_FIXTURE), JSON.stringify(gfFixtureBody));
+check("GF fixture 键序一致（无新增字段、无挪位）", Object.keys(gfFixtureBody).join(",") === "model,prompt,duration,aspect_ratio,mode,enableSound", Object.keys(gfFixtureBody).join(","));
 
 console.log(`\n${passed} 通过 / ${failures.length} 失败`);
 if (failures.length) {
