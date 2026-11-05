@@ -6,7 +6,7 @@ import { nanoid } from "nanoid";
 import i18n from "@/i18n";
 import { normalizeLapianDefaultModel, normalizeLapianModelList } from "@/lib/canvas/lapian-model";
 
-export type ApiCallFormat = "openai" | "gemini" | "sdgf";  // sdgf=聚鑫 SD GF 统一视频 API（/v1/videos）
+export type ApiCallFormat = "openai" | "gemini" | "sdgf" | "wan"; // sdgf=聚鑫 SD GF 统一视频 API（/v1/videos）；wan=万相 CLI bridge（/api/wan/video/*）
 export type ModelCapability = "image" | "video" | "text" | "audio";
 export type ReasoningEffort = "auto" | "low" | "medium" | "high" | "xhigh";
 
@@ -216,7 +216,8 @@ export function resolveModelScript(config: AiConfig, value: string) {
 
 function isAiConfigReady(config: AiConfig, model: string) {
     const match = findChannelModel(config, model);
-    return Boolean(match && match.channel.baseUrl.trim() && match.channel.apiKey.trim());
+    // wan（万相 CLI bridge）不需要 API Key——key 可任意留空，只认 bridge 地址；其余格式维持 key 必填
+    return Boolean(match && match.channel.baseUrl.trim() && (match.channel.apiFormat === "wan" || match.channel.apiKey.trim()));
 }
 
 export const useConfigStore = create<ConfigStore>()(
@@ -486,11 +487,12 @@ function normalizeChannels(config: AiConfig) {
 export function defaultBaseUrlForApiFormat(apiFormat: ApiCallFormat) {
     if (apiFormat === "gemini") return GEMINI_BASE_URL;
     if (apiFormat === "sdgf") return "https://sdapi.jxinai.com";
+    if (apiFormat === "wan") return "http://127.0.0.1:8779"; // 宿主 bridge（画布 vite proxy /api 同域转发，前端实际走相对路径）
     return OPENAI_BASE_URL;
 }
 
 function normalizeApiFormat(apiFormat: unknown): ApiCallFormat {
-    if (apiFormat === "gemini" || apiFormat === "sdgf") return apiFormat;
+    if (apiFormat === "gemini" || apiFormat === "sdgf" || apiFormat === "wan") return apiFormat;
     return "openai";
 }
 

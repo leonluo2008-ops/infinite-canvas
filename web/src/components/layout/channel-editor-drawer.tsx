@@ -18,6 +18,7 @@ export function ChannelEditorDrawer({ open, channel, onSave, onClose }: { open: 
         { label: "OpenAI", value: "openai" },
         { label: "Gemini", value: "gemini" },
         { label: "SD GF（聚鑫统一视频）", value: "sdgf" },
+        { label: t("config.channelEditor.formats.wan"), value: "wan" },
     ];
     const capabilityOptions: Array<{ label: string; value: ModelCapability }> = ["image", "video", "text", "audio"].map((value) => ({ label: t(`config.channelEditor.capabilities.${value}`), value: value as ModelCapability }));
 
@@ -32,7 +33,9 @@ export function ChannelEditorDrawer({ open, channel, onSave, onClose }: { open: 
 
     const changeApiFormat = (apiFormat: ApiCallFormat) => {
         const baseUrl = !draft.baseUrl.trim() || draft.baseUrl.trim() === defaultBaseUrlForApiFormat(draft.apiFormat) ? defaultBaseUrlForApiFormat(apiFormat) : draft.baseUrl;
-        patch({ apiFormat, baseUrl });
+        // wan（万相 CLI bridge）：模型列表为空时预填建议模型（wan-omni2video，视频能力），不给空列表卡住渠道选择
+        const models = apiFormat === "wan" && !draft.models.length ? [{ name: "wan-omni2video", capability: "video" as const }] : draft.models;
+        patch({ apiFormat, baseUrl, models });
     };
 
     const applySelection = (names: string[]) => {

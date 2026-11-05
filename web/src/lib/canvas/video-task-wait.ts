@@ -69,7 +69,7 @@ export function storedVideoTaskProvider(provider: VideoTaskProvider): VideoTaskP
  * 从节点 metadata 恢复轮询 provider：存的原值直接用；缺失/未知/老数据回退 openai（维持旧行为）。
  */
 export function resumedVideoTaskProvider(provider: unknown): VideoTaskProvider {
-    return provider === "openai" || provider === "gemini" || provider === "plugin" || provider === "sdgf" ? provider : "openai";
+    return provider === "openai" || provider === "gemini" || provider === "plugin" || provider === "sdgf" || provider === "wan" ? provider : "openai";
 }
 
 /**

@@ -81,6 +81,7 @@ export async function createVideoGenerationTask(config: AiConfig, prompt: string
     const requestConfig = resolveModelRequestConfig(config, selectedModel);
     const script = resolveModelScript(config, selectedModel);
     if (script) return createPluginVideoTask(requestConfig, selectedModel, script, prompt, references, options);
+    if (requestConfig.apiFormat === "wan") return createWanVideoTask(requestConfig, selectedModel, prompt, references, options);
     assertVideoConfig(requestConfig, requestConfig.model);
     if (requestConfig.apiFormat === "sdgf") return createSdgfVideoTask(requestConfig, selectedModel, prompt, references, options);
     if (requestConfig.apiFormat === "gemini") return createGeminiVideoTask(requestConfig, selectedModel, prompt, references, options);
@@ -93,6 +94,11 @@ export async function pollVideoGenerationTask(config: AiConfig, task: VideoGener
         return result ? { status: "completed", result } : { status: "failed", error: apiText("pluginVideoExpired") };
     }
     const requestConfig = resolveModelRequestConfig(config, task.model);
+    if (task.provider === "wan") {
+        // wan 的 key 可任意留空，不能走要求 apiKey 的 assertVideoConfig
+        assertWanVideoConfig(requestConfig, requestConfig.model);
+        return pollWanVideoTask(requestConfig, task, options);
+    }
     assertVideoConfig(requestConfig, requestConfig.model);
     if (task.provider === "gemini") return pollGeminiVideoTask(requestConfig, task, options);
     if (task.provider === "sdgf") return pollSdgfVideoTask(requestConfig, task, options);
@@ -263,6 +269,112 @@ async function pollSdgfVideoTask(config: AiConfig, task: VideoGenerationTask, op
         return { status: "pending" };
     } catch (error) {
         throw new Error(readAxiosError(error, "SD GF 任务查询失败（沿用同一任务 ID 重查，勿重新创建）"));
+    }
+}
+
+// ---- 万相 CLI（宿主 bridge，wan-repro）-------------------------------------------
+// 合同（bridge 侧并行开发，三端点固定）：
+//   POST {base}/api/wan/video/run    body {prompt, images:[{name,dataUrl}], duration, ratio, resolution, audio, confirm:true} → {job, taskId}
+//   GET  {base}/api/wan/video/job/{job}   → {status: running|done|failed, stage, elapsed, error?}
+//   GET  {base}/api/wan/video/file/{taskId} → video/mp4
+// 本机 bridge 走画布 vite proxy 同域相对路径（/api → 127.0.0.1:8779），免 CORS、公网隧道部署同样可用；
+// baseUrl 是非回环地址（远程 bridge）时才绝对直连。SDGF 专用校验（时长 4–30 硬拒、比例白名单、mode 枚举）对本分支不生效，
+// 参数直接从画布配置映射；两段式确认由画布生成流程自身承担，confirm 恒 true。
+// videoTaskId 透存 jobId；taskId（成片文件 ID）只随 run 返回一次——job→taskId 映射落 localStorage，
+// 页面刷新后的重查仍能拉到成片（pluginVideoResults 的纯内存 Map 刷新即失效，这里必须活过刷新）。
+
+const WAN_FILE_TASK_STORE_KEY = "wan_video_file_tasks";
+const wanVideoFileTasks = new Map<string, string>(); // job → taskId
+
+function rememberWanFileTask(job: string, taskId: string) {
+    if (!job || !taskId) return;
+    wanVideoFileTasks.set(job, taskId);
+    try {
+        if (typeof localStorage === "undefined") return;
+        localStorage.setItem(WAN_FILE_TASK_STORE_KEY, JSON.stringify(Object.fromEntries([...wanVideoFileTasks.entries()].slice(-200))));
+    } catch {
+        // 隐私模式等存不进就算了——本会话 Map 仍可用
+    }
+}
+
+function recallWanFileTask(job: string): string {
+    if (wanVideoFileTasks.has(job)) return wanVideoFileTasks.get(job) || "";
+    try {
+        if (typeof localStorage !== "undefined") {
+            const raw = localStorage.getItem(WAN_FILE_TASK_STORE_KEY);
+            const parsed: unknown = raw ? JSON.parse(raw) : null;
+            if (parsed && typeof parsed === "object") for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) wanVideoFileTasks.set(key, String(value));
+        }
+    } catch {
+        // 坏载荷当不存在
+    }
+    return wanVideoFileTasks.get(job) || "";
+}
+
+// 回环 bridge（含默认 127.0.0.1:8779）→ 相对路径走 vite proxy /api；远程 bridge → 绝对地址直连
+function wanVideoUrl(config: Pick<AiConfig, "baseUrl">, path: string) {
+    const base = config.baseUrl.trim().replace(/\/+$/, "");
+    const isLoopback = !base || /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$/i.test(base);
+    return withLocalProxy(`${isLoopback ? "" : base}/api/wan/video${path}`);
+}
+
+function assertWanVideoConfig(config: AiConfig, model: string) {
+    // wan 不校验 API Key（key 可任意留空）；只认模型 + bridge 地址
+    if (!model) throw new Error(apiText("videoModelRequired"));
+    if (!config.baseUrl.trim()) throw new Error(apiText("wanBridgeRequired"));
+}
+
+function wanDuration(seconds: string): number {
+    return Number(clampVideoSeconds(seconds)) || 6;
+}
+
+async function createWanVideoTask(config: AiConfig, model: string, prompt: string, references: ReferenceImage[], options?: VideoMediaOptions): Promise<VideoGenerationTask> {
+    assertWanVideoConfig(config, model);
+    const images = await Promise.all(references.map(async (image, index) => ({ name: image.name || `ref-${index + 1}.png`, dataUrl: await imageToDataUrl(image) })));
+    const body: Record<string, unknown> = {
+        prompt,
+        images,
+        duration: wanDuration(config.videoSeconds),
+        ratio: videoAspectRatio(config.size || "16:9"),
+        resolution: normalizeVideoResolution(config.vquality),
+        audio: boolConfig(config.videoGenerateAudio, true),
+        confirm: true,
+    };
+    let created: unknown;
+    try {
+        created = (await axios.post<Record<string, unknown>>(wanVideoUrl(config, "/run"), body, { headers: { "Content-Type": "application/json" }, signal: options?.signal, timeout: 300000 })).data;
+    } catch (error) {
+        // 与 SDGF 同款排障透出：响应体全文 + 请求体快照（images 摘要、prompt 截断）——run 触发真实生成，状态不明时勿重复提交
+        let detail = readAxiosError(error, apiText("wanVideoCreateFailed"));
+        if (axios.isAxiosError(error) && error.response?.data !== undefined) {
+            try { detail += ` | 响应体: ${JSON.stringify(error.response.data).slice(0, 400)}`; } catch { /* 不可序列化则略 */ }
+        }
+        const snapshot = { ...body, images: `${images.length} 张`, prompt: `${prompt.slice(0, 80)}…(共${prompt.length}字)` };
+        throw new Error(`${detail} | 请求体: ${JSON.stringify(snapshot)}`);
+    }
+    const record = (created || {}) as Record<string, unknown>;
+    const job = typeof record.job === "string" ? record.job.trim() : "";
+    const fileTaskId = typeof record.taskId === "string" ? record.taskId.trim() : "";
+    if (!job) throw new Error(apiText("wanVideoNoJob"));
+    rememberWanFileTask(job, fileTaskId);
+    return { id: job, provider: "wan", model };
+}
+
+async function pollWanVideoTask(config: AiConfig, task: VideoGenerationTask, options?: RequestOptions): Promise<VideoGenerationTaskState> {
+    try {
+        const raw = (await axios.get<Record<string, unknown>>(wanVideoUrl(config, `/job/${encodeURIComponent(task.id)}`), { signal: options?.signal })).data;
+        const status = String(raw?.status || "");
+        if (status === "failed") return { status: "failed", error: readApiErrorMessage(raw?.error) || apiText("wanVideoFailed") };
+        if (status === "done") {
+            const fileTaskId = recallWanFileTask(task.id);
+            if (!fileTaskId) throw new Error(apiText("wanVideoFileMissing"));
+            const content = await axios.get<Blob>(wanVideoUrl(config, `/file/${encodeURIComponent(fileTaskId)}`), { responseType: "blob", signal: options?.signal });
+            await assertVideoBlob(content.data);
+            return { status: "completed", result: { blob: content.data } };
+        }
+        return { status: "pending" };
+    } catch (error) {
+        throw new Error(readAxiosError(error, apiText("wanVideoQueryFailed")));
     }
 }
 

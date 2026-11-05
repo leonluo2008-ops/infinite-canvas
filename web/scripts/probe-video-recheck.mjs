@@ -1,5 +1,5 @@
 /**
- * M6-T6 SDGF 假失败修复探针（provider 四值透存 / 瞬态 failed 复核 / 失败节点重查入口）。
+ * M6-T6 SDGF 假失败修复探针（provider 五值透存（含 wan） / 瞬态 failed 复核 / 失败节点重查入口）。
  *
  * 直接转译真模块（esbuild 打包 src/lib/canvas/video-task-wait.ts，注入假 poll/delay，
  * 不走网络、不连 bridge、不花钱、不出网）；接线层（project.tsx / video.ts / 工具栏 / i18n）
@@ -94,15 +94,16 @@ equal("sdgf 复核连败阈值 3", mod.SDGF_FAILED_RECHECK_LIMIT, 3);
 equal("sdgf 复核间隔 8000ms", mod.SDGF_FAILED_RECHECK_DELAY_MS, 8000);
 
 // ---------------------------------------------------------------------------
-// 2. provider 四值透存不折叠
+// 2. provider 五值透存不折叠（wan=万相 CLI bridge，2026-11-05 加）
 // ---------------------------------------------------------------------------
-for (const provider of ["openai", "gemini", "plugin", "sdgf"]) {
+for (const provider of ["openai", "gemini", "plugin", "sdgf", "wan"]) {
     equal(`创建回写透存 ${provider} 原值`, mod.storedVideoTaskProvider(provider), provider);
 }
 equal("恢复：sdgf 原值恢复（本次事故根因）", mod.resumedVideoTaskProvider("sdgf"), "sdgf");
 equal("恢复：gemini 原值恢复", mod.resumedVideoTaskProvider("gemini"), "gemini");
 equal("恢复：openai 原值恢复", mod.resumedVideoTaskProvider("openai"), "openai");
 equal("恢复：plugin 原值恢复", mod.resumedVideoTaskProvider("plugin"), "plugin");
+equal("恢复：wan 原值恢复", mod.resumedVideoTaskProvider("wan"), "wan");
 equal("恢复：老数据缺 provider 回退 openai", mod.resumedVideoTaskProvider(undefined), "openai");
 equal("恢复：脏数据回退 openai", mod.resumedVideoTaskProvider("junk"), "openai");
 equal("恢复：null 回退 openai", mod.resumedVideoTaskProvider(null), "openai");
@@ -180,7 +181,7 @@ check("project.tsx 不再有任何 gemini/openai 三元折叠", !projectSrc.incl
 check("project.tsx 重查路由：有 taskId 先 pollVideoNodeTask（不重新创建）", /hasResumableVideoTask\(node\)[\s\S]{0,120}await pollVideoNodeTask\(node\)/.test(projectSrc), "重查路由缺失");
 
 const canvasTypes = readSrc("src/types/canvas.ts");
-check("metadata.videoTaskProvider 放宽为四值联合", canvasTypes.includes("videoTaskProvider?: VideoTaskProvider") && /export type VideoTaskProvider = "openai" \| "gemini" \| "plugin" \| "sdgf"/.test(canvasTypes), "类型未放宽");
+check("metadata.videoTaskProvider 放宽为五值联合（含 wan）", canvasTypes.includes("videoTaskProvider?: VideoTaskProvider") && /export type VideoTaskProvider = "openai" \| "gemini" \| "plugin" \| "sdgf" \| "wan"/.test(canvasTypes), "类型未放宽");
 
 const videoSrc = readSrc("src/services/api/video.ts");
 check("video.ts 等待循环委托给纯逻辑层 waitForVideoTaskOutput", videoSrc.includes("waitForVideoTaskOutput({") && videoSrc.includes("provider: task.provider,"), "委托缺失");

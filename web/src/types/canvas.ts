@@ -23,8 +23,8 @@ export enum CanvasNodeType {
 export type CanvasNodeTypeId = CanvasNodeType | (string & {});
 
 export type CanvasNodeStatus = "idle" | "success" | "loading" | "error";
-/** 视频生成任务的后端协议四值（与 services/api/video.ts 任务 provider 对齐）；sdgf=聚鑫 SD GF 统一视频 API。 */
-export type VideoTaskProvider = "openai" | "gemini" | "plugin" | "sdgf";
+/** 视频生成任务的后端协议五值（与 services/api/video.ts 任务 provider 对齐）；sdgf=聚鑫 SD GF 统一视频 API；wan=万相 CLI bridge。 */
+export type VideoTaskProvider = "openai" | "gemini" | "plugin" | "sdgf" | "wan";
 export type CanvasGenerationMode = "text" | "image" | "video" | "audio";
 export type CanvasImageGenerationType = "generation" | "edit";
 
