@@ -1,0 +1,10 @@
+{
+  "name": "wan-repro-canvas",
+  "version": "0.1.0",
+  "private": true,
+  "description": "infinite-canvas fork（wan-repro 交付分支）：画布前端在 web/，引擎运行时在 wanrepro/，整合包打包器在 scripts/bundle.mjs",
+  "scripts": {
+    "bundle": "node scripts/bundle.mjs",
+    "bundle:dry": "node scripts/bundle.mjs --dry-run"
+  }
+}
