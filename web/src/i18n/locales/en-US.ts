@@ -6,6 +6,7 @@ export default {
     theme: { toggle: "Toggle theme" },
     common: {
         cancel: "Cancel",
+        confirm: "Confirm",
         save: "Save",
         edit: "Edit",
         done: "Done",
@@ -370,6 +371,8 @@ export default {
             applied: "Optional sections saved: {{segments}}",
             appliedNone: "Optional sections cleared (back to default)",
             renderFailed: "Rendering with optional sections failed: {{error}} — falling back to the raw breakdown text this time",
+            presetFetchFailed: "Projection render request failed: {{error}} — falling back to the raw breakdown text this time",
+            missingTask: "Breakdown node has no task ID; projection unavailable — falling back to the raw breakdown text this time",
         },
         reverseComposer: "Reference image: @[node:{{imageId}}]\nTask: @[node:{{textId}}]",
         editors: {

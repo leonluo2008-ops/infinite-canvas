@@ -3,7 +3,7 @@
  *
  * 这里的正文不是「终稿提示词」，而是写进「转换指令」文本节点的任务书：
  * 生成期配置节点把拉片正文与指令正文一起贴进请求（canvas-node-generation.ts buildComposerGenerationContext），
- * 模型按本指令把九层 IR 改写成一条可提交的视频提示词。
+ * 模型按本指令把十层 IR 改写成一条可提交的视频提示词。
  *
  * 模板结构依据 wan-repro 仓 templates/*.md（lumi-4section / timeline-narrative /
  * employee-checklist / seven-section / seedance-flow）；本文件只存「怎么改写」的指令，
@@ -41,7 +41,7 @@ const REFERENCE_RULES = `# 参考图怎么用
 输入里的「# 附注」小节、模板依据说明、字段名回显都只当背景，不写进输出。`;
 
 const TASK_PREAMBLE = (structureName: string) => `# 任务
-你会收到这段拉片正文：目标片子的九层拆解（场景 / 产品 / 光影 / 镜头 / 运动 / 意境 / 分镜表 / 声音 / 资产）。
+你会收到这段拉片正文：目标片子的十层拆解（场景 / 产品 / 光影 / 镜头 / 运动 / 意境 / 分镜表 / 声音 / 资产）。
 把它改写成一条可直接提交给视频生成模型的提示词：保留原片的创意与镜头语言，主体换成我们自己的产品与人物。
 骨架按「${structureName}」写，段落顺序与标题不要改。`;
 

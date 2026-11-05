@@ -653,6 +653,39 @@ function InfiniteCanvasPage() {
         [message, t],
     );
 
+    // T8/T9：拉片 → 提交正文。默认规范 timeline-narrative（有先例成片）。
+    // 剥离「# 附注」节（v4 审计 B-03：附注随提示词提交会在聚鑫链复发——唯一转换点在这里）。
+    // T6-B5 画布侧：源拉片节点 metadata.lapianOptional（勾选的可选段字母）透传 `?optional=`，
+    // 勾了的段才进正文；空/缺省 = 现状行为。generateVideoFromLapianNode 等路径都经这里取数，透传一处收口。
+    // （T6-F4①：定义上移到 createConnectedNode 之前——它要进后者的 deps 数组，声明顺序必须在前。）
+    const lapianPromptPreset = useCallback(
+        async (lapianNode: CanvasNodeData): Promise<string> => {
+            const taskId = String(lapianNode.metadata?.taskId || "");
+            if (!taskId) {
+                // 没有任务号拉不了投影（旧节点/异常节点）——明示后再回退正文，不做黑盒（T6-F4①）。
+                message.warning(t("canvas.lapianOptional.missingTask"));
+                return "";
+            }
+            const optional = parseLapianOptional(String(lapianNode.metadata?.lapianOptional || "")).join(",");
+            try {
+                const d = await fetch(`/api/render/${encodeURIComponent(taskId)}/timeline-narrative?optional=${encodeURIComponent(optional)}`).then((r) => r.json());
+                if (!d || d.error) {
+                    // 渲染失败（如模板没有该可选段/任务不在数据根里）→ 明确提示，再走正文回退，不做黑盒。
+                    message.warning(t("canvas.lapianOptional.renderFailed", { error: String(d?.error || "") }));
+                    return "";
+                }
+                const text = String(d.text || "");
+                const cut = text.indexOf("\n# 附注");
+                return (cut >= 0 ? text.slice(0, cut) : text).trim();
+            } catch (e) {
+                // 网络层失败（代理断/服务挂）同样出提示——静默吞掉=黑盒回退（T6-F4① 抓到的现场）。
+                message.warning(t("canvas.lapianOptional.presetFetchFailed", { error: String((e as Error)?.message || e) }));
+                return "";
+            }
+        },
+        [message, t],
+    );
+
     const createConnectedNode = useCallback(
         (type: CanvasNodeType.Image | CanvasNodeType.Text | CanvasNodeType.Config | CanvasNodeType.Video | CanvasNodeType.Audio | CanvasNodeType.Lapian, pending: PendingConnectionCreate) => {
             // 拉线路径：视频 →（拉线）→ 拉片。不直接建节点：先弹意图弹层，执行后才建（独立任务语义）。
@@ -692,7 +725,7 @@ function InfiniteCanvasPage() {
             setPendingConnectionCreate(null);
             setConnecting(null);
         },
-        [effectiveConfig.canvasImageCount, effectiveConfig.count, effectiveConfig.imageModel, effectiveConfig.model, effectiveConfig.size, message, setConnecting, t],
+        [effectiveConfig.canvasImageCount, effectiveConfig.count, effectiveConfig.imageModel, effectiveConfig.model, effectiveConfig.size, lapianPromptPreset, message, setConnecting, t],
     );
 
     const cancelPendingConnectionCreate = useCallback(() => {
@@ -912,7 +945,7 @@ function InfiniteCanvasPage() {
                         id: lapId,
                         type: CanvasNodeType.Lapian,
                         title: `拉片 · ${up.id}`,
-                        position: dropPosition ?? { x: videoNode.position.x, y: videoNode.position.y + (videoNode.height || 236) + 48 },  // 拉线落点优先；默认视频正下方
+                        position: dropPosition ?? { x: videoNode.position.x + (videoNode.width || 240) + 96, y: videoNode.position.y },  // 拉线落点优先；默认视频右侧（从左到右规范）
                         width: size.width,
                         height: size.height,
                         metadata: { taskId: up.id, jobId: String(run.job || ""), intent, lapPhase: "loading" },  // 不用 status（二开仓通用 loading/error 分支会拦截内容渲染）
@@ -997,32 +1030,6 @@ function InfiniteCanvasPage() {
             return null;
         }
     }, []);
-
-    // T8/T9：拉片 → 提交正文。默认规范 timeline-narrative（有先例成片）。
-    // 剥离「# 附注」节（v4 审计 B-03：附注随提示词提交会在聚鑫链复发——唯一转换点在这里）。
-    // T6-B5 画布侧：源拉片节点 metadata.lapianOptional（勾选的可选段字母）透传 `?optional=`，
-    // 勾了的段才进正文；空/缺省 = 现状行为。generateVideoFromLapianNode 等路径都经这里取数，透传一处收口。
-    const lapianPromptPreset = useCallback(
-        async (lapianNode: CanvasNodeData): Promise<string> => {
-            const taskId = String(lapianNode.metadata?.taskId || "");
-            if (!taskId) return "";
-            const optional = parseLapianOptional(String(lapianNode.metadata?.lapianOptional || "")).join(",");
-            try {
-                const d = await fetch(`/api/render/${encodeURIComponent(taskId)}/timeline-narrative?optional=${encodeURIComponent(optional)}`).then((r) => r.json());
-                if (!d || d.error) {
-                    // 勾了可选段但渲染失败（如模板没有该可选段）→ 明确提示，再走正文回退，不做黑盒。
-                    if (optional) message.warning(t("canvas.lapianOptional.renderFailed", { error: String(d?.error || "") }));
-                    return "";
-                }
-                const text = String(d.text || "");
-                const cut = text.indexOf("\n# 附注");
-                return (cut >= 0 ? text.slice(0, cut) : text).trim();
-            } catch {
-                return "";
-            }
-        },
-        [message, t],
-    );
 
     // T7：拉片 → 生成视频（工具栏路径）。Config(视频模式)+连线+开面板+投影预填（剥附注）。
     const generateVideoFromLapianNode = useCallback(
@@ -1534,10 +1541,28 @@ function InfiniteCanvasPage() {
                 title: "生成视频：用拉片结果作提示词",
                 label: "生成视频",
                 icon: <Video className="size-4" />,
-                onClick: () => generateVideoFromLapianNode(node),
+                onClick: () => {
+                    // T6-F4①：以前直接把视频节点传给 generateVideoFromLapianNode——视频节点没有
+                    // taskId（有的只是 Text→Video 改型残留的 content），lapianPromptPreset 走 !taskId
+                    // 静默回退，预填变成投影原文且零 /api/render 请求。改为先找该视频下游的拉片节点，
+                    // 从拉片结果派生；没有/有多条拉片连线都明示中止，不猜。
+                    const lapianChildren = connectionsRef.current
+                        .filter((connection) => connection.fromNodeId === node.id)
+                        .map((connection) => nodesRef.current.find((item) => item.id === connection.toNodeId))
+                        .filter((item): item is CanvasNodeData => item?.type === CanvasNodeType.Lapian && Boolean(item.metadata?.content));
+                    if (!lapianChildren.length) {
+                        message.warning("先对这个视频跑拉片——出了拉片结果再生成视频");
+                        return;
+                    }
+                    if (lapianChildren.length > 1) {
+                        message.warning("这个视频有不止一条拉片结果——只保留一条拉片连线再生成视频");
+                        return;
+                    }
+                    generateVideoFromLapianNode(lapianChildren[0]);
+                },
             }];
         },
-        [createLapianAssetSlots, createLapianPromptNodes, generateVideoFromLapianNode, t],
+        [createLapianAssetSlots, createLapianPromptNodes, generateVideoFromLapianNode, message, t],
     );
 
     // T3-E 入口：终稿（普通文本节点）才有【生成视频】；带 promptTemplate 的是转换指令节点，

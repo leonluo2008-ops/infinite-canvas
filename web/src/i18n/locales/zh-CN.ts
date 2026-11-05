@@ -6,6 +6,7 @@ export default {
     theme: { toggle: "切换主题" },
     common: {
         cancel: "取消",
+        confirm: "确认",
         save: "保存",
         edit: "编辑",
         done: "完成",
@@ -370,6 +371,8 @@ export default {
             applied: "已保存可选段：{{segments}}",
             appliedNone: "可选段已全部取消（保持现状）",
             renderFailed: "可选段渲染失败：{{error}}——这次先用拉片正文兜底",
+            presetFetchFailed: "投影渲染请求失败：{{error}}——这次先用拉片正文兜底",
+            missingTask: "拉片节点缺少任务号，拉不到投影——这次先用拉片正文兜底",
         },
         reverseComposer: "参考图片：@[node:{{imageId}}]\n任务说明：@[node:{{textId}}]",
         editors: {
