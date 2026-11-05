@@ -1,17 +1,14 @@
 /**
- * 运镜覆盖度探针（B4a″/B4b′/B4c′，纯文本 + 纯函数，不连渠道、不花钱）。
+ * 运镜覆盖度探针（B4a″/B4b′/B4c′/B7，纯文本 + 纯函数，不连渠道、不花钱）。
  *
  * 转译真模块 web/src/lib/canvas/camera-coverage.ts（esbuild 打包后 import），断言口径：
- *   ① 三条有值调度行（推 / 跟 / 固定机位）+ 产物只有推与跟 → covered 2 / total 3、missing 含「固定机位」；
- *   ② 全部〔缺字段〕（兜底文字里带「推」「固定机位」）→ total 0，兜底不算命中；
- *   ③ 「移动/移步/移位」不是运镜：调度行只有这些词、产物也写「移动」→ total 0 不计；
- *   ④ covered === total 时计数照样正确（不因全绿而丢 total）；
- *   ⑤ 格式容错：`- 镜头调度：` / `**镜头调度**：` / 半角冒号 / 无项目符号都认；
- *   ⑥ 整词族不重复计：「平移」只算一个词，不再被单字「移」加一次；「机位固定」算命中；
- *   ⑦ 真实拉片 fixture（画布 pop-1-3 四镜原文）：4 条调度行 → total 3（镜3 无运镜词不进分母）；
- *   ⑧ 旧格式拉片（pop3test，7/7 镜〔缺字段〕）→ total 0，不虚报；
- *   ⑨ 接线没退化成空转：project.tsx 两处落盘都调 cameraCoverage、canvas-node.tsx 挂角标、
- *     types/canvas.ts 有字段、角标对 undefined / total 0 静默。
+ *   A 段 老口径回归（B7b 换标准词表后逐条重算，改过期望值的地方都写了理由）：
+ *     A1 三条有值调度行 + 产物缺词族；A2 全部〔缺字段〕兜底不算；A3「移动/移步/移位」不是运镜；
+ *     A4 covered === total 计数正确；A5 格式容错；A6 整词族不重复计；
+ *     A7 真实 fixture（画布 pop-1-3 四镜原文）；A8 旧格式拉片（pop3test 7/7 缺字段）；
+ *     A9 接线没退化成空转（project.tsx / canvas-node.tsx / types/canvas.ts）。
+ *   B 段 B7c 新八条：标准词表 + 兼容层 + 镜头主语窗（产物侧误命中防线）。
+ *   C 段 三源一致：拆解 prompt 两处词表段逐字相同、改写契约沿用条款、coverage 词表同源。
  *
  *   node scripts/probe-camera-coverage.mjs
  * 任何一条不成立退出码 1。
@@ -52,54 +49,63 @@ function check(name, condition, detail) {
 }
 const show = (value) => JSON.stringify(value);
 
-console.log("① 三条有值调度行 + 产物缺一个词族");
+console.log("A1 三条有值调度行 + 产物缺词族");
 const threeLines = ["【拉片段 01】", "0-1秒｜原片镜1", "- 镜头调度：低机位起幅缓慢推近，特写", "1-2秒｜原片镜2", "- 镜头调度：手持稳定跟随人物前行，中景", "2-3秒｜原片镜3", "- 镜头调度：固定机位平视，全景"].join("\n");
 const productMissingOne = "镜头从低机位缓推靠近，随后稳定跟随人物，浅景深电影感。";
 const case1 = cameraCoverage(threeLines, productMissingOne);
-check("total === 3", case1.total === 3, show(case1));
-check("covered === 2", case1.covered === 2, show(case1));
-check("missing 含「固定机位」且只有它", case1.missing.length === 1 && case1.missing[0] === "固定机位", show(case1.missing));
+// B7b 口径变更重算：原期望 total 3 / covered 2 / missing 一个「固定机位」。
+// 标准词表把「低机位」「平视」「手持」这些机位状态词也收进镜头运动列，分母从 3 变 6；
+// 「推近」认基础族「推」（产物写「缓推靠近」），所以 covered 3。
+check("total === 6", case1.total === 6, show(case1));
+check("covered === 3", case1.covered === 3, show(case1));
+check("missing 是 手持 / 固定机位 / 平视", show(case1.missing) === show(["手持", "固定机位", "平视"]), show(case1.missing));
 
-console.log("② 全部〔缺字段〕：兜底文字里的运镜词不算，分母 0");
+console.log("A2 全部〔缺字段〕：兜底文字里的运镜词不算，分母 0");
 const missingField = ["- 镜头调度：〔缺字段〕（表无镜头列；五层镜1 兜底：机位与运镜：00:00-00:02固定机位；00:03微推向悬浮手机）", "- 镜头调度：〔缺字段〕（表无镜头列，五 镜头 层无对应行）", "- 镜头调度：〔旧格式无运镜列〕（分镜表只有景别，00:01 跟拍）"].join("\n");
 const case2 = cameraCoverage(missingField, "推近、跟随、固定机位全都有");
 check("total === 0", case2.total === 0, show(case2));
 check("covered === 0", case2.covered === 0, show(case2));
 check("missing 为空", case2.missing.length === 0, show(case2.missing));
 
-console.log("③ 「移动/移步/移位」不是运镜：调度行与产物都出现也不算");
+console.log("A3 「移动/移步/移位」不是运镜：调度行与产物都出现也不算");
 for (const daily of ["移动", "移步", "移位"]) {
     const lapian = `- 镜头调度：人物沿斑马线${daily}，景别不变`;
     const prompt = `人物在画面中${daily}，背景保持虚化。`;
     const result = cameraCoverage(lapian, prompt);
     check(`「${daily}」→ total 0`, result.total === 0 && result.covered === 0, show(result));
 }
-const realMove = cameraCoverage("- 镜头调度：定焦锁定微移，特写", "机身轻微微移。");
+// 产物侧改成带镜头主语的写法：B7b 加了镜头主语窗，「机身轻微微移」这种没有
+// 镜头/机位/画面/视角/运镜的句子不再算命中（口径变更，夹具跟着改）。
+const realMove = cameraCoverage("- 镜头调度：定焦锁定微移，特写", "镜头轻微微移。");
 check("对照：「微移」是真运镜 → total 1 / covered 1", realMove.total === 1 && realMove.covered === 1, show(realMove));
-const mixedDaily = cameraCoverage("- 镜头调度：人物移动后镜头前推，近景", "先移动再前推。");
-check("同行「移动」+「推」→ 只算「推」", mixedDaily.total === 1 && mixedDaily.covered === 1, show(mixedDaily));
+const mixedDaily = cameraCoverage("- 镜头调度：人物移动后镜头前推，近景", "镜头先移动再前推。");
+check("同行「移动」+「前推」→ 只算「前推」（前推占位后不再计「推」）", mixedDaily.total === 1 && mixedDaily.covered === 1, show(mixedDaily));
 
-console.log("④ covered === total：全命中也要正确计数");
+console.log("A4 covered === total：全命中也要正确计数");
 const fullLapian = "- 镜头调度：匀速前推，特写\n- 镜头调度：缓慢摇移下落，全景至中景";
-const fullPrompt = "匀速前推至产品特写，随后缓慢摇移下落拉出全景。";
+// 产物加「镜头」并缩短句距：摇/移 要落在镜头主语 14 字窗内（B7b 口径）。
+const fullPrompt = "镜头先匀速前推至特写，再缓慢摇移下落。";
 const case4 = cameraCoverage(fullLapian, fullPrompt);
 check("covered === total === 3", case4.covered === 3 && case4.total === 3, show(case4));
-check("missing 为空", case4.missing.length === 0, show(case4.missing));
+check("missing 为空", case4.missing.length === 0, show(case4));
 
-console.log("⑤ 格式容错：项目符号 / 加粗 / 半角冒号 / 无符号");
-const formats = ["- **镜头调度**：前推逼近", "镜头调度: 后拉远离", "* 镜头调度：环绕一周", "- 镜头调度 ： 变焦推近"].join("\n");
+console.log("A5 格式容错：项目符号 / 加粗 / 半角冒号 / 无符号");
+// 第二行原为「后拉远离」，其中「拉远」与「后拉」在同一位置重叠；词表加长扫描后
+// 会取「拉远」吃掉两个词。夹具加一个连接字去歧义（口径没变，只是让夹具不再踩重叠）。
+const formats = ["- **镜头调度**：前推逼近", "镜头调度: 后拉并远离", "* 镜头调度：环绕一周", "- 镜头调度 ： 变焦推近"].join("\n");
 const case5 = cameraCoverage(formats, "随便什么产物");
-// 第四行「变焦推近」是两个动作（变焦 + 推），一行两词都要进分母。
-check("四种写法都进分母 → total 5（含一行两词）", case5.total === 5, show(case5));
-check("全部未写 → covered 0 / missing 4（「推」出现两次只列一次）", case5.covered === 0 && case5.missing.length === 4, show(case5));
+// 词表扩容后：前推 / 后拉 + 远离 / 环绕 / 变焦 + 推近 = 6（原期望 5：旧的「推」与「推近」是同一个词）。
+check("四种写法都进分母 → total 6（两行各两个词）", case5.total === 6, show(case5));
+check("全部未写 → covered 0 / missing 6", case5.covered === 0 && case5.missing.length === 6, show(case5));
 
-console.log("⑥ 整词族不重复计：平移、机位固定");
+console.log("A6 整词族不重复计：平移、机位固定");
 const phraseLapian = "- 镜头调度：平移跟拍，中景\n- 镜头调度：机位固定，特写\n- 镜头调度：环绕半圈，近景";
-const case6 = cameraCoverage(phraseLapian, "机位固定为主，环绕半圈，横向平移并跟随一次。");
+// 产物改成带镜头主语的写法：「跟拍」一族认基础族「跟」，所以「跟随」也算命中（B7b 同族归并）。
+const case6 = cameraCoverage(phraseLapian, "机位固定为主，环绕半圈；镜头横向平移并跟随一次。");
 check("「平移跟拍」= 两个词，「平移」不再额外计一个「移」→ total 4", case6.total === 4, show(case6));
 check("四词全命中 → covered 4", case6.covered === 4, show(case6));
 
-console.log("⑦ 真实 fixture：画布 pop-1-3 四镜调度原文");
+console.log("A7 真实 fixture：画布 pop-1-3 四镜调度原文");
 const realLapian = [
     "- 镜头调度：仰角后退并上摇，特写",
     "- 镜头调度：匀速后退拉远，中景",
@@ -108,11 +114,14 @@ const realLapian = [
 ].join("\n");
 const realProduct = "低机位仰拍起幅，随后后退上摇再匀速拉远，最后推近定格……焦点从足部平滑移到面部，最终锁死在悬浮瓶体上。";
 const case7 = cameraCoverage(realLapian, realProduct);
-check("4 条调度行 → total 3（镜3 无运镜词不进分母）", case7.total === 3, show(case7));
-check("镜1 摇 / 镜2 拉 / 镜4 移 全在产物里 → covered 3", case7.covered === 3, show(case7));
-check("missing 空", case7.missing.length === 0, show(case7.missing));
+// B7b 口径变更重算：原期望 total 3（推/摇/移三个旧词）。标准词表把 仰角、后退、上摇、拉远
+// 各立成词，镜 1/2/3 的后退各计一次 → total 7；产物命中 后退/上摇/拉远 与「推」（推近的
+// 基础族），缺 仰角（产物写的是「仰拍」）与 移（「移到面部」离镜头主语超过 14 字）。
+check("4 条调度行 → total 7", case7.total === 7, show(case7));
+check("covered 5", case7.covered === 5, show(case7));
+check("missing 是 仰角 / 移", show(case7.missing) === show(["仰角", "移"]), show(case7.missing));
 
-console.log("⑧ 旧格式拉片（pop3test 7/7 镜〔缺字段〕）→ 分母 0");
+console.log("A8 旧格式拉片（pop3test 7/7 镜〔缺字段〕）→ 分母 0");
 const legacyPath = path.resolve(root, "..", "wanrepro/analysis/reverse/pop3test/拉片-jimeng-lapian.md");
 if (existsSync(legacyPath)) {
     const legacy = cameraCoverage(readFileSync(legacyPath, "utf8"), "前推、跟拍、固定机位随便写");
@@ -122,7 +131,7 @@ if (existsSync(legacyPath)) {
     console.log(`  skip ${legacyPath} 不在（跨仓证据未随行）`);
 }
 
-console.log("⑨ 接线没退化成空转（文本级防退化）");
+console.log("A9 接线没退化成空转（文本级防退化）");
 const projectSrc = readFileSync(path.join(src, "pages/canvas/project.tsx"), "utf8");
 const nodeSrc = readFileSync(path.join(src, "components/canvas/canvas-node.tsx"), "utf8");
 const typesSrc = readFileSync(path.join(src, "types/canvas.ts"), "utf8");
@@ -137,9 +146,75 @@ check("角标对 undefined / total 0 静默", /if \(!coverage \|\| coverage\.tot
 check("角标文案「运镜 N/M」", /运镜 \{coverage\.covered\}\/\{coverage\.total\}/.test(nodeSrc));
 check("未覆盖用红色、全覆盖用中性色", /bg-red-600\/85/.test(nodeSrc) && /bg-black\/55/.test(nodeSrc));
 
+console.log("B7c-① 调度行「仰角后退并上摇，特写」→ 三词全命中");
+const shotWords = cameraCoverage("- 镜头调度：仰角后退并上摇，特写", "");
+check("分母 = 仰角 / 后退 / 上摇，景别「特写」不算", shotWords.total === 3 && show(shotWords.missing) === show(["仰角", "后退", "上摇"]), show(shotWords));
+const shotHit = cameraCoverage("- 镜头调度：仰角后退并上摇，特写", "镜头仰角后退，随后上摇到面部。");
+check("产物三词都有 → covered 3 / missing 空", shotHit.covered === 3 && shotHit.total === 3 && shotHit.missing.length === 0, show(shotHit));
+
+console.log("B7c-② 「后退减速并轻仰，中近景」→ 后退命中，「轻仰」不另立词");
+const backPedal = cameraCoverage("- 镜头调度：后退减速并轻仰，中近景", "镜头后退减速，重心轻仰。");
+check("total 1 / covered 1（「轻仰」不进词表）", backPedal.total === 1 && backPedal.covered === 1 && show(backPedal.missing) === "[]", show(backPedal));
+
+console.log("B7c-③ 产物句「瓶体在中央悬停旋转」不算旋转");
+const bottleSpin = cameraCoverage("- 镜头调度：旋转半圈，近景", "瓶体在中央悬停旋转。");
+check("旋转没被物体自转骗到 → covered 0 / missing 旋转", bottleSpin.total === 1 && bottleSpin.covered === 0 && show(bottleSpin.missing) === show(["旋转"]), show(bottleSpin));
+
+console.log("B7c-④ 产物句「人物后退一步」不算后退");
+const personBack = cameraCoverage("- 镜头调度：后退一步，中景", "人物后退一步。");
+check("人走路的后退不算运镜 → covered 0", personBack.total === 1 && personBack.covered === 0, show(personBack));
+
+console.log("B7c-⑤ 产物句「镜头匀速后退拉远」→ 后退 + 拉远都算");
+const cameraBack = cameraCoverage("- 镜头调度：后退拉远，远景", "镜头匀速后退拉远。");
+check("两个词都过窗 → covered 2 / total 2", cameraBack.total === 2 && cameraBack.covered === 2, show(cameraBack));
+
+console.log("B7c-⑥ 「固定，特写」裸固定 → 算固定机位族");
+const bareFixed = cameraCoverage("- 镜头调度：固定，特写", "镜头全程固定。");
+check("裸「固定」归一成「固定机位」→ covered 1", bareFixed.total === 1 && bareFixed.covered === 1, show(bareFixed));
+const bareFixedWords = cameraCoverage("- 镜头调度：固定，特写", "");
+check("词名归一：missing 里写「固定机位」", show(bareFixedWords.missing) === show(["固定机位"]), show(bareFixedWords));
+
+console.log("B7c-⑦ 「升格慢动作」不计（时间节奏，不是镜头运动）");
+const slowMotion = cameraCoverage("- 镜头调度：升格慢动作，特写", "镜头升格慢动作。");
+check("「升格」里的「升」不算 → total 0", slowMotion.total === 0 && slowMotion.covered === 0, show(slowMotion));
+
+console.log("B7c-⑧ 特写 / 中景 / 全景 / 远景属景别，不计");
+const shotSizes = cameraCoverage("- 镜头调度：特写转中景，全景，远景", "镜头特写转中景再拉全景。");
+check("全是景别词 → total 0", shotSizes.total === 0 && shotSizes.covered === 0 && shotSizes.missing.length === 0, show(shotSizes));
+
+console.log("C 三源一致：拆解 prompt 两处词表段 / 改写契约沿用条款 / coverage 词表");
+const promptPath = path.resolve(root, "..", "wanrepro/prompts/视频拆解.md");
+const promptSrc = readFileSync(promptPath, "utf8");
+const vocabLines = promptSrc.split(/\r?\n/).filter((line) => line.includes("【选词·镜头语言】"));
+check("拆解 prompt 里两处词表段（2 行）", vocabLines.length === 2, `${vocabLines.length} 行`);
+check("两处词表段逐字相同", vocabLines.length === 2 && vocabLines[0] === vocabLines[1], vocabLines[1] === undefined ? "缺第二处" : `长度 ${vocabLines[0].length} vs ${vocabLines[1].length}`);
+const at = (needle) => promptSrc.indexOf(needle);
+const between = (from, to) => promptSrc.slice(at(from), at(to));
+check("一处落在「五 镜头」层（机位与运镜行下）", between("## 五 镜头", "## 六 意境").includes("【选词·镜头语言】"));
+check("一处落在「七 分镜表」的镜头运动列定义处", between("## 七 分镜表", "## 八 声音").includes("【选词·镜头语言】"));
+
+const vocabulary = vocabLines[0] ?? "";
+const CORE_WORDS = ["推", "拉", "摇", "移", "跟", "升", "降", "环绕", "甩镜", "变焦", "旋转", "固定机位"];
+const absent = (text) => CORE_WORDS.filter((word) => !text.includes(word));
+check("拆解 prompt 词表段含 12 基础族", absent(vocabulary).length === 0, absent(vocabulary).join("/"));
+check("拆解 prompt 词表段含「复合与方向」「机位状态」两节", vocabulary.includes("复合与方向：") && vocabulary.includes("机位状态：") && vocabulary.includes("升格/慢动作属时间节奏"));
+
+const templatesPath = path.join(src, "lib/canvas/lapian-prompt-templates.ts");
+const templatesSrc = readFileSync(templatesPath, "utf8");
+check("改写契约含「标准镜头语言」沿用条款", templatesSrc.includes("标准镜头语言") && templatesSrc.includes("不自创同义说法"));
+check("改写契约词表主体与拆解 prompt 一致（12 基础族都在）", absent(templatesSrc).length === 0, absent(templatesSrc).join("/"));
+
+const coverageSrc = readFileSync(path.join(src, "lib/canvas/camera-coverage.ts"), "utf8");
+check("coverage 源文件含 12 基础族", absent(coverageSrc).length === 0, absent(coverageSrc).join("/"));
+const notInDenominator = CORE_WORDS.filter((word) => {
+    const result = cameraCoverage(`- 镜头调度：${word}，特写`, "");
+    return result.total !== 1 || result.missing[0] !== word;
+});
+check("coverage 行为：12 基础族逐个进分母且词名归一", notInDenominator.length === 0, notInDenominator.join("/"));
+
 console.log(`\n${passed} 通过 / ${failures.length} 失败`);
 if (failures.length) {
     console.error("\n失败项：\n- " + failures.join("\n- "));
     process.exit(1);
 }
-console.log("PASS：运镜覆盖度口径 + 两处落盘接线 + 卡片角标接线全部成立");
+console.log("PASS：标准镜头词表（拆解 prompt / 改写契约 / coverage 三源一致）+ 兼容层 + 镜头主语窗 + 两处落盘接线 + 卡片角标接线全部成立");
