@@ -653,7 +653,11 @@ function InfiniteCanvasPage() {
         [message, t],
     );
 
-    // T8/T9：拉片 → 提交正文。默认规范 timeline-narrative（有先例成片）。
+    // T8/T9：拉片 → 提交正文。默认规范 seedance-flow（即梦画布/集梦工作台单段流式，甲方一手件，
+    // 所有者 2026-11-05 拍板默认）。此前默认 timeline-narrative（模板 D）。
+    // 二期预留：多模板/多结构提示词接入画布原生「提示词源」系统（config-prompt-sources / prompt-source-editor-drawer），
+    // 到时把 LAPIAN_DEFAULT_TEMPLATE 改为从提示词源库取——本常量即唯一接入点。
+    const LAPIAN_DEFAULT_TEMPLATE = "seedance-flow";
     // 剥离「# 附注」节（v4 审计 B-03：附注随提示词提交会在聚鑫链复发——唯一转换点在这里）。
     // T6-B5 画布侧：源拉片节点 metadata.lapianOptional（勾选的可选段字母）透传 `?optional=`，
     // 勾了的段才进正文；空/缺省 = 现状行为。generateVideoFromLapianNode 等路径都经这里取数，透传一处收口。
@@ -668,7 +672,7 @@ function InfiniteCanvasPage() {
             }
             const optional = parseLapianOptional(String(lapianNode.metadata?.lapianOptional || "")).join(",");
             try {
-                const d = await fetch(`/api/render/${encodeURIComponent(taskId)}/timeline-narrative?optional=${encodeURIComponent(optional)}`).then((r) => r.json());
+                const d = await fetch(`/api/render/${encodeURIComponent(taskId)}/${LAPIAN_DEFAULT_TEMPLATE}?optional=${encodeURIComponent(optional)}`).then((r) => r.json());
                 if (!d || d.error) {
                     // 渲染失败（如模板没有该可选段/任务不在数据根里）→ 明确提示，再走正文回退，不做黑盒。
                     message.warning(t("canvas.lapianOptional.renderFailed", { error: String(d?.error || "") }));
