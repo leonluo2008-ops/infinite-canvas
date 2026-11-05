@@ -1,5 +1,6 @@
 // 拉片节点（M3.1）：由「视频节点 → 工具栏拉片 → 执行」创建的结果节点。
-// 只读结果 + 状态机：loading（轮询 job）/ done（拉片正文）/ error（重试）。
+// 只读结果 + 状态机：loading（轮询 job，无超时死线）/ done（拉片正文）/ error（重试）。
+// 轮询自适应：前 2 分钟 2s、之后 5s——大拆解 10-20 分钟属正常，lost 只留给 job 404。
 // 独立任务语义：每个节点一次任务（metadata.taskId/jobId/intent）；刷新恢复归 M5，
 // 本组件给「重查」兜底（job 404 时按 taskId 直接拉投影）。
 import { useEffect, useRef, useState } from "react";
@@ -8,9 +9,13 @@ import { canvasThemes } from "@/lib/canvas-theme";
 import type { CanvasNodeData } from "@/types/canvas";
 
 const BRIDGE = ""; // 同域相对路径：本地 dev 由 vite proxy 转发，公网由隧道同域转发
-const POLL_MS = 2000;
-const POLL_TIMEOUT_MS = 180000;
+const POLL_MS_FAST = 2000;      // 前 2 分钟：快速反馈
+const POLL_MS_SLOW = 5000;      // 之后放慢：拆解可跑 10-20 分钟，持续轮询不设超时死线
+const SLOW_AFTER_MS = 120000;   // 超过 2 分钟切慢轮询
+const SLOW_HINT_AFTER_SEC = 180; // 已用时超 3 分钟，追加安抚文案
 const MAX_NET_ERRORS = 3;
+
+const fmtElapsed = (sec: number) => `${Math.floor(sec / 60)}:${String(sec % 60).padStart(2, "0")}`;
 
 type Phase = "loading" | "done" | "error" | "lost";
 
@@ -20,6 +25,7 @@ export function LapianNodeContent({ node, onContentChange }: { node: CanvasNodeD
     const intent = String(node.metadata?.intent || "");
     const [phase, setPhase] = useState<Phase>("loading");
     const [elapsed, setElapsed] = useState(0);
+    const [stage, setStage] = useState("");
     const [message, setMessage] = useState("");
     const [markdown, setMarkdown] = useState("");
     const timerRef = useRef<number | null>(null);
@@ -32,6 +38,8 @@ export function LapianNodeContent({ node, onContentChange }: { node: CanvasNodeD
         startedRef.current = Date.now();
         netErrRef.current = 0;
         const tick = async () => {
+            // 自适应间隔按「已等了多久」算：前 2 分钟 2s，之后 5s——轮询永不因时长自杀。
+            const delay = Date.now() - startedRef.current < SLOW_AFTER_MS ? POLL_MS_FAST : POLL_MS_SLOW;
             try {
                 const r = await fetch(`${BRIDGE}/api/job/${jobId}`);
                 if (r.status === 404) {
@@ -53,27 +61,31 @@ export function LapianNodeContent({ node, onContentChange }: { node: CanvasNodeD
                     setPhase("error"); setMessage(d.error || "拆解失败（见服务端日志）");
                     return;
                 }
-                setElapsed(Math.round((Date.now() - startedRef.current) / 1000));
-                if (Date.now() - startedRef.current > POLL_TIMEOUT_MS) {
-                    setPhase("lost"); setMessage("超过 3 分钟还没跑完（可重查，或稍后回来）。");
-                    return;
-                }
-                timerRef.current = window.setTimeout(tick, POLL_MS);
+                // 还在跑：同步后端阶段（后端暂未上报 stage 时前端兜底「拆解中」），按自适应间隔继续。
+                setStage(typeof d.stage === "string" && d.stage ? d.stage : "");
+                timerRef.current = window.setTimeout(tick, delay);
             } catch {
                 netErrRef.current += 1;
                 if (netErrRef.current >= MAX_NET_ERRORS) {
                     setPhase("error"); setMessage("连不上 bridge（:8776）。确认 ui-server 在跑，然后重试。");
                     return;
                 }
-                timerRef.current = window.setTimeout(tick, POLL_MS);
+                timerRef.current = window.setTimeout(tick, delay);
             }
         };
         void tick();
         return () => { if (timerRef.current) window.clearTimeout(timerRef.current); };
     }, [phase, jobId, taskId]);
 
+    // 已用时展示钟：1s 一跳、与轮询解耦——切到 5s 慢轮询后读数也不冻结。
+    useEffect(() => {
+        if (phase !== "loading") return;
+        const t = window.setInterval(() => setElapsed(Math.round((Date.now() - startedRef.current) / 1000)), 1000);
+        return () => window.clearInterval(t);
+    }, [phase]);
+
     const requery = async () => {
-        setPhase("loading"); setElapsed(0); startedRef.current = Date.now();
+        setPhase("loading"); setElapsed(0); setStage(""); startedRef.current = Date.now();
         try {
             const lp = await fetch(`${BRIDGE}/api/lapian/${encodeURIComponent(taskId)}`).then((x) => x.json());
             if (lp && !lp.error) { setMarkdown(lp.markdown || ""); setPhase("done"); onContentChange?.(node.id, lp.markdown || ""); return; }
@@ -95,8 +107,9 @@ export function LapianNodeContent({ node, onContentChange }: { node: CanvasNodeD
             <div className="thin-scrollbar min-h-0 flex-1 overflow-auto p-2 text-[11px] leading-relaxed" style={{ color: theme.node.text }}>
                 {phase === "loading" && (
                     <div data-lapian-loading style={{ color: theme.node.muted }}>
-                        拆解中… 已 {elapsed}s（job {jobId.slice(-4)}）
+                        {stage || "拆解中"}… 已用时 {fmtElapsed(elapsed)}（job {jobId.slice(-4)}）
                         {intent ? <div className="mt-1" style={{ color: theme.node.faint }}>需求：{intent}</div> : null}
+                        {elapsed >= SLOW_HINT_AFTER_SEC ? <div className="mt-1" style={{ color: theme.node.faint }}>大拆解较慢，通常 5-15 分钟，不用重开</div> : null}
                     </div>
                 )}
                 {phase === "lost" && <div data-lapian-lost style={{ color: "#fbbf24" }}>{message}</div>}
