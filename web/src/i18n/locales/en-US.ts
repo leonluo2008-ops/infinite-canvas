@@ -35,14 +35,14 @@ export default {
         video: { title: "Video settings", quality: "Quality", size: "Size", seconds: "Seconds", mode: "Mode", modes: { frames: "First & last frame", reference: "General reference" }, resolution: "Resolution", ratio: "Aspect ratio", duration: "Duration", smart: "Smart", output: "Output", generateAudio: "Generate audio", watermark: "Add watermark", adaptive: "Adaptive", sizes: { landscape: "Landscape", portrait: "Portrait", square: "Square", widescreen: "Widescreen", tall: "Tall", auto: "Auto" }, ratios: { landscape: "Landscape", portrait: "Portrait", square: "Square", standardLandscape: "Standard landscape", standardPortrait: "Standard portrait", cinematic: "Cinematic", adaptive: "Adaptive" } },
         audio: { title: "Audio settings", voice: "Voice", format: "Format", speed: "Speed", instructions: "Voice instructions", instructionsPlaceholder: "For example: natural, warm, and suitable for narration." },
         text: { title: "Text settings", reasoning: "Reasoning effort", count: "Generation count" },
-        model: { select: "Select model", assign: "Assign a model for {{capability}} in the provider settings", noMatch: "No matching {{capability}} models", addFirst: "Add a provider and models in Settings first", capabilities: { image: "image generation", video: "video", text: "text", audio: "audio" } },
+        model: { select: "Select model", assign: "Assign a model for {{capability}} in the provider settings", noMatch: "No matching {{capability}} models", addFirst: "Add a provider and models in Settings first", capabilities: { image: "image generation", video: "video", text: "text", audio: "audio", multimodal: "multimodal" } },
     },
     generation: { pending: ["Creating image", "Almost there", "Just a little longer", "Refining details"] },
     imageReferences: { label: "Image {{index}}", separator: ", ", promptPrefix: "Reference image labels: {{labels}}. Use these labels to interpret image references in the prompt.\n\n{{prompt}}" },
     modelPlugin: {
         pollTimeout: "Plugin polling timed out. Check the request script or try again later.", executionFailed: "Model request script failed: {{message}}", noImages: "The model request script did not return any images",
         variables: { prompt: "User prompt with the system prompt already included", images: "Reference images as a data URL array, available for image editing and image-to-video", videos: "Reference videos as a File array you can form.append; empty when none are attached from the canvas or workbench", audios: "Reference audio as a File array you can form.append; empty when none are attached from the canvas or workbench", messages: "Conversation message array including the system message", params: "Generation parameters: image {size,resolution,quality,count,background}, video {mode,seconds,size,resolution,ratio,generateAudio,watermark} (mode is frames for first/last frame or reference for general references; more than 2 images become reference), audio {voice,format,speed,instructions}", model: "Model name without the provider prefix", baseUrl: "Provider endpoint as entered, without appending /v1", apiKey: "Provider API key; add it to request headers yourself", systemPrompt: "Original system prompt", reasoningEffort: "Text reasoning effort; auto lets the script decide whether to send it", http: "Convenience client: http.post(path, body, {headers,params,responseType}), http.get(path, opts), and http.url(path). Authorization: Bearer apiKey is included by default and can be overridden. Relative paths append /v1 to baseUrl.", request: "Raw request({ method, url, headers, params, data, responseType }) with no default headers. Add authentication yourself. Relative URLs are joined to baseUrl without /v1.", poll: "poll(request, extract, {intervalMs,timeoutMs}) continues until extract returns a truthy value", sleep: "Delay with sleep(ms)", signal: "Cancellation signal that can be passed to http/request", onDelta: "Push streaming text with onDelta(text) for text models" },
-        returns: { image: "Text-to-image and image editing use different APIs; distinguish them by whether images is empty. Return an image URL or data URL, an array of them, or [{ dataUrl }] / [{ url }] / [{ b64_json }].", video: "Poll inside the script and return { url }, { blob }, or a video URL string.", audio: "Return a Blob, base64/data URL string, or { b64_json } / { data } / { url }.", text: "Push streaming output with onDelta(text), then return the complete text string." },
+        returns: { image: "Text-to-image and image editing use different APIs; distinguish them by whether images is empty. Return an image URL or data URL, an array of them, or [{ dataUrl }] / [{ url }] / [{ b64_json }].", video: "Poll inside the script and return { url }, { blob }, or a video URL string.", audio: "Return a Blob, base64/data URL string, or { b64_json } / { data } / { url }.", text: "Push streaming output with onDelta(text), then return the complete text string.", multimodal: "Understanding-type multimodal (read images/videos): no built-in template script; follow the channel's chat contract and return the complete text string." },
         templates: { openai: "OpenAI format", gemini: "Gemini format" },
         authoring: {
             intro: "Write a model request script for Infinite Canvas. Capability: {{capability}}. Target model: {{model}}.",
@@ -374,6 +374,13 @@ export default {
             presetFetchFailed: "Projection render request failed: {{error}} — falling back to the raw breakdown text this time",
             missingTask: "Breakdown node has no task ID; projection unavailable — falling back to the raw breakdown text this time",
         },
+        lapianModel: {
+            label: "Analysis model",
+            default: "Default (server-side model)",
+            emptyHint: "No model is tagged \"multimodal\" yet — open Settings → Channels and tag one",
+            warningNotFound: "The channel of the selected analysis model no longer exists — pick again or switch back to default",
+            warningIncomplete: "The channel of the selected analysis model is missing the endpoint or API key — complete it or switch back to default",
+        },
         reverseComposer: "Reference image: @[node:{{imageId}}]\nTask: @[node:{{textId}}]",
         editors: {
             reset: "Reset", zoomOut: "Zoom out", zoomIn: "Zoom in", loading: "Loading", unknown: "Unknown", cancel: "Cancel",
@@ -626,6 +633,7 @@ export default {
                 video: "Video",
                 text: "Text",
                 audio: "Audio",
+                multimodal: "Multimodal · image/video understanding",
             },
         },
         modelSelect: {

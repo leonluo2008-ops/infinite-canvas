@@ -28,6 +28,7 @@ const BUILTIN_DEFINITIONS: CanvasNodeDefinition[] = [
     { type: CanvasNodeType.Group, title: i18n.t("canvas.node.group"), icon: <Group className={iconClass} />, minimapColor: "#94a3b8" },
     {
         type: CanvasNodeType.Lapian, title: "拉片", icon: <Clapperboard className={iconClass} />, minimapColor: "#eab308", description: "即梦结构拉片", showInCreateMenu: false,  // 只由「视频节点→拉片」创建（独立任务，需求 v4 原话 9）
+        hidePanel: true,  // M6-T7：拉片=只读结果节点（正文在节点卡内渲染），不开下方生成面板——否则 defaultMode 兜底成 image 模式，冒出生图模型选择器误导用户
         resource: (node: CanvasNodeData) => (node.metadata?.content ? { kind: "text" as const, text: String(node.metadata.content) } : null),  // T6：拉片=文本数据源（所有者裁定：产出文本供任何数据流节点连线取用）
     },
 ].map((def) => {

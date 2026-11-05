@@ -6,7 +6,8 @@ import { nanoid } from "nanoid";
 import i18n from "@/i18n";
 
 export type ApiCallFormat = "openai" | "gemini" | "sdgf";  // sdgf=聚鑫 SD GF 统一视频 API（/v1/videos）
-export type ModelCapability = "image" | "video" | "text" | "audio";
+/** multimodal=理解型多模态（读图/读视频），与 image（出图）区分——拉片等分析场景按此标签选模型（M6-T7-A）。 */
+export type ModelCapability = "image" | "video" | "text" | "audio" | "multimodal";
 export type ReasoningEffort = "auto" | "low" | "medium" | "high" | "xhigh";
 
 export type ChannelModel = {
@@ -185,6 +186,9 @@ export function modelMatchesCapability(config: AiConfig, value: string, capabili
 }
 
 export function resolveModelForCapability(config: AiConfig, currentModel: string | undefined, capability: ModelCapability) {
+    // multimodal 没有全局默认（分析模型按节点选，存 metadata.lapianModel）——不匹配时回退空，
+    // 绝不冒用生图/文本模型顶替（M6-T7-A）。
+    if (capability === "multimodal") return currentModel && modelCapabilityOf(config, currentModel) === "multimodal" ? currentModel : "";
     const defaultModel = capability === "image" ? config.imageModel : capability === "video" ? config.videoModel : capability === "audio" ? config.audioModel : config.textModel;
     const fallbackModel = capability === "image" ? defaultConfig.imageModel : capability === "video" ? defaultConfig.videoModel : capability === "audio" ? defaultConfig.audioModel : defaultConfig.textModel;
     for (const model of [currentModel, defaultModel]) {

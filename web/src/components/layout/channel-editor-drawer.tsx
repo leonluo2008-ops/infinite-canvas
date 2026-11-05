@@ -19,7 +19,7 @@ export function ChannelEditorDrawer({ open, channel, onSave, onClose }: { open: 
         { label: "Gemini", value: "gemini" },
         { label: "SD GF（聚鑫统一视频）", value: "sdgf" },
     ];
-    const capabilityOptions: Array<{ label: string; value: ModelCapability }> = ["image", "video", "text", "audio"].map((value) => ({ label: t(`config.channelEditor.capabilities.${value}`), value: value as ModelCapability }));
+    const capabilityOptions: Array<{ label: string; value: ModelCapability }> = ["image", "video", "text", "audio", "multimodal"].map((value) => ({ label: t(`config.channelEditor.capabilities.${value}`), value: value as ModelCapability }));  // multimodal=读图/读视频的理解型（M6-T7-A）
 
     useEffect(() => {
         if (open && channel) setDraft(channel);

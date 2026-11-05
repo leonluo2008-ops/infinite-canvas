@@ -54,6 +54,7 @@ import { buildNodeMentionReferences, getGenerationResourceNodes, getGroupResourc
 import { exportCanvasProjects } from "@/lib/canvas/canvas-export";
 import { applyNodeConfigPatch, audioMetadata, buildAudioGenerationMetadata, buildImageGenerationMetadata, createCanvasNode, imageMetadata, videoMetadata } from "@/lib/canvas/canvas-node-factory";
 import { DEFAULT_LAPIAN_PROMPT_TEMPLATE_ID, LAPIAN_INTENT_PLACEHOLDER, getLapianPromptTemplate, type LapianPromptTemplateId } from "@/lib/canvas/lapian-prompt-templates";
+import { buildLapianRunBody, checkLapianSelection, multimodalModelGroups } from "@/lib/canvas/lapian-model";  // M6-T7-B：分析模型过滤/请求体装配（纯逻辑层）
 import { attachedImageIdOf, buildLapianAssetManifest, buildLapianAssetSlots, collectLapianAssetReferences, parseLapianAssetBlocks, truncateAssetCaption, upsertLapianAssetManifest, type LapianAssetLabels, type LapianBlock } from "@/lib/canvas/lapian-assets";
 import { DERIVED_GAP, nudgeIntoFree, placeGridRightOf, placeRightOf, placeRowRightOf, rectOfNode } from "@/lib/canvas/derived-layout";
 import { extractVideoParams } from "@/lib/canvas/video-params";
@@ -270,6 +271,7 @@ function InfiniteCanvasPage() {
     const [cropNodeId, setCropNodeId] = useState<string | null>(null);
     const [lapianNodeId, setLapianNodeId] = useState<string | null>(null);
     const [lapianIntent, setLapianIntent] = useState("");
+    const [lapianModel, setLapianModel] = useState("");  // M6-T7-B：本次拉片的分析模型（channelId::model）；空 = 走 bridge 默认
     const [lapianBusy, setLapianBusy] = useState(false);
     const [lapianError, setLapianError] = useState("");
     const [lapianTemplateNodeId, setLapianTemplateNodeId] = useState<string | null>(null);
@@ -695,6 +697,7 @@ function InfiniteCanvasPage() {
             // 拉线路径：视频 →（拉线）→ 拉片。不直接建节点：先弹意图弹层，执行后才建（独立任务语义）。
             if (type === CanvasNodeType.Lapian) {
                 setLapianIntent("");
+                setLapianModel("");
                 setLapianNodeId(pending.connection.nodeId);
                 setLapianPendingPosition(pending.position);
                 setPendingConnectionCreate(null);
@@ -915,11 +918,14 @@ function InfiniteCanvasPage() {
         applyAgentOps,
     });
     const handleLapianExecute = useCallback(
-        async (videoNode: CanvasNodeData, intent: string, dropPosition?: Position) => {
+        async (videoNode: CanvasNodeData, intent: string, dropPosition?: Position, modelSelection?: string) => {
             const LOG = (msg: string) => { (window as unknown as { __lapianLog?: string[] }).__lapianLog = [...((window as unknown as { __lapianLog?: string[] }).__lapianLog || []), `${new Date().toLocaleTimeString()} ${msg}`]; };
             LOG(`start node=${videoNode.id}`);
             const key = videoNode.metadata?.storageKey;
             if (!key) throw new Error("这个视频节点没有本地字节（可能是外部链接）——重新把视频文件拖进画布再试");
+            // M6-T7-B：选了分析模型先验渠道（渠道被删/配置不全会发半截请求）——明示拦下，不静默回退默认模型。
+            const selectionCheck = checkLapianSelection(modelSelection, effectiveConfig.channels);
+            if (!selectionCheck.ok) throw new Error(t(selectionCheck.reason === "not-found" ? "canvas.lapianModel.warningNotFound" : "canvas.lapianModel.warningIncomplete"));
             setLapianBusy(true);
             try {
                 LOG("getting blob");
@@ -934,10 +940,13 @@ function InfiniteCanvasPage() {
                 }).then((r) => r.json());
                 LOG(`upload=${JSON.stringify(up).slice(0, 120)}`);
                 if (up.error) throw new Error(up.error);
+                // M6-T7-B：不选模型时请求体与现状一致（只 {id,intent}，旧链路零回归）；选了则随请求带 {model, channel:{baseUrl,key,model}}
+                //（参照 services/api/video.ts 生成节点的渠道透传；值全部来自用户渠道配置，不硬编码任何模型名）。
+                const runBody = buildLapianRunBody(up.id, intent, modelSelection, effectiveConfig.channels);
                 const run = await fetch(`/api/lapian/run`, {
                     method: "POST",
                     headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ id: up.id, intent }),
+                    body: JSON.stringify(runBody),
                 }).then((r) => r.json());
                 LOG(`run=${JSON.stringify(run).slice(0, 120)}`);
                 if (run.error) throw new Error(run.error);
@@ -952,7 +961,7 @@ function InfiniteCanvasPage() {
                         position: dropPosition ?? { x: videoNode.position.x + (videoNode.width || 240) + 96, y: videoNode.position.y },  // 拉线落点优先；默认视频右侧（从左到右规范）
                         width: size.width,
                         height: size.height,
-                        metadata: { taskId: up.id, jobId: String(run.job || ""), intent, lapPhase: "loading" },  // 不用 status（二开仓通用 loading/error 分支会拦截内容渲染）
+                        metadata: { taskId: up.id, jobId: String(run.job || ""), intent, lapPhase: "loading", lapianModel: modelSelection || undefined },  // 不用 status（二开仓通用 loading/error 分支会拦截内容渲染）；lapianModel=本任务用的分析模型（channelId::model）
                     },
                 ]);
                 setConnections((prev) => [...prev, { id: nanoid(), fromNodeId: videoNode.id, toNodeId: lapId }]);
@@ -967,8 +976,11 @@ function InfiniteCanvasPage() {
                 setLapianBusy(false);
             }
         },
-        [],
+        [effectiveConfig, t],
     );
+
+    // M6-T7-B：「分析模型」下拉数据源=带 multimodal 标签的模型，按渠道分组（组序=渠道序）。
+    const lapianModelGroups = useMemo(() => multimodalModelGroups(effectiveConfig.channels), [effectiveConfig.channels]);
 
     const lapianPopoverNode = lapianNodeId ? nodes.find((n) => n.id === lapianNodeId) : null;
     const lapianTemplateNode = lapianTemplateNodeId ? nodes.find((n) => n.id === lapianTemplateNodeId) ?? null : null;
@@ -1545,7 +1557,7 @@ function InfiniteCanvasPage() {
                 title: "拉片：拆解这个视频，出即梦结构拉片",
                 label: "拉片",
                 icon: <Clapperboard className="size-4" />,
-                onClick: () => { setLapianIntent(""); setLapianNodeId(node.id); },
+                onClick: () => { setLapianIntent(""); setLapianModel(""); setLapianNodeId(node.id); },
             }, {
                 id: "wan-gen-video",
                 title: "生成视频：用拉片结果作提示词",
@@ -4283,6 +4295,27 @@ function InfiniteCanvasPage() {
                                 onChange={(e) => setLapianIntent(e.target.value)}
                                 data-lapian-intent
                             />
+                            {/* M6-T7-B 分析模型：数据源=渠道里带 multimodal 标签的模型（按渠道分组 optgroup）；默认不选=走 bridge 默认。 */}
+                            <div className="mb-3" data-lapian-model-row>
+                                <label className="mb-1 block text-xs text-stone-400" htmlFor="lapian-model-select">{t("canvas.lapianModel.label")}</label>
+                                <select
+                                    id="lapian-model-select"
+                                    className="h-9 w-full rounded-xl border border-stone-700 bg-stone-950 px-2 text-sm text-stone-100 outline-none focus:border-stone-500"
+                                    value={lapianModel}
+                                    onChange={(e) => setLapianModel(e.target.value)}
+                                    data-lapian-model
+                                >
+                                    <option value="">{t("canvas.lapianModel.default")}</option>
+                                    {lapianModelGroups.map((group) => (
+                                        <optgroup key={group.channelId} label={group.channelName}>
+                                            {group.models.map((model) => (
+                                                <option key={model.value} value={model.value}>{model.name}</option>
+                                            ))}
+                                        </optgroup>
+                                    ))}
+                                </select>
+                                {!lapianModelGroups.length ? <div className="mt-1 text-[11px] leading-relaxed text-stone-500">{t("canvas.lapianModel.emptyHint")}</div> : null}
+                            </div>
                             {lapianError ? <div className="mb-3 rounded-lg border border-red-500/40 bg-red-500/10 p-2 text-xs leading-relaxed text-red-300" data-lapian-error-text>{lapianError}</div> : null}
                             <div className="flex justify-end gap-2">
                                 <button type="button" className="rounded-lg px-3 py-1.5 text-sm text-stone-400 hover:bg-white/5" onClick={() => { setLapianNodeId(null); setLapianPendingPosition(null); }}>取消</button>
@@ -4293,7 +4326,7 @@ function InfiniteCanvasPage() {
                                     data-lapian-execute
                                     onClick={() => {
                                         setLapianError("");
-                                        void handleLapianExecute(lapianPopoverNode, lapianIntent.trim(), lapianPendingPosition ?? undefined).then(() => { setLapianNodeId(null); setLapianPendingPosition(null); }).catch((e: Error) => setLapianError(e.message));
+                                        void handleLapianExecute(lapianPopoverNode, lapianIntent.trim(), lapianPendingPosition ?? undefined, lapianModel || undefined).then(() => { setLapianNodeId(null); setLapianPendingPosition(null); setLapianModel(""); }).catch((e: Error) => setLapianError(e.message));
                                     }}
                                 >
                                     {lapianBusy ? "上传中…" : "执行拉片"}

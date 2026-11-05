@@ -99,6 +99,8 @@ export type CanvasNodeMetadata = {
     lapianSourceId?: string;
     /** 可选段（T6-B5 画布侧）：渲染提示词时要打开的可选段字母（如 "A,C"，逗号分隔）；空/缺省 = 全关（现状行为）。 */
     lapianOptional?: string;
+    /** 分析模型（M6-T7-B）：拉片节点创建时选的多模态模型引用，格式 `channelId::model`（use-config-store 同款编码）；空/缺省 = 走服务端默认模型。 */
+    lapianModel?: string;
     generationMode?: CanvasGenerationMode;
     generationType?: CanvasImageGenerationType;
     model?: string;
