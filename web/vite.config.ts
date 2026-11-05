@@ -59,8 +59,12 @@ function autoStartBridge(): Plugin {
                     server.config.logger.info(`[bridge] :${bridgePort} 已在跑，复用`);
                     return;
                 }
+                // 单一源（2026-11-05 收敛）：引擎在本仓 wanrepro/（交付分支自带）。
+                // WANREPRO_ROOT 可覆盖（如旧主仓兼容）；默认相对仓库根的 wanrepro/。
+                const repoRoot = resolve(__dirname, "..");
                 const candidates = [
                     process.env.WANREPRO_ROOT,
+                    resolve(repoRoot, "wanrepro"),
                     "E:/OneDrive/工作文件夹/电商视频-廖总",
                 ].filter(Boolean) as string[];
                 const root = candidates.find((dir) => {
