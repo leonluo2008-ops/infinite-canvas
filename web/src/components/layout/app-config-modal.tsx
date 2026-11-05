@@ -9,6 +9,7 @@ import { videoResolutionOptions } from "@/components/video-settings-panel";
 import { ChannelEditorDrawer } from "@/components/layout/channel-editor-drawer";
 import { ConfigLocalProxy } from "@/components/layout/config-local-proxy";
 import { ConfigPromptSources } from "@/components/layout/config-prompt-sources";
+import { ConfigLapianModels } from "@/components/layout/config-lapian-models";
 import { ConfigLocalStorage } from "@/components/layout/config-local-storage";
 import type { AppLocale } from "@/i18n";
 import { exportAppConfig, importAppConfig } from "@/services/config-file";
@@ -17,6 +18,7 @@ import { testWebdavConnection, WEBDAV_MANIFEST_FILE_NAME } from "@/services/webd
 import { audioFormatOptions, audioVoiceOptions, normalizeAudioSpeedValue } from "@/lib/audio-generation";
 import { computeMediaSize, inferMediaRatio, inferMediaScale, mediaScaleOptions, parseVideoResolution } from "@/lib/media-size";
 import { createModelChannel, modelOptionsFromChannels, normalizeModelOptionValue, selectableModelsByCapability, useConfigStore, type AiConfig, type ApiCallFormat, type ConfigTabKey, type ModelCapability, type ModelChannel } from "@/stores/use-config-store";
+import { normalizeLapianDefaultModel, normalizeLapianModelList } from "@/lib/canvas/lapian-model";
 
 type ModelGroup = {
     capability: ModelCapability;
@@ -216,6 +218,11 @@ export function AppConfigPanel({ showDoneButton = false, initialTab = "channels"
                         ),
                     },
                     {
+                        key: "lapian-models",
+                        label: t("config.tabs.lapianModels"),
+                        children: <ConfigLapianModels />,
+                    },
+                    {
                         key: "local-proxy",
                         label: t("config.tabs.localProxy"),
                         children: <ConfigLocalProxy />,
@@ -398,12 +405,16 @@ function withChannels(config: AiConfig, channels: ModelChannel[]): AiConfig {
         apiKey: channels[0]?.apiKey || config.apiKey,
         apiFormat: channels[0]?.apiFormat || config.apiFormat,
     };
+    // M6-T7-R：渠道增删改后同步归一拉片模型清单/默认（会话内即时生效，不等持久化 reload）。
+    const lapianModels = normalizeLapianModelList(config.lapianModels, channels);
     return {
         ...next,
         imageModel: pickDefaultModel(next, "image", config.imageModel),
         videoModel: pickDefaultModel(next, "video", config.videoModel),
         textModel: pickDefaultModel(next, "text", config.textModel),
         audioModel: pickDefaultModel(next, "audio", config.audioModel),
+        lapianModels,
+        lapianDefaultModel: normalizeLapianDefaultModel(config.lapianDefaultModel, lapianModels, channels),
     };
 }
 

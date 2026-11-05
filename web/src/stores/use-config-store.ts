@@ -4,10 +4,10 @@ import { persist } from "zustand/middleware";
 import { nanoid } from "nanoid";
 
 import i18n from "@/i18n";
+import { normalizeLapianDefaultModel, normalizeLapianModelList } from "@/lib/canvas/lapian-model";
 
 export type ApiCallFormat = "openai" | "gemini" | "sdgf";  // sdgf=聚鑫 SD GF 统一视频 API（/v1/videos）
-/** multimodal=理解型多模态（读图/读视频），与 image（出图）区分——拉片等分析场景按此标签选模型（M6-T7-A）。 */
-export type ModelCapability = "image" | "video" | "text" | "audio" | "multimodal";
+export type ModelCapability = "image" | "video" | "text" | "audio";
 export type ReasoningEffort = "auto" | "low" | "medium" | "high" | "xhigh";
 
 export type ChannelModel = {
@@ -40,6 +40,10 @@ export type AiConfig = {
     audioFormat: string;
     audioSpeed: string;
     audioInstructions: string;
+    /** 拉片可用模型清单（M6-T7-R）：跨渠道勾选的 `channelId::model` 引用；独立清单，不动模型在渠道里的能力归属。 */
+    lapianModels: string[];
+    /** 全局默认拉片模型引用；空 = 未设默认（走 bridge 默认模型）。 */
+    lapianDefaultModel: string;
     videoSeconds: string;
     vquality: string;
     videoGenerateAudio: string;
@@ -66,7 +70,7 @@ export type WebdavSyncConfig = {
     directory: string;
     lastSyncedAt: string;
 };
-export type ConfigTabKey = "channels" | "local-proxy" | "preferences" | "prompt-sources" | "webdav" | "local-storage";
+export type ConfigTabKey = "channels" | "lapian-models" | "local-proxy" | "preferences" | "prompt-sources" | "webdav" | "local-storage";
 
 export type ChannelCredentialsImportResult = {
     status: "created" | "updated" | "missing-base-url" | "invalid-base-url";
@@ -109,6 +113,8 @@ export const defaultConfig: AiConfig = {
     audioFormat: "mp3",
     audioSpeed: "1",
     audioInstructions: "",
+    lapianModels: [],
+    lapianDefaultModel: "",
     videoSeconds: "6",
     vquality: "720",
     videoGenerateAudio: "true",
@@ -186,9 +192,6 @@ export function modelMatchesCapability(config: AiConfig, value: string, capabili
 }
 
 export function resolveModelForCapability(config: AiConfig, currentModel: string | undefined, capability: ModelCapability) {
-    // multimodal 没有全局默认（分析模型按节点选，存 metadata.lapianModel）——不匹配时回退空，
-    // 绝不冒用生图/文本模型顶替（M6-T7-A）。
-    if (capability === "multimodal") return currentModel && modelCapabilityOf(config, currentModel) === "multimodal" ? currentModel : "";
     const defaultModel = capability === "image" ? config.imageModel : capability === "video" ? config.videoModel : capability === "audio" ? config.audioModel : config.textModel;
     const fallbackModel = capability === "image" ? defaultConfig.imageModel : capability === "video" ? defaultConfig.videoModel : capability === "audio" ? defaultConfig.audioModel : defaultConfig.textModel;
     for (const model of [currentModel, defaultModel]) {
@@ -260,6 +263,9 @@ export const useConfigStore = create<ConfigStore>()(
                 if (!Array.isArray(persistedConfig.channels)) config.channels = [];
                 const channels = normalizeChannels(config);
                 const models = modelOptionsFromChannels(channels);
+                // 拉片模型清单/默认随持久化归一：渠道被删或模型改名后失效引用自动剔除，默认必须仍在清单内（M6-T7-R）。
+                const lapianModels = normalizeLapianModelList(config.lapianModels, channels);
+                const lapianDefaultModel = normalizeLapianDefaultModel(config.lapianDefaultModel, lapianModels, channels);
                 return {
                     ...current,
                     webdav: { ...defaultWebdavSyncConfig, ...persistedWebdav },
@@ -269,6 +275,8 @@ export const useConfigStore = create<ConfigStore>()(
                         apiFormat: normalizeApiFormat(config.apiFormat),
                         channels,
                         models,
+                        lapianModels,
+                        lapianDefaultModel,
                         imageModel: normalizeModelOptionValue(config.imageModel || config.model, channels),
                         videoModel: normalizeModelOptionValue(config.videoModel, channels),
                         textModel: normalizeModelOptionValue(config.textModel || config.model, channels),

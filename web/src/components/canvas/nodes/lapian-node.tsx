@@ -6,6 +6,7 @@
 import { useEffect, useRef, useState } from "react";
 
 import { canvasThemes } from "@/lib/canvas-theme";
+import { decodeChannelModelRef } from "@/lib/canvas/lapian-model";
 import type { CanvasNodeData } from "@/types/canvas";
 
 const BRIDGE = ""; // 同域相对路径：本地 dev 由 vite proxy 转发，公网由隧道同域转发
@@ -23,6 +24,8 @@ export function LapianNodeContent({ node, onContentChange }: { node: CanvasNodeD
     const taskId = String(node.metadata?.taskId || "");
     const jobId = String(node.metadata?.jobId || "");
     const intent = String(node.metadata?.intent || "");
+    // 透明（T7-R ③）：节点上直接可见本任务实际用的分析模型（创建时落盘的实际值；空 = 走服务端默认，不显示）。
+    const modelName = decodeChannelModelRef(String(node.metadata?.lapianModel || ""))?.model || "";
     const [phase, setPhase] = useState<Phase>("loading");
     const [elapsed, setElapsed] = useState(0);
     const [stage, setStage] = useState("");
@@ -100,6 +103,7 @@ export function LapianNodeContent({ node, onContentChange }: { node: CanvasNodeD
             <div className="flex shrink-0 items-center gap-1.5 border-b px-2 py-1.5 text-xs" style={{ borderColor: theme.node.stroke, background: theme.node.panel }}>
                 <span className="shrink-0 font-medium" style={{ color: theme.node.muted }}>拉片</span>
                 <span className="min-w-0 flex-1 truncate" style={{ color: theme.node.faint }} data-lapian-taskid>{taskId}</span>
+                {modelName ? <span className="shrink-0 rounded-md px-1.5 py-0.5 text-[10px]" style={{ color: theme.node.muted, border: `1px solid ${theme.node.stroke}` }} data-lapian-model-name title={modelName}>{modelName}</span> : null}
                 {phase === "done" || phase === "error" || phase === "lost" ? (
                     <button type="button" className="shrink-0 rounded-md px-1.5 py-0.5 text-[11px]" style={{ color: theme.node.muted, border: `1px solid ${theme.node.stroke}` }} onClick={() => void requery()} data-lapian-requery>重查</button>
                 ) : null}

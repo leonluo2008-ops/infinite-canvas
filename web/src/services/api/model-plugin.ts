@@ -968,9 +968,6 @@ return await generateText({
 });`,
         },
     ],
-    // multimodal 是理解型能力（读图/读视频）：调用即 OpenAI/Gemini 对话合同，无模板脚本——
-    // 空数组让脚本编辑器「从模板开始」区不出按钮（M6-T7-A）。
-    multimodal: [],
     };
 }
 
