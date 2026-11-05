@@ -33,7 +33,6 @@ const REFERENCE_RULES = `# 参考图怎么用
 # 写的时候
 - 陈述句、现在时、动词驱动；只写看得见的东西，看不见的不猜。
 - 一条动作一句话，句子连着写。
-- 镜头给人的感受直接写进对应镜头句：「电影感」「很震撼」「极具冲击力」「松弛」「高级感」这类氛围词，连同灯光质感（顺光通透、硬影对比、暖调光泽），能帮视频模型准确理解这个镜头要什么调性——该写就写，写在它修饰的那个镜头上。
 - 不用 JSON、不用表格、不回显字段名（不写「站位：」「运动形态：」）。
 - 要约束就写成一句看得见的指令（「全程机位不动，只有瓶身在画面中央旋转」），不列禁止清单。
 
@@ -71,12 +70,29 @@ const IMAGE_NUMBER_RULES = `# 图号纪律
 - 清单里有几个号就用到几号，不越过最后一位；清单外的号一个都不发明。`;
 
 /**
- * 镜头语言段（B7d）：拉片侧与改写侧用同一张标准词表。
+ * 镜头语言段（B8 契约单一事实源）：与拆解侧共用 wanrepro/contracts/camera-contract.md。
+ * ts 里不另抄词表——import 契约原文切片（§1 选词表 + §2 感受表述），改契约文件即两侧同时生效。
  * 这是正向选词指导（红线 15）：告诉模型从哪里选词，不列禁词。
  */
+import cameraContractRaw from "../../../../wanrepro/contracts/camera-contract.md?raw";
+
+function contractSection(markers: [string, string]): string {
+    const start = cameraContractRaw.indexOf(markers[0]);
+    const end = cameraContractRaw.indexOf(markers[1]);
+    if (start < 0 || end < 0 || end <= start) {
+        throw new Error("camera-contract.md 缺段落标记，无法切片：" + markers.join(" / "));
+    }
+    return cameraContractRaw.slice(start, end).trim();
+}
+
 const CAMERA_LANGUAGE_RULES = `# 镜头语言
-镜头运动用词沿用拉片「镜头调度」行的标准镜头语言（推、拉、摇、移、跟、升、降、环绕、甩镜、变焦、旋转、固定机位，及推近/拉远/上摇/横移/跟拍/后退/升起等复合方向词），不自创同义说法。
-拉片与这里用的是同一张表：词对词写下来，覆盖度才对得上，模型也才认得出这一镜机器在怎么动。`;
+镜头运动用词沿用拉片「镜头调度」行的标准镜头语言，不自创同义说法。拉片与这里用的是同一份契约（原文如下）：
+
+${contractSection(["## §1 选词表", "## §3 口吻"])}
+
+${contractSection(["## §2 镜头感受与灯光表述", "## §3 口吻"]).replace("## §2 镜头感受与灯光表述\n", "")}
+
+提示词侧落点：感受与灯光词写进它修饰的那个镜头句。词对词写下来，覆盖度才对得上，模型也才认得出这一镜机器在怎么动。`;
 
 /** 五套共用的收尾规则：参考图用法 + 镜头语言 + 用户意图 + 图号纪律。 */
 const COMMON_RULES = `${REFERENCE_RULES}

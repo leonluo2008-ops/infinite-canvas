@@ -24,6 +24,9 @@ async function loadModule(relativePath, name) {
         platform: "node",
         logLevel: "silent",
         alias: { "@": path.join(root, "src") },
+        // lapian-prompt-templates.ts raw import 契约文件（.md?raw）——按文本内联，
+        // 与 vite ?raw 语义一致；esbuild 对 query 后缀按扩展名匹配 loader。
+        loader: { ".md": "text" },
     });
     return import(pathToFileURL(outfile).href);
 }

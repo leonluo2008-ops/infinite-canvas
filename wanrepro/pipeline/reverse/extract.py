@@ -192,7 +192,11 @@ def load_api_key() -> str:
 # ---------------------------------------------------------------- 提示词（单一真源）
 
 def read_prompt(prompt_path: Path = PROMPT_PATH) -> str:
-    """从定版提示词文件里取第一个 ``` 围栏内的正文，不硬编码副本。"""
+    """从定版提示词文件里取第一个 ``` 围栏内的正文，不硬编码副本。
+
+    围栏正文里的 `{{镜头语言契约}}` 占位在返回前替换为 contracts/camera-contract.md
+    的 §1+§2 全文——拆解与画布改写共用同一份契约（单一事实源），两侧不可能漂移。
+    """
     try:
         raw = prompt_path.read_text(encoding="utf-8")
     except OSError as exc:
@@ -201,7 +205,8 @@ def read_prompt(prompt_path: Path = PROMPT_PATH) -> str:
     match = FENCE_RE.search(raw)
     if not match:
         raise PrecheckError(f"提示词源头 {prompt_path} 里没有 ``` 围栏，无法取正文")
-    body = match.group(1).strip("\r\n").strip()
+    # 原写法 strip(CRLF) + strip() 的等价简化（去围栏首尾空白）
+    body = match.group(1).strip()
 
     # 源头必须自带十层标题，否则说明围栏取错了（例如取到「下游怎么消费」那段代码）
     # ⚠️ 不要对整篇 body 做 normalize_heading——它会把换行压成空格，标题行再也匹配不到
@@ -210,7 +215,31 @@ def read_prompt(prompt_path: Path = PROMPT_PATH) -> str:
     if missing:
         raise PrecheckError(
             "提示词源头第一个围栏疑似不是提示词正文，缺标题：" + "、".join(missing))
+
+    body = _inject_camera_contract(body)
     return body
+
+
+def _inject_camera_contract(body: str) -> str:
+    """把 {{镜头语言契约}} 占位替换为契约 §1+§2 全文。
+
+    占位符存在而契约文件缺失/无内容 → PrecheckError（失败即失败，不静默发半截任务书）；
+    占位符不存在（旧版任务书）→ 原样返回，兼容未引用契约的历史正文。
+    """
+    placeholder = "{{镜头语言契约}}"
+    if placeholder not in body:
+        return body
+    contract_path = REPO_ROOT / "contracts" / "camera-contract.md"
+    try:
+        contract = contract_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise PrecheckError(f"任务书引用了镜头语言契约但读不到 {contract_path}：{exc}") from exc
+    # §1 起到 §3 前 = 选词表 + 感受表述两节
+    m = re.search(r"(## §1 .*?)(?=\n## §3 )", contract, re.S)
+    if not m:
+        raise PrecheckError(f"契约 {contract_path} 缺 §1/§2 段落结构，无法注入")
+    section = m.group(1).strip()
+    return body.replace(placeholder, section)
 
 
 def build_prompt(base_text: str, intent: str, facts: dict | None = None,

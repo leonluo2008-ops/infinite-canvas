@@ -182,35 +182,48 @@ console.log("B7c-⑧ 特写 / 中景 / 全景 / 远景属景别，不计");
 const shotSizes = cameraCoverage("- 镜头调度：特写转中景，全景，远景", "镜头特写转中景再拉全景。");
 check("全是景别词 → total 0", shotSizes.total === 0 && shotSizes.covered === 0 && shotSizes.missing.length === 0, show(shotSizes));
 
-console.log("C 三源一致：拆解 prompt 两处词表段 / 改写契约沿用条款 / coverage 词表");
+console.log("C 契约单一事实源：拆解占位注入 / 改写契约 raw import / coverage 逐词可识别");
+// C-1 契约文件本体
+const contractPath = path.resolve(root, "..", "wanrepro/contracts/camera-contract.md");
+const contractSrc = readFileSync(contractPath, "utf8");
+const contractLines = contractSrc.split(/\r?\n/);
+const wordLine = (prefix) => contractLines.find((line) => line.startsWith(prefix)) ?? "";
+const baseLine = wordLine("- 基础族：");
+const compoundLine = wordLine("- 复合与方向：");
+const stateLine = wordLine("- 机位状态：");
+check("契约含 §1/§2/§3 三节标记", contractSrc.includes("## §1 选词表") && contractSrc.includes("## §2 镜头感受与灯光表述") && contractSrc.includes("## §3 口吻"));
+check("契约 §1 三行词表（基础族/复合与方向/机位状态）", baseLine.length > 10 && compoundLine.length > 10 && stateLine.length > 10);
+check("契约含升格/景别排除说明", contractSrc.includes("升格") && contractSrc.includes("景别"));
+
+// C-2 拆解侧：占位注入（extract.py 发送前替换）
 const promptPath = path.resolve(root, "..", "wanrepro/prompts/视频拆解.md");
 const promptSrc = readFileSync(promptPath, "utf8");
-const vocabLines = promptSrc.split(/\r?\n/).filter((line) => line.includes("【选词·镜头语言】"));
-check("拆解 prompt 里两处词表段（2 行）", vocabLines.length === 2, `${vocabLines.length} 行`);
-check("两处词表段逐字相同", vocabLines.length === 2 && vocabLines[0] === vocabLines[1], vocabLines[1] === undefined ? "缺第二处" : `长度 ${vocabLines[0].length} vs ${vocabLines[1].length}`);
-const at = (needle) => promptSrc.indexOf(needle);
-const between = (from, to) => promptSrc.slice(at(from), at(to));
-check("一处落在「五 镜头」层（机位与运镜行下）", between("## 五 镜头", "## 六 意境").includes("【选词·镜头语言】"));
-check("一处落在「七 分镜表」的镜头运动列定义处", between("## 七 分镜表", "## 八 声音").includes("【选词·镜头语言】"));
+check("拆解 prompt 分镜表处用占位 {{镜头语言契约}}（恰好 1 处）", (promptSrc.match(/\{\{镜头语言契约\}\}/g) ?? []).length === 1);
+check("拆解 prompt 五层处是指向句（不重复全文）", promptSrc.includes("遵循上文分镜表部分的【镜头语言契约】"));
+const at2 = (needle) => promptSrc.indexOf(needle);
+const between2 = (from, to) => promptSrc.slice(at2(from), at2(to));
+check("占位落在「七 分镜表」段", between2("## 七 分镜表", "## 八 声音").includes("{{镜头语言契约}}"));
+check("指向句落在「五 镜头」层", between2("## 五 镜头", "## 六 意境").includes("遵循上文分镜表部分"));
+const extractPy = readFileSync(path.resolve(root, "..", "wanrepro/pipeline/reverse/extract.py"), "utf8");
+check("extract.py 有契约注入函数且读契约文件", extractPy.includes("_inject_camera_contract") && extractPy.includes("camera-contract.md"));
 
-const vocabulary = vocabLines[0] ?? "";
-const CORE_WORDS = ["推", "拉", "摇", "移", "跟", "升", "降", "环绕", "甩镜", "变焦", "旋转", "固定机位"];
-const absent = (text) => CORE_WORDS.filter((word) => !text.includes(word));
-check("拆解 prompt 词表段含 12 基础族", absent(vocabulary).length === 0, absent(vocabulary).join("/"));
-check("拆解 prompt 词表段含「复合与方向」「机位状态」两节", vocabulary.includes("复合与方向：") && vocabulary.includes("机位状态：") && vocabulary.includes("升格/慢动作属时间节奏"));
-
+// C-3 改写侧：raw import 契约，不另抄词表
 const templatesPath = path.join(src, "lib/canvas/lapian-prompt-templates.ts");
 const templatesSrc = readFileSync(templatesPath, "utf8");
-check("改写契约含「标准镜头语言」沿用条款", templatesSrc.includes("标准镜头语言") && templatesSrc.includes("不自创同义说法"));
-check("改写契约词表主体与拆解 prompt 一致（12 基础族都在）", absent(templatesSrc).length === 0, absent(templatesSrc).join("/"));
+check("改写契约 raw import 契约文件", templatesSrc.includes("camera-contract.md?raw"));
+check("改写契约含沿用条款（不自创同义说法）", templatesSrc.includes("标准镜头语言") && templatesSrc.includes("不自创同义说法"));
+const importZone = templatesSrc.slice(templatesSrc.indexOf("CAMERA_LANGUAGE_RULES"), templatesSrc.indexOf("COMMON_RULES"));
+check("改写契约切片注入 §1 与 §2", importZone.includes("contractSection") && importZone.includes("§1") && importZone.includes("§2"));
 
-const coverageSrc = readFileSync(path.join(src, "lib/canvas/camera-coverage.ts"), "utf8");
-check("coverage 源文件含 12 基础族", absent(coverageSrc).length === 0, absent(coverageSrc).join("/"));
-const notInDenominator = CORE_WORDS.filter((word) => {
-    const result = cameraCoverage(`- 镜头调度：${word}，特写`, "");
-    return result.total !== 1 || result.missing[0] !== word;
+// C-4 消费层逐词校验：契约 §1 每个词都必须能被 coverage 识别（加词不跟 → 这里红）
+const parseWords = (line) => line.replace(/^- [^：]+：/, "").split("、").map((word) => word.trim()).filter(Boolean);
+const allContractWords = [...parseWords(baseLine), ...parseWords(compoundLine), ...parseWords(stateLine)];
+check("契约词表非空（≥40 词）", allContractWords.length >= 40, `${allContractWords.length} 词`);
+const unrecognized = allContractWords.filter((word) => {
+    const result = cameraCoverage(`- 镜头调度：${word}，特写`, `镜头${word}。`);
+    return result.total < 1 || result.covered < 1;
 });
-check("coverage 行为：12 基础族逐个进分母且词名归一", notInDenominator.length === 0, notInDenominator.join("/"));
+check("契约 §1 全部词 coverage 可识别（进分母且命中）", unrecognized.length === 0, unrecognized.join("/"));
 
 console.log(`\n${passed} 通过 / ${failures.length} 失败`);
 if (failures.length) {
