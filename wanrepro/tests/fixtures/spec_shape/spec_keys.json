@@ -1,0 +1,120 @@
+{
+ "version": "1.0.0",
+ "_purpose": "spec.json 的**字段形状**锚点。只保留键路径与类型，不含任何业务值。供 spec/skeleton_projection.json 的 existing 路径与 B2 schema 迁移做依据。",
+ "_origin": "提取自 analysis/reverse/484/spec.json（2026-10-29），该文件本身因内容矛盾已被清理；本文件只保留结构。",
+ "_warning": "这不是产物样例，不能当 fixture 喂给渲染器——里面没有真实值。",
+ "shape": {
+  "meta": {
+   "duration_s": "<float>",
+   "fps": "<float>",
+   "aspect_ratio": "<str>",
+   "has_audio": "<bool>",
+   "shot_count": "<int>",
+   "cut_points_s": []
+  },
+  "global": {
+   "style_three": {
+    "look": "<str>",
+    "palette": "<str>",
+    "mood": "<str>"
+   },
+   "scene_env": "<str>",
+   "lighting": {
+    "direction": "<str>",
+    "quality": "<str>",
+    "color_temp": "<str>",
+    "notes": "<str>"
+   },
+   "consistency_requirements": [
+    "<str>"
+   ]
+  },
+  "shots": [
+   {
+    "shot_id": "<int>",
+    "start_s": "<float>",
+    "end_s": "<float>",
+    "shot_size": "<str>",
+    "camera_angle": "<str>",
+    "focal_feel": "<str>",
+    "camera_move": "<str>",
+    "move_speed": "<str>",
+    "subject_primary": "<str>",
+    "action_steps": [
+     {
+      "t_s": "<float>",
+      "who": "<str>",
+      "physical_step": "<str>",
+      "direction": "<str>"
+     }
+    ],
+    "product_presence": {
+     "present": "<bool>",
+     "bbox_rel": {
+      "x": "<float>",
+      "y": "<float>",
+      "w": "<float>",
+      "h": "<float>"
+     },
+     "screen_share_pct": "<int>",
+     "occluded_from_s": "<float>",
+     "leaves_frame_at_s": "<float>",
+     "appearance_notes": "<str>"
+    },
+    "props": [
+     {
+      "item": "<str>",
+      "count_start": "<int>",
+      "count_end": "<int>",
+      "change_rule": "<str>"
+     }
+    ],
+    "onscreen_text": [
+     {
+      "t_from_s": "<float>",
+      "t_to_s": "<float>",
+      "text": "<str>",
+      "style": "<str>"
+     }
+    ],
+    "audio": {
+     "bgm_style": "<str>",
+     "has_voice": "<bool>",
+     "voice_transcript": "<str>",
+     "sfx": [
+      {
+       "t_s": "<float>",
+       "desc": "<str>"
+      }
+     ]
+    },
+    "transition_out": "<str>",
+    "absent": [
+     "<str>"
+    ],
+    "single_shot_prompt": "<str>"
+   }
+  ],
+  "story": {
+   "hook": "<str>",
+   "development": "<str>",
+   "ending": "<str>"
+  },
+  "audio_summary": {
+   "bgm": "<str>",
+   "voice": "<str>",
+   "sfx": "<str>"
+  },
+  "replication": {
+   "ai_difficulty": "<str>",
+   "hard_parts": [
+    "<str>"
+   ],
+   "must_shoot_live": [
+    "<str>"
+   ],
+   "product_swap_suggestion": "<str>",
+   "person_swap_suggestion": "<str>"
+  }
+ }
+}

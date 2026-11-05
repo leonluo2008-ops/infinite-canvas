@@ -15,3 +15,10 @@ web/public/plugins
 plugins/canvas/*/dist
 plugins/canvas/*/node_modules
 web/public/plugins
+# wanrepro 引擎运行时产物（不进 git）
+wanrepro/analysis/
+wanrepro/output/
+wanrepro/.env
+wanrepro/bridge.log
+wanrepro/scratch/
+wanrepro/**/__pycache__/

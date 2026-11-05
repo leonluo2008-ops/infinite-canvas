@@ -1,0 +1,32 @@
+{
+  "meta": {
+    "measured": {
+      "duration_s": 13.347,
+      "width": 1920,
+      "height": 1080,
+      "fps": 30,
+      "cut_points_s": []
+    }
+  },
+  "shots": [
+    {
+      "contact": [
+        {
+          "from": "tray",
+          "to": "bottle",
+          "type": "顶到",
+          "direction": "up",
+          "driven": "hand"
+        }
+      ],
+      "end_composition": "Bottle centered in frame"
+    }
+  ],
+  "conflicts": [
+    {
+      "field": "duration_s",
+      "vlm": 12.0,
+      "measured": 13.347
+    }
+  ]
+}

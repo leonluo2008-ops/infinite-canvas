@@ -1,0 +1,26 @@
+{
+  "meta": {
+    "measured": {
+      "width": 1920,
+      "height": 1080,
+      "fps": 30,
+      "cut_points_s": [
+        6.0
+      ]
+    }
+  },
+  "shots": [
+    {
+      "contact": [
+        {
+          "from": "纸托",
+          "to": "瓶身",
+          "type": "顶到",
+          "direction": "由下向上",
+          "driven": "人工摆放"
+        }
+      ],
+      "end_composition": "瓶身位于画面中央，标签朝向镜头"
+    }
+  ]
+}

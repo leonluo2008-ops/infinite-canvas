@@ -1,0 +1,2488 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""本地 Web UI：选视频 → 看拆解 → 改命名/传图（自动识别）→ 选模板 → 拿提示词和有序图片包。
+
+它解决的唯一问题：**提示词里的 @图片N 和实际上传的图片必须一一对应**。
+所以这里的每个动作都围绕「序号」：清单的 # 列 = 资产清单的 图片N = 提示词里的 @图片N
+= assets/图片N.<ext> = 图片包里的 图片N.<ext>。
+
+用法
+----
+    py -3 ui/server.py                       # 127.0.0.1:8776，自动开浏览器
+    py -3 ui/server.py --port 9000 --no-browser
+
+只用标准库：http.server / json / base64 / zipfile / subprocess / pathlib。
+整合包形态：ROOT/web-dist/ 存在时 serve 其静态产物（SPA，/api 口径不变），并优先用
+包内 runtime/ffmpeg、包根 config/token 口令、app/config/channel-config.json 预置；
+开发机没有这些目录，行为完全不变。
+不改 pipeline/reverse/{extract,confirm,render}.py，不改 templates/，不改拆解.md；
+对待确认清单.md 只改「命名」列。
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import hashlib
+import io
+import json
+import os
+import re
+import secrets
+import subprocess
+import sys
+import threading
+import time
+import traceback
+import unicodedata
+import urllib.parse
+import urllib.request
+import webbrowser
+import zipfile
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+# Windows 无窗口补丁（2026-11-05）：画布 vite 自动拉起 bridge 后，孙进程（ffmpeg/python）
+# 会各弹一个终端窗口。本进程直接装补丁；子进程链经 PYTHONPATH 注入 pipeline/_nowindow
+# 的 sitecustomize（Python 启动自动执行）实现全链覆盖。
+_NOWINDOW_DIR = str(ROOT / "pipeline" / "_nowindow")
+if _NOWINDOW_DIR not in sys.path:
+    sys.path.insert(0, _NOWINDOW_DIR)
+os.environ["PYTHONPATH"] = _NOWINDOW_DIR + (os.pathsep + os.environ["PYTHONPATH"] if os.environ.get("PYTHONPATH") else "")
+import sitecustomize  # noqa: E402  （_nowindow 目录；import 即安装 subprocess 无窗口补丁）
+
+ANALYSIS = ROOT / "analysis" / "reverse"
+RAW = ROOT / "原始资料"
+UPLOADS = ROOT / "uploads"                 # 界面上传的新视频落这里；原始资料/ 一个字节不动
+TEMPLATES = ROOT / "templates"
+UI_DIR = Path(__file__).resolve().parent
+INDEX: Path | None = None  # 老 web 工具页已删（M6-T8）；留空占位防旧引用，随后续清理移除
+# 整合包形态：app/web-dist/ 放面布前端构建产物；存在 = 整合包，serve 它（SPA）。
+# 开发机没有这个目录，相关分支全部退回现状。
+WEB_DIST = ROOT / "web-dist"
+WEB_DIST_ROOT: Path | None = WEB_DIST.resolve() if WEB_DIST.is_dir() else None
+PY = sys.executable
+
+
+def ui_index() -> Path:
+    """首页入口：只有整合包形态的 web-dist/index.html（画布 SPA 构建产物）。
+    2026-11-05 老 web 工具页（ui/index.html）已按 M6-T8 删除——开发机上画布走
+    vite 开发服 :3000，:8779 根路径不提供页面。"""
+    if WEB_DIST_ROOT is None:
+        raise ApiError(503, "老 web 工具页已删除（M6-T8）。画布入口：开发机 vite :3000，整合包构建 web-dist 后自动提供。")
+    return WEB_DIST_ROOT / "index.html"
+
+IMAGE_EXT = {"png", "jpg", "jpeg", "webp"}
+VIDEO_EXT = {"mp4", "mov", "webm"}
+MAX_UPLOAD = int(os.environ.get("WAN_MAX_UPLOAD_MB", "500")) * 1024 * 1024   # 单个视频上限；公网演示时用环境变量收到 120
+# 公网模式：设了 WAN_TOKEN 就要求带口令；本机开发不设，行为完全不变。
+TOKEN = os.environ.get("WAN_TOKEN", "").strip()
+if not TOKEN:
+    # 整合包兼容：包根 config/token 首行当口令；WAN_TOKEN 未设才读，环境变量优先。
+    _token_file = ROOT.parent / "config" / "token"
+    if _token_file.is_file():
+        try:
+            TOKEN = _token_file.read_text(encoding="utf-8-sig", errors="replace").splitlines()[0].strip()
+        except (OSError, IndexError):
+            TOKEN = ""
+FP_NAME = ".源视频指纹.json"
+# 万相 omni2video 的真参数域（别自己造：不在这些值里的会直接 400）
+RATIOS = ("16:9", "9:16", "1:1", "4:3", "3:4")
+RESOLUTIONS = ("480P", "720P", "1080P")
+TOKEN_RE = re.compile(r"[0-9a-f]{16}")     # 预演令牌：sha256 前 16 位十六进制
+GEN_STALE = 60 * 60          # 记录写着 running 但一小时没动静 → 当它挂了，允许重开
+MAGIC = (
+    (b"\x89PNG\r\n\x1a\n", "png"),
+    (b"\xff\xd8\xff", "jpg"),
+)
+MIME = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg", "webp": "image/webp"}
+VIDEO_MIME = {"mp4": "video/mp4", "m4v": "video/x-m4v", "mov": "video/quicktime", "webm": "video/webm"}
+# 整合包静态 serve（web-dist）：按扩展名给 Content-Type，其余回 octet-stream。
+STATIC_MIME = {
+    ".html": "text/html; charset=utf-8",
+    ".js": "text/javascript; charset=utf-8",
+    ".mjs": "text/javascript; charset=utf-8",
+    ".css": "text/css; charset=utf-8",
+    ".svg": "image/svg+xml",
+    ".png": "image/png",
+    ".ico": "image/x-icon",
+    ".json": "application/json",
+    ".map": "application/json",
+    ".webmanifest": "application/manifest+json",
+    ".txt": "text/plain; charset=utf-8",
+    ".woff": "font/woff",
+    ".woff2": "font/woff2",
+    ".ttf": "font/ttf",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".webp": "image/webp",
+}
+
+# Range: bytes=0-1023 / bytes=1024- / bytes=-2048（后缀）
+RANGE_RE = re.compile(r"^bytes=(\d*)-(\d*)$")
+CHUNK = 64 * 1024
+
+ID_RE = re.compile(r"^[\w\u4e00-\u9fa5.\-]{1,64}$")
+ASSET_RE = re.compile(r"^图片(\d+)\.(png|jpg|jpeg|webp)$", re.IGNORECASE)
+HEAD_RE = re.compile(r"^##\s*([一二三四五六七八九十])\s+(.+?)\s*$")
+
+# 上传文件名里的隐形字符：零宽空格/连接符、方向控制符、BOM、软连字符。
+# 仓里已有先例（`需求录屏.mp4` 带 U+200B），不清掉的话路径看起来一样却打不开。
+INVISIBLE_RE = re.compile(r"[\u200b-\u200f\u202a-\u202e\u2060\ufeff\u00ad]")
+UNSAFE_RE = re.compile(r'[\\/:*?"<>|\x00-\x1f\x7f]')
+
+WRITE_LOCK = threading.Lock()
+ANALYZING: set[str] = set()      # 正在跑的拆解（一次付费调用，别让双击变两次）
+# 公网演示：/api/analyze 改成「提交 → 轮询」，否则隧道/边缘在 100 秒就会断（524），
+# 而一次拆解实测 60–150 秒。JOBS 存进度，BUSY 保证全局同时只跑一个（一次付费调用）。
+JOBS: dict[str, dict] = {}
+JOBS_LOCK = threading.Lock()
+ANALYZE_BUSY = threading.Lock()
+JOB_TTL = 3600                   # 一小时前的任务记录随手清掉
+
+# 资产图「识别命名」的后台状态：(task_id, no) → {state, name, warning, started, elapsed}
+# 命名要调多模态模型，实测 10–50 秒；挂在 /api/upload 的响应里就等于让界面假死，
+# 所以上传只负责落盘，命名另开线程跑，前端轮询 /api/naming/<id>/<no> 拿结果。
+NAMING: dict[tuple[str, int], dict] = {}
+NAMING_LOCK = threading.Lock()
+NAMING_KEEP = 900                # 跑完的状态保留 15 分钟（供刷新后的轮询），过期清掉
+
+
+class ApiError(Exception):
+    def __init__(self, status: int, msg: str) -> None:
+        super().__init__(msg)
+        self.status = status
+        self.msg = msg
+
+
+# ---------------------------------------------------------------- 基础读写
+
+
+def read_text(path: Path) -> str:
+    if not path.is_file():
+        return ""
+    return path.read_text(encoding="utf-8-sig", errors="replace")
+
+
+def write_text(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write(text)
+
+
+def task_dir(task_id: str) -> Path:
+    if not task_id or ".." in task_id or not ID_RE.match(task_id):
+        raise ApiError(400, f"任务 id 不合法：{task_id!r}")
+    d = ANALYSIS / task_id
+    if not d.is_dir():
+        raise ApiError(404, f"任务不存在：{task_id}")
+    return d
+
+
+def assets_dir(task_id: str) -> Path:
+    d = task_dir(task_id) / "assets"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def video_file(task_id: str, strict: bool = True) -> Path | None:
+    """从 .源视频指纹.json 的「路径」读回源视频。
+
+    指纹里存的是**相对仓库根**的路径（如 `原始资料/…/x.mp4`，文件名里可能带零宽
+    字符），所以只在不是绝对路径时才拼 ROOT，其余原样保留——不要 normalize 名字。
+    strict=False 供列表用：任何问题都返回 None，不抛。
+    """
+    fp = ANALYSIS / task_id / ".源视频指纹.json"
+    if not fp.is_file():
+        if not strict:
+            return None
+        raise ApiError(404, f"{task_id} 没有 .源视频指纹.json，无法定位源视频")
+    try:
+        meta = json.loads(read_text(fp) or "{}")
+    except json.JSONDecodeError:
+        if not strict:
+            return None
+        raise ApiError(500, f"{task_id} 的 .源视频指纹.json 不是合法 JSON") from None
+    raw = str((meta or {}).get("路径") or "").strip()
+    if not raw:
+        if not strict:
+            return None
+        raise ApiError(404, f"{task_id} 的 .源视频指纹.json 里没有「路径」")
+    path = Path(raw)
+    if not path.is_absolute():
+        path = ROOT / raw
+    try:
+        path = path.resolve()
+    except OSError:
+        if not strict:
+            return None
+        raise ApiError(400, f"源视频路径不合法：{raw}") from None
+    if not path.is_file():
+        if not strict:
+            return None
+        raise ApiError(404, f"源视频文件不在了：{raw}")
+    return path
+
+
+# ---------------------------------------------------------------- 拆解 / 清单 / 产物
+
+
+def parse_dissection(task_id: str) -> list[dict]:
+    """拆解.md → [{title, body}]，十层按原文顺序。"""
+    text = read_text(task_dir(task_id) / "拆解.md")
+    layers: list[dict] = []
+    cur: dict | None = None
+    buf: list[str] = []
+    for raw in text.splitlines():
+        m = HEAD_RE.match(raw)
+        if m:
+            if cur is not None:
+                cur["body"] = "\n".join(buf).strip()
+            cur = {"title": f"{m.group(1)} {m.group(2)}", "body": ""}
+            layers.append(cur)
+            buf = []
+            continue
+        if raw.startswith("## "):
+            if cur is not None:
+                cur["body"] = "\n".join(buf).strip()
+                cur, buf = None, []
+            continue
+        if cur is not None:
+            buf.append(raw)
+    if cur is not None:
+        cur["body"] = "\n".join(buf).strip()
+    # 去掉开头的 HTML 注释（耗时/token 那行不进 UI）
+    for layer in layers:
+        layer["body"] = re.sub(r"^\s*<!--.*?-->\s*", "", layer["body"], flags=re.S).strip()
+    return layers
+
+
+def table_cells(line: str) -> list[str] | None:
+    s = line.strip()
+    if not s.startswith("|"):
+        return None
+    if re.fullmatch(r"\|[\s:|-]+\|", s):
+        return None
+    return [c.strip() for c in s.strip("|").split("|")]
+
+
+def decode_desc_cell(value: str) -> str:
+    """解码描述列自己的安全编码，不改变用户文本中的其他 HTML 实体。"""
+    return (value.replace("&#124;", "|").replace("&#10;", chr(10))
+            .replace("&#13;", chr(13)).replace("&#38;", "&"))
+
+
+def encode_desc_cell(value: str) -> str:
+    """把描述中的表格控制字符编码，读回后恢复为原文。"""
+    return (str(value).replace("&", "&#38;").replace("|", "&#124;")
+            .replace(chr(13), "&#13;").replace(chr(10), "&#10;"))
+
+
+def parse_checklist(task_id: str) -> list[dict]:
+    rows: list[dict] = []
+    for raw in read_text(task_dir(task_id) / "待确认清单.md").splitlines():
+        cells = table_cells(raw)
+        if not cells or len(cells) < 6 or not re.fullmatch(r"\d+", cells[0]):
+            continue
+        rows.append({
+            "no": int(cells[0]),
+            "kind": cells[1],
+            "seen": cells[2],
+            "name": cells[3],
+            "image": cells[4],
+            "lock": cells[5],
+            "suggest": cells[6] if len(cells) > 6 else "",
+            "my_desc": decode_desc_cell(cells[7]) if len(cells) > 7 else "",
+        })
+    return rows
+
+
+def task_intent(task_id: str) -> str:
+    """读取任务当前意图；缺文件等同空字符串。"""
+    path = task_dir(task_id) / "意图.txt"
+    return path.read_bytes().decode("utf-8") if path.is_file() else ""
+
+
+def intent_hash(intent: str) -> str:
+    return hashlib.sha256(intent.encode("utf-8")).hexdigest()
+
+
+def task_intent_changed(task_id: str, intent: str | None = None) -> bool:
+    """当前意图哈希与拆解成功时记录的哈希不同；老指纹缺字段按空意图兼容。"""
+    d = task_dir(task_id)
+    current = task_intent(task_id) if intent is None else intent
+    try:
+        meta = json.loads(read_text(d / FP_NAME) or "{}")
+    except json.JSONDecodeError:
+        return bool(current)
+    stored = meta.get("意图哈希", intent_hash("")) if isinstance(meta, dict) else intent_hash("")
+    return stored != intent_hash(current)
+
+
+def ensure_checklist_width(cells: list[str]) -> None:
+    while len(cells) < 8:
+        cells.append("")
+
+
+def _update_checklist_cell(task_id: str, no: int, index: int, value: str) -> bool:
+    path = task_dir(task_id) / "待确认清单.md"
+    if not path.is_file():
+        raise ApiError(404, "待确认清单.md 不存在，先跑一次拆解")
+    with WRITE_LOCK:
+        lines = read_text(path).splitlines()
+        for i, raw in enumerate(lines):
+            cells = table_cells(raw)
+            if not cells:
+                continue
+            if "类别" in cells and len(cells) < 8:
+                ensure_checklist_width(cells)
+                cells[6] = "建议"
+                cells[7] = "用我的描述"
+                lines[i] = "| " + " | ".join(cells) + " |"
+                continue
+            if len(cells) < 6 or not re.fullmatch(r"\d+", cells[0]):
+                continue
+            if int(cells[0]) != no:
+                continue
+            ensure_checklist_width(cells)
+            cells[index] = value
+            lines[i] = "| " + " | ".join(cells) + " |"
+            write_text(path, "\n".join(lines) + "\n")
+            return True
+    raise ApiError(404, f"待确认清单里没有第 {no} 行")
+
+
+def set_checklist_image(task_id: str, no: int, filename: str) -> bool:
+    """把已落盘图片写回资产图列；这是渲染器判断「有资产图」的绑定真源。"""
+    return _update_checklist_cell(task_id, no, 4, filename)
+
+
+def set_checklist_desc(task_id: str, no: int, text: str) -> bool:
+    """保存第 8 列描述；空字符串也要能清空人工覆盖。"""
+    return _update_checklist_cell(task_id, no, 7, encode_desc_cell(text))
+
+
+def set_checklist_name(task_id: str, no: int, name: str) -> bool:
+    """只改「命名」列（第 4 列）；其余字节原样保留。"""
+    clean = re.sub(r"\s+", " ", name).replace("|", "｜").strip()
+    return _update_checklist_cell(task_id, no, 3, clean)
+
+
+def parse_asset_sheet(task_id: str) -> list[dict]:
+    rows: list[dict] = []
+    for raw in read_text(task_dir(task_id) / "资产清单.md").splitlines():
+        cells = table_cells(raw)
+        if not cells or len(cells) < 4:
+            continue
+        m = re.fullmatch(r"图片(\d+)", cells[0])
+        pending = cells[0] in ("—", "-", "–", "")
+        if not m and not pending:
+            continue
+        what = cells[2]
+        row_no = 0
+        mm = re.match(r"清单第\s*(\d+)\s*行\s*·\s*", what)
+        if mm:
+            row_no = int(mm.group(1))
+            what = what[mm.end():]
+        rows.append({
+            "no": int(m.group(1)) if m else 0,     # 提示词图号；0 = 还没备图，不进正文
+            "row": row_no,                          # 清单行号：上传与写回都按它对齐
+            "type": cells[1],
+            "what": what,
+            "lock": cells[3],
+        })
+    return rows
+
+
+def asset_files(task_id: str) -> dict[int, Path]:
+    found: dict[int, Path] = {}
+    d = task_dir(task_id) / "assets"
+    if not d.is_dir():
+        return found
+    for p in sorted(d.iterdir()):
+        m = ASSET_RE.match(p.name)
+        if m and p.is_file():
+            found[int(m.group(1))] = p
+    return found
+
+
+def latest_prompt(task_id: str) -> tuple[str, str]:
+    """→ (正文, 模板名)；取 mtime 最新的 提示词-<tpl>.md。"""
+    files = sorted(task_dir(task_id).glob("提示词-*.md"),
+                   key=lambda p: p.stat().st_mtime, reverse=True)
+    if not files:
+        return "", ""
+    path = files[0]
+    return read_text(path), path.stem[len("提示词-"):]
+
+
+# ---------------------------------------------------------------- 人工复检（B1/B2）
+
+RECHECK_TIMEOUT = 60
+
+
+def recheck_call(task_id: str, extra: list[str] | None = None) -> dict:
+    """跑 `pipeline/recheck.py --json`：检测与写回只有那一份实现，这里不另写一套判断。
+
+    命令行出错是一行中文（stderr），直接转给页面——「复检项不存在」「只能改一行」
+    这些都要人看得懂，不该变成 500 加 traceback。
+    """
+    args = ["pipeline/recheck.py", "--id", task_id, "--json"] + list(extra or [])
+    code, out, err = run_py(args, timeout=RECHECK_TIMEOUT)
+    if code != 0:
+        raise ApiError(400, (err.strip().splitlines() or [f"复检失败（退出 {code}）"])[-1])
+    try:
+        data = json.loads(out.strip().splitlines()[-1])
+    except (json.JSONDecodeError, IndexError):
+        raise ApiError(500, "复检清单输出看不懂：" + tail(out)) from None
+    if not isinstance(data, dict) or not isinstance(data.get("items"), list):
+        raise ApiError(500, "复检清单输出不是一个对象：" + tail(out))
+    data.setdefault("pending", 0)
+    return data
+
+
+def render_task(task_id: str, stem: str, optional: str = "") -> str:
+    """调 render.py 重渲染一版模板，返回落盘的模板名。模板不存在 → 400。
+
+    `optional` 是要打开的可选段字母（如 `C`，逗号分隔可多个）：render.py 默认全关，
+    不透传的话界面选了「品牌收束」也不会出现在正文里（2026-11-04 路 A 审计 B5——
+    UI 是唯一入口，这里传了才算数）。
+    """
+    if not re.fullmatch(r"[0-9A-Za-z._-]{1,64}", stem) or not (TEMPLATES / f"{stem}.md").is_file():
+        raise ApiError(400, f"模板不存在：templates/{stem}.md")
+    argv = ["pipeline/reverse/render.py", "--id", task_id, "--template", stem]
+    if str(optional or "").strip():
+        argv += ["--optional", str(optional).strip()]
+    code, out, err = run_py(argv, timeout=120)
+    if code != 0:
+        raise ApiError(500, f"render.py 退出 {code}：{tail(err) or tail(out)}")
+    return latest_prompt(task_id)[1] or stem
+
+
+def build_assets(task_id: str) -> list[dict]:
+    """资产清单表 + 实际落盘图片 → 一份带 url 的对齐表。"""
+    files = asset_files(task_id)
+    out: list[dict] = []
+    for row in parse_asset_sheet(task_id):
+        f = files.get(row.get("row") or row["no"]) or files.get(row["no"])
+        row["file"] = f.name if f else ""
+        row["url"] = f"/assets/{urllib.parse.quote(task_id)}/{urllib.parse.quote(f.name)}" if f else ""
+        out.append(row)
+    # 清单里没有、但盘上有的（手放进去的图）也列出来，免得「传了图却没显示」。
+    # 判重要按**清单行号**：图号只发给已备图的资产，没备图的行图号是 0，
+    # 拿图号判重会把「第 2 行已传图（图号1）」和「盘上 图片2.png」当成两件东西，
+    # 页面就会同一个资产出现两行（实测 10 个资产显示成 15 行）。
+    known = {int(r.get("row") or r["no"]) for r in out}
+    for no, f in sorted(files.items()):
+        if no in known:
+            continue
+        out.append({"no": no, "row": no, "type": "未在清单内", "what": f.name, "lock": "",
+                    "file": f.name,
+                    "url": f"/assets/{urllib.parse.quote(task_id)}/{urllib.parse.quote(f.name)}"})
+    out.sort(key=lambda r: (r.get("row") or 10 ** 6, r["no"]))   # 按清单行号排，没行号的垫底
+    return out
+
+
+DIALOGUE_NAME = "台词改写.md"
+RECEIPT_NAME = "渲染回执.json"
+TIME_CODE_RE = re.compile(r"\d{1,2}:\d{2}(?:\.\d+)?\s*[-–—~～]\s*\d{1,2}:\d{2}(?:\.\d+)?")
+QUOTE_CHARS = "\"'“”‘’「」『』"
+
+
+def dialogue_map(task_id: str) -> list[dict] | None:
+    """`台词改写.md` → [{start, source, zh}]；文件不在 → None（页面据此整块不显示）。
+
+    解析口径与生产端 `render.py:load_dialogue_rows` 一致：全角/半角竖线、有无项目符号都先
+    归一，再取「时间码 / 原文 / 中文」三列；标题行与分隔行按内容剔除，不假设模型格式。
+    """
+    path = task_dir(task_id) / DIALOGUE_NAME
+    if not path.is_file():
+        return None
+    rows: list[dict] = []
+    for raw in read_text(path).splitlines():
+        line = re.sub(r"\s*[|｜]\s*", "｜", raw.strip().lstrip("-*+• ").strip())
+        if "｜" not in line:
+            continue
+        cells = [c.strip() for c in line.strip("｜").split("｜")]
+        if len(cells) < 3 or all(re.fullmatch(r"[-: ]*", c) for c in cells):
+            continue
+        if any(key in c for c in cells for key in ("起-止", "原文", "中文")):
+            continue
+        code = TIME_CODE_RE.search(cells[0])
+        source = cells[1].strip().strip(QUOTE_CHARS).strip()
+        zh = cells[2].strip()
+        if not code or not source or not zh:
+            continue
+        rows.append({"start": code.group(0), "source": source, "zh": zh})
+    return rows
+
+
+def intent_receipt(task_id: str) -> dict | None:
+    """`渲染回执.json` 原样读回（dialogue_total / hits / misses / residual / language_line）。
+
+    缺失或坏了 → None：一个回执文件不该把整个任务页打成 500。
+    """
+    path = task_dir(task_id) / RECEIPT_NAME
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(read_text(path) or "{}")
+    except json.JSONDecodeError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def task_payload(task_id: str) -> dict:
+    prompt_text, template = latest_prompt(task_id)
+    src = video_file(task_id, strict=False)
+    source: dict = {}
+    if src is not None:
+        try:
+            abs_path = str(src)
+        except OSError:
+            abs_path = ""
+        source = {"name": src.name, "rel": rel_path(src), "abs": abs_path}
+    return {
+        "id": task_id,
+        "disc": {"layers": parse_dissection(task_id)},
+        "checklist": parse_checklist(task_id),
+        "prompt": {"text": prompt_text, "template": template},
+        "assets": build_assets(task_id),
+        "source": source,
+        "intent": task_intent(task_id),
+        "intent_changed": task_intent_changed(task_id),
+        # 意图回执（C-3）：页面看「原句 → 中文」，复制正文只给成品。文件不在就是 null。
+        "dialogueMap": dialogue_map(task_id),
+        "intentReceipt": intent_receipt(task_id),
+    }
+
+
+# ---------------------------------------------------------------- 生成成片（万相 CLI）
+
+
+GEN_DIR = "生成"
+GEN_RECORD = "记录.json"
+
+
+def gen_dir(task_id: str) -> Path:
+    return task_dir(task_id) / GEN_DIR
+
+
+def gen_record(task_id: str) -> dict:
+    """`生成/记录.json` 原样读回；没有/坏了 → {}（别让一个记录文件把整页打成 500）。"""
+    path = gen_dir(task_id) / GEN_RECORD
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(read_text(path) or "{}")
+    except json.JSONDecodeError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def gen_state(task_id: str) -> dict:
+    """页面轮询用：记录 + 成片是否真在盘上 + 带版本号的 url（换了片子能刷掉浏览器缓存）。"""
+    rec = gen_record(task_id)
+    if not rec:
+        return {"status": "idle", "template": latest_prompt(task_id)[1], "available": False,
+                "preflight": {}}
+    state = dict(rec)
+    name = str(rec.get("video") or "")
+    path = gen_dir(task_id) / name if name else None
+    state["available"] = bool(path and path.is_file() and path.stat().st_size > 0)
+    state["url"] = (f"/genvideo/{urllib.parse.quote(task_id)}?v={int(path.stat().st_mtime)}"
+                    if state["available"] else "")
+    state["bytes"] = path.stat().st_size if state["available"] else 0
+    # 提交前核对的结果要能透到页面：出片之后才看得见「当时核过什么」
+    state["preflight"] = rec.get("preflight") or {}
+    if state.get("status") == "running":
+        age = time.time() - float(rec.get("started") or 0)
+        state["elapsed"] = round(age, 1)
+        state["stale"] = age > GEN_STALE
+    return state
+
+
+GEN_PLAN_TIMEOUT = 240       # 预演要启 node、查余额、前后各拉一次任务列表；给足但不无限等
+
+
+def gen_plan(task_id: str, template: str, duration: int, ratio: str, resolution: str,
+             audio: bool = True) -> dict:
+    """跑一次 `wan_video.plan`（**里面已经带了预演核对**）→ 计划字典。
+
+    这是唯一的核对入口：弹层打开时、任一参数变化时、点「确认生成」时，都走这一条，
+    所以页面上看到的核对行和服务端提交前判的东西是**同一个函数**算出来的。
+    """
+    args = ["pipeline/gen/wan_video.py", "--id", task_id,
+            "--duration", str(duration), "--ratio", ratio, "--resolution", resolution,
+            "--audio-output", "true" if audio else "false"]
+    if template:
+        args += ["--template", template]
+    code, out, err = run_py(args, timeout=GEN_PLAN_TIMEOUT)
+    if code != 0:
+        raise ApiError(400, tail(err) or tail(out) or f"计划失败（退出 {code}）")
+    try:
+        info = json.loads(out.strip().splitlines()[-1])
+    except (json.JSONDecodeError, IndexError):
+        raise ApiError(500, "计划输出看不懂：" + tail(out)) from None
+    if not isinstance(info, dict):
+        raise ApiError(500, "计划输出不是一个对象：" + tail(out)) from None
+    return info
+
+
+# ------------------------------------------------- 万相视频生成 bridge（canvas 任务）
+# 画布端一手件：POST /api/wan/video/run 建任务 → 后台子进程跑 wan_video.py →
+# GET /api/wan/video/job/<jobId> 轮询（状态映射以 生成/记录.json 为唯一状态源，引擎契约）→
+# GET /api/wan/video/file/<taskId> 拿成片。并发：万相 CLI 同时只认一条，第二条 409。
+
+WAN_TEMPLATE = "canvas"                     # bridge 专用模板：提示词-canvas.md → 成片-canvas.mp4
+WAN_RATIOS = ("16:9", "9:16", "1:1")        # 画布端只暴露这三个画幅
+WAN_RESOLUTIONS = {"480": "480P", "720": "720P", "1080": "1080P"}   # 画布端给数字；引擎 argparse 要 P 后缀（RESOLUTIONS=480P/720P/1080P，见 wan_submit.py:31）
+WAN_JOB_TIMEOUT = 3600                      # 引擎内部预演+提交+等待合计可到 ~45 分钟，这里兜底
+WAN_BUSY = threading.Lock()                 # 同时最多 1 条万相 job（CLI 限制；并发会重复扣费）
+DATAURL_RE = re.compile(r"^data:image/([\w.+-]+);base64,(.*)$", re.S)
+DATAURL_EXT = {"png": "png", "jpeg": "jpg", "jpg": "jpg", "webp": "webp"}
+
+
+def decode_data_url(raw: str, name: str) -> tuple[bytes, str]:
+    """`data:image/<mime>;base64,…` → (字节, 扩展名)。mime 决定落盘扩展名，文件名只做展示。"""
+    m = DATAURL_RE.match(str(raw or "").strip())
+    if not m:
+        raise ApiError(400, f"图片 {name} 的 dataUrl 不是 data:image/…;base64, 形式")
+    ext = DATAURL_EXT.get(m.group(1).lower())
+    if not ext:
+        raise ApiError(400, f"图片 {name} 的格式 image/{m.group(1)} 不支持（只收 png/jpg/webp）")
+    try:
+        return base64.b64decode(re.sub(r"\s+", "", m.group(2)), validate=True), ext
+    except ValueError:
+        raise ApiError(400, f"图片 {name} 的 base64 解不出来") from None
+
+
+def wan_prepare_task(prompt: str, images: list) -> str:
+    """建 `wan-<unixts>` 任务目录并落盘输入：提示词-canvas.md + assets/图片N.<ext>（按序）。
+
+    目录建在 analysis/reverse/ 下——wan_video.py 的 task_dir() 只认那里
+    （`ANALYSIS = ROOT/"analysis"/"reverse"`，引擎不改，bridge 就按引擎的输入约定走）。
+    """
+    with WRITE_LOCK:
+        ts = int(time.time())
+        while (ANALYSIS / f"wan-{ts}").exists():        # 同秒并发 → 顺延到下一个空闲时间戳
+            ts += 1
+        task_id = f"wan-{ts}"
+        d = ANALYSIS / task_id
+        (d / "assets").mkdir(parents=True, exist_ok=True)
+        write_text(d / f"提示词-{WAN_TEMPLATE}.md", prompt)
+        for no, item in enumerate(images, start=1):     # 列表顺序 = 图号顺序，@图片N 按此对齐
+            name = str(item.get("name") or f"图片{no}")
+            blob, ext = decode_data_url(item.get("dataUrl"), name)
+            if not blob:
+                raise ApiError(400, f"图片 {name} 是空的（0 字节）")
+            (d / "assets" / f"图片{no}.{ext}").write_bytes(blob)
+        return task_id
+
+
+def wan_argv(task_id: str, duration: int, ratio: str, resolution: str,
+             audio: bool, confirm: bool) -> list[str]:
+    """wan_video.py 子进程命令行（唯一拼装点；参数名与其 argparse 逐一对过）。
+
+    不带 `--confirm` = 引擎只打计划不提交（引擎契约：花钱动作必须显式确认）。
+    """
+    argv = ["pipeline/gen/wan_video.py", "--id", task_id, "--template", WAN_TEMPLATE,
+            "--duration", str(duration), "--ratio", ratio,
+            "--resolution", WAN_RESOLUTIONS[resolution],
+            "--audio-output", "true" if audio else "false"]
+    if confirm:
+        argv.append("--confirm")
+    return argv
+
+
+def wan_video_job_state(job_id: str) -> dict:
+    """/api/wan/video/job/<jobId>：JOBS 记录 + 生成/记录.json → 轮询状态。
+
+    记录.json 是唯一状态源；子进程退出码只补「进程级失败」：
+    exit != 0 → failed + stderr 尾部一句（引擎把原因打在 stderr 最后一行）。
+    """
+    with JOBS_LOCK:
+        rec = JOBS.get(job_id)
+        rec = dict(rec) if rec else None
+    if rec is None or rec.get("kind") != "wan-video":
+        raise ApiError(404, "没有这个万相视频任务号（可能服务重启过，重新发起一次生成即可）")
+    task_id = str(rec.get("task_id") or "")
+    try:
+        gen_rec = gen_record(task_id)
+        gen_path = gen_dir(task_id)
+    except ApiError:
+        gen_rec, gen_path = {}, None
+
+    out: dict = {"status": "running", "stage": "计划",
+                 "elapsed": round(time.time() - float(rec.get("started") or time.time()), 1),
+                 "taskId": task_id}
+    final_name = f"成片-{WAN_TEMPLATE}.mp4"
+    jstatus = str(gen_rec.get("status") or "")
+    if jstatus == "done":
+        out.update(status="done", stage="完成")
+        return out
+    if jstatus == "failed":
+        out.update(status="failed", stage="失败",
+                   error=str(gen_rec.get("error") or "生成失败（原因见任务记录）"))
+        return out
+    if jstatus == "running":
+        if not gen_rec.get("taskId"):
+            out["stage"] = "已提交"               # 记录已写、taskId 还没回填 = CLI 提交中
+        elif gen_path is not None and (
+                (gen_path / final_name).is_file()
+                or any(p.name != final_name for p in gen_path.glob("*.mp4"))):
+            out["stage"] = "下载中"               # CLI 已往 生成/ 落 mp4（还没改名成成片）
+        else:
+            out["stage"] = "生成中"
+
+    job_status = str(rec.get("status") or "running")
+    if job_status == "error":                    # bridge 自己起子进程/记日志就挂了
+        out.update(status="failed", error=str(rec.get("error") or "bridge 内部异常"))
+    elif job_status == "done" and int(rec.get("exit") or 0) != 0:
+        lines = [ln for ln in str(rec.get("stderr") or "").strip().splitlines() if ln.strip()]
+        out.update(status="failed",
+                   error=lines[-1] if lines else f"wan_video.py 退出码 {rec.get('exit')}")
+    elif job_status == "done" and jstatus != "running":
+        out.update(status="done", stage="完成")   # dry 计划：引擎退出 0 且没有记录.json
+    return out
+
+
+# ---------------------------------------------------------------- 子进程调用
+
+
+def run_py(args: list[str], timeout: int, extra_env: dict | None = None) -> tuple[int, str, str]:
+    child_env = {**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1"}
+    if extra_env:
+        child_env.update(extra_env)
+    proc = subprocess.run(
+        [PY, *args],
+        cwd=str(ROOT),
+        capture_output=True,
+        timeout=timeout,
+        env=child_env,
+    )
+    out = proc.stdout.decode("utf-8", errors="replace")
+    err = proc.stderr.decode("utf-8", errors="replace")
+    return proc.returncode, out, err
+
+
+def tail(text: str, limit: int = 1200) -> str:
+    text = (text or "").strip()
+    return text[-limit:]
+
+
+def slug(text: str) -> str:
+    s = re.sub(r"[^0-9A-Za-z_-]+", "-", text).strip("-")
+    return (s[:32] or "task").lower()
+
+
+def new_task_id(video: Path) -> str:
+    base = slug(video.stem)
+    candidate, n = base, 1
+    while (ANALYSIS / candidate).exists():
+        n += 1
+        candidate = f"{base}-{n}"
+    return candidate
+
+
+# ---------------------------------------------------------------- 视频上传 / 建任务
+
+
+def head_sha256(path: Path, limit: int = 1024 * 1024) -> str:
+    """前 1MB 的 sha256——与 analyze.py 的指纹算法逐字节一致（同一条片子才认得出）。"""
+    digest = hashlib.sha256()
+    remaining = limit
+    with open(path, "rb") as fh:
+        while remaining > 0:
+            chunk = fh.read(min(CHUNK, remaining))
+            if not chunk:
+                break
+            digest.update(chunk)
+            remaining -= len(chunk)
+    return digest.hexdigest()
+
+
+def rel_path(path: Path) -> str:
+    """仓库内路径记相对（与 analyze.py 的 display_path 同款），指纹才能跨机器对账。"""
+    try:
+        return path.resolve().relative_to(ROOT).as_posix()
+    except (ValueError, OSError):
+        return str(path)
+
+
+def clean_video_name(raw: str) -> tuple[str, str]:
+    """→ (stem, ext)。清隐形字符、剥目录、挡掉非法字符；只认 mp4/mov/webm。"""
+    name = INVISIBLE_RE.sub("", unicodedata.normalize("NFC", str(raw or "")))
+    name = name.replace("\\", "/").rsplit("/", 1)[-1]      # 去掉任何目录成分
+    name = UNSAFE_RE.sub("-", name).strip(" .")
+    stem, dot, ext = name.rpartition(".")
+    if not dot:
+        raise ApiError(400, f"认不出文件格式：{raw or '(无文件名)'}（只收 MP4 / MOV / WEBM）")
+    ext = ext.lower()
+    if ext not in VIDEO_EXT:
+        raise ApiError(400, f"只收 MP4 / MOV / WEBM，收到 .{ext}")
+    stem = re.sub(r"\s+", " ", stem).strip(" .")[:60] or "video"
+    return stem, ext
+
+
+def sniff_video(head: bytes, ext: str) -> bool:
+    """看一眼文件头：扩展名对不上内容就早点拒——否则 /video/<id> 会 200 但播放器放不出来。"""
+    if ext == "webm":
+        return head[:4] == b"\x1aE\xdf\xa3"               # EBML
+    if len(head) >= 8 and head[4:8] == b"ftyp":           # mp4 / mov 标准起手
+        return True
+    return head[4:8] in (b"moov", b"mdat", b"wide", b"free", b"skip", b"pnot", b"uuid")
+
+
+def task_id_base(stem: str) -> str:
+    base = slug(stem)
+    if base == "task":        # slug() 把非 ASCII 全吃掉；纯中文名退化成这个，改用短哈希
+        base = "video-" + hashlib.sha1(stem.encode("utf-8")).hexdigest()[:8]
+    return base[:48]
+
+
+def unique_task_id(base: str) -> str:
+    candidate, n = base, 1
+    while (ANALYSIS / candidate).exists():
+        n += 1
+        candidate = f"{base}-{n}"
+    return candidate
+
+
+def write_fingerprint(task_id: str, video: Path) -> dict:
+    """照 analyze.py 的字段名写 .源视频指纹.json（/video/<id> 靠「路径」定位源视频）。"""
+    stat = video.stat()
+    meta = {
+        "路径": rel_path(video),
+        "大小": stat.st_size,
+        "mtime_ns": stat.st_mtime_ns,
+        "前1MB_sha256": head_sha256(video),
+        "记录时间": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    path = ANALYSIS / task_id / FP_NAME
+    with WRITE_LOCK:
+        write_text(path, json.dumps(meta, ensure_ascii=False, indent=2) + "\n")
+    return meta
+
+
+def place_upload(temp: Path, stem: str, ext: str) -> Path:
+    """把临时文件挪进 uploads/；重名不覆盖（x.mp4 → x-2.mp4）。O_EXCL 占位防同名并发。"""
+    UPLOADS.mkdir(parents=True, exist_ok=True)
+    n = 0
+    while True:
+        n += 1
+        cand = UPLOADS / (f"{stem}.{ext}" if n == 1 else f"{stem}-{n}.{ext}")
+        try:
+            os.close(os.open(cand, os.O_CREAT | os.O_EXCL | os.O_WRONLY))
+        except FileExistsError:
+            continue
+        try:
+            os.replace(temp, cand)
+        except OSError:
+            cand.unlink(missing_ok=True)
+            raise
+        return cand
+
+
+def create_task_from_upload(video: Path) -> str:
+    """给刚上传的视频建 `analysis/reverse/<id>/` + 指纹。不写别的产物（拆解要花钱，得人点头）。"""
+    task_id = unique_task_id(task_id_base(video.stem))
+    (ANALYSIS / task_id).mkdir(parents=True, exist_ok=True)
+    write_fingerprint(task_id, video)
+    return task_id
+
+
+def pending_task_for(video: Path) -> str | None:
+    """同一条源视频、已由上传建了目录但还没有 拆解.md → 复用那个 id。
+
+    不复用的话 /api/analyze 会另建 `<id>-2`，留下一个只有指纹的空壳目录。
+    """
+    if not ANALYSIS.is_dir():
+        return None
+    for d in sorted(ANALYSIS.iterdir()):
+        if not d.is_dir() or (d / "拆解.md").is_file():
+            continue
+        src = video_file(d.name, strict=False)
+        if src is None:
+            continue
+        try:
+            if src.resolve() == video:
+                return d.name
+        except OSError:
+            continue
+    return None
+
+
+# ---------------------------------------------------------------- 图片命名
+
+
+def import_asset_namer():
+    sys.path.insert(0, str(ROOT / "pipeline" / "reverse"))
+    import asset_name  # noqa: PLC0415 - 延迟导入，避免服务启动时依赖 API
+    return asset_name
+
+
+def detect_ext(filename: str, blob: bytes) -> str:
+    suffix = Path(filename).suffix.lower().lstrip(".")
+    if suffix in IMAGE_EXT:
+        return "jpg" if suffix == "jpeg" else suffix
+    for magic, ext in MAGIC:
+        if blob.startswith(magic):
+            return ext
+    if blob[:4] == b"RIFF" and blob[8:12] == b"WEBP":
+        return "webp"
+    raise ApiError(400, f"认不出图片格式：{filename or '(无文件名)'}")
+
+
+def save_asset(task_id: str, no: int, filename: str, blob: bytes) -> Path:
+    if no < 1:
+        raise ApiError(400, "no 必须是 ≥1 的整数")
+    ext = detect_ext(filename, blob)
+    d = assets_dir(task_id)
+    for old in d.glob(f"图片{no}.*"):          # 同序号重传 = 覆盖
+        if old.is_file() and old.name != f"图片{no}.{ext}":
+            old.unlink()
+    path = d / f"图片{no}.{ext}"
+    with WRITE_LOCK:
+        path.write_bytes(blob)
+    return path
+
+
+def name_and_store(task_id: str, no: int, path: Path) -> tuple[str, str, str]:
+    """调 asset_name 识别 → 写回清单命名列和描述列。→ (名字, 描述, 失败原因)"""
+    kind = "主体"
+    for row in parse_checklist(task_id):
+        if row["no"] == no:
+            kind = row["kind"] if row["kind"] in ("主体", "服装", "人物", "场景", "道具") else "主体"
+            break
+    try:
+        mod = import_asset_namer()
+        name, desc = mod.identify(path, kind)
+    except Exception as err:                   # noqa: BLE001 - 命名失败不能拖垮上传
+        return "", "", f"自动命名失败：{getattr(err, 'msg', None) or err}"
+    if name:
+        set_checklist_name(task_id, no, name)
+    # 只有已有人工描述时才保护它；自动识别描述仅负责预填空列。
+    current = next((r for r in parse_checklist(task_id) if r["no"] == no), None)
+    if desc and not (current and current.get("my_desc", "").strip()):
+        set_checklist_desc(task_id, no, desc)
+    return name, desc, ""
+
+
+def naming_state(task_id: str, no: int) -> dict:
+    """→ {state: running|done|failed|unknown, name, warning, elapsed}。"""
+    with NAMING_LOCK:
+        st = NAMING.get((task_id, no))
+        if st is None:
+            return {"no": no, "state": "unknown", "name": "", "desc": "", "warning": "", "elapsed": 0.0}
+        out = dict(st)
+    if out.get("state") == "running":
+        out["elapsed"] = round(time.time() - float(out.get("started") or time.time()), 1)
+    return out
+
+
+def start_naming(task_id: str, no: int, path: Path) -> None:
+    """后台跑识别命名，立刻返回。落盘与命名拆开：用户先看到图，再看到名字。"""
+    with NAMING_LOCK:
+        NAMING[(task_id, no)] = {"state": "running", "name": "", "desc": "", "warning": "",
+                                 "started": time.time(), "elapsed": 0.0}
+
+    def work() -> None:
+        try:
+            name, desc, warning = name_and_store(task_id, no, path)
+        except Exception as err:               # noqa: BLE001 - 后台线程不能静默死掉
+            traceback.print_exc()
+            name, desc, warning = "", "", f"自动命名失败：{getattr(err, 'msg', None) or err}"
+        with NAMING_LOCK:
+            started = float((NAMING.get((task_id, no)) or {}).get("started") or time.time())
+            NAMING[(task_id, no)] = {
+                "state": "failed" if warning else "done",
+                "name": name, "desc": desc, "warning": warning,
+                "started": started, "elapsed": round(time.time() - started, 1),
+            }
+            # 清掉过期状态，别让常开着的服务只涨不落
+            cutoff = time.time() - NAMING_KEEP
+            for key, val in list(NAMING.items()):
+                if val.get("state") != "running" and float(val.get("started") or 0) < cutoff:
+                    NAMING.pop(key, None)
+
+    threading.Thread(target=work, name=f"asset-name-{task_id}-{no}", daemon=True).start()
+
+
+# ---------------------------------------------------------------- multipart
+
+
+def parse_multipart(body: bytes, boundary: str) -> tuple[dict[str, str], dict[str, tuple[str, bytes]]]:
+    fields: dict[str, str] = {}
+    files: dict[str, tuple[str, bytes]] = {}
+    sep = b"--" + boundary.encode("latin-1")
+    for chunk in body.split(sep):
+        if not chunk or chunk in (b"--\r\n", b"--"):
+            continue
+        chunk = chunk[2:] if chunk.startswith(b"\r\n") else chunk
+        if chunk.endswith(b"\r\n"):
+            chunk = chunk[:-2]
+        head, _, data = chunk.partition(b"\r\n\r\n")
+        if not _:
+            continue
+        text = head.decode("utf-8", errors="replace")
+        m = re.search(r'name="([^"]*)"', text)
+        if not m:
+            continue
+        field = m.group(1)
+        fm = re.search(r'filename="([^"]*)"', text)
+        if fm is not None:
+            files[field] = (fm.group(1), data)
+        else:
+            fields[field] = data.decode("utf-8", errors="replace")
+    return fields, files
+
+
+# ---------------------------------------------------------------- 资产位截帧（T3-J2）
+
+# 资产位节点要「原片截图」。截帧在 bridge 侧做，理由同拉片/渲染：ffmpeg 不进浏览器。
+# 入参只有 task_id + 资产名——源视频路径由 .源视频指纹.json 查回，时间区间由 拆解.md 的
+# 「出现于：00:00-02.03、04.07-06.00」解析，取第一段的中点。前端不传视频、不传时间。
+FRAME_DIR = "frames"
+FRAME_MAX_WIDTH = 960
+SPAN_TEXT_RE = re.compile(r"出现于[：:]\s*([^）)\n]+)")
+SPAN_RANGE_RE = re.compile(r"(\d{1,2}(?::\d{1,2})?(?:\.\d{1,2})?)\s*[-–—~]\s*(\d{1,2}(?::\d{1,2})?(?:\.\d{1,2})?)")
+
+
+def parse_timecode(token: str, duration: float = 0.0) -> float | None:
+    """IR 的时间码混用：`00:00`（分:秒）与 `02.03`（秒.百分秒）。
+
+    `06:00` 在 6.85 秒的片子里是 6 秒而不是 6 分——按分:秒读出来超过时长就退回按秒读。
+    """
+    raw = str(token or "").strip().replace("：", ":")
+    if not raw:
+        return None
+    if ":" in raw:
+        head, _, tail = raw.partition(":")
+        try:
+            value = float(head) * 60 + float(tail)
+        except ValueError:
+            return None
+        if duration > 0 and value > duration:
+            try:
+                return float(raw.replace(":", "."))
+            except ValueError:
+                return None
+        return value
+    try:
+        return float(raw)
+    except ValueError:
+        return None
+
+
+def video_duration(video: Path) -> float:
+    """ffprobe 读时长；读不到就 0（后面只影响越界保护，不影响截帧）。"""
+    try:
+        proc = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=nw=1:nk=1", str(video)],
+            capture_output=True, timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return 0.0
+    try:
+        return float(proc.stdout.decode("utf-8", "replace").strip().splitlines()[0])
+    except (IndexError, ValueError):
+        return 0.0
+
+
+def asset_span(task_id: str, name: str, duration: float = 0.0) -> tuple[float, float] | None:
+    """拆解.md 里这条资产的「出现于」第一段区间（秒）。找不到 → None（截帧退到首帧附近）。"""
+    path = ANALYSIS / task_id / "拆解.md"
+    if not path.is_file():
+        return None
+    for line in read_text(path).splitlines():
+        if name not in line:
+            continue
+        span = SPAN_TEXT_RE.search(line)
+        if not span:
+            continue
+        hit = SPAN_RANGE_RE.search(span.group(1))
+        if not hit:
+            continue
+        start = parse_timecode(hit.group(1), duration)
+        end = parse_timecode(hit.group(2), duration)
+        if start is None or end is None or end <= start:
+            continue
+        return start, end
+    return None
+
+
+def jpeg_size(path: Path) -> tuple[int, int]:
+    """JPEG 的 SOF 段读宽高（只为落节点 naturalWidth/Height，不值得再起一次 ffprobe）。"""
+    data = path.read_bytes()
+    index = 2
+    while index + 9 < len(data):
+        if data[index] != 0xFF:
+            index += 1
+            continue
+        marker = data[index + 1]
+        if marker in (0xC0, 0xC1, 0xC2, 0xC3):
+            height = (data[index + 5] << 8) | data[index + 6]
+            width = (data[index + 7] << 8) | data[index + 8]
+            return width, height
+        index += 2 + ((data[index + 2] << 8) | data[index + 3])
+    return 0, 0
+
+
+def build_asset_frame(task_id: str, name: str) -> dict:
+    """资产位截帧：返回帧图路径 + 时刻 + 尺寸；同一 (任务, 资产, 时刻) 命中缓存不重跑 ffmpeg。"""
+    video = video_file(task_id)
+    duration = video_duration(video)
+    span = asset_span(task_id, name, duration)
+    if span:
+        at = round((span[0] + span[1]) / 2, 2)
+    else:
+        # 没有出现区间：退到片头附近的一帧。宁可给一张「不太准的原片」，也不要一张白卡（所有者原话）。
+        at = round(max(0.0, min(0.4, (duration or 0.8) / 10)), 2)
+    out_dir = task_dir(task_id) / "assets" / FRAME_DIR
+    out_dir.mkdir(parents=True, exist_ok=True)
+    # 文件名带资产名哈希：slug() 只留 ASCII，「人物A / 服装A」都会塌成 a，同刻就撞同一张缓存。
+    tag = hashlib.sha1(name.encode("utf-8")).hexdigest()[:8]
+    path = out_dir / f"{slug(name)}-{tag}-{at:.2f}.jpg"
+    if not path.is_file() or path.stat().st_size <= 0:
+        cmd = [
+            "ffmpeg", "-v", "error", "-nostdin", "-y",
+            "-ss", f"{at:.2f}", "-i", str(video), "-frames:v", "1",
+            "-vf", "scale=w=min(960\\,iw):h=-2",
+            "-q:v", "3", str(path),
+        ]
+        try:
+            proc = subprocess.run(cmd, capture_output=True, timeout=120)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise ApiError(500, f"截帧跑不起来：{exc}") from None
+        if proc.returncode != 0 or not path.is_file() or path.stat().st_size <= 0:
+            raise ApiError(500, "截帧失败：" + (tail(proc.stderr.decode("utf-8", "replace")) or f"退出码 {proc.returncode}"))
+    width, height = jpeg_size(path)
+    url = f"/api/asset-frame/{urllib.parse.quote(task_id)}?name={urllib.parse.quote(name)}&raw=1"
+    return {"ok": True, "t": at, "approx": span is None, "span": list(span) if span else None,
+            "width": width, "height": height, "url": url, "path": str(path)}
+
+
+# ---------------------------------------------------------------- HTTP
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "WanUI/1.0"
+    protocol_version = "HTTP/1.1"
+
+    # -- 输出 ------------------------------------------------------
+    def send_body(self, data: bytes, status: int = 200, ctype: str = "application/octet-stream",
+                  extra: dict[str, str] | None = None) -> None:
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "no-store")
+            origin = self.headers.get("Origin") or ""
+            if origin in CANVAS_ORIGINS:          # 画布 dev（:3000）fetch 白名单
+                self.send_header("Access-Control-Allow-Origin", origin)
+            for k, v in (extra or {}).items():
+                self.send_header(k, v)
+            self.end_headers()
+            if self.command != "HEAD":
+                self.wfile.write(data)
+        except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
+            # 客户端已经断开（刷新/关标签/取消上传）。socket 死了，没什么可写的，
+            # 安静收工即可——不能让它冒到 dispatch 变成一条假的 500。
+            self.close_connection = True
+
+    def send_json(self, obj, status: int = 200) -> None:
+        data = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+        self.send_body(data, status, "application/json; charset=utf-8")
+
+    def query_param(self, key: str) -> str:
+        q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        return (q.get(key) or [""])[0]
+
+    def log_message(self, fmt: str, *args) -> None:
+        sys.stderr.write(f"[ui] {self.address_string()} {fmt % args}\n")
+
+    def handle_one_request(self) -> None:
+        """浏览器关 keep-alive 连接会打断 readline，抛 ConnectionResetError。
+
+        这不是错误：请求早已正常返回 200，只是客户端不打招呼就断开了
+        （刷新页面、关标签、headless 截图退出都会这样）。默认实现会把整段
+        traceback 打到 stderr，双击 启动UI.bat 的人看到满屏红字会以为坏了。
+        """
+        try:
+            super().handle_one_request()
+        except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
+            self.close_connection = True
+
+    # -- 入参 ------------------------------------------------------
+    def read_body(self) -> bytes:
+        length = int(self.headers.get("Content-Length") or 0)
+        return self.rfile.read(length) if length else b""
+
+    def read_json(self) -> dict:
+        body = self.read_body()
+        if not body:
+            return {}
+        try:
+            payload = json.loads(body.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            raise ApiError(400, "请求体不是合法 JSON") from None
+        if not isinstance(payload, dict):
+            raise ApiError(400, "请求体必须是 JSON 对象")
+        return payload
+
+    # -- 路由 ------------------------------------------------------
+    def do_GET(self) -> None:
+        self.dispatch("GET")
+
+    def do_HEAD(self) -> None:
+        self.dispatch("GET")
+
+    def gate(self) -> bool:
+        """公网口径：设了 WAN_TOKEN 就要求口令，没设就直通（本机开发行为不变）。
+
+        `?token=…` 校验通过后种 HttpOnly Cookie 并 302 到不带 token 的地址，
+        这样刷新、点链接、下载图片都不会再把口令写进历史记录。
+        """
+        if not TOKEN:
+            return True
+        # 本机直连（Host 是 127.0.0.1/localhost）不用口令；隧道过来的请求 Host 是公网域名，
+        # 客户端地址同样是 127.0.0.1，所以必须靠 Host 头区分，不能只看 client_address。
+        host = (self.headers.get("Host") or "").split(":")[0].strip("[]").lower()
+        # v1.0.0 公网：vite proxy 会把 Host 改写成 127.0.0.1:8776，Host 判定失效——
+        # 以 X-Forwarded-Forwarded 链为准：CF/隧道链路必带真实客户端 IP，出现非私网 IP 一律走口令。
+        xff = (self.headers.get("X-Forwarded-For") or "")
+        ips = [ip.strip() for ip in xff.split(",") if ip.strip()]
+        def _private(ip: str) -> bool:
+            return ip.startswith(("127.", "10.", "192.168.", "172.", "::1", "localhost")) or ip == ""
+        if any(not _private(ip) for ip in ips):
+            pass  # 有公网来源 IP：落到下方口令校验，Host 是什么都不豁免
+        elif host in ("127.0.0.1", "localhost", "::1"):
+            return True
+        parsed = urllib.parse.urlparse(self.path)
+        query = urllib.parse.parse_qs(parsed.query)
+        given = (query.get("token") or [""])[0].strip()
+        if given and secrets.compare_digest(given, TOKEN):
+            rest = [(k, v) for k, vs in query.items() if k != "token" for v in vs]
+            # v1.0.0 画布公网（隧道→vite:3000，bridge 走 /api 代理）：token 入口直接落到画布首页，
+            # cookie 已种（同域），甲方再访问任意 /api 均通过。
+            target = "/"
+            self.send_response(302)
+            self.send_header("Location", target)
+            self.send_header("Set-Cookie", f"wan_auth={TOKEN}; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return False
+        cookie = self.headers.get("Cookie") or ""
+        m = re.search(r"(?:^|;\s*)wan_auth=([^;]+)", cookie)
+        if m and secrets.compare_digest(m.group(1).strip(), TOKEN):
+            return True
+        self.send_body(
+            "需要访问口令。\n用法：在地址后面加 ?token=<口令>，例如 https://<域名>/?token=…\n"
+            "（这个站点会调用付费模型，所以默认不对外开放。）".encode("utf-8"),
+            401, "text/plain; charset=utf-8",
+        )
+        return False
+
+    def do_POST(self) -> None:
+        self.dispatch("POST")
+
+    def do_OPTIONS(self) -> None:
+        origin = self.headers.get("Origin") or ""
+        rmethod = (self.headers.get("Access-Control-Request-Method") or "").upper()
+        if origin in CANVAS_ORIGINS and rmethod:
+            self.send_response(204)
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Filename")
+            self.send_header("Access-Control-Max-Age", "86400")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        self.send_body(b"{}", 404, "application/json")
+
+    def dispatch(self, method: str) -> None:
+        if method == "OPTIONS":
+            self.do_OPTIONS()
+            return
+        try:
+            if not self.gate():
+                return
+            path = urllib.parse.urlparse(self.path).path
+            if method == "GET":
+                self.route_get(path)
+            else:
+                self.route_post(path)
+        except ApiError as err:
+            self.send_json({"error": err.msg}, err.status)
+        except subprocess.TimeoutExpired:
+            self.send_json({"error": "子进程超时"}, 500)
+        except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
+            # 客户端在写回途中跑了（刷新、关标签、上传到一半取消）。
+            # 这不是服务故障：既不该记 500，也不该再往一个已死的 socket 写错误响应。
+            self.close_connection = True
+        except Exception:                       # noqa: BLE001 - 兜底：绝不把异常写成 0/空
+            traceback.print_exc()
+            try:
+                self.send_json({"error": "服务内部异常，见终端 traceback"}, 500)
+            except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
+                self.close_connection = True
+
+    def route_get(self, path: str) -> None:
+        # ---- 图床直链（M4）：https://vc-t.aistar.work/vc/<key> → uploads/vc/<key> ----
+        if path.startswith("/vc/"):
+            rel = path[len("/vc/"):]
+            target = (UPLOADS / "vc" / rel).resolve()
+            if not str(target).startswith(str((UPLOADS / "vc").resolve())) or not target.is_file():
+                raise ApiError(404, "图床里没有这个文件")
+            mime = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp"}.get(target.suffix.lower(), "application/octet-stream")
+            self.send_body(target.read_bytes(), 200, mime)
+            return
+        if path in ("/", "/index.html"):
+            index = ui_index()
+            if not index.is_file():
+                raise ApiError(500, "ui/index.html 不见了" if WEB_DIST_ROOT is None
+                               else "web-dist/index.html 不见了")
+            self.send_body(index.read_bytes(), 200, "text/html; charset=utf-8")
+            return
+        if path == "/api/videos":
+            self.send_json({"videos": list_videos()})
+            return
+        if path == "/api/tasks":
+            self.send_json({"tasks": list_tasks()})
+            return
+        # ---- 整合包：面布前端首启导入渠道预置（app/config/channel-config.json）----
+        if path == "/api/bootstrap-config":
+            preset = ROOT / "config" / "channel-config.json"
+            if not preset.is_file():
+                raise ApiError(404, "no preset")
+            self.send_body(preset.read_bytes(), 200, "application/json")
+            return
+        # ---- 画布 bridge（M3）：三个只读 API，供画布前端（:3000）fetch -------
+        if path == "/api/specs":
+            sys.path.insert(0, str(ROOT / "pipeline" / "reverse"))
+            from spec_registry import load_registry
+            self.send_json({"specs": load_registry()})
+            return
+        m = re.fullmatch(r"/api/lapian/([^/]+)", path)
+        if m:
+            self.send_json(lapian_payload(urllib.parse.unquote(m.group(1)),
+                                          self.query_param("spec") or "jimeng-lapian"))
+            return
+        m = re.fullmatch(r"/api/render/([^/]+)/([^/]+)", path)
+        if m:
+            self.send_json(render_payload(urllib.parse.unquote(m.group(1)),
+                                          urllib.parse.unquote(m.group(2)),
+                                          self.query_param("optional")))
+            return
+        m = re.fullmatch(r"/api/job/([0-9a-f]+)", path)
+        if m:
+            with JOBS_LOCK:
+                rec = JOBS.get(m.group(1))
+                rec = dict(rec) if rec else None
+            if rec is None:
+                raise ApiError(404, "没有这个任务号（可能服务重启过，重开一次拆解即可）")
+            payload = {"status": rec.get("status")}
+            if rec.get("status") == "done":
+                payload["result"] = rec.get("result")
+                payload["elapsed"] = rec.get("elapsed")
+            elif rec.get("status") == "error":
+                # error 文案原样全量透传（前端 error 态要展示全文），缺理由时给兜底话
+                payload["error"] = str(rec.get("error") or "拆解失败（bridge 没记下原因，重查一次或看 bridge.log）")
+            else:
+                payload["elapsed"] = round(time.time() - float(rec.get("started") or time.time()), 1)
+                # running 态顺带读该任务 进度.json 透出当前阶段（M6-T6F）；读不到就缺省，不影响原响应
+                stage_rec = read_progress(rec.get("task_id"))
+                stage_name = str(stage_rec.get("stage") or "") if stage_rec else ""
+                if stage_name:
+                    payload["stage"] = stage_name
+                    if stage_rec.get("ts"):
+                        payload["stage_ts"] = stage_rec.get("ts")
+            self.send_json(payload)
+            return
+        m = re.fullmatch(r"/api/wan/video/job/([^/]+)", path)
+        if m:
+            self.send_json(wan_video_job_state(urllib.parse.unquote(m.group(1))))
+            return
+        m = re.fullmatch(r"/api/wan/video/file/([^/]+)", path)
+        if m:
+            self.serve_wan_video(urllib.parse.unquote(m.group(1)))
+            return
+        m = re.fullmatch(r"/api/generate/([^/]+)", path)
+        if m:
+            self.send_json(gen_state(urllib.parse.unquote(m.group(1))))
+            return
+        m = re.fullmatch(r"/genvideo/([^/]+)", path)
+        if m:
+            self.serve_generated(urllib.parse.unquote(m.group(1)))
+            return
+        m = re.fullmatch(r"/api/task/([^/]+)", path)
+        if m:
+            self.send_json(task_payload(urllib.parse.unquote(m.group(1))))
+            return
+        m = re.fullmatch(r"/api/recheck/([^/]+)", path)
+        if m:
+            tid = urllib.parse.unquote(m.group(1))
+            task_dir(tid)
+            self.send_json(recheck_call(tid))
+            return
+        m = re.fullmatch(r"/api/naming/([^/]+)/(\d+)", path)
+        if m:
+            tid = urllib.parse.unquote(m.group(1))
+            task_dir(tid)
+            self.send_json(naming_state(tid, int(m.group(2))))
+            return
+        m = re.fullmatch(r"/api/zip/([^/]+)", path)
+        if m:
+            self.download_zip(urllib.parse.unquote(m.group(1)))
+            return
+        m = re.fullmatch(r"/api/asset-frame/([^/]+)", path)
+        if m:
+            # T3-J2：资产位截帧。?meta 默认返回 JSON（含 url），?raw=1 直接回 JPEG 给 <img>。
+            tid = urllib.parse.unquote(m.group(1))
+            name = (self.query_param("name") or "").strip()
+            if not name:
+                raise ApiError(400, "要带 name=<资产名>（拆解.md 里资产行的名字）")
+            task_dir(tid)                        # 校验任务 id（不合法/不存在 → 400/404）
+            info = build_asset_frame(tid, name)
+            if self.query_param("raw") == "1":
+                self.send_body(Path(info["path"]).read_bytes(), 200, "image/jpeg")
+                return
+            info.pop("path", None)
+            self.send_json(info)
+            return
+        m = re.fullmatch(r"/assets/([^/]+)/([^/]+)", path)
+        if m:
+            # 整合包形态：Vite 构建产物（/assets/index-*.js 等）与任务资产图共用 /assets/ 前缀，
+            # web-dist 里真有这个文件就先按静态给；没有才走任务资产路由（行为与开发机一致）。
+            if self.try_static(path):
+                return
+            self.serve_asset(urllib.parse.unquote(m.group(1)), urllib.parse.unquote(m.group(2)))
+            return
+        m = re.fullmatch(r"/video/([^/]+)", path)
+        if m:
+            self.serve_video(urllib.parse.unquote(m.group(1)))
+            return
+        # ---- 整合包形态兜底：现有路由都没命中且非 /api/* → web-dist 静态文件 ----
+        # 目录/不存在回退 index.html（SPA path 路由 /canvas/<id>）；/api/* 照旧 404 JSON。
+        if WEB_DIST_ROOT is not None and not path.startswith("/api/"):
+            self.serve_static(path)
+            return
+        raise ApiError(404, f"没有这个地址：{path}")
+
+    def route_post(self, path: str) -> None:
+        if path == "/api/asset/upload":
+            self.do_asset_upload()
+            return
+        if path == "/api/video/upload":
+            self.do_video_upload()
+            return
+        if path == "/api/lapian/run":
+            payload = self.read_json()
+            tid = str(payload.get("id") or "")
+            task_dir(tid)                     # 校验任务存在（404 语义一致）
+            vf = video_file(tid)              # 指纹解析源视频路径（404/500 语义沿用）
+            rel = vf.resolve().relative_to(ROOT) if str(vf.resolve()).startswith(str(ROOT)) else vf
+            # M6-T7-C：可选 分析模型/渠道 透传（不传 → 与旧版完全一致）
+            extra_args, extra_env = lapian_channel_passthrough(payload)
+            self.send_json(start_analyze_job(str(rel), str(payload.get("intent") or ""), tid,
+                                             extra_args=extra_args, extra_env=extra_env))
+            return
+        if path == "/api/wan/video/run":
+            self.do_wan_video_run()
+            return
+        if path == "/api/analyze":
+            payload = self.read_json()
+            intent = str(payload.get("intent") or "")
+            task_id = str(payload.get("id") or "")
+            # 公网口径：立刻回 job id，前端轮询 /api/job/<id>；同步跑会被边缘 100s 掐断
+            self.send_json(start_analyze_job(str(payload.get("video") or ""), intent, task_id))
+            return
+        m = re.fullmatch(r"/api/name/([^/]+)", path)
+        if m:
+            tid = urllib.parse.unquote(m.group(1))
+            payload = self.read_json()
+            try:
+                no = int(payload.get("no"))
+            except (TypeError, ValueError):
+                raise ApiError(400, "no 必须是整数") from None
+            set_checklist_name(tid, no, str(payload.get("name") or ""))
+            self.send_json({"ok": True, "no": no})
+            return
+        m = re.fullmatch(r"/api/desc/([^/]+)", path)
+        if m:
+            tid = urllib.parse.unquote(m.group(1))
+            payload = self.read_json()
+            try:
+                no = int(payload.get("row"))
+            except (TypeError, ValueError):
+                raise ApiError(400, "row 必须是整数") from None
+            text = str(payload.get("text") or "")
+            set_checklist_desc(tid, no, text)
+            self.send_json({"ok": True, "row": no, "text": text})
+            return
+        m = re.fullmatch(r"/api/upload/([^/]+)", path)
+        if m:
+            self.do_upload(urllib.parse.unquote(m.group(1)))
+            return
+        m = re.fullmatch(r"/api/render/([^/]+)", path)
+        if m:
+            self.do_render(urllib.parse.unquote(m.group(1)))
+            return
+        m = re.fullmatch(r"/api/recheck/([^/]+)", path)
+        if m:
+            self.do_recheck(urllib.parse.unquote(m.group(1)))
+            return
+        m = re.fullmatch(r"/api/generate/([^/]+)", path)
+        if m:
+            self.do_generate(urllib.parse.unquote(m.group(1)))
+            return
+        m = re.fullmatch(r"/api/confirm/([^/]+)", path)
+        if m:
+            self.do_confirm(urllib.parse.unquote(m.group(1)))
+            return
+        m = re.fullmatch(r"/api/asset/delete/([^/]+)", path)
+        if m:
+            self.do_delete_asset(urllib.parse.unquote(m.group(1)))
+            return
+        self.read_body()                       # 排掉未读的请求体，别把 keep-alive 弄乱
+        raise ApiError(404, f"没有这个地址：{path}")
+
+    # -- 具体动作 --------------------------------------------------
+    def upload_filename(self) -> str:
+        """文件名从 X-Filename 头（percent-encoded）或 ?name= 取。"""
+        query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        header = self.headers.get("X-Filename") or ""
+        # 头是按 latin-1 解出来的；客户端若直接塞了 UTF-8 字节，这里还原成真 Unicode
+        if any("\x80" <= ch <= "\xff" for ch in header):
+            try:
+                header = header.encode("latin-1").decode("utf-8")
+            except (UnicodeEncodeError, UnicodeDecodeError):
+                pass
+        for raw in (urllib.parse.unquote(header), (query.get("name") or [""])[0]):
+            if raw.strip():
+                return raw.strip()
+        raise ApiError(400, "缺文件名：把文件名 percent-encode 后放 X-Filename 头（或 ?name=）")
+
+    def stream_to(self, temp: Path, length: int) -> int:
+        """把请求体按块写进 temp（不整个读进内存），返回实际字节数。"""
+        written = 0
+        left = length
+        with open(temp, "wb") as fh:
+            while left > 0:
+                chunk = self.rfile.read(min(CHUNK, left))
+                if not chunk:
+                    break
+                fh.write(chunk)
+                written += len(chunk)
+                left -= len(chunk)
+        return written
+
+    def do_asset_upload(self) -> None:
+        """POST /api/asset/upload —— 参考图字节 → 本地备份 + 转传 uguu → 公网 HTTPS 直链。
+
+        SD GF 的 images 只收公网 HTTPS 域名 URL。2026-11-03 实测：器灵生成端拉
+        Cloudflare Tunnel（vc-t.aistar.work）图不稳定（网关过、生成挂），同图换
+        uguu 源即通 → 全面切 uguu（docs/技术文档-SDGF带图生成排查与图床切换uguu-20261103.md）。
+        本地落盘保留作备份；uguu 失败时降级返回本地 tunnel 直链（source 标注）。
+        """
+        import urllib.parse as _up
+        length = int(self.headers.get("Content-Length") or 0)
+        if length <= 0:
+            raise ApiError(400, "请求体是空的：图片字节要放进 body")
+        if length > 20 * 1024 * 1024:
+            raise ApiError(413, f"图片太大（{length / 1048576:.1f} MB），上限 20 MB")
+        raw_name = _up.unquote(self.headers.get("X-Filename") or "ref.png")
+        suffix = Path(raw_name).suffix.lower()
+        if suffix not in {".png", ".jpg", ".jpeg", ".webp"}:
+            raise ApiError(400, f"参考图只收 png/jpg/webp（收到 {suffix or '无扩展名'}）")
+        data = self.rfile.read(length)
+        safe_name = re.sub(r"[^\w.\-]", "_", raw_name)
+        key = f"m4/{secrets.token_hex(4)}/{safe_name}"
+        dest = UPLOADS / "vc" / key
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(data)
+
+        url, source = self._upload_uguu(dest, safe_name), "uguu"
+        if not url:
+            url, source = f"https://vc-t.aistar.work/vc/{key}", "local-tunnel"
+        self.send_json({"url": url, "bytes": length, "source": source})
+
+    @staticmethod
+    def _upload_uguu(path: Path, name: str) -> str:
+        """转传 uguu（Pomf API），返回直链；任何异常返回空串由调用方降级。
+
+        直传与系统代理各试一次（uguu 是境外站，两种路径通哪个用哪个）。
+        """
+        boundary = "----wanrepro" + secrets.token_hex(8)
+        body = io.BytesIO()
+        body.write(f"--{boundary}\r\nContent-Disposition: form-data; name=\"files[]\"; "
+                   f"filename=\"{name}\"\r\nContent-Type: application/octet-stream\r\n\r\n".encode())
+        body.write(path.read_bytes())
+        body.write(f"\r\n--{boundary}--\r\n".encode())
+        payload = body.getvalue()
+        headers = {"Content-Type": f"multipart/form-data; boundary={boundary}",
+                   "User-Agent": "Mozilla/5.0 (wanrepro-bridge)"}
+        for handlers in ([urllib.request.ProxyHandler({})], None):  # 先直连，后环境代理
+            try:
+                opener = urllib.request.build_opener(*(handlers or []))
+                req = urllib.request.Request("https://uguu.se/upload?output=json",
+                                             data=payload, headers=headers, method="POST")
+                resp = json.loads(opener.open(req, timeout=60).read().decode())
+                url = str((resp.get("files") or [{}])[0].get("url") or "")
+                if url.startswith("https://"):
+                    return url
+            except Exception:
+                continue
+        return ""
+
+    def do_video_upload(self) -> None:
+        """POST /api/video/upload —— 收视频字节 → uploads/ → 建任务目录 + 指纹。
+
+        两种投递都收：
+          · 原始字节（前端走这条）：Content-Type: application/octet-stream，
+            文件名放 X-Filename（percent-encoded UTF-8）或 ?name=
+          · multipart/form-data（curl -F 顺手用）：只在小文件时走内存
+        """
+        length = int(self.headers.get("Content-Length") or 0)
+        if length <= 0:
+            raise ApiError(400, "请求体是空的：视频字节要放进 body")
+        if length > MAX_UPLOAD:
+            raise ApiError(413, f"视频太大（{length / 1048576:.1f} MB），上限 500 MB")
+        started = time.time()
+
+        ctype = (self.headers.get("Content-Type") or "").lower()
+        multipart = ctype.startswith("multipart/")
+        if multipart and length > 64 * 1024 * 1024:
+            raise ApiError(413, "multipart 上传上限 64 MB；大文件请用原始字节（curl --data-binary）")
+
+        UPLOADS.mkdir(parents=True, exist_ok=True)
+        temp = UPLOADS / f".incoming-{os.getpid()}-{int(time.time() * 1000)}.part"
+        try:
+            if multipart:
+                boundary = re.search(r"boundary=([^;]+)", self.headers.get("Content-Type") or "",
+                                     re.IGNORECASE)
+                if not boundary:
+                    raise ApiError(400, "multipart 缺 boundary")
+                _fields, files = parse_multipart(self.read_body(), boundary.group(1).strip().strip('"'))
+                if "file" not in files:
+                    raise ApiError(400, "multipart 里没有 file 字段")
+                filename, blob = files["file"]
+                temp.write_bytes(blob)
+            else:
+                filename = self.upload_filename()
+                self.stream_to(temp, length)
+
+            size = temp.stat().st_size
+            if size <= 0:
+                raise ApiError(400, "视频是空的（0 字节）")
+            stem, ext = clean_video_name(filename)
+            with open(temp, "rb") as fh:
+                head = fh.read(16)
+            if not sniff_video(head, ext):
+                raise ApiError(400, f"「{filename}」看着不是 {ext.upper()} 视频（文件头对不上），换个文件试试")
+
+            target = place_upload(temp, stem, ext)
+            task_id = create_task_from_upload(target)
+        finally:
+            temp.unlink(missing_ok=True)
+
+        self.send_json({
+            "ok": True,
+            "id": task_id,
+            "name": target.name,
+            "size": size,
+            "elapsed": round(time.time() - started, 1),
+        })
+
+    def do_upload(self, task_id: str) -> None:
+        task_dir(task_id)
+        ctype_raw = self.headers.get("Content-Type") or ""
+        raw = self.read_body()
+        if ctype_raw.lower().startswith("multipart/form-data"):
+            # boundary 大小写敏感（curl 会混大小写），不能对整条头做 lower()
+            m = re.search(r"boundary=([^;]+)", ctype_raw, re.IGNORECASE)
+            if not m:
+                raise ApiError(400, "multipart 缺 boundary")
+            fields, files = parse_multipart(raw, m.group(1).strip().strip('"'))
+            no_raw = fields.get("no", "")
+            if "file" not in files:
+                raise ApiError(400, "multipart 里没有 file 字段")
+            filename, blob = files["file"]
+        else:
+            try:
+                payload = json.loads(raw.decode("utf-8") or "{}")
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                raise ApiError(400, "请求体不是合法 JSON") from None
+            if not isinstance(payload, dict):
+                raise ApiError(400, "请求体必须是 JSON 对象")
+            no_raw = payload.get("no")
+            filename = str(payload.get("filename") or "upload.png")
+            try:
+                blob = base64.b64decode(str(payload.get("data_b64") or ""), validate=True)
+            except Exception:                   # noqa: BLE001
+                raise ApiError(400, "data_b64 解不出来") from None
+        # 上传按「清单行号」对齐；老调用只传 no，那时 no 就是清单行号，行为不变
+        try:
+            no = int(str(fields.get("row") or no_raw).strip()) if ctype_raw.lower().startswith("multipart/form-data")                 else int(str((payload.get("row") if isinstance(payload, dict) else None) or no_raw).strip())
+        except (TypeError, ValueError):
+            raise ApiError(400, "no/row 必须是整数") from None
+        if not blob:
+            raise ApiError(400, "图是空的（0 字节）")
+
+        path = save_asset(task_id, no, filename, blob)
+        set_checklist_image(task_id, no, path.name)
+        # 默认两步：先落盘、立刻回响应，命名后台跑（10–50 秒），前端轮询 /api/naming。
+        # 老的非浏览器调用（JSON + base64，脚本用）保持同步，行为不变。
+        query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        sync = not ctype_raw.lower().startswith("multipart/form-data")
+        flag = (query.get("sync") or [""])[0].strip().lower()
+        if flag:
+            sync = flag in ("1", "true", "yes", "on")
+
+        out = {
+            "ok": True,
+            "no": no,
+            "file": path.name,
+            "url": f"/assets/{urllib.parse.quote(task_id)}/{urllib.parse.quote(path.name)}",
+            "bytes": len(blob),
+        }
+        if sync:
+            name, desc, warning = name_and_store(task_id, no, path)
+            with NAMING_LOCK:
+                NAMING[(task_id, no)] = {
+                    "state": "failed" if warning else "done",
+                    "name": name, "desc": desc, "warning": warning,
+                    "started": time.time(), "elapsed": 0.0,
+                }
+            out["naming"] = "done"
+            out["name"] = name
+            out["desc"] = desc
+            if warning:
+                out["warning"] = warning
+        else:
+            start_naming(task_id, no, path)
+            out["naming"] = "running"
+        self.send_json(out)
+
+    def do_render(self, task_id: str) -> None:
+        task_dir(task_id)
+        payload = self.read_json()
+        template = str(payload.get("template") or "").strip()
+        stem = template[:-3] if template.endswith(".md") else template
+        # 可选段字母（如 C＝品牌收束与图文）：显式请求就要真进渲染 argv，不透传等于白选（B5）
+        render_task(task_id, stem, str(payload.get("optional") or ""))
+
+        text, tpl = latest_prompt(task_id)
+        self.send_json({"ok": True, "template": tpl or stem,
+                        "prompt": {"text": text, "template": tpl or stem},
+                        "assets": build_assets(task_id),
+                        # 重渲染会重写 渲染回执.json：一起返，免得页面上的回执停在上一次
+                        "dialogueMap": dialogue_map(task_id),
+                        "intentReceipt": intent_receipt(task_id)})
+
+    def do_recheck(self, task_id: str) -> None:
+        """人工复检的一条：use 改写拆解.md 那一行并重渲染；keep 只记 kept（文件不动）。
+
+        写回与检测都在 pipeline/recheck.py 里（那里是唯一实现）；这里只负责调它、
+        然后把提示词重新渲染一遍。**重渲染不是可选项**：preflight 与生成读的是盘上的
+        `提示词-<模板>.md`，不重渲染，人刚改的这一行永远到不了生成请求（核对行和
+        预演令牌也会停在旧正文上）。
+        """
+        task_dir(task_id)
+        payload = self.read_json()
+        action = str(payload.get("action") or "").strip()
+        if action not in ("use", "keep"):
+            raise ApiError(400, "action 只支持 use / keep")
+        item = str(payload.get("id") or "").strip()
+        if not item:
+            raise ApiError(400, "缺少复检项 id")
+
+        args = ["--use" if action == "use" else "--keep", item]
+        text = str(payload.get("text") or "")
+        if action == "use" and text.strip():
+            args += ["--text", text]
+        data = recheck_call(task_id, args)          # 原子写，不留 .bak
+
+        template = str(payload.get("template") or "").strip()
+        stem = template[:-3] if template.endswith(".md") else template
+        if not stem:
+            stem = latest_prompt(task_id)[1]
+        if stem:
+            try:
+                # 可选段跟渲染请求同口径透传：不带上，人刚看过的收束段就会在这次
+                # 重渲染里被静默关掉（2026-11-04 路 A 审计 B5 同源问题）
+                render_task(task_id, stem, str(payload.get("optional") or ""))
+            except ApiError as err:
+                raise ApiError(err.status, f"拆解已改并落盘，但重渲染失败：{err.msg}") from None
+
+        text_now, tpl = latest_prompt(task_id)
+        data["prompt"] = {"text": text_now, "template": tpl or stem}
+        self.send_json(data)
+
+    def do_generate(self, task_id: str) -> None:
+        """两段式：不带 confirm 只回计划（查余额、数图、跑一次预演，全免费）；带 confirm 才真提交。
+
+        花钱这件事必须由人点两次：第一次看参数、核对行和余额，第二次才是「扣灵感值」。
+        带 confirm 的请求**服务端自己再跑一遍预演**，并要求 preflightToken 与本次算出的
+        令牌相等且核对通过，否则 409 直接返回、绝不提交——页面上的按钮禁用只是体验，
+        真正拦在这里（提示词重渲染过、参数被改过，令牌就对不上）。
+        生成要跑几分钟，放后台线程里跑，页面轮询 /api/generate/<id> 看 `生成/记录.json`。
+        """
+        task_dir(task_id)
+        payload = self.read_json()
+        template = str(payload.get("template") or "").strip()
+        try:
+            duration = int(payload.get("duration") or 15)
+        except (TypeError, ValueError):
+            raise ApiError(400, "duration 必须是整数") from None
+        if not 2 <= duration <= 30:
+            raise ApiError(400, "时长只支持 2–30 秒（万相的上限）")
+        ratio = str(payload.get("ratio") or "9:16")
+        if ratio not in RATIOS:
+            raise ApiError(400, f"画幅只支持 {'/'.join(RATIOS)}")
+        resolution = str(payload.get("resolution") or "1080P")
+        if resolution not in RESOLUTIONS:
+            raise ApiError(400, f"分辨率只支持 {'/'.join(RESOLUTIONS)}")
+        audio = bool(payload.get("audio", True))
+
+        plan = gen_plan(task_id, template, duration, ratio, resolution, audio)
+
+        if not payload.get("confirm"):
+            self.send_json({"plan": plan})
+            return
+
+        # —— 复核闸门：不接受页面报上来的结果，自己重算一次 ——
+        pf = plan.get("preflight") if isinstance(plan.get("preflight"), dict) else {}
+        token = str(payload.get("preflightToken") or "").strip()
+        # 先按格式收口（16 位十六进制）：compare_digest 只吃 ASCII，页面塞中文进来会抛 TypeError
+        if (not pf.get("ok") or not TOKEN_RE.fullmatch(token)
+                or not secrets.compare_digest(token, str(pf.get("token") or ""))):
+            self.send_json({"error": "核对未通过或参数已变，未提交", "preflight": pf}, 409)
+            return
+
+        state = gen_state(task_id)
+        if state.get("status") == "running" and not state.get("stale"):
+            raise ApiError(409, "已经有一条在跑了，等它出来再点（同时跑两条等于扣两次钱）")
+        args = ["pipeline/gen/wan_video.py", "--id", task_id]
+        if template:
+            args += ["--template", template]
+        args += ["--duration", str(duration), "--ratio", ratio, "--resolution", resolution,
+                 "--audio-output", "true" if audio else "false", "--confirm"]
+        threading.Thread(target=self._run_generate, args=(task_id, args),
+                         daemon=True, name=f"gen-{task_id}").start()
+        time.sleep(0.3)                                     # 让线程先把 running 写进记录
+        self.send_json({"started": True, "state": gen_state(task_id)})
+
+
+    def _run_generate(self, task_id: str, args: list[str]) -> None:
+        code, out, err = run_py(args, timeout=1900)
+        gen_dir(task_id).mkdir(parents=True, exist_ok=True)
+        (gen_dir(task_id) / "日志.txt").write_text(
+            f"退出码 {code}\n--- stdout ---\n{out}\n--- stderr ---\n{err}\n", encoding="utf-8")
+
+    # -- 万相视频生成 bridge（canvas 任务）--------------------------
+
+    def do_wan_video_run(self) -> None:
+        """POST /api/wan/video/run —— 建任务 + 起后台生成，立即返回 {job, taskId}。
+
+        与 /api/analyze 同款「提交 → 轮询」：生成要跑几分钟，不能同步等。
+        confirm=false 只打计划不花钱（引擎契约：花钱动作必须显式确认）。
+        """
+        payload = self.read_json()
+        prompt = str(payload.get("prompt") or "")
+        if not prompt.strip():
+            raise ApiError(400, "prompt 不能为空")
+        try:
+            duration = int(payload.get("duration"))
+        except (TypeError, ValueError):
+            raise ApiError(400, "duration 必须是整数（2–30 秒）") from None
+        if not 2 <= duration <= 30:
+            raise ApiError(400, "时长只支持 2–30 秒（万相的上限）")
+        ratio = str(payload.get("ratio") or "")
+        if ratio not in WAN_RATIOS:
+            raise ApiError(400, f"画幅只支持 {'/'.join(WAN_RATIOS)}")
+        resolution = str(payload.get("resolution") or "")
+        if resolution not in WAN_RESOLUTIONS:
+            raise ApiError(400, "分辨率只支持 480 / 720 / 1080")
+        audio = bool(payload.get("audio", True))
+        confirm = bool(payload.get("confirm"))
+        images = payload.get("images")
+        images = images if isinstance(images, list) else []
+        for item in images:
+            if not isinstance(item, dict):
+                raise ApiError(400, "images 必须是 [{name, dataUrl}] 列表")
+
+        if not WAN_BUSY.acquire(blocking=False):      # CLI 限制：同时只认一条，第二条直接挡
+            raise ApiError(409, "已经有一个万相生成在跑（CLI 同时只认一条），稍后再试")
+        now = time.time()
+        job_id = secrets.token_hex(8)
+        try:
+            task_id = wan_prepare_task(prompt, images)   # 落盘失败则释放并发位，不留占坑
+        except BaseException:
+            WAN_BUSY.release()
+            raise
+        with JOBS_LOCK:
+            for stale, old in list(JOBS.items()):        # 过期任务记录随手清（与拆解同款）
+                if now - float(old.get("started") or now) > JOB_TTL:
+                    JOBS.pop(stale, None)
+            JOBS[job_id] = {"status": "running", "started": now,
+                            "kind": "wan-video", "task_id": task_id}
+        argv = wan_argv(task_id, duration, ratio, resolution, audio, confirm)
+        threading.Thread(target=self._run_wan_video, args=(job_id, task_id, argv),
+                         daemon=True, name=f"wan-video-{task_id}").start()
+        self.send_json({"job": job_id, "taskId": task_id})
+
+    def _run_wan_video(self, job_id: str, task_id: str, argv: list[str]) -> None:
+        """后台线程：跑 wan_video.py（提交与否由 argv 里的 --confirm 决定）。
+
+        结束后把退出码/stderr 尾部记进 JOBS，日志落 生成/bridge日志.txt，释放并发位。
+        """
+        code, out, err, error = -1, "", "", ""
+        try:
+            code, out, err = run_py(argv, timeout=WAN_JOB_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            code, err = 124, f"wan_video.py 超过 {WAN_JOB_TIMEOUT}s 没跑完，按失败处理"
+        except Exception as exc:                     # noqa: BLE001 - 后台线程不能静默死掉
+            traceback.print_exc()
+            error = f"bridge 起子进程失败：{exc}"
+        try:
+            gen = ANALYSIS / task_id / GEN_DIR
+            gen.mkdir(parents=True, exist_ok=True)
+            (gen / "bridge日志.txt").write_text(
+                f"命令行 {' '.join(argv)}\n退出码 {code}\n--- stdout ---\n{out}\n--- stderr ---\n{err}\n",
+                encoding="utf-8")
+        except OSError:
+            pass
+        finally:
+            WAN_BUSY.release()
+        with JOBS_LOCK:
+            rec = JOBS.get(job_id)
+            if rec is not None:
+                rec.update(status="error" if error else "done", exit=code,
+                           stderr=tail(err, 400), stdout=tail(out, 400),
+                           error=error,
+                           elapsed=round(time.time() - float(rec.get("started") or 0), 1))
+
+    def do_confirm(self, task_id: str) -> None:
+        """在已有「拆解.md」上补生成「待确认清单.md」。
+
+        为什么不复用 /api/analyze：那条会重跑视频拆解，一次模型调用要几十秒还花钱。
+        用户只是漏了清单（或想按新拆解重建），本地抽实体是零成本动作。
+        """
+        task_dir(task_id)
+        self.read_body()
+        disc = ANALYSIS / task_id / "拆解.md"
+        if not disc.is_file():
+            raise ApiError(400, f"{task_id} 还没有拆解.md，先跑一次拆解")
+
+        code, out, err = run_py(["pipeline/reverse/confirm.py", str(disc)], timeout=120)
+        if code != 0:
+            raise ApiError(500, f"confirm.py 退出 {code}：{tail(err) or tail(out)}")
+        self.send_json({"ok": True, "checklist": parse_checklist(task_id)})
+
+    # -- 整合包静态 serve（web-dist）--------------------------------
+
+    def try_static(self, url_path: str) -> bool:
+        """web-dist 里有 url_path 对应的**文件**就 serve 并返回 True；否则 False（继续原路由）。
+
+        只在整合包形态（WEB_DIST_ROOT 非空）生效；路径穿越企图一律 False，绝不 serve。
+        """
+        root = WEB_DIST_ROOT
+        if root is None:
+            return False
+        rel = urllib.parse.unquote(url_path).lstrip("/")
+        if not rel:
+            return False
+        try:
+            target = (root / rel).resolve()
+            target.relative_to(root)               # 防路径穿越：必须仍在 web-dist 内
+        except (ValueError, OSError):
+            return False
+        if target.is_file():
+            self.send_body(target.read_bytes(), 200,
+                           STATIC_MIME.get(target.suffix.lower(), "application/octet-stream"))
+            return True
+        return False
+
+    def serve_static(self, url_path: str) -> None:
+        """整合包形态兜底：web-dist 静态文件；是目录或不存在 → 回退 index.html（SPA path 路由）。"""
+        root = WEB_DIST_ROOT
+        if root is None:
+            raise ApiError(404, f"没有这个地址：{url_path}")
+        rel = urllib.parse.unquote(url_path).lstrip("/")
+        try:
+            target = ((root / rel) if rel else root).resolve()
+            target.relative_to(root)               # 防路径穿越：必须仍在 web-dist 内
+        except (ValueError, OSError):
+            raise ApiError(404, f"没有这个地址：{url_path}") from None
+        if target.is_dir() or not target.is_file():
+            target = root / "index.html"
+        if not target.is_file():
+            raise ApiError(404, f"没有这个地址：{url_path}")
+        self.send_body(target.read_bytes(), 200,
+                       STATIC_MIME.get(target.suffix.lower(), "application/octet-stream"))
+
+    def serve_asset(self, task_id: str, filename: str) -> None:
+        if not ASSET_RE.match(filename):
+            raise ApiError(404, "只认 assets/图片N.<ext>")
+        path = (task_dir(task_id) / "assets" / filename)
+        if not path.is_file():
+            raise ApiError(404, f"图不存在：{filename}")
+        ext = path.suffix.lower().lstrip(".")
+        self.send_body(path.read_bytes(), 200, MIME.get(ext, "application/octet-stream"))
+
+    def serve_video(self, task_id: str) -> None:
+        """流式返回源视频，支持 Range（206）——不支持的话 <video> 拖不动进度条。"""
+        task_dir(task_id)                      # 先校验 id（不合法/不存在 → 400/404）
+        self.send_mp4(video_file(task_id))
+
+    def serve_generated(self, task_id: str) -> None:
+        """返回万相生成的成片（同样走 Range 流）。没有就 404，绝不拿源视频顶替。"""
+        state = gen_state(task_id)
+        if not state.get("available"):
+            raise ApiError(404, "还没有生成成片")
+        self.send_mp4(gen_dir(task_id) / state["video"])
+
+    def serve_wan_video(self, task_id: str) -> None:
+        """GET /api/wan/video/file/<taskId> —— wan-<ts> 任务的成片 成片-canvas.mp4。
+
+        画布端按 taskId 直取成片；不校验任务目录存在（成片在不在本身就是要回答的问题）。
+        """
+        if not task_id or ".." in task_id or not ID_RE.match(task_id):
+            raise ApiError(400, f"任务 id 不合法：{task_id!r}")
+        final = ANALYSIS / task_id / GEN_DIR / f"成片-{WAN_TEMPLATE}.mp4"
+        if not final.is_file():
+            raise ApiError(404, f"{task_id} 还没有生成成片（{final.name}）")
+        self.send_mp4(final)
+
+    def send_mp4(self, path: Path) -> None:
+        try:
+            total = path.stat().st_size
+        except OSError as err:
+            raise ApiError(500, f"读不到源视频大小：{err}") from None
+        if total <= 0:
+            raise ApiError(500, "源视频是 0 字节")
+
+        ext = path.suffix.lower().lstrip(".")
+        ctype = VIDEO_MIME.get(ext, "application/octet-stream")
+        status, start, end = 200, 0, total - 1
+        raw_range = (self.headers.get("Range") or "").strip()
+
+        if raw_range:
+            m = RANGE_RE.match(raw_range)
+            if not m or (m.group(1) == "" and m.group(2) == ""):
+                self.send_range_error(total, raw_range)
+                return
+            first, last = m.group(1), m.group(2)
+            if first == "":                    # 后缀区间：bytes=-2048
+                n = int(last)
+                if n <= 0:
+                    self.send_range_error(total, raw_range)
+                    return
+                start, end = max(0, total - n), total - 1
+            else:
+                start = int(first)
+                end = total - 1 if last == "" else min(int(last), total - 1)
+            if start >= total or start > end:
+                self.send_range_error(total, raw_range)
+                return
+            status = 206
+
+        length = end - start + 1
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Accept-Ranges", "bytes")
+            self.send_header("Content-Length", str(length))
+            self.send_header("Cache-Control", "no-store")
+            if status == 206:
+                self.send_header("Content-Range", f"bytes {start}-{end}/{total}")
+            self.end_headers()
+            if self.command == "HEAD":
+                return
+            with open(path, "rb") as fh:
+                fh.seek(start)
+                left = length
+                while left > 0:
+                    chunk = fh.read(min(CHUNK, left))
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    left -= len(chunk)
+        except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
+            # 播放器拖动进度条会主动断开上一个 Range 连接，这是正常行为。
+            self.close_connection = True
+
+    def send_range_error(self, total: int, raw_range: str) -> None:
+        data = json.dumps({"error": f"Range 不满足：{raw_range}"}, ensure_ascii=False).encode("utf-8")
+        self.send_response(416)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("Content-Range", f"bytes */{total}")
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(data)
+
+    def do_delete_asset(self, task_id: str) -> None:
+        """删掉某个序号的资产图（同序号的所有扩展名）。只动 assets/图片N.*。"""
+        assets_dir(task_id)
+        payload = self.read_json()
+        try:
+            no = int(payload.get("no"))
+        except (TypeError, ValueError):
+            raise ApiError(400, "no 必须是整数") from None
+        removed: list[str] = []
+        with WRITE_LOCK:
+            for old in assets_dir(task_id).glob(f"图片{no}.*"):
+                if old.is_file():
+                    old.unlink()
+                    removed.append(old.name)
+        set_checklist_image(task_id, no, "")
+        self.send_json({"ok": True, "no": no, "removed": removed})
+
+    def download_zip(self, task_id: str) -> None:
+        files = asset_files(task_id)
+        if not files:
+            raise ApiError(404, "这个任务还没有任何资产图，先传图")
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            for seq, no in enumerate(sorted(files), start=1):   # 按清单行号排序，重排成 1..K 与 @图片N 对齐
+                zf.write(files[no], arcname=f"图片{seq}{files[no].suffix}")
+        name = f"图片包-{task_id}.zip"
+        quoted = urllib.parse.quote(name)
+        # filename* 给浏览器（Chrome 存成「图片包-<id>.zip」）；
+        # filename= 是给 curl 这类只认 ASCII 的客户端的回退。
+        self.send_body(
+            buf.getvalue(), 200, "application/zip",
+            {"Content-Disposition": f"attachment; filename=\"assets-{task_id}.zip\"; "
+                                    f"filename*=UTF-8''{quoted}"},
+        )
+
+
+# ---------------------------------------------------------------- 目录扫描 / 拆解
+
+
+def list_videos() -> list[dict]:
+    out: list[dict] = []
+    if not RAW.is_dir():
+        return out
+    for p in sorted(RAW.rglob("*")):
+        if not p.is_file() or p.suffix.lower() != ".mp4":
+            continue
+        try:
+            size = p.stat().st_size
+        except OSError:
+            continue
+        out.append({
+            "path": p.relative_to(ROOT).as_posix(),
+            "name": p.name,
+            "size_mb": round(size / 1048576, 1),
+        })
+    out.sort(key=lambda v: v["path"])
+    return out
+
+
+CANVAS_ORIGINS = {"http://127.0.0.1:3000", "http://localhost:3000"}
+
+
+def lapian_payload(tid: str, spec: str) -> dict:
+    """M3 bridge：IR → 拉片 blocks + markdown（只读投影，不落盘）。"""
+    sys.path.insert(0, str(ROOT / "pipeline" / "reverse"))
+    import render_lapian
+    from render import Fail
+    d = ROOT / "analysis" / "reverse" / tid
+    if not d.is_dir():
+        raise ApiError(404, f"任务不存在：{tid}")
+    try:
+        fm, rows = render_lapian.load_spec(spec)
+        blocks = render_lapian.project(render_lapian.IR(d), rows)
+    except Fail as e:
+        raise ApiError(400, f"拉片投影失败：{e}")
+    return {"task": tid, "spec": spec, "blocks": blocks,
+            "markdown": render_lapian.render_markdown(tid, spec, blocks)}
+
+
+def render_payload(tid: str, spec_name: str, optional: str = "") -> dict:
+    """M3 bridge：生成规范 → 提示词正文（走 render.py，产物照常落盘可回看）。"""
+    sys.path.insert(0, str(ROOT / "pipeline" / "reverse"))
+    from spec_registry import load_registry
+    from render import Fail, main as render_main
+    specs = {s["file"].removesuffix(".md"): s for s in load_registry()}
+    meta = specs.get(spec_name)
+    if meta is None:
+        raise ApiError(404, f"规范不存在：{spec_name}")
+    if meta["类型"] != "生成":
+        raise ApiError(400, f"{spec_name} 是{meta['类型']}规范，不是生成规范")
+    task_dir(tid)                                    # 校验任务存在（404 语义一致）
+    tpl_stem = Path(meta["正文模板"]).stem
+    argv = ["--id", tid, "--template", tpl_stem]
+    if str(optional or "").strip():                  # bridge 与 handler 同口径：可选段要透传（B5）
+        argv += ["--optional", str(optional).strip()]
+    try:
+        code = render_main(argv)
+    except Fail as e:
+        raise ApiError(400, f"渲染失败：{e}")
+    if code != 0:
+        raise ApiError(500, f"渲染退出码 {code}")
+    text = (ROOT / "analysis" / "reverse" / tid / f"提示词-{tpl_stem}.md").read_text(encoding="utf-8")
+    return {"task": tid, "spec": spec_name, "template": tpl_stem, "text": text}
+
+
+def list_tasks() -> list[dict]:
+    out: list[dict] = []
+    if not ANALYSIS.is_dir():
+        return out
+    for d in ANALYSIS.iterdir():
+        if not d.is_dir():
+            continue
+        prompts = list(d.glob("提示词-*.md"))
+        src = video_file(d.name, strict=False)
+        out.append({
+            "id": d.name,
+            "has_disc": (d / "拆解.md").is_file(),
+            "has_check": (d / "待确认清单.md").is_file(),
+            "has_prompt": bool(prompts),
+            "video": src.name if src else "",
+            "intent": task_intent(d.name),
+            "intent_changed": task_intent_changed(d.name),
+            "mtime": int(max([p.stat().st_mtime for p in d.iterdir() if p.is_file()] or
+                             [d.stat().st_mtime])),
+        })
+    out.sort(key=lambda t: t["mtime"], reverse=True)
+    return out
+
+
+def read_progress(task_id) -> dict | None:
+    """读任务的拆解进度文件（analyze.py 阶段透出用，M6-T6F）。
+
+    读不到 / 坏 JSON / id 不合法 一律返回 None——进度只是锦上添花，
+    绝不影响 /api/job 原有响应。格式归 pipeline/reverse/progress.py。
+    """
+    tid = str(task_id or "")
+    if not tid or "/" in tid or "\\" in tid or tid in (".", ".."):
+        return None
+    try:
+        sys.path.insert(0, str(ROOT / "pipeline" / "reverse"))
+        from progress import read_progress as _read_progress
+        return _read_progress(ANALYSIS / tid)
+    except Exception:                        # noqa: BLE001 —— 读不到就当没有
+        return None
+
+
+# ------------------------------------------------------- 拉片渠道透传（M6-T7-C）
+
+_VERSION_SUFFIX_RE = re.compile(r"/v\d+[a-z]*$")
+
+
+def normalize_gemini_base(url: str) -> str:
+    """渠道 baseUrl 归一（拆解走 Gemini 原生 generateContent 端点）。
+
+    渠道配置常填裸域名（不带版本段）——自动补默认版本 /v1beta；
+    显式带 /v1、/v1beta 等版本段则尊重原值。空值返回空串（不透传 base-url）。
+    """
+    base = (url or "").strip().rstrip("/")
+    if not base:
+        return ""
+    if _VERSION_SUFFIX_RE.search(base):
+        return base
+    return f"{base}/v1beta"
+
+
+def lapian_channel_passthrough(payload: dict) -> tuple[list[str], dict]:
+    """从 /api/lapian/run 请求体提取可选「分析模型 / 渠道」→（analyze.py 附加参数, 子进程附加环境）。
+
+    channel 形如 {baseUrl, key, model}（与生成节点随请求带渠道的做法同款）；顶层 model 是
+    只选模型名的简写，channel.model 优先。什么都不传 → ([], {})：命令行与环境与旧版完全
+    一致（旧任务零回归）。key 不上命令行——子进程会把命令行原样打进日志，密钥走环境变量
+    JXIN_API_KEY 传（extract.load_api_key 本就环境变量优先，读法不变）。
+    """
+    channel = payload.get("channel")
+    channel = channel if isinstance(channel, dict) else {}
+
+    def clean(value) -> str:
+        return str(value or "").strip()
+
+    model = clean(channel.get("model")) or clean(payload.get("model"))
+    base = normalize_gemini_base(clean(channel.get("baseUrl")))
+    key = clean(channel.get("key"))
+    argv: list[str] = []
+    if model:
+        argv += ["--model", model]
+    if base:
+        argv += ["--base-url", base]
+    env = {"JXIN_API_KEY": key} if key else {}
+    return argv, env
+
+
+def analyze_argv(rel: str, task_id: str, intent: str,
+                 extra_args: list[str] | None = None) -> list[str]:
+    """拆解子进程命令行（唯一拼装点）；不透传时与历史版本逐字节一致。"""
+    return ["analyze.py", rel, "--id", task_id, "--yes", "--intent", intent] + list(extra_args or [])
+
+
+def start_analyze_job(video: str, intent: str = "", requested_task_id: str = "",
+                      extra_args: list[str] | None = None,
+                      extra_env: dict | None = None) -> dict:
+    """提交拆解任务，立刻返回 job id；真正的 analyze.py 在后台线程里跑。"""
+    if not ANALYZE_BUSY.acquire(blocking=False):
+        raise ApiError(409, "已经有一个拆解在跑，等它跑完（约 1–3 分钟）再点")
+    now = time.time()
+    job_id = secrets.token_hex(8)
+    with JOBS_LOCK:
+        for stale, rec in list(JOBS.items()):
+            if now - float(rec.get("started") or now) > JOB_TTL:
+                JOBS.pop(stale, None)
+        JOBS[job_id] = {"status": "running", "started": now}
+
+    def run() -> None:
+        def on_task(task_id: str) -> None:
+            """job→task 映射（M6-T6F）：analyze_video 把任务 id 定下来就回填，
+            /api/job 轮询端据此读该任务的 进度.json 透出当前阶段。"""
+            with JOBS_LOCK:
+                rec = JOBS.get(job_id)
+                if rec is not None:
+                    rec["task_id"] = task_id
+
+        try:
+            result = analyze_video(video, intent, requested_task_id, on_task,
+                                   extra_args=extra_args, extra_env=extra_env)
+            rec = {"status": "done", "result": result, "started": now,
+                   "elapsed": round(time.time() - now, 1)}
+        except ApiError as err:
+            rec = {"status": "error", "error": err.msg, "started": now,
+                   "elapsed": round(time.time() - now, 1)}
+        except Exception as exc:                    # noqa: BLE001
+            traceback.print_exc()
+            rec = {"status": "error", "error": f"服务内部异常：{exc}", "started": now,
+                   "elapsed": round(time.time() - now, 1)}
+        finally:
+            ANALYZE_BUSY.release()
+        with JOBS_LOCK:
+            JOBS[job_id] = rec
+
+    threading.Thread(target=run, daemon=True, name=f"analyze-{job_id}").start()
+    return {"job": job_id}
+
+
+def analyze_video(video: str, intent: str = "", requested_task_id: str = "",
+                  on_task=None, extra_args: list[str] | None = None,
+                  extra_env: dict | None = None) -> dict:
+    """跑一次拆解。on_task：任务 id 定下来时的回调（job→task 映射，可空）。"""
+    if not video:
+        raise ApiError(400, "缺 video")
+    path = Path(video)
+    if not path.is_absolute():
+        path = ROOT / path
+    try:
+        path = path.resolve()
+    except OSError:
+        raise ApiError(400, f"路径不合法：{video}") from None
+    if not path.is_file() or path.suffix.lower() != ".mp4":
+        raise ApiError(400, f"视频不存在或不是 mp4：{video}")
+    try:
+        rel = path.relative_to(ROOT).as_posix()
+    except ValueError:
+        raise ApiError(400, "视频必须在仓库目录内（原始资料/ 或 uploads/）") from None
+
+    # 已有任务重拆沿用原 id；新任务仍按源视频查找/生成。
+    if requested_task_id:
+        task_id = task_dir(requested_task_id).name
+        recorded = video_file(task_id, strict=True)
+        if recorded.resolve() != path:
+            raise ApiError(400, "任务 id 与 video 不是同一条源视频")
+    else:
+        task_id = pending_task_for(path) or new_task_id(path)
+    task_path = ANALYSIS / task_id
+    task_path.mkdir(parents=True, exist_ok=True)
+    with WRITE_LOCK:
+        if task_id in ANALYZING:
+            raise ApiError(409, f"{task_id} 正在拆解，等它跑完（约 30–60 秒）")
+        write_text(task_path / "意图.txt", intent)
+        ANALYZING.add(task_id)
+    started = time.time()
+
+    # 进度透出（M6-T6F）：先把 job→task 映射记下，再立刻写「抽帧」——
+    # 盖掉同任务上一轮的残留进度（旧文件可能还写着「完成」），轮询端马上有阶段可看。
+    if on_task is not None:
+        try:
+            on_task(task_id)
+        except Exception:                    # noqa: BLE001 —— 显示用途，不影响拆解
+            pass
+    try:
+        sys.path.insert(0, str(ROOT / "pipeline" / "reverse"))
+        from progress import write_progress
+        write_progress(task_path, "抽帧")
+    except Exception:                        # noqa: BLE001 —— 同上
+        pass
+
+    try:
+        code, out, err = run_py(analyze_argv(rel, task_id, intent, extra_args),
+                                timeout=600, extra_env=extra_env)
+    except subprocess.TimeoutExpired:
+        raise ApiError(500, "analyze.py 超过 600s 没跑完") from None
+    finally:
+        with WRITE_LOCK:
+            ANALYZING.discard(task_id)
+    if code != 0:
+        raise ApiError(500, f"analyze.py 退出 {code}：{tail(err) or tail(out)}")
+    return {"id": task_id, "elapsed": round(time.time() - started, 1),
+            "log": tail(out)}
+
+
+# ---------------------------------------------------------------- 入口
+
+
+def bundle_ffmpeg_source() -> str:
+    """整合包 runtime：ROOT/../runtime/ffmpeg/ 里有 ffmpeg.exe → 该目录前插进 PATH。
+
+    子进程（pipeline 调 ffprobe/ffmpeg）自动继承这份 PATH；目录不存在（开发机）不动 PATH。
+    返回来源名（包内 / PATH）给启动横幅。
+    """
+    bundled = (ROOT.parent / "runtime" / "ffmpeg").resolve()
+    if (bundled / "ffmpeg.exe").is_file():
+        os.environ["PATH"] = str(bundled) + os.pathsep + os.environ.get("PATH", "")
+        return "包内"
+    return "PATH"
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(description="本地 Web UI（拆解 → 命名/传图 → 提示词 + 图片包）")
+    ap.add_argument("--port", type=int, default=8776)
+    ap.add_argument("--host", default="127.0.0.1")
+    ap.add_argument("--no-browser", action="store_true", help="不自动开浏览器")
+    args = ap.parse_args(argv)
+
+    ffmpeg_src = bundle_ffmpeg_source()
+
+    # M6-T8 后：开发机不再要求本地页面文件——画布在 vite :3000；整合包有 web-dist。
+    if WEB_DIST_ROOT is not None and not (WEB_DIST_ROOT / "index.html").is_file():
+        print(f"[FAIL exit=2] 缺页面：{WEB_DIST_ROOT / 'index.html'}", file=sys.stderr)
+        return 2
+
+    try:
+        httpd = ThreadingHTTPServer((args.host, args.port), Handler)
+    except OSError as err:
+        print(f"[FAIL exit=2] 端口 {args.port} 起不来：{err}", file=sys.stderr)
+        return 2
+
+    url = f"http://{args.host}:{args.port}/"
+    print(f"[OK] {url}  （Ctrl+C 停）", flush=True)
+    print(f"     仓库：{ROOT}", flush=True)
+    print(f"     ffmpeg: {ffmpeg_src}", flush=True)
+    if not args.no_browser and WEB_DIST_ROOT is not None:
+        threading.Timer(0.8, lambda: webbrowser.open(url)).start()  # 整合包才开页；开发机画布在 vite :3000
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        print("\n[ui] 已停", flush=True)
+    finally:
+        httpd.server_close()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

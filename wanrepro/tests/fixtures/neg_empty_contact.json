@@ -1,0 +1,17 @@
+{
+  "meta": {
+    "measured": {
+      "duration_s": 12.5,
+      "width": 1920,
+      "height": 1080,
+      "fps": 30,
+      "cut_points_s": [6.0]
+    }
+  },
+  "shots": [
+    {
+      "contact": [],
+      "end_composition": "瓶身位于画面中央，标签朝向镜头"
+    }
+  ]
+}

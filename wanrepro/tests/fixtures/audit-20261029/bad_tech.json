@@ -1,0 +1,1 @@
+{"meta": {"width": 576}, "shots": [{"contact": [{"from": "a", "to": "b", "type": "接触", "direction": "向左", "driven": "a推动b"}], "end_composition": "主体在画面中央，背景清晰可见。", "action_steps": [{"t_s": 0.0, "who": "主体", "physical_step": "静止", "direction": "前方"}]}]}

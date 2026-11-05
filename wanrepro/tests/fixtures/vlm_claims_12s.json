@@ -1,0 +1,51 @@
+{
+  "meta": {
+    "duration_s": 12.0,
+    "aspect_ratio": "9:16",
+    "fps": 30.0,
+    "shot_count": 2,
+    "cut_points_s": [
+      0.0,
+      8.9
+    ],
+    "has_audio": true
+  },
+  "global": {
+    "scene_env": "白色透光台面上的产品与纸托甜点"
+  },
+  "shots": [
+    {
+      "shot_id": 1,
+      "subject_primary": "中央香水瓶与周围甜点",
+      "props": [
+        "纸托甜点",
+        "香水瓶"
+      ],
+      "contact": [
+        {
+          "from": "纸托",
+          "to": "瓶身",
+          "type": "顶到",
+          "direction": "由下向上",
+          "driven": "人工摆放"
+        }
+      ],
+      "end_composition": "瓶身位于画面中央，标签朝向镜头，周围纸托散布在台面上"
+    },
+    {
+      "shot_id": 2,
+      "subject_primary": "黑色背景上的平台搜索尾卡",
+      "props": [],
+      "contact": [
+        {
+          "from": "搜索框",
+          "to": "画面中心",
+          "type": "顶到",
+          "direction": "静止",
+          "driven": "界面动画"
+        }
+      ],
+      "end_composition": "黑底搜索界面居中显示账号名称与平台标志"
+    }
+  ]
+}

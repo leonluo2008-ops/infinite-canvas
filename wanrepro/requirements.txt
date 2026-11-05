@@ -1,0 +1,40 @@
+# 依赖声明
+#
+# 口径
+# ----
+# · 只写第三方包；标准库（argparse / json / subprocess / urllib …）不写，Python 自带。
+# · 不锁版本：本项目不固定版本（DEPENDENCY-POLICY.md 的裁定），装了能跑就行。
+# · 每条写清「谁在用、干什么」——以后缺包报 ImportError 时，能一眼定位是哪条命令。
+#
+# 先给结论
+# --------
+# S1–S3 主链（analyze.py → pipeline/reverse/{extract,confirm,render}.py）**零第三方依赖**：
+# 装好 Python 3.10+ 直接能跑，一条 `pip install` 都不用敲。
+# 下面四个包服务的是「读视频像素」和「语音转写」的旁路工具，主链不 import 它们；
+# 但它们在 pipeline/ 里被引用，所以必须声明——不声明，那些命令会 ImportError。
+
+# OpenCV：解帧、帧差、切点检测、画质指标、局部修补
+#   使用方：pipeline/reverse/{detect_scenes,verify_cuts,gate,delogo_local,local_inpaint}.py
+#           pipeline/review/measure_motion.py
+opencv-python
+
+# NumPy：上面那几个文件的帧矩阵与统计量运算
+#   使用方：pipeline/reverse/{delogo_local,gate,local_inpaint}.py、pipeline/review/measure_motion.py
+numpy
+
+# faster-whisper：语音转写（台词逐句原文）
+#   使用方：pipeline/reverse/analyze_audio.py（函数内懒加载，不跑转写就不会触发）
+faster-whisper
+
+# CTranslate2：faster-whisper 的推理后端；analyze_audio.py 还用它探测有没有 GPU
+#   使用方：pipeline/reverse/analyze_audio.py
+ctranslate2
+
+# ---------------------------------------------------------------------------
+# 非 pip 依赖（装不上、也不该装进 requirements.txt）
+# ---------------------------------------------------------------------------
+# ffmpeg / ffprobe：必须在 PATH 里。
+#   · extract.py 用 ffprobe 做入口预检（能不能解码、有没有音轨、时长）
+#   · detect_scenes.py / analyze_audio.py 用 ffmpeg 抽帧、抽音轨
+#   · 缺了它们，拆解会在预检阶段退出码 2，不是「模型失败」
+# 自检：py -3 scripts/preflight.py（第 2 项就查这个）

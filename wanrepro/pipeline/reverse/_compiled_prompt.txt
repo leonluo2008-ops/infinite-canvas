@@ -1,0 +1,226 @@
+# 视频逆向拆解提示（v2 · 正向指令版）
+
+> 产出：一份可直接驱动视频生成模型的 JSON 规格。
+> v2 修掉 v1 的三处毛病：删掉"不是影评人"这类负向角色设定、删掉"禁用氛围感/电影感"（与官方示范相反）、把禁令改写成正向填写要求。
+
+---
+
+分析这段视频，按下面的 JSON 结构输出**一个 ```json 代码块**，不要任何解释文字。
+
+## 填写要求
+
+1. **每镜必须给出景别、机位、焦段观感、运镜、速度**，取值来自下方受控词表；表里没有的写最接近项。
+2. **动作写成物理步骤**：谁、用哪只手、抓住什么位置、朝哪个方向、移动多少；一条动作一个 `t_s`。
+3. **时间首尾相接**：所有镜头的 `start_s` / `end_s` 连续，不重叠不留空；有剪辑点就拆镜。
+4. **产品出现过的每一镜**都要给 `bbox_rel`（0~1 相对坐标，原点左上）和 `screen_share_pct`（整数百分比）。
+5. **声音分三层**：BGM 风格、有无人声（有则逐字转录）、音效及其秒点。
+6. **屏幕文字逐字记录**，含出现与消失秒点；平台尾卡（TikTok/Reels 搜索页）单独作为最后一镜。
+7. **看不清、听不清、判断不了** → 写 `"uncertain"`。
+8. **`absent` 写 3 条以上**：这类视频通常会有、但本条画面里没有出现的元素，可直接用作负向清单。
+9. 风格/情绪词照常用（电影感、胶片颗粒、质感这类），**同时给出对应参数**（焦段、景深、颗粒、色温、光位、画幅）。
+
+## 受控词表
+
+- `shot_size`: ECU / CU / MCU / MS / MWS / WS / EWS / TOPDOWN_FLATLAY
+- `camera_angle`: eye_level / high_angle / low_angle / overhead / dutch / over_shoulder
+- `camera_move`: static / push_in / pull_back / pan_left / pan_right / tilt_up / tilt_down / truck_left / truck_right / pedestal_up / pedestal_down / orbit / handheld_drift / zoom_in / zoom_out / rack_focus / whip_pan
+- `move_speed`: none / slow / medium / fast
+- `focal_feel`: 14 / 24 / 35 / 50 / 85 / 100 / macro / uncertain
+- `light_direction`: top / top_left / top_right / left / right / front / back / bottom / ambient
+- `light_quality`: hard / soft / diffuse
+- `transition`: none / hard_cut / dissolve / match_cut / whip / platform_card
+
+## 输出结构
+
+```json
+{
+  "meta": {
+    "duration_s": 0.0,
+    "fps": 0.0,
+    "aspect_ratio": "9:16",
+    "has_audio": true,
+    "shot_count": 1,
+    "cut_points_s": [0.0]
+  },
+  "global": {
+    "style_three": { "look": "画风", "palette": "色相+明度+对比", "mood": "情绪词，最多2个" },
+    "scene_env": "环境与背景的客观描述",
+    "lighting": { "direction": "top", "quality": "soft", "color_temp": "warm|cool|neutral", "notes": "投影/底透光/光带方向" },
+    "consistency_requirements": ["必须前后一致的元素，逐条"]
+  },
+  "shots": [
+    {
+      "shot_id": 1,
+      "start_s": 0.0,
+      "end_s": 3.0,
+      "shot_size": "TOPDOWN_FLATLAY",
+      "camera_angle": "overhead",
+      "focal_feel": "35",
+      "camera_move": "static",
+      "move_speed": "none",
+      "subject_primary": "主体是什么、在画面什么位置（九宫格+相对坐标）",
+      "action_steps": [
+        { "t_s": 0.4, "who": "哪只手/哪个人", "physical_step": "物理动作描述", "direction": "画面内运动方向" }
+      ],
+      "product_presence": {
+        "present": true,
+        "bbox_rel": { "x": 0.0, "y": 0.0, "w": 0.0, "h": 0.0 },
+        "screen_share_pct": 0,
+        "occluded_from_s": null,
+        "leaves_frame_at_s": null,
+        "appearance_notes": "形状/材质/颜色/朝向/标签可读文字"
+      },
+      "props": [ { "item": "道具名", "count_start": 0, "count_end": 0, "change_rule": "只减不增/位置移动/不变" } ],
+      "onscreen_text": [ { "t_from_s": 0.0, "t_to_s": 1.0, "text": "逐字", "style": "字体/大小/位置" } ],
+      "audio": { "bgm_style": "风格或 none", "has_voice": false, "voice_transcript": "逐字或 none", "sfx": [ { "t_s": 0.0, "desc": "音效描述" } ] },
+      "transition_out": "hard_cut",
+      "absent": ["本条画面里没有、但同类视频常见的元素"],
+      "single_shot_prompt": "按 [风格] + [环境] + [机位/景别/焦段] + [动作流] + [声音] 顺序写的单镜提示词，120~200 字"
+    }
+  ],
+  "story": { "hook": "0~x 秒发生什么", "development": "中段推进", "ending": "收尾方式与秒点" },
+  "audio_summary": { "bgm": "有/无 + 风格 + 版权风险", "voice": "有/无 + 语言", "sfx": "有/无 + 类型" },
+  "replication": {
+    "ai_difficulty": "A | B | C",
+    "hard_parts": ["最难复刻的环节，具体到秒点与动作"],
+    "must_shoot_live": ["必须实拍的元素，没有写 none"],
+    "product_swap_suggestion": "换产品要改哪些字段",
+    "person_swap_suggestion": "换人物要改哪些字段、风险在哪"
+  }
+}
+```
+
+## 已测得的技术参数（必须采信，不得改写）
+
+下面这段由 ffmpeg 实测得出。`duration_s`、`fps`、`shot_count`、`cut_points_s` 一律照抄，你只填语义字段。
+
+```json
+{
+ "duration_s": 13.347,
+ "width": 576,
+ "height": 1024,
+ "aspect_note": "9:16 精确",
+ "fps": 23.976,
+ "has_audio": true,
+ "stable_cut_points_s": [],
+ "shot_count": 1,
+ "framediff_per_second": [
+  {
+   "sec": 0,
+   "mean_score": 0.005,
+   "max_score": 0.0245
+  },
+  {
+   "sec": 1,
+   "mean_score": 0.0083,
+   "max_score": 0.0316
+  },
+  {
+   "sec": 2,
+   "mean_score": 0.0042,
+   "max_score": 0.0114
+  },
+  {
+   "sec": 3,
+   "mean_score": 0.0067,
+   "max_score": 0.0296
+  },
+  {
+   "sec": 4,
+   "mean_score": 0.0041,
+   "max_score": 0.0195
+  },
+  {
+   "sec": 5,
+   "mean_score": 0.0047,
+   "max_score": 0.0146
+  },
+  {
+   "sec": 6,
+   "mean_score": 0.0031,
+   "max_score": 0.022
+  },
+  {
+   "sec": 7,
+   "mean_score": 0.0047,
+   "max_score": 0.0136
+  },
+  {
+   "sec": 8,
+   "mean_score": 0.0006,
+   "max_score": 0.0029
+  },
+  {
+   "sec": 9,
+   "mean_score": 0.0531,
+   "max_score": 1.0
+  },
+  {
+   "sec": 10,
+   "mean_score": 0.0026,
+   "max_score": 0.0141
+  },
+  {
+   "sec": 11,
+   "mean_score": 0.0011,
+   "max_score": 0.0048
+  },
+  {
+   "sec": 12,
+   "mean_score": 0.0013,
+   "max_score": 0.0037
+  },
+  {
+   "sec": 13,
+   "mean_score": 0.0014,
+   "max_score": 0.0037
+  }
+ ],
+ "audio_rms_per_second": [
+  {
+   "sec": 0,
+   "rms_db": -23.08
+  },
+  {
+   "sec": 1,
+   "rms_db": -20.95
+  },
+  {
+   "sec": 2,
+   "rms_db": -15.69
+  },
+  {
+   "sec": 3,
+   "rms_db": -15.66
+  },
+  {
+   "sec": 4,
+   "rms_db": -17.28
+  },
+  {
+   "sec": 5,
+   "rms_db": -18.69
+  },
+  {
+   "sec": 6,
+   "rms_db": -15.97
+  },
+  {
+   "sec": 7,
+   "rms_db": -16.67
+  },
+  {
+   "sec": 8,
+   "rms_db": -17.97
+  },
+  {
+   "sec": 9,
+   "rms_db": -12.08
+  },
+  {
+   "sec": 10,
+   "rms_db": -45.09
+  }
+ ]
+}
+```
