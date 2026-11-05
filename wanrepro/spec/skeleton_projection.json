@@ -1,0 +1,250 @@
+{
+  "version": "1.0.0",
+  "updated": "2026-10-29",
+  "status": "draft",
+  "_purpose": "S1「骨架字段全等」的唯一真源。需求.md / 架构与数据契约.md / schema / 验收脚本只准引用本文件，不得各自再列一份。",
+  "_grounding": "本文件的 existing 路径取自真实产物 `analysis/reverse/484/spec.json` 的字段形状（2026-10-29 提取）。**该产物本体已于同日清理**（内容自相矛盾，见 `docs/体检-20261029.md` B2）；字段形状已固化在 `tests/fixtures/spec_shape/spec_keys.json`（79 条键路径，只含类型不含业务值），本文件的 existing/to_add 路径以它为锚点。",
+  "comparison_modes": {
+    "exact": "严格相等（字符串/布尔/枚举/整数）",
+    "num_tol": "数值相等，容差见 tol 字段",
+    "set_equal": "先归一化（去空白/小写/去标点）再按多重集比较",
+    "same_length": "数组长度必须相等",
+    "all_present": "只要求非空，不比较内容"
+  },
+  "existing": [
+    {
+      "path": "meta.duration_s",
+      "type": "number",
+      "mode": "num_tol",
+      "tol": 0.001,
+      "source": "measured",
+      "why": "时长直接决定分镜时间码，差一点就错位"
+    },
+    {
+      "path": "meta.fps",
+      "type": "number",
+      "mode": "num_tol",
+      "tol": 0.001,
+      "source": "measured",
+      "why": "帧率影响抽帧与运动模糊描述"
+    },
+    {
+      "path": "meta.aspect_ratio",
+      "type": "string",
+      "mode": "exact",
+      "source": "measured",
+      "why": "9:16 / 16:9 决定构图描述，不能变"
+    },
+    {
+      "path": "meta.has_audio",
+      "type": "boolean",
+      "mode": "exact",
+      "source": "measured",
+      "why": "决定是否有声音节"
+    },
+    {
+      "path": "meta.shot_count",
+      "type": "integer",
+      "mode": "exact",
+      "source": "measured",
+      "why": "镜数 = 分镜段数，S1 的核心判据"
+    },
+    {
+      "path": "meta.cut_points_s",
+      "type": "array<number>",
+      "mode": "num_tol",
+      "tol": 0.05,
+      "extra": "same_length",
+      "source": "measured",
+      "why": "切点位置；容差 50ms 是因为 scene 检测对转场帧的归属有天然抖动"
+    },
+    {
+      "path": "shots[].shot_id",
+      "type": "integer",
+      "mode": "exact",
+      "source": "derived",
+      "why": "顺序必须稳定"
+    },
+    {
+      "path": "shots[].start_s",
+      "type": "number",
+      "mode": "num_tol",
+      "tol": 0.001,
+      "source": "measured",
+      "why": "分镜时间码起点"
+    },
+    {
+      "path": "shots[].end_s",
+      "type": "number",
+      "mode": "num_tol",
+      "tol": 0.001,
+      "source": "measured",
+      "why": "分镜时间码终点"
+    },
+    {
+      "path": "shots[].shot_size",
+      "type": "enum",
+      "mode": "exact",
+      "source": "observed_classification",
+      "why": "景别决定提示词里的构图措辞"
+    },
+    {
+      "path": "shots[].camera_angle",
+      "type": "enum",
+      "mode": "exact",
+      "source": "observed_classification",
+      "why": "俯拍/平视是硬约束"
+    },
+    {
+      "path": "shots[].camera_move",
+      "type": "enum",
+      "mode": "exact",
+      "source": "observed_classification",
+      "why": "固定机位 vs 推拉摇移"
+    },
+    {
+      "path": "shots[].product_presence.present",
+      "type": "boolean",
+      "mode": "exact",
+      "source": "observed_classification",
+      "why": "有没有产品在画面里"
+    },
+    {
+      "path": "shots[].onscreen_text[].text",
+      "type": "array<string>",
+      "mode": "set_equal",
+      "source": "observed_classification",
+      "why": "屏幕文字要不要后期叠，取决于此"
+    },
+    {
+      "path": "shots[].audio.has_voice",
+      "type": "boolean|null",
+      "mode": "exact",
+      "source": "observed_classification",
+      "null_means": "该镜无音轨或未取到音频，渲染时必须写「台词待确认」，不得写「无台词」",
+      "why": "台词判定"
+    }
+  ],
+  "to_add": [
+    {
+      "path": "shots[].product_presence.in_hand",
+      "type": "enum",
+      "values": ["none", "holding", "handled_by"],
+      "mode": "exact",
+      "source": "observed_classification",
+      "batch": "B5",
+      "why": "真实产物只有 present/bbox/占比，没有「在手上」这个概念；而手握比例图的触发完全依赖它。none=无手；holding=有人握着；handled_by=被手拿起又放下"
+    },
+    {
+      "path": "shots[].audio.language",
+      "type": "string|null",
+      "format": "ISO639-1",
+      "mode": "exact",
+      "source": "observed_classification",
+      "batch": "B1",
+      "why": "真实产物 audio_summary.voice 是自由中文（「有，英语歌词女声」），不可判；需要独立结构化字段"
+    },
+    {
+      "path": "audio_summary.has_bgm",
+      "type": "boolean|null",
+      "mode": "exact",
+      "source": "observed_classification",
+      "batch": "B1",
+      "why": "现存 audio_summary.bgm 是描述性中文，无法机器判"
+    },
+    {
+      "path": "core_mechanism.type",
+      "type": "string",
+      "mode": "exact",
+      "source": "observed_classification",
+      "batch": "B8",
+      "why": "取值为 spec/mechanisms.json 的 family id；none 表示无机制"
+    },
+    {
+      "path": "key_events[].action",
+      "type": "array<string>",
+      "mode": "set_equal",
+      "source": "observed_classification",
+      "batch": "B8",
+      "why": "覆盖完整性的判据；枚举见 需求.md KEY-EVENTS"
+    },
+    {
+      "path": "assets[].kind",
+      "type": "array<string>",
+      "mode": "set_equal",
+      "values": ["product", "person", "hand_hold", "scene", "prop"],
+      "source": "derived",
+      "batch": "B5",
+      "why": "资产清单条目类型"
+    }
+  ],
+  "not_in_skeleton": {
+    "_why": "以下字段属于描述层，允许两次运行不同，不参与 S1 全等判定",
+    "paths": [
+      "shots[].subject_primary",
+      "shots[].action_steps[].physical_step",
+      "shots[].product_presence.appearance_notes",
+      "shots[].props",
+      "shots[].transition_out",
+      "shots[].absent",
+      "shots[].single_shot_prompt",
+      "shots[].focal_feel",
+      "shots[].move_speed",
+      "global.*",
+      "story.*",
+      "audio_summary.bgm",
+      "audio_summary.voice",
+      "audio_summary.sfx",
+      "replication.*"
+    ]
+  },
+  "reference_object": {
+    "_problem": "第 1 稿写的是 same_spec_two_renders —— 但渲染器无 LLM、天然确定，两次渲染必等，这个判据**永远不会 FAIL**，等于没验「换个人也出同水平」。已改两层。",
+    "S1a_acquire_stability": {
+      "mode": "reacquire",
+      "what": "同一条片**独立取证两次**（两次独立 API 调用、各自出 spec），比两份 spec 的骨架投影",
+      "why": "这才是「换个人操作」的真实检验：模型随机性是唯一的方差源，两个人跑同一工具，差别就在这里",
+      "can_fail": true,
+      "threshold_policy": "**先测后定**：B8 完成后跑第一次基线测量（同一片跑 3 次），把实测一致率写进本文件；**实测前不得宣称达标**",
+      "provisional_thresholds": {
+        "critical_fields": "100% 一致（3 次中 3 次）",
+        "normal_fields": "≥80% 一致（3 次中至少 2 次）",
+        "_note": "80% 是暂定的工程直觉值，不是拍脑袋的验收线；实测出来是多少就写多少"
+      }
+    },
+    "S1b_render_determinism": {
+      "mode": "render",
+      "what": "同一份 spec 渲染两次，比 `prompt.md` 字节",
+      "why": "回归保护——防止有人往渲染器里塞时间戳/随机数/字典序漂移，把噪声混进真差异里",
+      "can_fail": true,
+      "threshold": "字节完全相同"
+    },
+    "_removed": "原 same_spec_two_renders 单条判据已废弃"
+  },
+  "field_grading": {
+    "_why": "S1a 要分关键/普通，因为 measured 字段必然稳，observed_classification 字段带模型方差，不能用同一阈值",
+    "critical": [
+      "meta.duration_s",
+      "meta.shot_count",
+      "meta.aspect_ratio",
+      "meta.cut_points_s",
+      "shots[].start_s",
+      "shots[].end_s",
+      "shots[].audio.has_voice"
+    ],
+    "normal": [
+      "meta.fps",
+      "shots[].shot_id",
+      "shots[].shot_size",
+      "shots[].camera_angle",
+      "shots[].camera_move",
+      "shots[].product_presence.present",
+      "shots[].product_presence.in_hand",
+      "shots[].onscreen_text[].text",
+      "core_mechanism.type",
+      "key_events[].action",
+      "assets[].kind"
+    ],
+    "excluded": "见 not_in_skeleton"
+  }
+}

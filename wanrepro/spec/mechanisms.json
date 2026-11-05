@@ -1,0 +1,251 @@
+{
+  "version": "1.0.0",
+  "updated": "2026-10-29",
+  "status": "draft",
+  "_note": "机制族本体。B8 分类器与 B6 渲染器共同消费此文件；不得在代码里硬编码机制名。来源：library/mechanisms/lumi-ai-video-17.md（外部参考，17 条）+ 已验证样本（吊扇遮挡换款）。",
+  "_evidence_levels": {
+    "validated": "有 ≥1 条参考片 + ≥1 次成功出片",
+    "observed": "有参考片，无成功出片",
+    "assumed": "仅从标题/描述推断，未见表征"
+  },
+  "families": [
+    {
+      "id": "occlusion_swap",
+      "name_zh": "遮挡擦除换款",
+      "aliases": ["叶片遮挡换款", "机械臂擦除换装", "wipe-by-occluder"],
+      "evidence_level": "validated",
+      "evidence": ["原始资料/员工补充需求/生成*的瑕疵视频-提示词验证.mp4", "library/mechanisms/lumi-ai-video-17.md#Part.19"],
+      "detect": {
+        "required": [
+          "一个不透明物体在镜头与主体之间周期性/一次性扫过",
+          "扫过时机位固定，主体位置不变",
+          "扫过前后主体的身份发生替换"
+        ],
+        "signals": ["前景大面积遮挡帧序列", "遮挡前后帧的主体外观差异", "机位无位移"]
+      },
+      "template": {
+        "spatial_relation": "遮挡物位于镜头与主体之间，距镜头更近；被遮挡主体在更远处",
+        "pivot_rule": "旋转轴/驱动结构始终在画面外，只露出遮挡面",
+        "entry_direction": "每次均从同一侧进入、沿同一轨迹离开",
+        "occlusion_duration_s": "0.8-1.2，需能看清进入、遮挡、离开全过程",
+        "swap_condition": "仅当主体被完全遮住的那一瞬才替换",
+        "post_swap_continuity": ["位置", "尺寸", "朝向", "光照"],
+        "motion_blur": "遮挡物边缘允许轻微运动模糊，背景与主体保持清晰"
+      },
+      "continuity_constraints": ["position", "size", "orientation", "lighting"],
+      "negative_defaults": [
+        "禁止在无遮挡状态下改变主体颜色、编号或文字",
+        "禁止渐变、溶解、闪白、粒子、液化",
+        "禁止两个主体同框或重叠",
+        "不展示遮挡物的完整结构（电机、吊杆、网罩、支架、底座、机械臂杆体）"
+      ],
+      "known_failure_modes": ["瓶身位置与大小轻微漂移（本样本实测）"],
+      "params": {
+        "cycle_count": {"type": "int", "min": 1, "max": 6, "note": "扫过几次 = 换几次"},
+        "fake_last_cycle": {"type": "bool", "default": false, "note": "最后一次可刻意不换（样本与 Part.19 均有此手法）"}
+      }
+    },
+    {
+      "id": "motion_blur_wipe",
+      "name_zh": "运动模糊擦除变装",
+      "evidence_level": "observed",
+      "evidence": ["library/mechanisms/lumi-ai-video-17.md#Part.20"],
+      "detect": {"required": ["快速横向甩动/转身产生大面积运动模糊", "模糊帧前后主体身份变化"], "signals": ["单帧强方向性模糊"]},
+      "template": {"spatial_relation": "主体与背景相对固定，擦拭由高速运动完成", "swap_condition": "模糊峰值帧完成替换", "post_swap_continuity": ["位置", "姿态"]},
+      "continuity_constraints": ["position", "pose"],
+      "negative_defaults": ["禁止硬切", "禁止叠化"],
+      "known_failure_modes": [],
+      "params": {"blur_strength": {"type": "enum", "values": ["light", "medium", "heavy"]}}
+    },
+    {
+      "id": "whip_pan",
+      "name_zh": "甩镜切换",
+      "evidence_level": "observed",
+      "evidence": ["library/mechanisms/lumi-ai-video-17.md#Part.3"],
+      "detect": {"required": ["高速摇镜导致画面短暂拖影", "摇镜落点与起点为不同构图"], "signals": ["镜头角速度突变"]},
+      "template": {"spatial_relation": "同一空间内多点位，靠摇镜串联", "swap_condition": "摇镜拖影期间完成场景/主体切换", "post_swap_continuity": ["光线方向"]},
+      "continuity_constraints": ["lighting"],
+      "negative_defaults": ["禁止硬切代替甩镜"],
+      "known_failure_modes": [],
+      "params": {"pan_count": {"type": "int", "min": 1, "max": 5}}
+    },
+    {
+      "id": "instant_replace",
+      "name_zh": "瞬间替换",
+      "evidence_level": "observed",
+      "evidence": ["library/mechanisms/lumi-ai-video-17.md#Part.5"],
+      "detect": {"required": ["两个主体占据同一位置", "切换发生在两帧之间无过渡"], "signals": ["相邻帧完全不同的物体"]},
+      "template": {"spatial_relation": "替换前后占据画面同一区域", "swap_condition": "单帧内完成，无过渡帧", "post_swap_continuity": ["位置", "占幅"]},
+      "continuity_constraints": ["position", "scale"],
+      "negative_defaults": ["禁止渐变", "禁止形变过渡"],
+      "known_failure_modes": [],
+      "params": {}
+    },
+    {
+      "id": "stretch_transform",
+      "name_zh": "拉伸变形",
+      "evidence_level": "observed",
+      "evidence": ["library/mechanisms/lumi-ai-video-17.md#Part.4"],
+      "detect": {"required": ["主体被拉长成流线", "流线保持原主体色彩"], "signals": ["长条状高光带"]},
+      "template": {"spatial_relation": "从主体原位置向画外延伸", "swap_condition": "拉伸终点揭示目标形态", "post_swap_continuity": ["色彩"]},
+      "continuity_constraints": ["color"],
+      "negative_defaults": ["禁止断裂", "禁止分叉"],
+      "known_failure_modes": [],
+      "params": {"stretch_target": {"type": "enum", "values": ["off_screen", "into_shape", "into_text"]}}
+    },
+    {
+      "id": "material_morph",
+      "name_zh": "材质变身",
+      "evidence_level": "observed",
+      "evidence": ["library/mechanisms/lumi-ai-video-17.md#Part.6", "#Part.14"],
+      "detect": {"required": ["原材料逐步转化为成品", "转化过程连续可见"], "signals": ["材质纹理渐变"]},
+      "template": {"spatial_relation": "同一位置完成材质替换", "swap_condition": "原料消失即刻成品成型", "post_swap_continuity": ["位置", "占幅"]},
+      "continuity_constraints": ["position", "scale"],
+      "negative_defaults": ["禁止闪白跳切"],
+      "known_failure_modes": [],
+      "params": {}
+    },
+    {
+      "id": "liquid_forming",
+      "name_zh": "液体成型",
+      "evidence_level": "observed",
+      "evidence": ["library/mechanisms/lumi-ai-video-17.md#Part.2"],
+      "detect": {"required": ["容器倾倒", "液体在地面扩散并形成图形/文字"], "signals": ["流体扩散边界"]},
+      "template": {"spatial_relation": "液体沿地面平面扩散，镜头俯视或平视", "swap_condition": "液体抵达目标形状时停止", "post_swap_continuity": ["表面反光"]},
+      "continuity_constraints": ["lighting"],
+      "negative_defaults": ["禁止液体凭空出现", "禁止形状突变"],
+      "known_failure_modes": [],
+      "params": {"forms": {"type": "enum", "values": ["text", "logo", "product_shape"]}}
+    },
+    {
+      "id": "plane_escape",
+      "name_zh": "平面跃出",
+      "evidence_level": "observed",
+      "evidence": ["library/mechanisms/lumi-ai-video-17.md#Part.1"],
+      "detect": {"required": ["主体原本印在平面介质上", "主体脱离平面变为立体"], "signals": ["平面→立体的透视变化"]},
+      "template": {"spatial_relation": "从平面介质表面垂直方向脱离", "swap_condition": "脱离瞬间完成由静到动的转变", "post_swap_continuity": ["朝向"]},
+      "continuity_constraints": ["orientation"],
+      "negative_defaults": ["禁止平面内直接放大冒充跃出"],
+      "known_failure_modes": [],
+      "params": {}
+    },
+    {
+      "id": "boundary_grab",
+      "name_zh": "越界取物",
+      "evidence_level": "observed",
+      "evidence": ["library/mechanisms/lumi-ai-video-17.md#Part.18"],
+      "detect": {"required": ["主体原本在屏幕/画面内的平面媒介里", "被拉出到现实空间"], "signals": ["媒介边框被跨越"]},
+      "template": {"spatial_relation": "屏幕为边界，跨越方向由画外指向现实", "swap_condition": "越过边界时尺度重算", "post_swap_continuity": ["尺度"]},
+      "continuity_constraints": ["scale"],
+      "negative_defaults": ["禁止屏幕内容整体平移冒充取出"],
+      "known_failure_modes": [],
+      "params": {}
+    },
+    {
+      "id": "external_pull",
+      "name_zh": "外部力拉走",
+      "evidence_level": "observed",
+      "evidence": ["library/mechanisms/lumi-ai-video-17.md#Part.13"],
+      "detect": {"required": ["画外射入物体缠住/钩住主体", "主体被拖出画面"], "signals": ["线性牵引轨迹"]},
+      "template": {"spatial_relation": "牵引物从画外进入，主体随之离开", "swap_condition": "主体离开画面时场景保持", "post_swap_continuity": ["背景"]},
+      "continuity_constraints": ["background"],
+      "negative_defaults": ["禁止主体自行飞出"],
+      "known_failure_modes": [],
+      "params": {}
+    },
+    {
+      "id": "scale_contrast",
+      "name_zh": "尺度反差",
+      "evidence_level": "observed",
+      "evidence": ["library/mechanisms/lumi-ai-video-17.md#Part.12"],
+      "detect": {"required": ["极小主体与常规物体同框", "尺度比明显失真"], "signals": ["尺度比例异常"]},
+      "template": {"spatial_relation": "小主体在常规物体内部/表面活动", "swap_condition": "无需换款，靠反差成立", "post_swap_continuity": ["光照一致性"]},
+      "continuity_constraints": ["lighting"],
+      "negative_defaults": ["禁止小主体比例漂移"],
+      "known_failure_modes": [],
+      "params": {"scale_ratio": {"type": "string", "note": "如 1:50"}}
+    },
+    {
+      "id": "light_rhythm",
+      "name_zh": "光控节拍",
+      "evidence_level": "observed",
+      "evidence": ["library/mechanisms/lumi-ai-video-17.md#Part.7"],
+      "detect": {"required": ["开关/闪光事件与主体出现一一对应", "存在声音-画面同步节拍"], "signals": ["亮灭帧序列"]},
+      "template": {"spatial_relation": "光源位置固定，主体逐个进入光照区", "swap_condition": "每次亮起新增一个主体", "post_swap_continuity": ["位置"]},
+      "continuity_constraints": ["position"],
+      "negative_defaults": ["禁止一次亮起多个（除非结尾合并）"],
+      "known_failure_modes": [],
+      "params": {"beat_count": {"type": "int", "min": 2, "max": 8}}
+    },
+    {
+      "id": "collision_pop",
+      "name_zh": "碰撞触发放大",
+      "evidence_level": "observed",
+      "evidence": ["library/mechanisms/lumi-ai-video-17.md#Part.9"],
+      "detect": {"required": ["外力碰撞导致主体脱手飞出", "空中放大后悬浮再落地"], "signals": ["抛物线轨迹 + 尺度突变"]},
+      "template": {"spatial_relation": "主体脱离手持后在镜头前放大", "swap_condition": "放大期间细节揭示", "post_swap_continuity": ["朝向"]},
+      "continuity_constraints": ["orientation"],
+      "negative_defaults": ["禁止穿模", "禁止落地弹跳夸张"],
+      "known_failure_modes": [],
+      "params": {}
+    },
+    {
+      "id": "float_hero",
+      "name_zh": "悬浮展示",
+      "evidence_level": "observed",
+      "evidence": ["library/mechanisms/lumi-ai-video-17.md#Part.15", "#Part.21"],
+      "detect": {"required": ["主体悬空无支撑", "姿态缓慢旋转或漂浮"], "signals": ["无投影或投影异常"]},
+      "template": {"spatial_relation": "主体脱离地面，背景留白", "swap_condition": "多主体时靠快切切换", "post_swap_continuity": ["光照"]},
+      "continuity_constraints": ["lighting"],
+      "negative_defaults": ["禁止出现支撑物"],
+      "known_failure_modes": [],
+      "params": {}
+    },
+    {
+      "id": "game_match",
+      "name_zh": "游戏化匹配",
+      "evidence_level": "observed",
+      "evidence": ["library/mechanisms/lumi-ai-video-17.md#Part.10"],
+      "detect": {"required": ["主体逐个落格", "出现连线/消除反馈"], "signals": ["网格排版"]},
+      "template": {"spatial_relation": "网格固定，主体填入格子", "swap_condition": "连成一线触发奖励画面", "post_swap_continuity": ["网格位置"]},
+      "continuity_constraints": ["position"],
+      "negative_defaults": ["禁止格子位置漂移"],
+      "known_failure_modes": [],
+      "params": {"grid": {"type": "string", "note": "如 3x3"}}
+    },
+    {
+      "id": "none",
+      "name_zh": "无核心机制",
+      "evidence_level": "validated",
+      "evidence": ["单瓶静态展示类参考片（484 / 官号参考1）"],
+      "detect": {"required": ["全片无遮挡/替换/变形/位移等非常规事件", "主体与机位均静止或仅轻微运动"], "signals": ["低运动量"]},
+      "template": {"spatial_relation": "—", "swap_condition": "—", "post_swap_continuity": []},
+      "continuity_constraints": [],
+      "negative_defaults": ["不得凭空编造机制来解释一条静态片"],
+      "known_failure_modes": ["模型倾向于强行编一个机关"],
+      "params": {}
+    }
+  ],
+  "classification_rules": {
+    "output_field": "core_mechanism.type",
+    "_tristate": "三态协议。此前 must_choose_one + fallback:none + unknown_policy 三套语义互相打架（审计第 2 轮指出），已删除前两者。",
+    "states": {
+      "matched": "唯一族的 required 全部成立，且不与更高优先级族冲突 → 输出该族 id",
+      "no_mechanism": "**仅当**全片无遮挡/替换/变形/位移/光控等非常规事件，且主体与机位静止或仅轻微运动（即 families.none 的 required 成立）→ 输出 \"none\"",
+      "unknown": "证据不足、或多族 required 同时成立 → 输出 type=null + ambiguous=true + candidate_families[]。**禁止回退成 none**"
+    },
+    "conflict_policy": "同一条片命中多族时，按各族 priority 从低到高（数值越小越优先）择一；若前两名 priority 相同或 required 命中数相同 → 判 unknown，不猜",
+    "evidence_required": "分类器必须为每条 required 输出布尔 + 证据时间段（t_from_s/t_to_s），不允许只给结论",
+    "confidence_threshold": 0.6
+  },
+  "mutual_exclusion": {
+    "_why": "审计第 2 轮指出：occlusion_swap / instant_replace / motion_blur_wipe / whip_pan 的 required 会互相误命中，因为都涉及『主体身份变化』。必须显式排他。",
+    "rules": [
+      {"pair": ["occlusion_swap", "instant_replace"], "discriminator": "是否存在**可辨识的不透明遮挡物**完整盖住主体（occlusion_swap 有；instant_replace 无，是两帧直接换）", "priority": {"occlusion_swap": 1, "instant_replace": 9}},
+      {"pair": ["occlusion_swap", "motion_blur_wipe"], "discriminator": "遮挡物是否有**实体形状与边界**（occlusion_swap 有；motion_blur_wipe 只有方向性拖影、无实体轮廓）", "priority": {"occlusion_swap": 1, "motion_blur_wipe": 5}},
+      {"pair": ["instant_replace", "motion_blur_wipe"], "discriminator": "两者间是否存在**过渡帧**（motion_blur_wipe 有拖影过渡；instant_replace 无过渡）", "priority": {"motion_blur_wipe": 5, "instant_replace": 9}},
+      {"pair": ["whip_pan", "motion_blur_wipe"], "discriminator": "模糊是否伴随**镜头朝向改变**（whip_pan 摄影机转向、背景换；motion_blur_wipe 机位固定、背景不变）", "priority": {"whip_pan": 4, "motion_blur_wipe": 5}},
+      {"pair": ["float_hero", "scale_contrast"], "discriminator": "是否存在**尺度比失真**（scale_contrast 有极小主体；float_hero 尺度正常只是无支撑）", "priority": {"scale_contrast": 6, "float_hero": 8}}
+    ]
+  }
+}

@@ -1,0 +1,109 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Analysis M1 Incremental Fields",
+  "type": "object",
+  "required": [
+    "meta",
+    "shots"
+  ],
+  "properties": {
+    "meta": {
+      "type": "object",
+      "required": [
+        "measured"
+      ],
+      "properties": {
+        "measured": {
+          "type": "object",
+          "required": [
+            "duration_s",
+            "width",
+            "height",
+            "fps",
+            "cut_points_s"
+          ],
+          "properties": {
+            "duration_s": {
+              "type": "number"
+            },
+            "width": {
+              "type": "integer"
+            },
+            "height": {
+              "type": "integer"
+            },
+            "fps": {
+              "type": "number"
+            },
+            "cut_points_s": {
+              "type": "array",
+              "items": {
+                "type": "number"
+              }
+            }
+          }
+        }
+      }
+    },
+    "shots": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": [
+          "contact",
+          "end_composition"
+        ],
+        "properties": {
+          "contact": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "object",
+              "required": [
+                "from",
+                "to",
+                "type",
+                "direction",
+                "driven"
+              ],
+              "properties": {
+                "from": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "to": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "type": {
+                  "type": "string",
+                  "minLength": 1,
+                  "enum": [
+                    "接触",
+                    "顶到",
+                    "推挤",
+                    "带动",
+                    "摩擦"
+                  ]
+                },
+                "direction": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "driven": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              }
+            }
+          },
+          "end_composition": {
+            "type": "string",
+            "minLength": 10
+          }
+        }
+      }
+    }
+  }
+}

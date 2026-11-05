@@ -34,7 +34,7 @@ FFMPEG_URL = ("https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/"
               "ffmpeg-master-latest-win64-gpl.zip")
 
 # 随 app/ 的仓库目录（拉片链运行所需；产品中立——projects/ 与原始资料绝不进包）
-APP_DIRS = ["pipeline", "prompts", "templates", "library", "specs"]
+APP_DIRS = ["pipeline", "prompts", "templates", "library", "specs", "spec", "wanrepro"]
 APP_FILES = ["analyze.py", "ui/server.py"]
 
 
