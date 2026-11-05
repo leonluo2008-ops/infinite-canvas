@@ -24,6 +24,10 @@
  *   <out>/work/{projects,uploads}  <out>/logs/  <out>/docs/
  *   <out>/启动整合包.bat  <out>/manage.ps1  <out>/PACKAGE-INFO.json
  *
+ * ⛔ 文件覆盖只能用 copyFileSync：本机 Node 24（Windows）上 fs.cpSync 覆盖**已存在**的文件会
+ *    让进程静默崩掉（exit 127、无异常无堆栈）——实测矩阵：cpSync→新文件 OK，cpSync→同名旧文件
+ *    必崩；copyFileSync / writeFileSync 覆盖都正常。目录拷贝仍用 cpSync，但目标先 rm -rf。
+ *
  * 铁律（每条都是踩坑换来的）：
  * - 打包=拷贝+排除，不是清理源仓；源仓一个字节都不动。
  * - 代码目录先删后拷（不做 merge 拷贝）——否则上一轮删掉的老页/老规范会永远留在包里。
@@ -34,7 +38,7 @@
 import { randomBytes } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import {
-  cpSync, existsSync, mkdirSync, readdirSync, readFileSync,
+  copyFileSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSync,
   rmSync, statSync, writeFileSync,
 } from "node:fs";
 import path from "node:path";
@@ -242,7 +246,7 @@ function bootstrapRuntimeFromCache(runtimeDir) {
   for (const want of ["ffmpeg.exe", "ffprobe.exe"]) {
     const hit = walk(ffTmp).find((p) => path.basename(p).toLowerCase() === want);
     if (!hit) fail(`ffmpeg 包内找不到 ${want}`);
-    cpSync(hit, path.join(runtimeDir, "ffmpeg", want));
+    copyFileSync(hit, path.join(runtimeDir, "ffmpeg", want));
   }
   rmSync(tmp, { recursive: true, force: true });
 }
@@ -259,7 +263,7 @@ function ensureRuntime() {
       const from = path.join(src, rel);
       if (!existsSync(from)) fail(`--runtime-from 里也没有 ${rel}`);
       mkdirSync(path.dirname(path.join(runtimeDir, rel)), { recursive: true });
-      cpSync(from, path.join(runtimeDir, rel));
+      copyFileSync(from, path.join(runtimeDir, rel));
     }
     const after = runtimeStatus();
     if (after.length) fail(`runtime 仍缺：${after.join(", ")}`);
@@ -288,7 +292,7 @@ function syncApp(distDir) {
   for (const file of MANIFEST.files) {
     const src = path.join(ENGINE, file);
     if (!existsSync(src)) fail(`引擎文件缺失：wanrepro/${file}`);
-    cpSync(src, path.join(app, file));
+    copyFileSync(src, path.join(app, file));
     shipped.push(file);
   }
   const webDst = path.join(app, MANIFEST.webDist);
@@ -352,14 +356,14 @@ function installManager() {
   const srcBat = path.join(ENGINE, "scripts", "bundle", "启动整合包.bat");
   const srcPs = path.join(ENGINE, "scripts", "bundle", "manage.ps1");
   if (!existsSync(srcBat) || !existsSync(srcPs)) fail("引擎内缺 scripts/bundle/{启动整合包.bat, manage.ps1}");
-  cpSync(srcBat, path.join(OUT, "启动整合包.bat"));
+  copyFileSync(srcBat, path.join(OUT, "启动整合包.bat"));
   // PS 5.1 无 BOM 会按 ANSI 解析中文 → 必须 UTF-8 BOM；统一 CRLF 与现役包一致
   const body = readFileSync(srcPs, "utf8").replace(/\r?\n/g, "\r\n");
   writeFileSync(path.join(OUT, "manage.ps1"), "\uFEFF" + body, "utf8");
 
   const srcGuide = path.join(ENGINE, "scripts", "bundle", "DEPLOY-GUIDE.md");
   mkdirSync(path.join(OUT, "docs"), { recursive: true });
-  if (existsSync(srcGuide)) cpSync(srcGuide, path.join(OUT, "docs", "DEPLOY-GUIDE.md"));
+  if (existsSync(srcGuide)) copyFileSync(srcGuide, path.join(OUT, "docs", "DEPLOY-GUIDE.md"));
   mkdirSync(path.join(OUT, "docs", "licenses"), { recursive: true });
   writeFileSync(
     path.join(OUT, "docs", "licenses", "THIRD-PARTY.md"),
