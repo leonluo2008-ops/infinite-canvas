@@ -23,7 +23,7 @@ export type LapianPromptTemplate = {
     instruction: string;
 };
 
-export const DEFAULT_LAPIAN_PROMPT_TEMPLATE_ID: LapianPromptTemplateId = "lumi-4section";
+export const DEFAULT_LAPIAN_PROMPT_TEMPLATE_ID: LapianPromptTemplateId = "seedance-flow";
 
 const REFERENCE_RULES = `# 参考图怎么用
 - 用 @图片1 @图片2 … 指代参考图，编号就是「本次参考图」清单里的编号，从 1 连续排到 N；清单里没有的号不写。
@@ -122,7 +122,7 @@ ${COMMON_RULES}`,
 ✅ 片长：<秒数> 秒（<画幅>｜<宽>p）
 ✅ 人物：<年龄感><气质词><性别>，<发型>，身穿<服装>
 ✅ 产品：<产品>，严格保持形状、标签、尺寸比例、标签文字不变，全片稳定不变
-✅ 镜头：<剪辑方式>，<机位稳定性>，<景别>
+✅ 镜头：<剪辑方式>，<运镜方式>，<机位稳定性>，<景别>
 ✅ 口播：<语种（地区变体）>，<收音方式>，口型对位，<有无 BGM>，<有无字幕>
 ✅ 分镜（N个镜头，0–10 秒）
   其下每行一个说话人一句话：[画外音] | 说话人：台词原文 —— 台词照原文语言逐字写，不译、不注音、不加动作提示。
@@ -158,7 +158,7 @@ ${COMMON_RULES}`,
 
 # 结构（整篇一段话：不换行、不加标题、不加附注）
 1. 全局设定与主体指认：一句开场给画幅 + 影像质感 + 主体指认——每个人物、产品、场景各给一个图号与 2–6 字短说明，一句到底，外形细节不写。
-2. 时段连续推进：按「N-M秒」一段一句推进，先说景别与场景，再说主体（@图片N 紧跟主体）与动作朝向，接镜头运动，最后是画面内容与转场；句与句直接相接成一段，中间不空行。
+2. 时段连续推进：按「N-M秒」一段一句推进，先说景别与场景，再说主体（@图片N 紧跟主体）与动作朝向，接镜头状态（每个时段句必带：运动方式+方向或速度；原片机位不动就写机位固定），最后是画面内容与转场；句与句直接相接成一段，中间不空行。
 3. 全程一致性收尾：末尾一句收尾——运镜平滑流畅、转场自然、色调过渡连贯、人物形象与所引图一致、产品外观全程不变形。
 
 ${COMMON_RULES}`,
@@ -166,5 +166,5 @@ ${COMMON_RULES}`,
 ];
 
 export function getLapianPromptTemplate(id?: string | null): LapianPromptTemplate {
-    return LAPIAN_PROMPT_TEMPLATES.find((item) => item.id === id) ?? LAPIAN_PROMPT_TEMPLATES[0];
+    return LAPIAN_PROMPT_TEMPLATES.find((item) => item.id === id) ?? LAPIAN_PROMPT_TEMPLATES.find((item) => item.id === DEFAULT_LAPIAN_PROMPT_TEMPLATE_ID) ?? LAPIAN_PROMPT_TEMPLATES[0];
 }

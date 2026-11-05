@@ -286,11 +286,18 @@ def _shot_four_subblocks(ir: IR, row: list[str], idx: int) -> list[str]:
     if lens_bits:
         lens_line = f"- 镜头调度：{'，'.join(lens_bits)}"
     else:
-        # 旧格式缺列：五 镜头 层的对应行兜底（镜K 行）
+        # 旧格式缺列：五 镜头 层按**关键词定位**兜底，不按序号瞎取。
+        # 2026-11-06 修：原 five[idx] 会把镜 2 对到「焦段与景深」行（层行数 ≠ 分镜行数，
+        # 旧拆解五层通常只有 2 行：机位与运镜 / 焦段与景深）。
         five = ir.layer_lines("五")
-        pick = five[idx] if idx < len(five) else ""
-        lens_line = (f"- 镜头调度：〔缺字段〕（表无镜头列；五层镜{idx + 1} 兜底：{pick}）" if pick
-                     else "- 镜头调度：〔缺字段〕（表无镜头列，五 镜头 层无对应行）")
+        pick = next((ln for ln in five if "机位与运镜" in ln), "")
+        if not pick:
+            pick = next((ln for ln in five if "运镜" in ln), "")
+        if pick:
+            # 去掉行首的 **标签**： 前缀，只留值
+            pick = re.sub(r"^\*{0,2}[^*：:]{0,6}运镜\*{0,2}\s*[：:]\s*", "", pick).strip()
+        lens_line = (f"- 镜头调度：〔缺字段〕（表无镜头列；五 镜头 层「机位与运镜」兜底：{pick}）" if pick
+                     else "- 镜头调度：〔旧格式无运镜列〕（建议重新拆解补齐分镜表）")
 
     # 影像渲染
     render_bits = []
