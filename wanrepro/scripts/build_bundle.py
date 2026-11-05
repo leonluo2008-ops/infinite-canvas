@@ -25,7 +25,7 @@ import zipfile
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
-CANVAS_WEB = Path("E:/User/GitHub/infinite-canvas/web")
+CANVAS_WEB = REPO.parent / "web"   # 单一源：引擎在 wanrepro/，画布 web/ 是同仓兄弟目录
 RUNTIME_DL = Path("E:/AI/wan-repro-bundle/runtime/_dl")  # 下载缓存（构建时复用）
 
 CPYTHON_URL = ("https://github.com/astral-sh/python-build-standalone/releases/download/"
