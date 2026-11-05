@@ -20,6 +20,7 @@ import { useThemeStore } from "@/stores/use-theme-store";
 import { cropDataUrl, splitDataUrl, upscaleDataUrl } from "@/lib/canvas/canvas-image-data";
 import { fitNodeSize, nodeSizeFromRatio } from "@/lib/canvas/canvas-node-size";
 import { captureVideoFrame, type VideoFramePosition } from "@/lib/canvas/canvas-video-frame";
+import { cameraCoverage } from "@/lib/canvas/camera-coverage";
 import { App, Button, Modal } from "antd";
 import { NODE_DEFAULT_SIZE, getNodeSpec } from "@/constant/canvas";
 import { ActiveConnectionPath, ConnectionPath } from "@/components/canvas/canvas-connections";
@@ -157,6 +158,17 @@ function applyGeneratedVideo(item: CanvasNodeData, video: UploadedFile, extra: C
         position: { x: item.position.x + item.width / 2 - videoSize.width / 2, y: item.position.y + item.height / 2 - videoSize.height / 2 },
         metadata: { ...item.metadata, ...videoMetadata(video), ...extra },
     };
+}
+
+/**
+ * B4b′：改写产物的运镜覆盖度要拿拉片正文当分母。
+ * 生成配置节点上留着 `lapianSourceId`，顺着它找拉片节点正文；拿不到（不是拉片链、拉片节点已删）
+ * 就返回空串，调用方据此跳过——不写 coverage、不报错，历史节点与普通改写零影响。
+ */
+function lapianTextOfSource(source: CanvasNodeData | null | undefined, nodes: CanvasNodeData[]) {
+    const lapianId = String(source?.metadata?.lapianSourceId || "");
+    if (!lapianId) return "";
+    return String(nodes.find((node) => node.id === lapianId)?.metadata?.content || "");
 }
 
 export default function CanvasPage() {
@@ -3554,6 +3566,11 @@ function InfiniteCanvasPage() {
                 const firstText = completedTexts[0];
                 if (completedTexts.length <= 1) setExpandedBatchNodeIds((current) => new Set([...current].filter((id) => id !== rootId)));
                 if (failedTexts.length) message.error(firstText ? t("canvas.projectPage.partialTextFailed") : failedTexts[0]?.errorDetails || t("canvas.projectPage.generationFailed"));
+                // B4b′：产物落盘时顺手算运镜覆盖度。分母来自拉片原文（配置节点 lapianSourceId → 拉片节点正文）；
+                // 拿不到拉片或这次一条都没成（没有正文可比）就整个跳过，不写字段也不报错。
+                const coverageText = (completedTexts.find((text) => text.id === (nodesRef.current.find((node) => node.id === rootId)?.metadata?.primaryTextId || textIds[0])) || firstText)?.content || "";
+                const lapianText = lapianTextOfSource(sourceNode, nodesRef.current);
+                const coverage = lapianText && coverageText ? cameraCoverage(lapianText, coverageText) : null;
                 setNodes((prev) =>
                     prev.map((node) => {
                         if (node.id === rootId) {
@@ -3567,6 +3584,7 @@ function InfiniteCanvasPage() {
                                     primaryTextId: primaryText?.id,
                                     status: primaryText ? NODE_STATUS_SUCCESS : NODE_STATUS_ERROR,
                                     errorDetails: primaryText ? undefined : t("canvas.projectPage.generationFailed"),
+                                    ...(coverage ? { cameraCoverage: coverage } : {}),
                                 },
                             };
                         }
@@ -3671,7 +3689,12 @@ function InfiniteCanvasPage() {
                         },
                         { signal: controller.signal },
                     );
-                    setNodes((prev) => prev.map((item) => (item.id === node.id ? { ...item, type: CanvasNodeType.Text, metadata: { ...item.metadata, content: answer || streamed, prompt, status: NODE_STATUS_SUCCESS } } : item)));
+                    // B4b′：重试这条也补 coverage。拉片从上游配置节点取（findRetrySourceNode 已爬到 Config）；
+                    // 爬不到/拉片正文空 → 不写字段、不报错（旧节点保持原样）。
+                    const retryText = answer || streamed;
+                    const retryLapianText = lapianTextOfSource(sourceNode, nodesRef.current);
+                    const retryCoverage = retryLapianText && retryText ? cameraCoverage(retryLapianText, retryText) : null;
+                    setNodes((prev) => prev.map((item) => (item.id === node.id ? { ...item, type: CanvasNodeType.Text, metadata: { ...item.metadata, content: retryText, prompt, status: NODE_STATUS_SUCCESS, ...(retryCoverage ? { cameraCoverage: retryCoverage } : {}) } } : item)));
                     return;
                 }
                 if (node.type === CanvasNodeType.Video) {

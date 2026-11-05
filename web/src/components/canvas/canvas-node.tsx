@@ -440,6 +440,8 @@ export const CanvasNode = React.memo(function CanvasNode({
 
                 {showImageInfo && hasImageContent ? <ImageInfoBar node={data} /> : null}
 
+                {data.type === CanvasNodeType.Text ? <CameraCoverageChip node={data} offsetTop={isBatchRoot} /> : null}
+
                 {!isGroup && !hasImageContent && !hasVideoContent && !hasAudioContent ? <div className="pointer-events-none absolute inset-x-0 bottom-0 h-12" style={{ background: `linear-gradient(to top, ${theme.canvas.background}66, transparent)` }} /> : null}
 
                 {referenceSelectionState && (referenceSelectionState !== "available" || hovered) ? (
@@ -950,6 +952,27 @@ function ImageInfoBar({ node }: { node: CanvasNodeData }) {
             <span className="max-w-full truncate rounded-md bg-black/55 px-2 py-1 text-[11px] font-medium leading-none text-white backdrop-blur-sm">
                 {width} x {height}
                 {size ? ` · ${size}` : ""}
+            </span>
+        </div>
+    );
+}
+
+/**
+ * B4c′：运镜覆盖度角标（产物节点右上角，复用 ImageInfoBar 的 chip 形态）。
+ * 只有改写过、且算过覆盖度的产物节点才有 `metadata.cameraCoverage`；历史节点没有这个字段 → 整块不渲染。
+ * total 0（拉片全是〔缺字段〕，或调度行里没有运镜词）= 没得比，也不渲染——不拿 0/0 冒充失败。
+ */
+function CameraCoverageChip({ node, offsetTop = false }: { node: CanvasNodeData; offsetTop?: boolean }) {
+    const coverage = node.metadata?.cameraCoverage;
+    if (!coverage || coverage.total <= 0) return null;
+    const complete = coverage.covered >= coverage.total;
+    return (
+        <div className={`pointer-events-none absolute right-3 z-40 max-w-[calc(100%-24px)] ${offsetTop ? "top-12" : "top-3"}`}>
+            <span
+                className={`max-w-full truncate rounded-md px-2 py-1 text-[11px] font-medium leading-none text-white backdrop-blur-sm ${complete ? "bg-black/55" : "bg-red-600/85"}`}
+                aria-label={coverage.missing.length ? `运镜覆盖 ${coverage.covered}/${coverage.total}，缺 ${coverage.missing.join("、")}` : `运镜覆盖 ${coverage.covered}/${coverage.total}`}
+            >
+                运镜 {coverage.covered}/{coverage.total}
             </span>
         </div>
     );

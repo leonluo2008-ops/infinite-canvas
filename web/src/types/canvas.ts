@@ -99,6 +99,15 @@ export type CanvasNodeMetadata = {
     lapianIntent?: boolean;
     /** 拉片派生节点的来源拉片 id（T3-G1）：挂图/摘图时据此重算清单行。 */
     lapianSourceId?: string;
+    /**
+     * 运镜覆盖度（B4b′）：拉片逐镜「镜头调度」行的运镜词，在改写产物全文里的命中情况。
+     * 只在拉片链改写产物落盘时写；历史节点没有这个字段（卡片角标据此静默不渲染）。
+     */
+    cameraCoverage?: {
+        covered: number;
+        total: number;
+        missing: string[];
+    };
     /** 可选段（T6-B5 画布侧）：渲染提示词时要打开的可选段字母（如 "A,C"，逗号分隔）；空/缺省 = 全关（现状行为）。 */
     lapianOptional?: string;
     /** 拉片模型（M6-T7-R）：本节点实际用的模型引用，格式 `channelId::model`（全局清单同款编码）；空/缺省 = 跟随全局默认（仍未设 = 走服务端默认模型）。 */
