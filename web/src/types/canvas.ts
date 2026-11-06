@@ -145,6 +145,8 @@ export type CanvasNodeMetadata = {
     videoTaskId?: string;
     // 原值透存不折叠——历史 bug：sdgf 被三元折叠成 openai，恢复轮询走错协议（M6-T6 假失败根因之一）。
     videoTaskProvider?: VideoTaskProvider;
+    // SDGF 站方进度 0-100（轮询回报，仅生成中有值）；缺失时 UI 退回「生成中」，不显示假数字。
+    videoProgress?: number;
     groupId?: string;
     interactive?: boolean; // Plugin node interaction/move state; see CanvasNodeDefinition.interactionToggle.
 };

@@ -52,11 +52,11 @@ const F = (message = "Qiling task failed") => ({ status: "failed", error: messag
 const P = { status: "pending" };
 const C = (url = "https://cdn.example.com/v.mp4") => ({ status: "completed", result: { url, mimeType: "video/mp4" } });
 
-/** 用假 poll/delay 驱动真等待循环，记录轮询次数/间隔/终局。 */
+/** 用假 poll/delay 驱动真等待循环，记录轮询次数/间隔/进度回调/终局。 */
 async function drive(provider, sequence) {
     let i = 0;
     const delays = [];
-    const out = { polls: 0, delays, failedError: null, timedOut: false, result: undefined, error: null };
+    const out = { polls: 0, delays, progress: [], failedError: null, timedOut: false, result: undefined, error: null };
     try {
         out.result = await mod.waitForVideoTaskOutput({
             provider,
@@ -69,6 +69,9 @@ async function drive(provider, sequence) {
             },
             delay: async (ms) => {
                 delays.push(ms);
+            },
+            onProgress: (pct) => {
+                out.progress.push(pct);
             },
             onTaskFailed: (error) => {
                 out.failedError = error;
@@ -179,6 +182,53 @@ try {
 check("isAborted 立即抛 AbortError", abortError?.name === "AbortError", `error ${abortError?.name}`);
 
 // ---------------------------------------------------------------------------
+// 5c. 进度百分比（SDGF 查询顶层 progress 0-100 → 等待层 onProgress → 节点/创作台 UI）
+//     实测 2026-11-06：GET /v1/videos/{id} 响应顶层有 progress（整数 0-100，完成=100）；
+//     旧代码只取 status+metadata.url，把 progress 丢掉了。
+// ---------------------------------------------------------------------------
+const PR = (pct) => ({ status: "pending", progress: pct });
+const ramping = await drive("sdgf", [PR(0), PR(37), PR(88), C()]);
+equal("pending 带 progress 时逐次回调 onProgress（值原样透传）", ramping.progress, [0, 37, 88]);
+check("进度回调不影响等到成片", Boolean(ramping.result) && ramping.polls === 4, `轮询 ${ramping.polls} / result ${Boolean(ramping.result)}`);
+
+const noProgress = await drive("sdgf", [P, P, C()]);
+equal("pending 无 progress 时不回调（不显示假数字、不崩溃）", noProgress.progress, []);
+check("无进度序列照常出片", Boolean(noProgress.result) && noProgress.polls === 3, `轮询 ${noProgress.polls}`);
+
+const instantNoProgress = await drive("sdgf", [C()]);
+equal("completed 不触发进度回调", instantNoProgress.progress, []);
+
+const failedNoProgress = await drive("sdgf", [F(), F(), C()]);
+equal("failed 复核路径不触发进度回调", failedNoProgress.progress, []);
+
+let missingCallbackError = null;
+try {
+    // 调用方没传 onProgress（老调用点）：带 progress 的 pending 也不能抛
+    await mod.waitForVideoTaskOutput({ provider: "sdgf", poll: async () => PR(50), delay: async () => {}, isAborted: () => true, onTaskFailed: () => {}, onTimeout: () => {} });
+} catch (error) {
+    missingCallbackError = error;
+}
+check("调用方不传 onProgress 时静默跳过（仅 abort 生效）", missingCallbackError?.name === "AbortError", `error ${missingCallbackError?.name}`);
+
+// 读层归一：真的数字且在 0-100 才透传；脏数据一律 undefined（当没进度，不当 0/100）
+for (const [label, input, expected] of [
+    ["0", 0, 0],
+    ["37", 37, 37],
+    ["100", 100, 100],
+    ["37.5（区间内小数，取整交给 UI）", 37.5, 37.5],
+    ["150 越界", 150, undefined],
+    ["-1 越界", -1, undefined],
+    ["字符串 \"42\"", "42", undefined],
+    ["null", null, undefined],
+    ["undefined", undefined, undefined],
+    ["NaN", Number.NaN, undefined],
+    ["Infinity", Number.POSITIVE_INFINITY, undefined],
+    ["对象 {}", {}, undefined],
+]) {
+    equal(`progress 归一：${label}`, mod.readVideoTaskProgress(input), expected);
+}
+
+// ---------------------------------------------------------------------------
 // 6. 失败节点「重查任务」入口开关
 // ---------------------------------------------------------------------------
 const failedNode = { type: "video", metadata: { videoTaskId: "vid-123", errorDetails: "Qiling task failed", status: "error" } };
@@ -225,6 +275,24 @@ const zhSrc = readSrc("src/i18n/locales/zh-CN.ts");
 const enSrc = readSrc("src/i18n/locales/en-US.ts");
 check("zh 文案：重查任务", zhSrc.includes('queryVideoTask: "重查任务"') && zhSrc.includes('queryVideoTaskTitle: "按已存任务 ID 重查生成状态（不重新创建任务）"'), "中文文案缺失");
 check("en 文案：Recheck task", enSrc.includes('queryVideoTask: "Recheck task"') && enSrc.includes('queryVideoTaskTitle: "Recheck generation status by stored task ID (no new task)"'), "英文文案缺失");
+
+// ---- 进度百分比接线（SDGF progress → 轮询状态 → 节点/创作台 UI）----
+check("video.ts sdgf 轮询读顶层 progress 并走读层归一", videoSrc.includes("const progress = readVideoTaskProgress(raw?.progress);") && videoSrc.includes('return progress === undefined ? { status: "pending" } : { status: "pending", progress };'), "sdgf 进度读取缺失");
+check("video.ts 只有 sdgf 分支读进度（wan/openai/gemini/plugin 零改动）", (videoSrc.match(/readVideoTaskProgress\(/g) || []).length === 1, `调用 ${(videoSrc.match(/readVideoTaskProgress\(/g) || []).length} 处`);
+check("video.ts 等待层把 onProgress 透传给纯逻辑层", videoSrc.includes("onProgress: (pct) => options?.onProgress?.(pct),"), "等待层回调未接线");
+
+check("project.tsx 创建流程把进度写进节点 metadata.videoProgress", /onProgress: \(pct\) => setNodes\(\(prev\) => prev\.map\(\(item\) => \(item\.id === nodeId[\s\S]{0,80}videoProgress: pct/.test(projectSrc), "创建流程进度未接线");
+check("project.tsx 重查流程把进度写进节点 metadata.videoProgress", /onProgress: \(pct\) => setNodes\(\(prev\) => prev\.map\(\(item\) => \(item\.id === node\.id[\s\S]{0,80}videoProgress: pct/.test(projectSrc), "重查流程进度未接线");
+check("project.tsx 出片/失败后清掉 videoProgress（不留死进度）", (projectSrc.match(/videoProgress: undefined/g) || []).length >= 3, `清理点 ${(projectSrc.match(/videoProgress: undefined/g) || []).length} 处`);
+
+const canvasNodeSrc = readSrc("src/components/canvas/canvas-node.tsx");
+check("canvas-node.tsx 生成中读节点 videoProgress 显示百分比", canvasNodeSrc.includes("node.metadata?.videoProgress") && canvasNodeSrc.includes('t("videoProgressLabel", { progress })'), "节点进度 UI 缺失");
+check("canvas-node.tsx 无进度退回原「生成中」文案", /progress === null \? t\("canvas\.node\.generating"\)/.test(canvasNodeSrc), "缺进度回退缺失");
+check("types/canvas.ts 声明 metadata.videoProgress", canvasTypes.includes("videoProgress?: number;"), "类型缺失");
+
+check("视频创作台把进度写进结果卡", workbenchSrc.includes("onProgress: (pct) => setResults(") && workbenchSrc.includes("progress={result.progress}"), "创作台进度未接线");
+check("视频创作台无进度退回原「生成中」文案", workbenchSrc.includes('percent === null ? t("workbench.generating") : t("videoProgressLabel", { progress: percent })'), "创作台回退缺失");
+check("zh/en 都有进度文案 videoProgressLabel", zhSrc.includes('videoProgressLabel: "生成中 {{progress}}%"') && enSrc.includes('videoProgressLabel: "Generating {{progress}}%"'), "进度文案缺失");
 
 // ---------------------------------------------------------------------------
 console.log(`probe-video-recheck: ${passed} passed, ${failures.length} failed`);

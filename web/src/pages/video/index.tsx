@@ -40,6 +40,8 @@ type GenerationResult = {
     status: "pending" | "success" | "failed";
     video?: GeneratedVideo;
     error?: string;
+    /** 站方进度 0-100（SDGF 轮询回报）；没有就是不显示百分比。 */
+    progress?: number;
 };
 
 type GenerationLog = {
@@ -326,6 +328,8 @@ export default function VideoPage() {
                 delay: async (ms) => {
                     await delay(ms);
                 },
+                // 进度写进当前 pending 结果卡；无进度渠道不回调 → 卡片停「生成中」。
+                onProgress: (pct) => setResults((value) => value.map((item) => (item.status === "pending" ? { ...item, progress: pct } : item))),
                 onTaskFailed: (error) => {
                     throw new Error(error);
                 },
@@ -480,7 +484,7 @@ export default function VideoPage() {
                         </div>
                         {results.length ? (
                             <div className="grid gap-4">
-                                {results.map((result) => (result.status === "success" && result.video ? <ResultVideoCard key={result.id} video={result.video} onDownload={downloadVideo} onSaveAsset={saveResultToAssets} /> : result.status === "failed" ? <FailedVideoCard key={result.id} error={result.error || t("workbench.generationFailed")} onRetry={retryResult} /> : <PendingVideoCard key={result.id} />))}
+                                {results.map((result) => (result.status === "success" && result.video ? <ResultVideoCard key={result.id} video={result.video} onDownload={downloadVideo} onSaveAsset={saveResultToAssets} /> : result.status === "failed" ? <FailedVideoCard key={result.id} error={result.error || t("workbench.generationFailed")} onRetry={retryResult} /> : <PendingVideoCard key={result.id} progress={result.progress} />))}
                             </div>
                         ) : (
                             <div className="flex min-h-[320px] flex-col items-center justify-center rounded-lg border border-dashed border-stone-300 text-center dark:border-stone-700 lg:min-h-[560px]">
@@ -562,13 +566,14 @@ function ResultVideoCard({ video, onDownload, onSaveAsset }: { video: GeneratedV
     );
 }
 
-function PendingVideoCard() {
+function PendingVideoCard({ progress }: { progress?: number }) {
     const { t } = useTranslation();
+    const percent = typeof progress === "number" && Number.isFinite(progress) ? Math.round(progress) : null;
     return (
         <div className="relative aspect-video overflow-hidden rounded-lg border border-dashed border-stone-300 bg-stone-50 dark:border-stone-700 dark:bg-stone-900">
             <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 text-sm text-stone-500 dark:text-stone-400">
                 <LoaderCircle className="size-6 animate-spin" />
-                <span>{t("workbench.generating")}</span>
+                <span>{percent === null ? t("workbench.generating") : t("videoProgressLabel", { progress: percent })}</span>
             </div>
         </div>
     );

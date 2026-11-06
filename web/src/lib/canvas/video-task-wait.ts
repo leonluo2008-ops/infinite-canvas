@@ -18,13 +18,15 @@ export const VIDEO_WAIT_POLL_INTERVAL_MS = 2500;
 export const SDGF_FAILED_RECHECK_LIMIT = 3;
 export const SDGF_FAILED_RECHECK_DELAY_MS = 8000;
 
-export type VideoWaitPollState<T> = { status: "pending" } | { status: "completed"; result: T } | { status: "failed"; error: string };
+export type VideoWaitPollState<T> = { status: "pending"; progress?: number } | { status: "completed"; result: T } | { status: "failed"; error: string };
 
 export type VideoWaitDriverOptions<T> = {
     provider: VideoTaskProvider;
     poll: () => Promise<VideoWaitPollState<T>>;
     delay: (ms: number) => Promise<void>;
     isAborted?: () => boolean;
+    /** 进度回调（0-100）。仅当本次 poll 为 pending 且带 progress 时调用；缺进度不回调——不显示假数字。 */
+    onProgress?: (pct: number) => void;
     onTaskFailed: (error: string) => never;
     onTimeout: () => never;
 };
@@ -51,6 +53,7 @@ export async function waitForVideoTaskOutput<T>(options: VideoWaitDriverOptions<
             continue;
         }
         failedStreak = 0;
+        if (typeof state.progress === "number" && Number.isFinite(state.progress)) options.onProgress?.(state.progress);
         if (attempt === VIDEO_WAIT_MAX_ATTEMPTS - 1) options.onTimeout();
         await options.delay(VIDEO_WAIT_POLL_INTERVAL_MS);
     }
@@ -81,4 +84,15 @@ export function resumedVideoTaskProvider(provider: unknown): VideoTaskProvider {
  */
 export function canRecheckVideoTask(node: { type: string; metadata?: { videoTaskId?: string; content?: unknown; status?: unknown } }): boolean {
     return node.type === CanvasNodeType.Video && Boolean(node.metadata?.videoTaskId) && !node.metadata?.content && node.metadata?.status !== "loading";
+}
+
+/**
+ * SDGF 查询响应顶层 `progress` 的读层归一（实测 2026-11-06：GET /v1/videos/{id} 顶层整数 0-100，完成任务=100）。
+ * 只透传「真的是数字且在 0-100」的值；字符串 "42"、null、NaN、越界（150/-1）一律 undefined——
+ * 脏数据当没进度处理（UI 退回「生成中」），绝不当 0 或 100 用，避免进度条说谎。
+ */
+export function readVideoTaskProgress(value: unknown): number | undefined {
+    if (typeof value !== "number" || !Number.isFinite(value)) return undefined;
+    if (value < 0 || value > 100) return undefined;
+    return value;
 }

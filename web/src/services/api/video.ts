@@ -4,7 +4,7 @@ import { nanoid } from "nanoid";
 import i18n from "@/i18n";
 import { dataUrlToFile, readFileAsDataUrl } from "@/lib/image-utils";
 import { clampVideoSeconds, computeVideoSize, inferVideoRatio } from "@/lib/media-size";
-import { waitForVideoTaskOutput } from "@/lib/canvas/video-task-wait";
+import { readVideoTaskProgress, waitForVideoTaskOutput } from "@/lib/canvas/video-task-wait";
 import { getMediaBlob, resolveMediaUrl, uploadMediaFile, type UploadedFile } from "@/services/file-storage";
 import { imageToDataUrl } from "@/services/image-storage";
 import { boolConfig, buildApiUrl, modelOptionName, resolveModelRequestConfig, resolveModelScript, withLocalProxy, type AiConfig } from "@/stores/use-config-store";
@@ -18,6 +18,8 @@ type VideoResponse = { id: string; status?: string; error?: { message?: string }
 type ApiVideoResponse = VideoResponse | { code?: number | string; data?: VideoResponse | null; msg?: string; message?: string; error?: { message?: string } };
 type ApiEnvelope<T> = T | { code?: number | string; data?: T | null; msg?: string; message?: string; error?: { message?: string } };
 type RequestOptions = { signal?: AbortSignal };
+/** 等待期选项：onProgress 只在等待循环里用（SDGF 渠道有进度，其余渠道不回调）。 */
+type VideoWaitOptions = RequestOptions & { onProgress?: (pct: number) => void };
 type VideoMediaOptions = RequestOptions & { videos?: ReferenceVideo[]; audios?: ReferenceAudio[] };
 const apiText = (key: string, options?: Record<string, unknown>) => i18n.t(`apiErrors.${key}`, options);
 
@@ -30,7 +32,7 @@ type GeminiVideoOperation = {
     error?: { message?: string };
     response?: { generateVideoResponse?: { generatedSamples?: Array<{ video?: { uri?: string } }> } };
 };
-export type VideoGenerationTaskState = { status: "pending" } | { status: "completed"; result: VideoGenerationResult } | { status: "failed"; error: string };
+export type VideoGenerationTaskState = { status: "pending"; progress?: number } | { status: "completed"; result: VideoGenerationResult } | { status: "failed"; error: string };
 
 /** Results for scripted (plugin) video models, which run their own create+poll in one shot at task creation. */
 const pluginVideoResults = new Map<string, VideoGenerationResult>();
@@ -50,14 +52,16 @@ export async function requestVideoGeneration(config: AiConfig, prompt: string, r
     return waitForVideoGenerationTask(config, await createVideoGenerationTask(config, prompt, references, options), options);
 }
 
-export async function waitForVideoGenerationTask(config: AiConfig, task: VideoGenerationTask, options?: RequestOptions): Promise<VideoGenerationResult> {
+export async function waitForVideoGenerationTask(config: AiConfig, task: VideoGenerationTask, options?: VideoWaitOptions): Promise<VideoGenerationResult> {
     // 等待循环（含 SDGF 瞬态 failed 复核：连续 3 次间隔 8s 仍 failed 才判死，completed 立即返回）
     // 在 lib/canvas/video-task-wait.ts 纯逻辑层，此处只注入网络与错误文案；openai/gemini/plugin 维持「failed 即死」。
+    // onProgress：SDGF 每次 pending 查询带 progress 时回传 0-100，由调用方决定落点（节点 metadata / 创作台状态）。
     return waitForVideoTaskOutput({
         provider: task.provider,
         poll: () => pollVideoGenerationTask(config, task, options),
         delay: (ms) => delay(ms, options?.signal),
         isAborted: () => Boolean(options?.signal?.aborted),
+        onProgress: (pct) => options?.onProgress?.(pct),
         onTaskFailed: (error) => {
             throw videoTaskFailed(error);
         },
@@ -263,6 +267,8 @@ async function pollSdgfVideoTask(config: AiConfig, task: VideoGenerationTask, op
         const raw = (await axios.get<Record<string, unknown>>(aiApiUrl(config, `/videos/${task.id}`), { headers: aiHeaders(config), signal: options?.signal })).data;
         const status = String(raw?.status || "");
         const metadata = (raw?.metadata || {}) as Record<string, unknown>;
+        // 站方进度：顶层 progress 整数 0-100（实测 2026-11-06，完成=100）。脏数据/缺失一律不透传。
+        const progress = readVideoTaskProgress(raw?.progress);
         // 聚鑫实测：metadata.url 可能是相对路径（/v1/videos/{id}/content）——只有完整 http(s) 才直连，否则走鉴权 content 端点
         const rawUrl = typeof metadata.url === "string" ? metadata.url : "";
         const url = /^https?:\/\//.test(rawUrl) ? rawUrl : "";
@@ -276,7 +282,7 @@ async function pollSdgfVideoTask(config: AiConfig, task: VideoGenerationTask, op
             const err = (raw?.error || {}) as { message?: string };
             return { status: "failed", error: readApiErrorMessage(err.message) || "SD GF 生成失败" };
         }
-        return { status: "pending" };
+        return progress === undefined ? { status: "pending" } : { status: "pending", progress };
     } catch (error) {
         throw new Error(readAxiosError(error, "SD GF 任务查询失败（沿用同一任务 ID 重查，勿重新创建）"));
     }

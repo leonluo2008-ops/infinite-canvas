@@ -38,6 +38,8 @@ export default {
         model: { select: "Select model", assign: "Assign a model for {{capability}} in the provider settings", noMatch: "No matching {{capability}} models", addFirst: "Add a provider and models in Settings first", capabilities: { image: "image generation", video: "video", text: "text", audio: "audio" } },
     },
     generation: { pending: ["Creating image", "Almost there", "Just a little longer", "Refining details"] },
+    // Video generation progress (SDGF progress 0-100). Shared by canvas video nodes and the video studio.
+    videoProgressLabel: "Generating {{progress}}%",
     imageReferences: { label: "Image {{index}}", separator: ", ", promptPrefix: "Reference image labels: {{labels}}. Use these labels to interpret image references in the prompt.\n\n{{prompt}}" },
     modelPlugin: {
         pollTimeout: "Plugin polling timed out. Check the request script or try again later.", executionFailed: "Model request script failed: {{message}}", noImages: "The model request script did not return any images",
