@@ -216,7 +216,10 @@ def parse_judgment(text: str) -> dict:
     if start < 0 or end <= start:
         raise ValueError("正文里没有 JSON 对象")
     try:
-        data = json.loads(raw[start:end + 1])
+        # raw_decode 只解第一个完整对象：模型偶发在判定 JSON 后面补第二段说明
+        # （或再跟一个 JSON），rfind("}") 会把尾巴圈进来 → Extra data 全窗判废
+        # （2026-11-06 实测 0:0.5 窗口连续失败）。红线13：读层入口集中归一。
+        data, _ = json.JSONDecoder().raw_decode(raw[start:])
     except json.JSONDecodeError as exc:
         raise ValueError(f"JSON 解析失败：{exc}") from exc
     if not isinstance(data, dict):
