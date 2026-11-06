@@ -239,6 +239,10 @@ def _inject_camera_contract(body: str) -> str:
     if not m:
         raise PrecheckError(f"契约 {contract_path} 缺 §1/§2 段落结构，无法注入")
     section = m.group(1).strip()
+    # 标题降级：契约的 ## §1/## §2 是给改写侧文档用的层级；注入拆解任务书时必须降成
+    # 非标题文本——平级 ## 会把任务书「一~十」十层固定结构撕开，实测导致分镜表/资产
+    # 层输出结构紊乱（角色错认、资产截图对位全错，2026-11-06 所有者真机反馈）。
+    section = re.sub(r"^## (§\d+ [^\n]+)$", r"【\1】", section, flags=re.M)
     return body.replace(placeholder, section)
 
 
