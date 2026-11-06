@@ -10,8 +10,9 @@ import { CanvasNodeType, type VideoTaskProvider } from "@/types/canvas";
  * 立即判死；且创建回写/恢复轮询处把 provider 二值化，sdgf 被折成 openai 走错协议。
  */
 
-// 常规轮询总上限与间隔（与重构前 waitForVideoGenerationTask 行为一致）。
-export const VIDEO_WAIT_MAX_ATTEMPTS = 120;
+// 常规轮询总上限与间隔。360 次 × 2.5s = 15 分钟：思念云实测生成普遍 5 分钟以上
+// （所有者 2026-11-06 报），原 120 次（5 分钟）正好卡在 p50 上必然误报超时。
+export const VIDEO_WAIT_MAX_ATTEMPTS = 360;
 export const VIDEO_WAIT_POLL_INTERVAL_MS = 2500;
 // SDGF 瞬态 failed 复核：连续 3 次 failed（间隔 8s）才判死；站方自愈窗口内 completed 即活。
 export const SDGF_FAILED_RECHECK_LIMIT = 3;

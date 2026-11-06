@@ -88,7 +88,7 @@ async function drive(provider, sequence) {
 // ---------------------------------------------------------------------------
 // 1. 合同常量
 // ---------------------------------------------------------------------------
-equal("总轮询上限仍 120 次", mod.VIDEO_WAIT_MAX_ATTEMPTS, 120);
+equal("总轮询上限 360 次（思念云普遍 5 分钟以上，15 分钟上限）", mod.VIDEO_WAIT_MAX_ATTEMPTS, 360);
 equal("常规轮询间隔 2500ms", mod.VIDEO_WAIT_POLL_INTERVAL_MS, 2500);
 equal("sdgf 复核连败阈值 3", mod.SDGF_FAILED_RECHECK_LIMIT, 3);
 equal("sdgf 复核间隔 8000ms", mod.SDGF_FAILED_RECHECK_DELAY_MS, 8000);
@@ -131,8 +131,8 @@ equal("pending 复位后下一轮回到常规间隔", reset.delays, [8000, 2500,
 const healViaPending = await drive("sdgf", [F(), P, C()]);
 check("sdgf failed→pending→completed 同样算自愈", Boolean(healViaPending.result) && healViaPending.polls === 3, `轮询 ${healViaPending.polls}`);
 
-const oscillation = await drive("sdgf", Array.from({ length: 120 }, (_, k) => (k % 2 === 0 ? F() : P)));
-check("sdgf failed/pending 振荡任务不会永久轮询（120 轮超时）", oscillation.timedOut && oscillation.polls === 120, `轮询 ${oscillation.polls} / timedOut ${oscillation.timedOut}`);
+const oscillation = await drive("sdgf", Array.from({ length: 360 }, (_, k) => (k % 2 === 0 ? F() : P)));
+check("sdgf failed/pending 振荡任务不会永久轮询（360 轮超时）", oscillation.timedOut && oscillation.polls === 360, `轮询 ${oscillation.polls} / timedOut ${oscillation.timedOut}`);
 
 // ---------------------------------------------------------------------------
 // 4. openai/gemini/plugin 维持「failed 即死」，零行为变化
@@ -150,7 +150,7 @@ const instant = await drive("sdgf", [C()]);
 check("completed 首轮即返回", Boolean(instant.result) && instant.polls === 1 && instant.delays.length === 0, `轮询 ${instant.polls}`);
 
 const capped = await drive("sdgf", [P]);
-check("一直 pending 也在 120 轮超时", capped.timedOut && capped.polls === 120, `轮询 ${capped.polls}`);
+check("一直 pending 也在 360 轮超时", capped.timedOut && capped.polls === 360, `轮询 ${capped.polls}`);
 
 let abortError = null;
 try {
