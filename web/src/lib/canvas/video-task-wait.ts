@@ -36,7 +36,7 @@ export type VideoWaitDriverOptions<T> = {
  *   openai/gemini/plugin 维持「failed 即死」原行为，其它渠道零行为变化。
  * - pending 复位连败计数（站方 failed → pending → completed 同样算自愈）。
  * - 总尝试仍受 VIDEO_WAIT_MAX_ATTEMPTS 上限：真死任务 3 轮即出结果，反复 failed/pending 振荡的任务
- *   到 120 轮超时，不会永久轮询。
+ *   到上限（360 轮）超时，不会永久轮询。
  */
 export async function waitForVideoTaskOutput<T>(options: VideoWaitDriverOptions<T>): Promise<T> {
     let failedStreak = 0;

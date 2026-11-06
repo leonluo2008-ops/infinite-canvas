@@ -152,6 +152,24 @@ check("completed 首轮即返回", Boolean(instant.result) && instant.polls === 
 const capped = await drive("sdgf", [P]);
 check("一直 pending 也在 360 轮超时", capped.timedOut && capped.polls === 360, `轮询 ${capped.polls}`);
 
+// ---------------------------------------------------------------------------
+// 5b. 超时上限与思念云真实时长匹配（所有者 2026-11-06 报障：5 分钟上限必误报）
+//     真实时长不可预知（未装耗时埋点），故用假时钟证明各档真实时长都能等到成片，
+//     且上限本身 = 360×2.5s = 15 分钟（≥ 思念云实测「普遍 5 分钟以上」的 3 倍余量）。
+// ---------------------------------------------------------------------------
+equal("超时上限换算成墙钟 = 15 分钟", mod.VIDEO_WAIT_MAX_ATTEMPTS * mod.VIDEO_WAIT_POLL_INTERVAL_MS, 15 * 60 * 1000);
+for (const [minutes, pendingRounds] of [
+    ["5.5 分钟", 133],
+    ["8 分钟", 200],
+    ["12 分钟", 288],
+    ["14.9 分钟（上限前一档）", 358],
+]) {
+    const slow = await drive("sdgf", [...Array.from({ length: pendingRounds }, () => P), C()]);
+    check(`思念云 ${minutes}出片不误报超时（等到成片）`, Boolean(slow.result) && !slow.timedOut && slow.polls === pendingRounds + 1, `轮询 ${slow.polls} / timedOut ${slow.timedOut}`);
+}
+const justOver = await drive("sdgf", Array.from({ length: 360 }, () => P));
+check("超过 15 分钟仍无结果才判超时（不是误判成片为超时）", justOver.timedOut && justOver.polls === 360, `轮询 ${justOver.polls}`);
+
 let abortError = null;
 try {
     await mod.waitForVideoTaskOutput({ provider: "sdgf", poll: async () => P, delay: async () => {}, isAborted: () => true, onTaskFailed: () => {}, onTimeout: () => {} });
@@ -186,6 +204,16 @@ check("metadata.videoTaskProvider 放宽为五值联合（含 wan）", canvasTyp
 const videoSrc = readSrc("src/services/api/video.ts");
 check("video.ts 等待循环委托给纯逻辑层 waitForVideoTaskOutput", videoSrc.includes("waitForVideoTaskOutput({") && videoSrc.includes("provider: task.provider,"), "委托缺失");
 check("video.ts 不再内联 120 次硬编码循环", !videoSrc.includes("for (let attempt = 0; attempt < 120"), "旧循环残留");
+
+// 视频创作台（/video）曾有第二套等待循环：120 次×2.5s=5 分钟上限，误报文案与画布节点同款
+// （videoWorkbench.timeout「视频生成超时，请稍后重试」）。两份循环必须同源，否则只修一处等于没修全。
+const workbenchSrc = readSrc("src/pages/video/index.tsx");
+check(
+    "视频创作台等待循环同源委托 waitForVideoTaskOutput（15 分钟上限 + sdgf 复核一并生效）",
+    workbenchSrc.includes("waitForVideoTaskOutput<VideoGenerationResult>({") && workbenchSrc.includes("poll: () => pollVideoGenerationTask(configOverride || taskConfig, task)"),
+    "创作台未委托纯逻辑层",
+);
+check("视频创作台不再内联 120 次/5 分钟硬编码循环", !workbenchSrc.includes("for (let attempt = 0; attempt < 120") && !workbenchSrc.includes("attempt === 119"), "旧循环残留");
 check("video.ts 轮询分流保留 sdgf 分支", videoSrc.includes('if (task.provider === "sdgf") return pollSdgfVideoTask'), "sdgf 分流缺失");
 check("video.ts sdgf 单次查询仍如实上报 failed（复核在等待层）", videoSrc.includes('if (status === "failed" || status === "cancelled")'), "sdgf failed 上报缺失");
 
