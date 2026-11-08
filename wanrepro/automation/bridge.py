@@ -52,6 +52,23 @@ def get(path: str) -> Any:
     return _request("GET", path)
 
 
+def get_bytes(path: str, timeout: int = 600) -> bytes:
+    """GET 二进制（成片下载）。空响应按失败抛（红线：空≠成功）。"""
+    url = f"{config.BRIDGE_BASE}{path}"
+    req = urllib.request.Request(url, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = resp.read()
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", errors="replace")[:300]
+        raise BridgeError(f"bridge GET {path} → HTTP {e.code}: {detail}") from None
+    except urllib.error.URLError as e:
+        raise BridgeError(f"bridge GET {path} 连不上: {e.reason}") from None
+    if not data:
+        raise BridgeError(f"bridge GET {path} → 空响应（按失败处理）")
+    return data
+
+
 def post_json(path: str, payload: dict) -> Any:
     # 中文必须 UTF-8 落字节——git-bash curl 直传 -d 会把 GBK 字节当 JSON，实测被拒
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")

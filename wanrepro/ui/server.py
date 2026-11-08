@@ -2762,6 +2762,11 @@ def render_payload(tid: str, spec_name: str, optional: str = "") -> dict:
         code = render_main(argv)
     except Fail as e:
         raise ApiError(400, f"渲染失败：{e}")
+    except SystemExit as e:                     # render.py 失败路径 raise SystemExit(code)（实测 2026-11-08：
+        # 模板缺原文依据文件时 exit 3 穿透 handler → 连接直接断、客户端拿到 RemoteDisconnected
+        # 而非 5xx JSON）——此处拦截，code 与 stderr 原文如实回给调用方（失败即失败，但不当连接黑洞）
+        detail = str(getattr(e, "code", "") or "")
+        raise ApiError(500, f"渲染异常退出（exit={detail or '?'}）——看 bridge 控制台 stderr 原文") from None
     if code != 0:
         raise ApiError(500, f"渲染退出码 {code}")
     text = (ROOT / "analysis" / "reverse" / tid / f"提示词-{tpl_stem}.md").read_text(encoding="utf-8")

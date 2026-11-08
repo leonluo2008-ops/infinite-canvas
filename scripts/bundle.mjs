@@ -51,7 +51,7 @@ const WEB = path.join(REPO, "web");
 // ---- 清单（改这里必须同步 self-check 项与 DEPLOY-GUIDE）--------------------
 const MANIFEST = {
   // 引擎运行时目录（以「运行时调用图」为准，不以目录观感为准）
-  dirs: ["pipeline", "prompts", "templates", "library", "specs", "ui", "spec", "wanrepro", "contracts"],
+  dirs: ["pipeline", "prompts", "templates", "library", "specs", "ui", "spec", "wanrepro", "contracts", "docs"],
   // 根级散件：analyze.py 由 bridge `run_py(["analyze.py", …])` 相对 ROOT 调，漏了=首拆才炸
   files: ["analyze.py", "requirements.txt"],
   webDist: "web-dist",
@@ -440,6 +440,8 @@ function selfCheck(shipped) {
     ["app/specs/jimeng-lapian.md", existsSync(path.join(OUT, "app", "specs", "jimeng-lapian.md"))],
     ["app/templates/seedance-flow.md", existsSync(path.join(OUT, "app", "templates", "seedance-flow.md"))],
     ["app/contracts/camera-contract.md", existsSync(path.join(OUT, "app", "contracts", "camera-contract.md"))],
+    // 2026-11-08：docs/ 是模板字符串路径引用的数据（seedance-flow 的原文依据），漏了=首渲 seedance-flow 才炸
+    ["app/docs/原提示词-单段流式.md", existsSync(path.join(OUT, "app", "docs", "原提示词-单段流式.md"))],
     ["app/analysis/reverse/", statSync(path.join(OUT, "app", "analysis", "reverse"), { throwIfNoEntry: false })?.isDirectory() === true],
     ["启动整合包.bat", existsSync(path.join(OUT, "启动整合包.bat"))],
     ["manage.ps1", existsSync(path.join(OUT, "manage.ps1"))],
