@@ -72,6 +72,18 @@ def upload_video(video: Path) -> dict:
     return out
 
 
+def upload_asset(image: Path) -> dict:
+    """POST /api/asset/upload（原始字节 + X-Filename）→ {url, bytes, source}。
+
+    url 是公网 HTTPS 直链（uguu 优先，失败降级 local-tunnel——server.py:1607）；
+    SDGF images 只收公网 HTTPS，调用方须校验 url 前缀。
+    """
+    encoded = urllib.parse.quote(image.name, safe="")
+    return _request("POST", "/api/asset/upload", body=image.read_bytes(), timeout=120,
+                    headers={"Content-Type": "application/octet-stream",
+                             "X-Filename": encoded})
+
+
 def tasks() -> list[dict]:
     """GET /api/tasks → 任务摘要列表。"""
     return list(config and get("/api/tasks").get("tasks") or [])
