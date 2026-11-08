@@ -35,6 +35,7 @@ import threading
 import time
 import traceback
 import unicodedata
+import urllib.error
 import urllib.parse
 import urllib.request
 import webbrowser
@@ -658,6 +659,52 @@ def decode_data_url(raw: str, name: str) -> tuple[bytes, str]:
         raise ApiError(400, f"图片 {name} 的 base64 解不出来") from None
 
 
+# ------------------------------------------- 参考图图床（asset/upload 与 sdgf 共用）
+# 渠道只收公网 HTTPS 直链：本地字节先留一份备份，再转传 uguu；uguu 不可用时降级到隧道直链。
+# 两条路都返回 https，调用方只需判「是不是 https」——别在这里替调用方决定失败。
+
+PUBLIC_IMAGE_TUNNEL = "https://vc-t.aistar.work/vc/"   # 图床降级直链前缀
+
+
+def upload_uguu_bytes(data: bytes, name: str) -> str:
+    """转传 uguu（Pomf API）返回直链；任何异常返回空串由调用方降级。
+
+    直传与系统代理各试一次（uguu 是境外站，两种路径通哪个用哪个）。
+    """
+    boundary = "----wanrepro" + secrets.token_hex(8)
+    body = io.BytesIO()
+    body.write(f"--{boundary}\r\nContent-Disposition: form-data; name=\"files[]\"; "
+               f"filename=\"{name}\"\r\nContent-Type: application/octet-stream\r\n\r\n".encode())
+    body.write(data)
+    body.write(f"\r\n--{boundary}--\r\n".encode())
+    payload = body.getvalue()
+    headers = {"Content-Type": f"multipart/form-data; boundary={boundary}",
+               "User-Agent": "Mozilla/5.0 (wanrepro-bridge)"}
+    for handlers in ([urllib.request.ProxyHandler({})], None):  # 先直连，后环境代理
+        try:
+            opener = urllib.request.build_opener(*(handlers or []))
+            req = urllib.request.Request("https://uguu.se/upload?output=json",
+                                         data=payload, headers=headers, method="POST")
+            resp = json.loads(opener.open(req, timeout=60).read().decode())
+            url = str((resp.get("files") or [{}])[0].get("url") or "")
+            if url.startswith("https://"):
+                return url
+        except Exception:
+            continue
+    return ""
+
+
+def store_public_image(data: bytes, raw_name: str) -> tuple[str, str]:
+    """参考图字节 → (公网 https 直链, 来源)。本地落 uploads/vc/ 作备份；先 uguu，失败降级隧道。"""
+    safe_name = re.sub(r"[^\w.\-]", "_", raw_name or "ref.png")
+    key = f"m4/{secrets.token_hex(4)}/{safe_name}"
+    dest = UPLOADS / "vc" / key
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_bytes(data)
+    url = upload_uguu_bytes(data, safe_name)
+    return (url, "uguu") if url else (f"{PUBLIC_IMAGE_TUNNEL}{key}", "local-tunnel")
+
+
 def wan_prepare_task(prompt: str, images: list) -> str:
     """建 `wan-<unixts>` 任务目录并落盘输入：提示词-canvas.md + assets/图片N.<ext>（按序）。
 
@@ -745,6 +792,466 @@ def wan_video_job_state(job_id: str) -> dict:
                    error=lines[-1] if lines else f"wan_video.py 退出码 {rec.get('exit')}")
     elif job_status == "done" and jstatus != "running":
         out.update(status="done", stage="完成")   # dry 计划：引擎退出 0 且没有记录.json
+    return out
+
+
+# --------------------------------------------- SDGF 视频生成 bridge（服务端合同）
+# 画布前端的提交/轮询/下载三件事（web/src/services/api/video.ts 的 sdgf 一族 +
+# sdgf-payload.ts 的两族方言）在这里复刻成服务端端点，automation 只带渠道配置直调，
+# 不用开浏览器：
+#   POST /api/sdgf/video/run   body {prompt, images?, duration, ratio, resolution, audio,
+#                                    mode?, confirm, channel{baseUrl,apiKey,model}}
+#        dry（confirm 不是布尔 true）→ {dry:true, preview, preflight}
+#        confirm=true              → {job, taskId, dry:false}，后台轮询并代下成片
+#   GET  /api/sdgf/video/job/<job>     → {status: running|done|failed, stage, elapsed, progress?, taskId, error?}
+#   GET  /api/sdgf/video/file/<taskId> → video/mp4（Range 流；成片落在 uploads/sdgf/<taskId>/）
+# 渠道合同（与前端逐字对齐，改一处必须同步另一处）：
+#   POST {base}/v1/videos（JSON，鉴权头带渠道 key）→ {id}
+#   GET  {base}/v1/videos/{id} → {status: queued|in_progress|completed|failed|cancelled,
+#                                progress: 0-100 数字, metadata.url}
+#   GET  {base}/v1/videos/{id}/content → 字节（metadata.url 不是完整 http(s) 时走这条）
+# 凭证只在请求内存里：不落盘、不进日志、任何响应都不回显（渠道错误文本里出现也抹成 ***）。
+
+SDGF_RATIOS = ("16:9", "9:16", "1:1", "4:3", "3:4", "adaptive")
+SDGF_METADATA_RATIOS = ("16:9", "9:16", "1:1")   # 站方文档枚举：别名族只认这三个进 metadata.ratio
+SDGF_RESOLUTIONS = ("480", "720", "1080")        # 只做参数核对；渠道按模型名定档，不发这个字段
+SDGF_LEGACY_MAX_SECONDS = 15                     # SD2.0 旧合同上限；SD2.5 全系 4–30 原样
+SDGF_LEGACY_MODEL_RE = re.compile(r"^sd2(\.0)?-", re.IGNORECASE)
+SDGF_FULL_MODEL_RE = re.compile(r"^SD2\.5-满血-GF-(480P|720P|1080P)$", re.IGNORECASE)
+SDGF_HTTP_TIMEOUT = 90                           # 创建/查询：与前端 axios 的 90s 一致
+SDGF_DOWNLOAD_TIMEOUT = 600                      # 成片下载：几分钟的 mp4 不能按 90s 掐
+SDGF_POLL_INTERVAL = 2.5                         # 与前端等待单点一致（360×2.5s=15 分钟）
+SDGF_POLL_MAX = 360
+SDGF_FAILED_RECHECK = 3                          # 站方存在瞬态 failed 自愈：连败 3 次才判死
+SDGF_FAILED_RECHECK_DELAY = 8
+SDGF_JOBS = threading.BoundedSemaphore(2)        # 并发上限 2（项目红线），第三条 409
+SDGF_RECORD = "任务.json"
+SDGF_FINAL = "成片.mp4"
+SDGF_DIRECT = urllib.request.build_opener(urllib.request.ProxyHandler({}))   # 渠道直连，不走系统代理
+
+
+def sdgf_api_base(raw: str) -> str:
+    """渠道 baseUrl → `…/v1`（与前端 buildApiUrl 同一条归一：已带 /v1 就不重复拼）。"""
+    base = str(raw or "").strip().rstrip("/")
+    if not base:
+        return ""
+    return base if base.lower().endswith("/v1") else base + "/v1"
+
+
+def sdgf_url_ok(url: str) -> bool:
+    """baseUrl 形态：https 一律放行；http 只放行回环（本地 mock）——凭证不走明文。"""
+    if not re.match(r"^https?://", url or "", re.IGNORECASE):
+        return False
+    if url.lower().startswith("https://"):
+        return True
+    return (urllib.parse.urlparse(url).hostname or "").lower() in ("127.0.0.1", "localhost", "::1")
+
+
+def mask_secret(text: str, secret: str) -> str:
+    """把渠道凭证从任何要回给调用方/写日志的文本里抹掉（渠道错误体可能原样回显 key）。"""
+    out = str(text or "")
+    return out.replace(secret, "***") if secret else out
+
+
+def sdgf_full_model(model: str) -> bool:
+    return bool(SDGF_FULL_MODEL_RE.match((model or "").strip()))
+
+
+def sdgf_ratio_fields(model: str, ratio: str) -> dict:
+    """比例字段：满血名只发顶层 aspect_ratio；别名族双写 metadata.ratio（网关只认后者）。"""
+    if sdgf_full_model(model):
+        return {"aspect_ratio": ratio}
+    return ({"aspect_ratio": ratio, "metadata": {"ratio": ratio}}
+            if ratio in SDGF_METADATA_RATIOS else {"aspect_ratio": ratio})
+
+
+def sdgf_sound_fields(model: str, audio: bool) -> dict:
+    """声音开关：满血名生效位在顶层 enableSound；别名族在 metadata.enableSound。"""
+    if not audio:
+        return {}
+    return {"enableSound": "on"} if sdgf_full_model(model) else {"metadata": {"enableSound": "on"}}
+
+
+def sdgf_clamp_duration(model: str, seconds: int) -> int:
+    """时长按代际：SD2.0 系旧合同上限 15（截断），SD2.5 全系 4–30 原样。"""
+    return min(seconds, SDGF_LEGACY_MAX_SECONDS) if SDGF_LEGACY_MODEL_RE.match((model or "").strip()) else seconds
+
+
+def sdgf_mode_name(mode: str, image_count: int) -> str:
+    """站方中文 mode 枚举（与前端 resolveVideoMode + sdgfMode 两张表逐条对齐）。"""
+    if mode == "reference":
+        return "参考生视频"
+    if image_count == 0:
+        return "文生视频"
+    if image_count == 1:
+        return "首帧生视频"
+    if image_count == 2:
+        return "首尾帧"
+    return "参考生视频"
+
+
+def sdgf_plan(payload: dict) -> dict:
+    """请求体 → 预演 + 结构化核对 + 真提交用的渠道请求体（**纯本地计算，不发网络请求**）。
+
+    核对项与前端对齐：时长 4–30（SD2.0 旧合同截断到 15）、画幅白名单、两个模型族的
+    比例/声音生效位、mode 按图数、参考图只收公网 HTTPS（dataUrl 到真提交前才换 URL）。
+    `preflight.reasons` 为空才算通过；ok=false 时 confirm=true 也不提交（不花钱）。
+    """
+    reasons: list[str] = []
+    notes: list[str] = []
+    channel = payload.get("channel") if isinstance(payload.get("channel"), dict) else {}
+    api_base = sdgf_api_base(str(channel.get("baseUrl") or ""))
+    model = str(channel.get("model") or "").strip()
+    key = str(channel.get("apiKey") or "").strip()
+    if not api_base:
+        reasons.append("channel.baseUrl 不能为空")
+    elif not sdgf_url_ok(api_base):
+        reasons.append("channel.baseUrl 必须是 https（http 只放行 127.0.0.1/localhost 的本地 mock）：凭证不走明文")
+    if not model:
+        reasons.append("channel.model 不能为空（模型名决定比例/声音方言与分辨率档位）")
+    if not key:
+        reasons.append("channel.apiKey 不能为空")
+
+    prompt = str(payload.get("prompt") or "")
+    if not prompt.strip():
+        reasons.append("prompt 不能为空")
+
+    duration = None
+    raw_duration = payload.get("duration")
+    try:
+        duration = int(round(float(raw_duration)))
+    except (TypeError, ValueError):
+        reasons.append(f"duration 必须是秒数（4–30，收到 {raw_duration!r}）")
+    else:
+        if not 4 <= duration <= 30:
+            reasons.append(f"duration 只支持 4–30 秒（收到 {duration}）")
+            duration = None
+        elif model:
+            clamped = sdgf_clamp_duration(model, duration)
+            if clamped != duration:
+                notes.append(f"{model} 属旧合同上限 15 秒：按 {clamped} 秒预演（请求 {duration} 秒）")
+                duration = clamped
+
+    ratio = str(payload.get("ratio") or "").strip()
+    if ratio not in SDGF_RATIOS:
+        reasons.append(f"ratio 只支持 {'/'.join(SDGF_RATIOS)}（收到 {ratio!r}）")
+
+    resolution = str(payload.get("resolution") or "").strip()
+    if resolution:
+        digits = resolution.lower()
+        digits = digits[:-1] if digits.endswith("p") else digits
+        if digits not in SDGF_RESOLUTIONS:
+            reasons.append(f"resolution 只支持 480/720/1080（收到 {resolution!r}）")
+        else:
+            model_res = re.search(r"(480|720|1080)P", model, re.IGNORECASE)
+            if model_res and model_res.group(1) != digits:
+                reasons.append(f"resolution={digits} 与模型名档位 {model_res.group(1).upper()}P 不一致"
+                               "（渠道按模型名定档，请换模型或改 resolution）")
+        notes.append("渠道按模型名定档：本端点不发 resolution/size 字段")
+
+    audio_raw = payload.get("audio", True)
+    if not isinstance(audio_raw, bool):
+        reasons.append("audio 必须是布尔（true/false）")
+    audio = audio_raw if isinstance(audio_raw, bool) else True
+
+    mode_raw = payload.get("mode")
+    if mode_raw not in (None, "", "frames", "reference"):
+        reasons.append(f"mode 只支持 reference/frames（收到 {mode_raw!r}）")
+    mode = "reference" if mode_raw == "reference" else "frames"
+
+    raw_images = payload.get("images")
+    raw_images = raw_images if isinstance(raw_images, list) else []
+    images: list[dict] = []
+    for no, item in enumerate(raw_images, start=1):
+        name, url, blob = f"ref-{no}.png", "", None
+        if isinstance(item, str):
+            url = item.strip()
+        elif isinstance(item, dict):
+            name = str(item.get("name") or name)
+            url = str(item.get("url") or "").strip()
+            if not url and item.get("dataUrl"):
+                try:
+                    blob, ext = decode_data_url(str(item.get("dataUrl")), name)
+                except ApiError as err:
+                    reasons.append(err.msg)
+                    continue
+                if not blob:
+                    reasons.append(f"参考图 {name} 是空的（0 字节）")
+                    continue
+                if len(blob) > 20 * 1024 * 1024:
+                    reasons.append(f"参考图 {name} 超过 20 MB（{len(blob) / 1048576:.1f} MB）")
+                    continue
+                name = f"{Path(name).stem or f'ref-{no}'}.{ext}"
+        else:
+            reasons.append(f"images[{no}] 必须是公网 URL 字符串或 {{name, dataUrl}}")
+            continue
+        if url and not url.lower().startswith("https://"):
+            reasons.append(f"参考图 {no} 的 URL 必须是公网 https 直链（收到 {url[:60]!r}）")
+            continue
+        if not url and blob is None:
+            reasons.append(f"参考图 {no} 既没有 url 也没有 dataUrl")
+            continue
+        images.append({"no": no, "name": name, "url": url, "data": blob})
+    if mode == "reference" and not images:
+        reasons.append("mode=reference 至少需要 1 张参考图（渠道没有 0 图参考模式）")
+    if any(not img["url"] for img in images):
+        notes.append("dataUrl 参考图在 confirm=true 时先换公网 URL（dry 只做本地校验，不上传）")
+
+    body: dict = {"prompt": prompt}
+    if model:
+        body["model"] = model
+    if duration:
+        body["duration"] = duration
+    ratio_fields = sdgf_ratio_fields(model, ratio) if (model and ratio in SDGF_RATIOS) else {}
+    sound_fields = sdgf_sound_fields(model, audio) if model else {}
+    if ratio_fields:
+        body["aspect_ratio"] = ratio_fields["aspect_ratio"]
+    metadata = {**(ratio_fields.get("metadata") or {}), **(sound_fields.get("metadata") or {})}
+    if metadata:
+        body["metadata"] = metadata
+    if sound_fields.get("enableSound"):
+        body["enableSound"] = sound_fields["enableSound"]
+    body["mode"] = sdgf_mode_name(mode, len(images))
+    if images:
+        body["images"] = [img["url"] or f"<dataUrl:{img['name']} 待传图床>" for img in images]
+
+    preview = {
+        "method": "POST",
+        "url": f"{api_base}/videos" if api_base else "",
+        "headers": {"Authorization": "Bearer ***", "Content-Type": "application/json"},
+        "channel": {"baseUrl": api_base, "model": model},
+        "body": body,
+        "images": [{"no": img["no"], "name": img["name"],
+                    "source": "url" if img["url"] else "dataUrl",
+                    "url": img["url"], "bytes": len(img["data"]) if img["data"] else None} for img in images],
+        "notes": notes,
+    }
+    return {
+        "preview": preview,
+        "preflight": {"ok": not reasons, "reasons": reasons},
+        "body": body,
+        "images": images,
+        "channel": {"baseUrl": api_base, "model": model},
+        "key": key,          # 内部字段：只给提交/轮询用，绝不进响应
+        "request": {"promptChars": len(prompt), "promptSha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+                    "model": model, "duration": duration, "ratio": ratio,
+                    "mode": body.get("mode"), "images": len(images)},
+    }
+
+
+def sdgf_http(url: str, key: str, *, method: str = "GET", body: dict | None = None,
+              timeout: int = SDGF_HTTP_TIMEOUT) -> bytes:
+    """渠道 HTTP（鉴权头与 JSON 序列化的唯一装配点；直连不走系统代理）。"""
+    headers = {"Accept": "application/json"}
+    data = None
+    if body is not None:
+        data = json.dumps(body, ensure_ascii=False).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with SDGF_DIRECT.open(req, timeout=timeout) as resp:
+            return resp.read()
+    except urllib.error.HTTPError as err:
+        text = err.read()[:600].decode("utf-8", errors="replace").strip()
+        raise ApiError(502, mask_secret(f"渠道响应 HTTP {err.code}：{text or err.reason}", key)) from None
+    except urllib.error.URLError as err:
+        raise ApiError(502, mask_secret(
+            f"渠道连不上（{err.reason}）——提交状态不明时勿重复提交，先到渠道控制台核对", key)) from None
+    except TimeoutError:
+        raise ApiError(504, "渠道请求超时——提交状态不明时勿重复提交，先到渠道控制台核对") from None
+
+
+def sdgf_create(api_base: str, key: str, body: dict) -> str:
+    """提交生成任务，返回渠道任务 id。任何「不确定有没有建成」都按失败报并要求核对，不自动重试。"""
+    raw = sdgf_http(f"{api_base}/videos", key, method="POST", body=body)
+    try:
+        obj = json.loads(raw.decode("utf-8") or "{}")
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise ApiError(502, f"创建响应不是 JSON（{len(raw)} 字节）——状态不明，先到渠道控制台核对再决定是否重提") from None
+    rec = obj if isinstance(obj, dict) else {}
+    task_id = str(rec.get("id") or rec.get("task_id") or "").strip()
+    if not task_id:
+        raise ApiError(502, "创建响应里没有任务 id——提交状态不明，先到渠道控制台核对，勿重复提交")
+    return task_id
+
+
+def sdgf_query(api_base: str, key: str, task_id: str) -> dict:
+    """查一次任务。progress 只透传 0–100 的数字（字符串/越界一律当没有，别让进度条说谎）。"""
+    raw = sdgf_http(f"{api_base}/videos/{urllib.parse.quote(task_id, safe='')}", key)
+    try:
+        obj = json.loads(raw.decode("utf-8") or "{}")
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise ApiError(502, f"查询响应不是 JSON（{len(raw)} 字节）") from None
+    rec = obj if isinstance(obj, dict) else {}
+    meta = rec.get("metadata") if isinstance(rec.get("metadata"), dict) else {}
+    url = str(meta.get("url") or "")
+    if not re.match(r"^https?://", url, re.IGNORECASE):
+        url = ""                                    # 相对路径/空 → 走鉴权 content 端点
+    prog = rec.get("progress")
+    progress = prog if isinstance(prog, (int, float)) and not isinstance(prog, bool) and 0 <= prog <= 100 else None
+    err = rec.get("error") if isinstance(rec.get("error"), dict) else {}
+    return {"status": str(rec.get("status") or ""), "progress": progress, "url": url,
+            "error": str(err.get("message") or "")}
+
+
+def sdgf_download(api_base: str, key: str, task_id: str, direct_url: str, dest: Path) -> int:
+    """成片落盘，返回字节数。
+
+    `metadata.url` 是完整 http(s) 就直取——**不带鉴权头**（可能落在第三方 CDN 上，别把 key 送出去）；
+    相对路径/空 → 走渠道 content 端点（带鉴权）。JSON 错误体与 0 字节都按失败，绝不当成片。
+    """
+    url, headers = direct_url, {"Accept": "video/mp4,*/*"}
+    if not url:
+        url = f"{api_base}/videos/{urllib.parse.quote(task_id, safe='')}/content"
+        headers["Authorization"] = f"Bearer {key}"
+    req = urllib.request.Request(url, headers=headers, method="GET")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    temp = dest.with_suffix(".part")
+    try:
+        with SDGF_DIRECT.open(req, timeout=SDGF_DOWNLOAD_TIMEOUT) as resp:
+            ctype = (resp.headers.get("Content-Type") or "").lower()
+            if "json" in ctype or "text/" in ctype:
+                text = resp.read(600).decode("utf-8", errors="replace").strip()
+                raise ApiError(502, mask_secret(f"成片下载拿到的是错误响应：{text[:400]}", key))
+            total = 0
+            with open(temp, "wb") as fh:
+                while True:
+                    chunk = resp.read(CHUNK)
+                    if not chunk:
+                        break
+                    fh.write(chunk)
+                    total += len(chunk)
+        if total <= 0:
+            raise ApiError(502, "成片是 0 字节（渠道返回空响应）")
+        temp.replace(dest)
+        return total
+    except urllib.error.HTTPError as err:
+        text = err.read()[:400].decode("utf-8", errors="replace").strip()
+        raise ApiError(502, mask_secret(f"成片下载 HTTP {err.code}：{text or err.reason}", key)) from None
+    except urllib.error.URLError as err:
+        raise ApiError(502, f"成片下载连不上（{err.reason}）") from None
+    finally:
+        temp.unlink(missing_ok=True)
+
+
+def sdgf_safe_id(task_id: str) -> str:
+    """渠道任务 id → 本地目录名。合法 id 原样用（服务重启后 /file 仍能按 id 找到成片），否则取 hash。"""
+    tid = str(task_id or "").strip()
+    if tid and ".." not in tid and ID_RE.match(tid):
+        return tid
+    return "h-" + hashlib.sha1(tid.encode("utf-8")).hexdigest()[:16]
+
+
+def sdgf_task_dir(task_id: str) -> Path:
+    return UPLOADS / "sdgf" / sdgf_safe_id(task_id)
+
+
+def sdgf_write_record(task_id: str, data: dict) -> None:
+    """任务记录落盘（诊断用；不含任何凭证，prompt 只留长度与 sha256）。"""
+    try:
+        path = sdgf_task_dir(task_id) / SDGF_RECORD
+        path.parent.mkdir(parents=True, exist_ok=True)
+        write_text(path, json.dumps({**data, "updated": int(time.time())}, ensure_ascii=False, indent=2))
+    except OSError:
+        pass                                          # 记录写不进去不影响生成本身
+
+
+def sdgf_host_images(plan: dict) -> dict:
+    """把预演体里的图片占位换成真 URL：URL 直接用；dataUrl 字节先换公网直链。
+
+    换不到就报错——宁可失败也不发一条没有参考图的请求（那会出一版跟提示词无关的片子还照样扣费）。
+    """
+    body = dict(plan["body"])
+    urls: list[str] = []
+    for img in plan["images"]:
+        url = img["url"]
+        if not url:
+            url, _source = store_public_image(img["data"], img["name"])
+        if not url.lower().startswith("https://"):
+            raise ApiError(502, f"参考图 {img['name']} 换公网 URL 失败（图床不可用）")
+        urls.append(url)
+    if urls:
+        body["images"] = urls
+    else:
+        body.pop("images", None)
+    return body
+
+
+def sdgf_job_update(job_id: str, **fields) -> None:
+    with JOBS_LOCK:
+        rec = JOBS.get(job_id)
+        if rec is not None:
+            rec.update(fields)
+
+
+def sdgf_run_job(job_id: str, task_id: str, api_base: str, key: str, meta: dict) -> None:
+    """后台线程：轮询渠道 → 下载成片 → 落记录。凭证只在内存里，线程结束即随栈释放。"""
+    try:
+        sdgf_write_record(task_id, {"job": job_id, "taskId": task_id, "status": "running",
+                                    "stage": "生成中", **meta})
+        failed_streak = 0
+        for _attempt in range(SDGF_POLL_MAX):
+            try:
+                state = sdgf_query(api_base, key, task_id)
+            except ApiError:
+                time.sleep(SDGF_POLL_INTERVAL)        # 查询失败不判死：同一任务 id 继续重查
+                continue
+            status = state["status"]
+            if status == "completed":
+                sdgf_job_update(job_id, stage="下载中")
+                size = sdgf_download(api_base, key, task_id, state["url"],
+                                     sdgf_task_dir(task_id) / SDGF_FINAL)
+                sdgf_job_update(job_id, status="done", stage="完成", progress=None, bytes=size)
+                sdgf_write_record(task_id, {"job": job_id, "taskId": task_id, "status": "done",
+                                            "stage": "完成", "bytes": size, **meta})
+                return
+            if status in ("failed", "cancelled"):
+                failed_streak += 1
+                if failed_streak >= SDGF_FAILED_RECHECK:
+                    raise ApiError(502, f"渠道判失败：{state['error'] or status}（已复核 {failed_streak} 次）")
+                time.sleep(SDGF_FAILED_RECHECK_DELAY)   # 站方瞬态 failed 会自愈：隔 8s 再核
+                continue
+            failed_streak = 0
+            if state["progress"] is not None:
+                sdgf_job_update(job_id, progress=state["progress"], stage="生成中")
+            time.sleep(SDGF_POLL_INTERVAL)
+        raise ApiError(504, f"等了 {round(SDGF_POLL_MAX * SDGF_POLL_INTERVAL / 60)} 分钟还没完成；"
+                            f"渠道任务 {task_id} 可能仍在跑——本端点没有续查入口，重提会重复计费，先到渠道控制台核对")
+    except ApiError as err:
+        message = mask_secret(err.msg, key)
+        sdgf_job_update(job_id, status="failed", stage="失败", progress=None, error=message)
+        sdgf_write_record(task_id, {"job": job_id, "taskId": task_id, "status": "failed",
+                                    "stage": "失败", "error": message, **meta})
+    except Exception as exc:                          # noqa: BLE001 - 后台线程不能静默死掉
+        traceback.print_exc()
+        message = mask_secret(f"bridge 内部异常：{exc}", key)
+        sdgf_job_update(job_id, status="failed", stage="失败", progress=None, error=message)
+        sdgf_write_record(task_id, {"job": job_id, "taskId": task_id, "status": "failed",
+                                    "stage": "失败", "error": message, **meta})
+    finally:
+        SDGF_JOBS.release()
+
+
+def sdgf_job_state(job_id: str) -> dict:
+    """/api/sdgf/video/job/<job>：JOBS 记录 → 轮询状态（progress 只在 running 且是 0–100 数字时透出）。"""
+    with JOBS_LOCK:
+        rec = JOBS.get(job_id)
+        rec = dict(rec) if rec else None
+    if rec is None or rec.get("kind") != "sdgf-video":
+        raise ApiError(404, "没有这个 SDGF 视频任务号（可能服务重启过，重新发起一次生成即可）")
+    status = str(rec.get("status") or "running")
+    out: dict = {"status": status, "stage": str(rec.get("stage") or ""),
+                 "elapsed": round(time.time() - float(rec.get("started") or time.time()), 1),
+                 "taskId": str(rec.get("task_id") or "")}
+    prog = rec.get("progress")
+    if status == "running" and isinstance(prog, (int, float)) and not isinstance(prog, bool) and 0 <= prog <= 100:
+        out["progress"] = prog
+    if status == "failed":
+        out["error"] = str(rec.get("error") or "生成失败")
+    if status == "done" and rec.get("bytes"):
+        out["bytes"] = rec["bytes"]
     return out
 
 
@@ -1409,6 +1916,14 @@ class Handler(BaseHTTPRequestHandler):
         if m:
             self.serve_wan_video(urllib.parse.unquote(m.group(1)))
             return
+        m = re.fullmatch(r"/api/sdgf/video/job/([^/]+)", path)
+        if m:
+            self.send_json(sdgf_job_state(urllib.parse.unquote(m.group(1))))
+            return
+        m = re.fullmatch(r"/api/sdgf/video/file/([^/]+)", path)
+        if m:
+            self.serve_sdgf_video(urllib.parse.unquote(m.group(1)))
+            return
         m = re.fullmatch(r"/api/generate/([^/]+)", path)
         if m:
             self.send_json(gen_state(urllib.parse.unquote(m.group(1))))
@@ -1491,6 +2006,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/wan/video/run":
             self.do_wan_video_run()
+            return
+        if path == "/api/sdgf/video/run":
+            self.do_sdgf_video_run()
             return
         if path == "/api/analyze":
             payload = self.read_json()
@@ -1598,44 +2116,8 @@ class Handler(BaseHTTPRequestHandler):
         if suffix not in {".png", ".jpg", ".jpeg", ".webp"}:
             raise ApiError(400, f"参考图只收 png/jpg/webp（收到 {suffix or '无扩展名'}）")
         data = self.rfile.read(length)
-        safe_name = re.sub(r"[^\w.\-]", "_", raw_name)
-        key = f"m4/{secrets.token_hex(4)}/{safe_name}"
-        dest = UPLOADS / "vc" / key
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        dest.write_bytes(data)
-
-        url, source = self._upload_uguu(dest, safe_name), "uguu"
-        if not url:
-            url, source = f"https://vc-t.aistar.work/vc/{key}", "local-tunnel"
+        url, source = store_public_image(data, raw_name)
         self.send_json({"url": url, "bytes": length, "source": source})
-
-    @staticmethod
-    def _upload_uguu(path: Path, name: str) -> str:
-        """转传 uguu（Pomf API），返回直链；任何异常返回空串由调用方降级。
-
-        直传与系统代理各试一次（uguu 是境外站，两种路径通哪个用哪个）。
-        """
-        boundary = "----wanrepro" + secrets.token_hex(8)
-        body = io.BytesIO()
-        body.write(f"--{boundary}\r\nContent-Disposition: form-data; name=\"files[]\"; "
-                   f"filename=\"{name}\"\r\nContent-Type: application/octet-stream\r\n\r\n".encode())
-        body.write(path.read_bytes())
-        body.write(f"\r\n--{boundary}--\r\n".encode())
-        payload = body.getvalue()
-        headers = {"Content-Type": f"multipart/form-data; boundary={boundary}",
-                   "User-Agent": "Mozilla/5.0 (wanrepro-bridge)"}
-        for handlers in ([urllib.request.ProxyHandler({})], None):  # 先直连，后环境代理
-            try:
-                opener = urllib.request.build_opener(*(handlers or []))
-                req = urllib.request.Request("https://uguu.se/upload?output=json",
-                                             data=payload, headers=headers, method="POST")
-                resp = json.loads(opener.open(req, timeout=60).read().decode())
-                url = str((resp.get("files") or [{}])[0].get("url") or "")
-                if url.startswith("https://"):
-                    return url
-            except Exception:
-                continue
-        return ""
 
     def do_video_upload(self) -> None:
         """POST /api/video/upload —— 收视频字节 → uploads/ → 建任务目录 + 指纹。
@@ -1964,6 +2446,60 @@ class Handler(BaseHTTPRequestHandler):
                            stderr=tail(err, 400), stdout=tail(out, 400),
                            error=error,
                            elapsed=round(time.time() - float(rec.get("started") or 0), 1))
+
+    # -- SDGF 视频生成 bridge（服务端合同）--------------------------
+
+    def do_sdgf_video_run(self) -> None:
+        """POST /api/sdgf/video/run —— 与 /api/wan/video/run 同形：立即回 {job, taskId}。
+
+        confirm 必须**是布尔 true** 才真提交（字符串 "false"/"1" 一律当 dry——AT-5 判据）；
+        dry 只做本地预演与结构化核对，不发任何请求、不花钱。
+        """
+        payload = self.read_json()
+        prompt = str(payload.get("prompt") or "")
+        if not prompt.strip():
+            raise ApiError(400, "prompt 不能为空")
+        if payload.get("images") is not None and not isinstance(payload.get("images"), list):
+            raise ApiError(400, "images 必须是列表（公网 https URL 字符串或 {name, dataUrl}）")
+        plan = sdgf_plan(payload)
+        if payload.get("confirm") is not True:
+            self.send_json({"dry": True, "preview": plan["preview"], "preflight": plan["preflight"]})
+            return
+        if not plan["preflight"]["ok"]:
+            self.send_json({"error": "预演未通过，未提交（不花钱）", "preflight": plan["preflight"]}, 400)
+            return
+        if not SDGF_JOBS.acquire(blocking=False):
+            raise ApiError(409, "同时最多 2 条 SDGF 生成在跑（并发上限），稍后再试")
+        try:
+            body = sdgf_host_images(plan)                 # dataUrl → 公网 URL（dry 不走到这里）
+            task_id = sdgf_create(plan["channel"]["baseUrl"], plan["key"], body)
+        except BaseException:
+            SDGF_JOBS.release()
+            raise
+        job_id = secrets.token_hex(8)
+        now = time.time()
+        with JOBS_LOCK:
+            for stale, old in list(JOBS.items()):         # 过期任务记录随手清（与万相同款）
+                if now - float(old.get("started") or now) > JOB_TTL:
+                    JOBS.pop(stale, None)
+            JOBS[job_id] = {"status": "running", "started": now, "kind": "sdgf-video",
+                            "task_id": task_id, "stage": "已提交", "progress": None}
+        threading.Thread(target=sdgf_run_job,
+                         args=(job_id, task_id, plan["channel"]["baseUrl"], plan["key"], plan["request"]),
+                         daemon=True, name=f"sdgf-video-{sdgf_safe_id(task_id)}").start()
+        self.send_json({"job": job_id, "taskId": task_id, "dry": False})
+
+    def serve_sdgf_video(self, task_id: str) -> None:
+        """GET /api/sdgf/video/file/<taskId> —— 本地成片（bridge 代下，凭证不出服务端）。
+
+        目录名就是渠道任务 id：服务重启后仍能按 id 找到已下完的成片（AT-6 归档依赖这一点）。
+        """
+        if not task_id or ".." in task_id or not ID_RE.match(task_id):
+            raise ApiError(400, f"任务 id 不合法：{task_id!r}")
+        final = sdgf_task_dir(task_id) / SDGF_FINAL
+        if not final.is_file():
+            raise ApiError(404, f"{task_id} 还没有成片（渠道没跑完，或没提交成功）")
+        self.send_mp4(final)
 
     def do_confirm(self, task_id: str) -> None:
         """在已有「拆解.md」上补生成「待确认清单.md」。
