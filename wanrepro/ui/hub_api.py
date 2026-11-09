@@ -10,6 +10,7 @@ automation 以子包 import（server.py 启动 cwd 不确定时由 _ensure_path 
 """
 from __future__ import annotations
 
+import re
 import sys
 import threading
 import traceback
@@ -21,7 +22,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from automation import discuss, generate, ingest, replace, state  # noqa: E402
+from automation import cards, discuss, frames, generate, ingest, replace, state  # noqa: E402
 
 TASKS_DIR = ROOT / "automation" / "projects"
 VIDEO_FILE = "成片.mp4"
@@ -99,6 +100,8 @@ def get_task(local_id: str) -> dict:
         "checklist_md": _read(_checklist_path(str(task.get("bridge_id")))),
         "prompt_md": _read(_prompt_path(task_dir, task)),
         "pair_lines": task.get("pending_replace") or [],
+        # AT-8 B2：置换台视觉包（合同 v3）。只读面——写路径见 set_asset。
+        "asset_cards": cards.build(str(task.get("bridge_id") or ""), local_id),
         "error": (task.get("history") or [{}])[-1].get("note", "")
         if task["state"] == "failed" else "",
         "gen": task.get("gen") or {},
@@ -210,6 +213,85 @@ def do_confirm(local_id: str) -> dict:
     except replace.ReplaceError as e:
         raise HubError(str(e)) from None
     return {"state": st}
+
+
+def _bridge_of(task_dir: Path) -> str:
+    bridge = str((state.load(task_dir) or {}).get("bridge_id") or "").strip()
+    if not bridge:
+        raise HubError(f"任务 {task_dir.name} 还没拆解（没有 bridge_id），没有清单可写")
+    return bridge
+
+
+def _record_pending(task_dir: Path, n: int, *, image_url: str | None,
+                    clear: bool, text: str | None, desc: str) -> None:
+    """`pending_replace` = 本次会话上传流水（语义保留：只记上传，不参与回显）。
+
+    置换台逐卡上传同样要落这条流水，否则确认（rendering 守卫要 assets_confirmed）无据可依；
+    「沿用/清空」是撤掉该行的流水，不是新增一条。
+    """
+    task = state.load(task_dir)
+    pending = [dict(item) for item in (task.get("pending_replace") or []) if isinstance(item, dict)]
+    before = [dict(item) for item in pending]
+    if clear:
+        pending = [item for item in pending if item.get("no") != n]
+    elif image_url:
+        entry = next((item for item in pending if item.get("no") == n), None)
+        if entry is None:
+            entry = {"no": n, "img": "", "url": "", "name": "", "desc": str(desc or "")[:40]}
+            pending.append(entry)
+        entry["url"] = image_url
+    elif text is not None:
+        entry = next((item for item in pending if item.get("no") == n), None)
+        if entry is not None:
+            entry["name"] = text
+    if pending == before:
+        return
+    pending.sort(key=lambda item: item.get("no") or 0)
+    state.save(task_dir, {**task, "pending_replace": pending})
+
+
+def set_asset(local_id: str, n: int, *, image_url: str | None = None,
+              clear: bool = False, text: str | None = None) -> dict:
+    """POST /api/hub/asset —— 置换台逐卡定向写（数据合同 v3 写合同）。
+
+    {task_id, n, image_url}   重传 = 覆盖该行资产图（fill_row 覆盖模式，不追加）
+    {task_id, n, clear: true} 「沿用」= 清空该行绑定
+    {task_id, n, text}        品牌视觉卡的文字，写清单「命名」列
+    回显真源是清单 md（不是 pending_replace）。
+    """
+    task_dir = _task_dir(local_id)
+    bridge = _bridge_of(task_dir)
+    if image_url and clear:
+        raise HubError("image_url 与 clear 只能给一个")
+    if not image_url and not clear and text is None:
+        raise HubError("请求要有 image_url / clear:true / text 之一")
+    try:
+        if image_url:
+            url = str(image_url).strip()
+            if not url.startswith("https://"):
+                raise HubError(f"image_url 必须是公网 HTTPS（SDGF 只收公网图）：{image_url!r}")
+            row = replace.set_row(bridge, n, image_urls=[url], overwrite=True)
+        elif clear:
+            row = replace.set_row(bridge, n, image_urls=[], overwrite=True)
+        else:
+            row = replace.set_row(bridge, n, name=re.sub(r"\s+", " ", str(text)).strip())
+    except replace.ReplaceError as e:
+        raise HubError(str(e)) from None
+    _record_pending(task_dir, n, image_url=(str(image_url).strip() if image_url else None),
+                    clear=clear, text=text, desc=row.get("desc") or "")
+    return {"ok": True, "task_id": local_id, "n": n,
+            "已传图": cards.split_urls(row.get("cur_assets") or ""),
+            "命名": row.get("name") or ""}
+
+
+def frame_file(local_id: str, filename: str) -> Path:
+    """置换台帧图（/api/hub/frame/<task>/<文件>）→ 磁盘路径；文件不在/名字不合法 → HubError。"""
+    task_dir = _task_dir(local_id)
+    bridge = _bridge_of(task_dir)
+    try:
+        return frames.resolve(bridge, filename)
+    except frames.FrameError as e:
+        raise HubError(str(e)) from None
 
 
 def do_render(local_id: str) -> dict:

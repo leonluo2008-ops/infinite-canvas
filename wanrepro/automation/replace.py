@@ -43,35 +43,58 @@ def checklist_path(bridge_id: str) -> Path:
     return p
 
 
+def row_cells(raw: str) -> list[str]:
+    """表格行 → 单元格（含首格 #）。容全角竖线，但**不把正文里的 ｜ 当分隔符**。
+
+    半角竖线优先；只有半角切不出 ≥5 格、行里又有全角竖线时才按全角切。
+    反过来的话，正文本身带「｜」的行（pop-3--7 品牌位一行写了三处包装字）会被切成错位的假列，
+    「建议」「资产图」全部串位——那是把人手填的列当成了模型写的正文。
+    """
+    body = raw.strip().strip("|｜").strip()
+    if "|" in body:
+        cells = [c.strip() for c in body.split("|")]
+        if len(cells) >= 5:
+            return cells
+    if "｜" in body:
+        return [c.strip() for c in body.strip("｜").split("｜")]
+    return [body]
+
+
 def parse_rows(md_text: str) -> list[dict]:
-    """读层归一：行号/类别/描述/现有资产图列。容全角竖线（红线：不假设格式）。"""
+    """读层归一：行号/类别/描述/命名/现有资产图列/建议。容全角竖线（红线：不假设格式）。"""
     rows = []
     for raw in md_text.splitlines():
-        line = raw.replace("｜", "|").strip()
-        m = re.match(r"^\|\s*(\d+)\s*\|(.+)\|\s*$", line)
-        if not m:
+        cells = row_cells(raw)
+        if len(cells) < 5 or not re.fullmatch(r"\d+", cells[0] or ""):
             continue
-        cells = [c.strip() for c in m.group(2).split("|")]
-        if len(cells) < 4 or cells[0] in ("类别", "---", "------"):
+        if cells[1] in ("类别", "---", "------"):
             continue
-        rows.append({"no": int(m.group(1)), "line": raw, "cat": cells[0],
-                     "desc": cells[1], "cur_assets": cells[3] if len(cells) > 3 else ""})
+        rows.append({"no": int(cells[0]), "line": raw, "cat": cells[1],
+                     "desc": cells[2],
+                     "name": cells[3],
+                     "cur_assets": cells[4],
+                     "advice": cells[6] if len(cells) > 6 else ""})
     return rows
 
 
-def fill_row(md_text: str, no: int, asset_urls: list[str], name: str | None) -> str:
-    """按 # 写「资产图」列（与「命名」列）。返回新全文。行格式以解析到的原样为准。"""
+def fill_row(md_text: str, no: int, asset_urls: list[str], name: str | None,
+             overwrite: bool = False) -> str:
+    """按 # 写「资产图」列（与「命名」列）。返回新全文。行格式以解析到的原样为准。
+
+    缺省（overwrite=False）与历史行为一致：资产图列**追加**（多图逗号隔开）。
+    overwrite=True = 置换台定向重传/「沿用」清空：整格替换（asset_urls 为空即清空该行绑定）。
+    """
     out = []
     hit = False
     for raw in md_text.splitlines():
-        line = raw.replace("｜", "|").strip()
-        m = re.match(r"^\|\s*(\d+)\s*\|", line)
-        if m and int(m.group(1)) == no:
-            cells = [c.strip() for c in line.strip("|").split("|")]
+        cells = row_cells(raw)
+        if cells and re.fullmatch(r"\d+", cells[0] or "") and int(cells[0]) == no:
             while len(cells) < 8:
                 cells.append("")
             joined = ",".join(asset_urls)
-            if joined:
+            if overwrite:
+                cells[4] = joined
+            elif joined:
                 cells[4] = joined if not cells[4] else f"{cells[4]},{joined}"
             if name:
                 cells[3] = name
@@ -82,6 +105,25 @@ def fill_row(md_text: str, no: int, asset_urls: list[str], name: str | None) -> 
     if not hit:
         raise ReplaceError(f"清单里没有第 {no} 行")
     return "\n".join(out) + ("\n" if md_text.endswith("\n") else "")
+
+
+def set_row(bridge_id: str, no: int, *, image_urls: list[str] | None = None,
+            name: str | None = None, overwrite: bool = False) -> dict:
+    """定向写清单一行（AT-8 置换台写路径）：资产图列覆盖/清空 + 命名列。返回写后该行。
+
+    写路径格式定死（数据合同 v3）：前端先走 uguu 拿 URL，再调这里写 md；不新增 multipart。
+    """
+    if image_urls is None and name is None:
+        raise ReplaceError("没有要写的东西：给 image_urls 或 name 之一")
+    path = checklist_path(bridge_id)
+    before = path.read_text(encoding="utf-8")
+    after = fill_row(before, no, list(image_urls or []), name, overwrite=overwrite)
+    if after != before:
+        path.write_text(after, encoding="utf-8")
+    row = next((r for r in parse_rows(after) if r["no"] == no), None)
+    if row is None:
+        raise ReplaceError(f"清单里没有第 {no} 行")
+    return row
 
 
 def collect_images(src: str) -> list[Path]:

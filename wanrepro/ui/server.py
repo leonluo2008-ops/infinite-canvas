@@ -1858,6 +1858,14 @@ class Handler(BaseHTTPRequestHandler):
         if m:
             self.send_json(hub_api.job_status(urllib.parse.unquote(m.group(1))))
             return
+        m = re.fullmatch(r"/api/hub/frame/([^/]+)/([^/]+)", path)
+        if m:
+            # AT-8 B2：置换台帧图（看帧缓存 / at8 派生帧同目录；只认 png/jpg，不认目录穿越）
+            f = hub_api.frame_file(urllib.parse.unquote(m.group(1)),
+                                   urllib.parse.unquote(m.group(2)))
+            self.send_body(f.read_bytes(), 200,
+                           MIME.get(f.suffix.lower().lstrip("."), "image/png"))
+            return
         m = re.fullmatch(r"/api/hub/render/([^/]+)", path)
         if m:
             self.send_json(hub_api.do_render(urllib.parse.unquote(m.group(1))))
@@ -2039,6 +2047,21 @@ class Handler(BaseHTTPRequestHandler):
         m = re.fullmatch(r"/api/hub/submit/([^/]+)", path)
         if m:
             self.send_json(hub_api.start_submit(urllib.parse.unquote(m.group(1))))
+            return
+        if path == "/api/hub/asset":
+            # AT-8 B2 写路径（数据合同 v3）：{task_id,n,image_url} 覆盖 / {…,clear:true} 清空 / {…,text} 写命名
+            payload = self.read_json()
+            try:
+                n = int(payload.get("n"))
+            except (TypeError, ValueError):
+                raise ApiError(400, "n 必须是整数（待确认清单的行号）") from None
+            text = payload.get("text")
+            self.send_json(hub_api.set_asset(
+                str(payload.get("task_id") or ""), n,
+                image_url=(str(payload.get("image_url") or "").strip() or None),
+                clear=bool(payload.get("clear")),
+                text=None if text is None else str(text),
+            ))
             return
         if path == "/api/asset/upload":
             self.do_asset_upload()
