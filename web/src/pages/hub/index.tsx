@@ -1,20 +1,36 @@
-import { LoaderCircle, RefreshCw } from "lucide-react";
-import { Button, Empty, Tag } from "antd";
-import { useCallback, useEffect, useState } from "react";
+import { History, LoaderCircle, Plus, RefreshCw } from "lucide-react";
+import { App, Button, Table, Tag, Tooltip, type TableColumnsType } from "antd";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { Link, useSearchParams } from "react-router-dom";
 
 import { errorText, listHubTasks, type HubTaskSummary } from "./hub-api";
-import { NewTaskCard } from "./new-task-card";
-import { TaskCard } from "./task-card";
+import { deleteGuard, HubStateTag } from "./hub-status";
+import { LegacyHubView } from "./legacy-view";
+import { NewTaskModal } from "./new-task-modal";
+import { TaskDeleteModal } from "./task-delete-modal";
+import { TaskDetailDrawer } from "./task-detail-drawer";
 
 /**
- * 自动化工作台中控台：任务卡片流 + 按状态操作。
- * 列表常开 5s 轮询；渲染/生成等阶段由卡片自己按状态补轮询。
+ * 自动化工作台 · 表格主视图（AT-9 B3/B4）：
+ * 摘要端点驱动表格（任务名/状态/已换资产数/创建时间/操作），点行开详情 Drawer；
+ * 顶部「新建任务」弹窗；删除二次确认（运行中禁用+tooltip；awaiting_* 输任务名确认）；
+ * 5s 列表轮询；?legacy=1 走旧卡片流（B6 验收过后删）。
  */
 export default function HubPage() {
+    const [searchParams] = useSearchParams();
+    if (searchParams.get("legacy") === "1") return <LegacyHubView />;
+    return <HubTableView />;
+}
+
+function HubTableView() {
+    const { message } = App.useApp();
     const [tasks, setTasks] = useState<HubTaskSummary[]>([]);
     const [loading, setLoading] = useState(true);
     const [refreshing, setRefreshing] = useState(false);
     const [error, setError] = useState("");
+    const [createOpen, setCreateOpen] = useState(false);
+    const [openId, setOpenId] = useState<string | null>(null);
+    const [deleteTarget, setDeleteTarget] = useState<HubTaskSummary | null>(null);
 
     const load = useCallback(async (manual = false) => {
         if (manual) setRefreshing(true);
@@ -30,70 +46,207 @@ export default function HubPage() {
         }
     }, []);
 
+    // 5s 列表轮询（摘要端点，列表不拉详情）。
     useEffect(() => {
         void load();
         const timer = window.setInterval(() => void load(), 5000);
         return () => window.clearInterval(timer);
     }, [load]);
 
-    const handleCreated = useCallback((task: HubTaskSummary) => {
-        setTasks((prev) => [task, ...prev.filter((item) => item.local_id !== task.local_id)]);
-    }, []);
-
     const patchState = useCallback((localId: string, state: string) => {
         setTasks((prev) => prev.map((item) => (item.local_id === localId ? { ...item, state } : item)));
     }, []);
 
-    const handleRefresh = useCallback(() => {
-        void load(true);
-    }, [load]);
+    const openTask = useMemo(() => tasks.find((item) => item.local_id === openId) || null, [tasks, openId]);
+
+    // 删除成功：从列表摘除；若删的是打开中的任务 → 关 Drawer。
+    const handleDeleted = useCallback(
+        (localId: string) => {
+            setTasks((prev) => prev.filter((item) => item.local_id !== localId));
+            setOpenId((prev) => (prev === localId ? null : prev));
+            void load();
+        },
+        [load],
+    );
+
+    const askDelete = useCallback((task: HubTaskSummary) => setDeleteTarget(task), []);
+
+    const columns: TableColumnsType<HubTaskSummary> = [
+        {
+            title: "任务名",
+            dataIndex: "task_name",
+            key: "task_name",
+            ellipsis: true,
+            render: (_, task) => (
+                <div className="min-w-0">
+                    <div className="truncate font-mono text-sm font-medium">{task.task_name || task.local_id}</div>
+                    <div className="truncate text-xs text-stone-400 dark:text-stone-500">{task.video_name || "参考视频"}</div>
+                </div>
+            ),
+        },
+        {
+            title: "状态",
+            dataIndex: "state",
+            key: "state",
+            width: 200,
+            render: (_, task) => (
+                <div className="space-y-1">
+                    <HubStateTag state={task.state} />
+                    {task.state === "discussing" && task.stage ? (
+                        <div className="flex items-center gap-1 text-xs text-stone-500 dark:text-stone-400">
+                            <LoaderCircle className="size-3 animate-spin" />
+                            {task.stage}
+                        </div>
+                    ) : null}
+                </div>
+            ),
+        },
+        {
+            title: "已换资产数",
+            dataIndex: "replaced",
+            key: "replaced",
+            width: 100,
+            render: (_, task) =>
+                task.replaced ? (
+                    <span className="font-mono text-sm">{task.replaced}</span>
+                ) : (
+                    <span className="text-xs text-stone-400 dark:text-stone-500">—</span>
+                ),
+        },
+        {
+            title: "创建时间",
+            dataIndex: "created_at",
+            key: "created_at",
+            width: 140,
+            render: (value: string) => <span className="text-sm text-stone-500 dark:text-stone-400">{formatCreatedAt(value)}</span>,
+        },
+        {
+            title: "操作",
+            key: "actions",
+            width: 150,
+            render: (_, task) => {
+                const guard = deleteGuard(task);
+                const deleteButton = (
+                    <Button
+                        size="small"
+                        danger
+                        ghost
+                        disabled={guard.disabled}
+                        onClick={(event) => {
+                            event.stopPropagation();
+                            setDeleteTarget(task);
+                        }}
+                    >
+                        删除
+                    </Button>
+                );
+                return (
+                    <div className="flex items-center gap-1.5" onClick={(event) => event.stopPropagation()}>
+                        <Button
+                            size="small"
+                            type="primary"
+                            ghost
+                            onClick={(event) => {
+                                event.stopPropagation();
+                                setOpenId(task.local_id);
+                            }}
+                        >
+                            打开
+                        </Button>
+                        {guard.disabled ? <Tooltip title={guard.reason || "运行中不可删"}>{deleteButton}</Tooltip> : deleteButton}
+                    </div>
+                );
+            },
+        },
+    ];
 
     return (
         <div className="flex h-full flex-col overflow-hidden bg-stone-50 text-stone-900 dark:bg-stone-950 dark:text-stone-100">
             <main className="thin-scrollbar min-h-0 flex-1 overflow-y-auto p-3 md:p-5">
-                <div className="mx-auto grid w-full max-w-[1680px] gap-4">
+                <div className="mx-auto flex w-full max-w-[1400px] flex-col gap-4">
                     <header className="flex flex-wrap items-end justify-between gap-3">
                         <div>
                             <h1 className="text-2xl font-semibold text-stone-950 dark:text-stone-100">自动化工作台</h1>
-                            <p className="mt-1 text-sm text-stone-500 dark:text-stone-400">参考片 → 拆解 → 置换 → 提示词 → 出片；任务状态自动刷新，按卡片上的操作往下走。</p>
+                            <p className="mt-1 text-sm text-stone-500 dark:text-stone-400">参考片 → 拆解 → 置换 → 提示词 → 出片；点行进任务详情。5 秒自动刷新。</p>
                         </div>
                         <div className="flex items-center gap-2">
+                            <Link to="/hub?legacy=1" className="text-xs text-stone-400 underline decoration-dotted transition hover:text-stone-600 dark:text-stone-500 dark:hover:text-stone-300">
+                                <History className="mr-1 inline size-3.5" />
+                                旧版卡片流
+                            </Link>
                             <Tag className="m-0 px-2 py-1">{tasks.length} 个任务</Tag>
-                            <Button icon={<RefreshCw className={`size-4 ${refreshing ? "animate-spin" : ""}`} />} loading={refreshing} onClick={handleRefresh}>
+                            <Button icon={<RefreshCw className={`size-4 ${refreshing ? "animate-spin" : ""}`} />} loading={refreshing} onClick={() => void load(true)}>
                                 刷新
+                            </Button>
+                            <Button type="primary" icon={<Plus className="size-4" />} onClick={() => setCreateOpen(true)}>
+                                新建任务
                             </Button>
                         </div>
                     </header>
 
-                    <NewTaskCard onCreated={handleCreated} onSubmitted={handleRefresh} />
-
                     {error ? (
                         <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-amber-200 bg-amber-50 px-4 py-2.5 text-sm text-amber-700 dark:border-amber-950 dark:bg-amber-950/20 dark:text-amber-300">
                             <span className="min-w-0 break-words">任务列表刷新失败：{error}</span>
-                            <Button size="small" onClick={handleRefresh}>
+                            <Button size="small" onClick={() => void load(true)}>
                                 再试一次
                             </Button>
                         </div>
                     ) : null}
 
-                    {loading && !tasks.length ? (
-                        <div className="flex min-h-[240px] flex-col items-center justify-center gap-2 rounded-lg border border-dashed border-stone-300 text-sm text-stone-500 dark:border-stone-700 dark:text-stone-400">
-                            <LoaderCircle className="size-5 animate-spin" />
-                            正在读取任务列表…
-                        </div>
-                    ) : tasks.length ? (
-                        <div className="grid grid-cols-1 gap-4 xl:grid-cols-2">
-                            {tasks.map((task) => (
-                                <TaskCard key={task.local_id} task={task} onStateChange={patchState} onRefresh={handleRefresh} />
-                            ))}
-                        </div>
-                    ) : (
-                        <div className="flex min-h-[280px] flex-col items-center justify-center rounded-lg border border-dashed border-stone-300 text-center dark:border-stone-700">
-                            <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="还没有任务，先在上方拖一条参考视频建任务。" />
-                        </div>
-                    )}
+                    <div className="rounded-lg border border-stone-200 bg-card p-2 shadow-sm dark:border-stone-800 md:p-3">
+                        <Table<HubTaskSummary>
+                            rowKey="local_id"
+                            columns={columns}
+                            dataSource={tasks}
+                            loading={loading && !tasks.length}
+                            size="middle"
+                            pagination={{ pageSize: 20, hideOnSinglePage: true, showSizeChanger: false }}
+                            onRow={(task) => ({
+                                onClick: () => setOpenId(task.local_id),
+                                className: "cursor-pointer",
+                            })}
+                            locale={{
+                                emptyText: (
+                                    <div className="flex min-h-[200px] flex-col items-center justify-center gap-2 text-sm text-stone-500 dark:text-stone-400">
+                                        还没有任务，点右上「新建任务」拖一条参考视频开始。
+                                    </div>
+                                ),
+                            }}
+                        />
+                    </div>
                 </div>
             </main>
+
+            <NewTaskModal
+                open={createOpen}
+                onClose={() => setCreateOpen(false)}
+                onCreated={(localId) => {
+                    message.success(`任务 ${localId} 已建立`);
+                    void load(true);
+                }}
+            />
+
+            {/* 详情 Drawer：key=任务号，切任务强制重挂载（轮询序号守卫双保险） */}
+            {openTask ? (
+                <TaskDetailDrawer
+                    key={openTask.local_id}
+                    task={openTask}
+                    open={Boolean(openId)}
+                    onClose={() => setOpenId(null)}
+                    onStateChange={patchState}
+                    onRefresh={() => void load()}
+                    onRequestDelete={askDelete}
+                />
+            ) : null}
+
+            <TaskDeleteModal task={deleteTarget} open={Boolean(deleteTarget)} onClose={() => setDeleteTarget(null)} onDeleted={handleDeleted} />
         </div>
     );
+}
+
+function formatCreatedAt(value: string) {
+    if (!value) return "";
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return value;
+    return date.toLocaleString("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false });
 }

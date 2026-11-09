@@ -11,12 +11,20 @@ export type HubTaskState = "ingested" | "discussing" | "awaiting_assets" | "rend
 
 export type HubTaskSummary = {
     local_id: string;
+    bridge_id?: string;
     state: HubTaskState | string;
     intent: string;
     created_at: string;
     video_name: string;
     gen_progress: number | null;
     has_output: boolean;
+    /** AT-9 B1 摘要三字段（旧 bridge 缺 → 归一为空，前端兜底显示）。 */
+    task_name?: string;
+    /** discussing 时的拆解阶段（实时计算，不落盘）。 */
+    stage?: string;
+    /** 已换资产数 "已换/必换"（实时计算，如 "1/2"）。 */
+    replaced?: string;
+    has_pending_replace?: boolean;
 };
 
 export type HubPairLine = {
@@ -38,6 +46,9 @@ export type HubCardFrame = {
     错误?: string;
 };
 
+/** 资产卡「画面位置」（AT-9 B1，九宫格 1-9 行主序：1=左上…9=右下；绑定展示帧所属镜次）。 */
+export type HubCardPosition = { 格: number; 镜次: number };
+
 /** 资产卡（数据合同 v3，B2：GET /api/hub/task/<id> 的 asset_cards[]；字段名与桥端中文键一一对应）。 */
 export type HubAssetCard = {
     n: number;
@@ -50,17 +61,35 @@ export type HubAssetCard = {
     已传图: string[];
     描述: string;
     同实体疑似: number[];
+    /** 同实体确认组（B2 写路径联动；空数组=不在任何确认组）。 */
+    同实体确认: number[];
+    /** 九宫格粗定位；旧 sidecar/缺值 → null（前端描述首句常驻+「未能标注」）。 */
+    画面位置: HubCardPosition | null;
     定位: string;
     时段来源: string;
 };
 
-/** POST /api/hub/asset 的返回（写清单后回显真源列）。 */
+/** 意图建议（AT-9 B1，复用 intent.py 解析；清单每行一条）。 */
+export type HubSuggestion = {
+    n: number;
+    /** 必须换 | 建议准备 | 可沿用；待核对行恒空。 */
+    档位: string;
+    理由: string;
+    镜次: number[];
+    /** 缺文件/解析失败/行号不匹配 → true 且档位恒空（禁自动归可沿用）。 */
+    待核对: boolean;
+};
+
+/** POST /api/hub/asset 的返回（写清单后回显真源列；该行在确认组里 → 组联动回显全组行）。 */
 export type HubAssetWriteResult = {
     ok?: boolean;
     task_id?: string;
     n?: number;
     已传图?: string[];
     命名?: string;
+    /** 组写入时：组内行号列表 + 全组行回显。 */
+    组?: number[];
+    rows?: { n: number; 已传图: string[]; 命名: string }[];
 };
 
 export type HubTaskDetail = HubTaskSummary & {
@@ -74,6 +103,8 @@ export type HubTaskDetail = HubTaskSummary & {
     pair_lines: HubPairLine[];
     /** 资产卡（数据合同 v3）；旧 bridge 无此字段 → 归一为 [] → 前端退化回文字配对表。 */
     asset_cards: HubAssetCard[];
+    /** 意图建议（AT-9 B1）；旧 bridge 无此字段 → 归一为 [] → 前端显式「尚无建议·待核对」。 */
+    suggestions: HubSuggestion[];
     /** 本会话有无置换写入（换图/沿用/品牌文字）；仅参考，前端以 asset_cards 已传图为准。 */
     has_pending_replace?: boolean;
     error: string;
@@ -113,8 +144,15 @@ export function errorText(error: unknown) {
 export async function listHubTasks(): Promise<HubTaskSummary[]> {
     // 合同是 {tasks:[...]}；兼容桥端直接回数组。
     const data = await request<{ tasks?: HubTaskSummary[] } | HubTaskSummary[]>("/api/hub/tasks");
-    if (Array.isArray(data)) return data;
-    return Array.isArray(data.tasks) ? data.tasks : [];
+    const rows = Array.isArray(data) ? data : Array.isArray(data.tasks) ? data.tasks : [];
+    return rows.map((row) => ({
+        ...row,
+        // AT-9 B1 摘要三字段：旧 bridge 缺 → 归一兜底（计算式字段，缺了就空串，表格列自己再兜）。
+        task_name: hubText(row.task_name) || row.local_id,
+        stage: hubText(row.stage),
+        replaced: hubText(row.replaced),
+        bridge_id: hubText(row.bridge_id) || undefined,
+    }));
 }
 
 export async function getHubTask(localId: string): Promise<HubTaskDetail> {
@@ -122,7 +160,12 @@ export async function getHubTask(localId: string): Promise<HubTaskDetail> {
     const data = await request<{ task?: HubTaskDetail } & Partial<HubTaskDetail>>(`/api/hub/task/${encodeURIComponent(localId)}`);
     const task = (data.task || (data as unknown as HubTaskDetail)) as HubTaskDetail;
     if (!task || !task.local_id) throw new Error("任务详情为空");
-    return { ...task, pair_lines: Array.isArray(task.pair_lines) ? task.pair_lines : [], asset_cards: normalizeAssetCards(task.asset_cards) };
+    return {
+        ...task,
+        pair_lines: Array.isArray(task.pair_lines) ? task.pair_lines : [],
+        asset_cards: normalizeAssetCards(task.asset_cards),
+        suggestions: normalizeSuggestions(task.suggestions),
+    };
 }
 
 /** 读层入口集中归一（项目硬约束 14 同款思路）：asset_cards 缺失/畸形不炸页面，逐字段兜底。 */
@@ -134,6 +177,7 @@ function normalizeAssetCards(value: unknown): HubAssetCard[] {
         const frames = Array.isArray(item["帧"]) ? (item["帧"] as unknown[]) : [];
         const urls = Array.isArray(item["已传图"]) ? (item["已传图"] as unknown[]) : [];
         const twins = Array.isArray(item["同实体疑似"]) ? (item["同实体疑似"] as unknown[]) : [];
+        const group = Array.isArray(item["同实体确认"]) ? (item["同实体确认"] as unknown[]) : [];
         const card: HubAssetCard = {
             n: Number(item.n) || 0,
             类别: hubText(item["类别"]),
@@ -158,10 +202,38 @@ function normalizeAssetCards(value: unknown): HubAssetCard[] {
             已传图: urls.map((url) => hubText(url)).filter(Boolean),
             描述: hubText(item["描述"]),
             同实体疑似: twins.map((x) => Number(x)).filter((x) => Number.isFinite(x) && x > 0),
+            同实体确认: group.map((x) => Number(x)).filter((x) => Number.isFinite(x) && x > 0),
+            画面位置: normalizePosition(item["画面位置"]),
             定位: hubText(item["定位"]),
             时段来源: hubText(item["时段来源"]),
         };
         return card;
+    });
+}
+
+/** 画面位置 {格,镜次}；缺值/畸形（含旧任务 null）→ null，前端按「未能标注」兜底。 */
+function normalizePosition(value: unknown): HubCardPosition | null {
+    if (!value || typeof value !== "object") return null;
+    const raw = value as JsonRecord;
+    const cell = Number(raw["格"]);
+    const shot = Number(raw["镜次"]);
+    if (!Number.isFinite(cell) || cell < 1 || cell > 9) return null;
+    return { 格: Math.round(cell), 镜次: Number.isFinite(shot) && shot > 0 ? Math.round(shot) : 0 };
+}
+
+/** 建议归一：非数组 → []（前端显式「尚无建议·待核对」，不自动归可沿用）。 */
+function normalizeSuggestions(value: unknown): HubSuggestion[] {
+    if (!Array.isArray(value)) return [];
+    return value.map((raw) => {
+        const item = (raw && typeof raw === "object" ? raw : {}) as JsonRecord;
+        const shots = Array.isArray(item["镜次"]) ? (item["镜次"] as unknown[]) : [];
+        return {
+            n: Number(item.n) || 0,
+            档位: hubText(item["档位"]),
+            理由: hubText(item["理由"]),
+            镜次: shots.map((x) => Number(x)).filter((x) => Number.isFinite(x) && x > 0),
+            待核对: Boolean(item["待核对"]),
+        };
     });
 }
 
@@ -190,8 +262,16 @@ export async function uploadHubAssets(localId: string, files: File[]): Promise<{
     return { filled: Array.isArray(data.filled) ? data.filled : [], state: data.state };
 }
 
-export async function confirmHubReplace(localId: string): Promise<{ state?: string }> {
-    return request<{ state?: string }>(`/api/hub/confirm/${encodeURIComponent(localId)}`, { method: "POST" });
+/**
+ * 确认置换 → 后端直接推进 rendering（AT-9 §四：前端零执行责任，确认后前端只关界面）。
+ * empty_confirm=true = 全沿用（空置换显式确认；无任何上传时唯一放行通道，replace.py 硬拒空确认）。
+ */
+export async function confirmHubReplace(localId: string, emptyConfirm = false): Promise<{ state?: string; 全沿用?: boolean }> {
+    return request<{ state?: string; 全沿用?: boolean }>(`/api/hub/confirm/${encodeURIComponent(localId)}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ empty_confirm: emptyConfirm }),
+    });
 }
 
 /**
@@ -243,4 +323,46 @@ export async function retryHubTask(localId: string): Promise<{ state?: string }>
 
 export function hubOutputUrl(localId: string) {
     return `/api/hub/file/${encodeURIComponent(localId)}`;
+}
+
+// ---------------------------------------------------------------- AT-9 B2 任务级端点
+
+/**
+ * 删除任务（AT-9 §六删除合同）。前端须按状态预检（本函数只管发请求，错误原文透出）：
+ *  - ingested/failed/done 免确认；awaiting_assets/awaiting_approval 必带 confirm_name（任务号或完整任务名）；
+ *  - 运行中（ingesting/discussing/rendering/generating）与排队 JOB → 桥端 409。
+ */
+export async function deleteHubTask(localId: string, confirmName?: string): Promise<{ ok?: boolean; deleted?: string; state_was?: string }> {
+    return request<{ ok?: boolean; deleted?: string; state_was?: string }>(`/api/hub/task/${encodeURIComponent(localId)}/delete`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ confirm_name: confirmName ?? null }),
+    });
+}
+
+/** 退回置换（受控回退边）：awaiting_approval → awaiting_assets，丢弃当前提示词。 */
+export async function rollbackHubTask(localId: string): Promise<{ state?: string; note?: string }> {
+    return request<{ state?: string; note?: string }>(`/api/hub/task/${encodeURIComponent(localId)}/rollback`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({}),
+    });
+}
+
+/** 成组（同实体确认组，≥2 行；组内一传全组联动）。rows=清单行号。 */
+export async function groupHubRows(localId: string, rows: number[]): Promise<{ ok?: boolean; 组?: number[][] }> {
+    return request<{ ok?: boolean; 组?: number[][] }>(`/api/hub/task/${encodeURIComponent(localId)}/group`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ rows }),
+    });
+}
+
+/** 解组：把行从所在确认组摘出。rows=清单行号。 */
+export async function ungroupHubRows(localId: string, rows: number[]): Promise<{ ok?: boolean; 组?: number[][] }> {
+    return request<{ ok?: boolean; 组?: number[][] }>(`/api/hub/task/${encodeURIComponent(localId)}/ungroup`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ rows }),
+    });
 }
