@@ -309,6 +309,56 @@ def load_suggested_shots(bridge_id: str) -> dict[int, list[int]]:
     return out
 
 
+# ---------------------------------------------------------------- 帧内框（AT-10 C2）
+
+GRID_CELL_SIZE = round(100 / 3, 2)   # 九宫格单格宽高（内容盒百分比 33.33）
+
+
+def grid_rect(cell) -> dict | None:
+    """九宫格格号 → 内容盒百分比 {x%,y%,w%,h%}（AT-10 矩阵：1=左上…9=右下，行主序）。
+
+    col=(N-1)%3、row=(N-1)//3，x/y=格左上角，w/h=33.33；坐标=图片 contain 后内容盒 0~100%。
+    非 1-9 整数（含 bool、浮点、字符串）→ None：越界不猜、不默认格 5（越界降级）。
+    """
+    if isinstance(cell, bool) or not isinstance(cell, int) or not 1 <= cell <= 9:
+        return None
+    col, row = (cell - 1) % 3, (cell - 1) // 3
+    return {"x%": round(col * 100 / 3, 2), "y%": round(row * 100 / 3, 2),
+            "w%": GRID_CELL_SIZE, "h%": GRID_CELL_SIZE}
+
+
+def frame_boxes(rows: list[dict], spans: dict[int, dict], names: dict[int, str],
+                shot: int) -> list[dict]:
+    """镜 shot 的帧内框集合（纯函数）：位置键镜次==shot 且格合法的行，行号升序。
+
+    框集合按镜身份统一（AT-10 §三）：同帧所有卡拿同一集合，「本卡」标记由调用方逐卡打，
+    纯函数里恒 False。角标=该行「建议」列原文（与 AT-8 卡片角标同源，禁新增识别调用）；
+    短名兜底与卡片短名一致（names 缺 → 类别 → #行号）。格非法的行不出框。
+    """
+    out: list[dict] = []
+    for row in sorted(rows, key=lambda r: r["no"]):
+        no = row["no"]
+        pos = (spans.get(no) or {}).get("画面位置")
+        key_shot = pos.get("镜次") if isinstance(pos, dict) else None
+        if isinstance(key_shot, bool) or not isinstance(key_shot, int) or key_shot != shot:
+            continue
+        rect = grid_rect(pos.get("格"))
+        if rect is None:
+            continue
+        out.append({
+            "行": no,
+            "短名": names.get(no) or (row.get("cat") or f"#{no}"),
+            "角标": row.get("advice") or "",
+            "格": pos["格"],
+            "x%": rect["x%"],
+            "y%": rect["y%"],
+            "w%": rect["w%"],
+            "h%": rect["h%"],
+            "本卡": False,
+        })
+    return out
+
+
 def build(bridge_id: str, local_id: str) -> list[dict]:
     """清单 + 侧车 + 帧 → asset_cards[]（按 n 升序；清单不存在 = 还没拆解，返回 []）。"""
     if not bridge_id:
@@ -346,6 +396,7 @@ def build(bridge_id: str, local_id: str) -> list[dict]:
                 continue
     suggested = load_suggested_shots(bridge_id)
     shared: dict[tuple, dict] = {}      # 组装级去重：("shot", 镜号) / ("fallback", 中段秒) → 同一帧对象
+    box_cache: dict[int, list] = {}     # AT-10 C2：帧内框集合按镜缓存（同一镜只组装一次，同帧多卡复用）
 
     def representative(no: int, payload: dict) -> dict:
         """该行代表帧：① 画面位置键所指镜 ② 意图建议里第一个可用镜 ③ 整片中段兜底。"""
@@ -378,13 +429,26 @@ def build(bridge_id: str, local_id: str) -> list[dict]:
         elif any(frame.get("定位") == "未精确定位" for frame in shots):
             located = "未精确定位"
         rep_frame = representative(no, payload)
-        # AT-10 C1 自身框标志：本行画面位置键正指代表帧所属镜（键的典型镜 = 代表镜）→ C2 才画本卡框；
+        # AT-10 C2 帧内框：代表帧精确定位且镜次是 int → 该镜框集合（按镜缓存），逐卡 copy 打「本卡」；
+        # 未定位 / 镜次非 int → []（不画框不标镜次）；本行无九宫格键 → 不产生自己的框但保留同镜他人的框
+        rep_boxed = rep_frame.get("定位") == "精确" and isinstance(rep_frame.get("镜次"), int) \
+            and not isinstance(rep_frame.get("镜次"), bool)
+        boxes: list[dict] = []
+        if rep_boxed:
+            rep_shot = int(rep_frame["镜次"])
+            if rep_shot not in box_cache:
+                box_cache[rep_shot] = frame_boxes(rows, spans, names, rep_shot)
+            boxes = [dict(box, 本卡=(box["行"] == no)) for box in box_cache[rep_shot]]
+        # AT-10 C1 自身框标志：本行画面位置键正指代表帧所属镜（键的典型镜 = 代表镜）
+        # ∧ 本行框确实生成（帧内框里存在 本卡=True 的框，C2 收紧：格非法/无键都不出框）→ 恒等于「帧内框有本卡框」
         # 键镜秒不可用回退到意图镜 / 无键 / 未定位 → False（回退镜没有该资产位置证据，只给帧不画框）
         pos = payload.get("画面位置")
-        own_box = bool(isinstance(pos, dict) and rep_frame.get("定位") == "精确"
-                       and isinstance(rep_frame.get("镜次"), int)
+        own_box = bool(isinstance(pos, dict)
                        and isinstance(pos.get("镜次"), int)
-                       and int(pos["镜次"]) == int(rep_frame["镜次"]))
+                       and not isinstance(pos.get("镜次"), bool)
+                       and rep_boxed
+                       and int(pos["镜次"]) == int(rep_frame["镜次"])
+                       and any(box["本卡"] for box in boxes))
         cards.append({
             "n": no,
             "类别": row.get("cat") or "",
@@ -394,9 +458,11 @@ def build(bridge_id: str, local_id: str) -> list[dict]:
             "出现时段": spans_now,
             "帧": shots,
             # AT-10 C1 代表帧（数据合同：{url, 秒, 镜次, 定位}；未定位时镜次 null、不画框不标镜次）
-            # 自身框：见上方 own_box 注释——C2 帧内框的「本卡」判定依据，探针断言 #7=False
+            # 自身框：见上方 own_box 注释——恒等于「帧内框里存在本卡框」，探针断言 #7=False
             "代表帧": rep_frame,
             "自身框": own_box,
+            # AT-10 C2 帧内框集合（{行,短名,角标,格,x%,y%,w%,h%,本卡}）；同帧多卡共享同一 base 仅本卡标记不同
+            "帧内框": boxes,
             "已传图": split_urls(row.get("cur_assets") or ""),
             "描述": row.get("desc") or "",
             "画面位置": payload.get("画面位置"),

@@ -49,6 +49,33 @@ export type HubCardFrame = {
 /** 资产卡「画面位置」（AT-9 B1，九宫格 1-9 行主序：1=左上…9=右下；绑定展示帧所属镜次）。 */
 export type HubCardPosition = { 格: number; 镜次: number };
 
+/**
+ * 资产卡代表帧（AT-10 C1 数据合同 {url, 秒, 镜次, 定位}）：
+ * 定位=精确|未定位；未定位时镜次=null、不画框不标镜次。
+ */
+export type HubCardRepresentativeFrame = {
+    url: string;
+    秒: number;
+    镜次: number | null;
+    定位: string;
+    来源?: string;
+    错误?: string;
+};
+
+/** 帧内框（AT-10 C2 数据合同）：某帧所属镜的框集合中的一框；本卡=true 表示属于当前卡。 */
+export type HubCardBox = {
+    行: number;
+    短名: string;
+    /** 该行「建议」列原文（与 AT-8 卡片角标同源）。 */
+    角标: string;
+    格: number;
+    "x%": number;
+    "y%": number;
+    "w%": number;
+    "h%": number;
+    本卡: boolean;
+};
+
 /** 资产卡（数据合同 v3，B2：GET /api/hub/task/<id> 的 asset_cards[]；字段名与桥端中文键一一对应）。 */
 export type HubAssetCard = {
     n: number;
@@ -58,6 +85,12 @@ export type HubAssetCard = {
     核心: boolean;
     出现时段: { 起: string; 止: string }[];
     帧: HubCardFrame[];
+    /** 资产卡代表帧（AT-10 C1 合同 {url,秒,镜次,定位}；未定位时镜次=null、不画框不标镜次）。 */
+    代表帧: HubCardRepresentativeFrame;
+    /** AT-10 C2：本行位置键正指代表帧所属镜 ∧ 本行框确实生成（恒等于「帧内框有本卡框」）。 */
+    自身框: boolean;
+    /** AT-10 C2 帧内框集合：该帧所属镜的全部框，同帧多卡共享同一集合、仅 本卡 标记不同。 */
+    帧内框: HubCardBox[];
     已传图: string[];
     描述: string;
     同实体疑似: number[];
@@ -191,13 +224,56 @@ function normalizeSelfCheck(value: unknown): HubSelfCheckItem[] | null {
     });
 }
 
-/** 读层入口集中归一（项目硬约束 14 同款思路）：asset_cards 缺失/畸形不炸页面，逐字段兜底。 */
-function normalizeAssetCards(value: unknown): HubAssetCard[] {
+/** 代表帧归一（AT-10 C1 合同）：url 文本、秒 有限数字否则 0、镜次 正整数否则 null、定位 文本；缺 → 未定位兜底（旧 bridge 不炸页面）。 */
+function normalizeRepresentativeFrame(value: unknown): HubCardRepresentativeFrame {
+    const raw = (value && typeof value === "object" ? value : {}) as JsonRecord;
+    const shot = Number(raw["镜次"]);
+    const frame: HubCardRepresentativeFrame = {
+        url: hubText(raw.url),
+        秒: typeof raw["秒"] === "number" && Number.isFinite(raw["秒"]) ? raw["秒"] : 0,
+        镜次: Number.isFinite(shot) && Number.isInteger(shot) && shot > 0 ? shot : null,
+        定位: hubText(raw["定位"]) || "未定位",
+    };
+    const source = hubText(raw["来源"]);
+    if (source) frame.来源 = source;
+    if (raw["错误"] !== undefined && raw["错误"] !== null) frame.错误 = hubText(raw["错误"]);
+    return frame;
+}
+
+/** 帧内框归一（AT-10 C2 合同）：数值字段有限数字兜底 0、本卡 Boolean；格 非 1-9 的框丢弃（前端不画坏框）。 */
+function normalizeBox(value: unknown): HubCardBox | null {
+    if (!value || typeof value !== "object") return null;
+    const raw = value as JsonRecord;
+    const cell = Number(raw["格"]);
+    if (!Number.isFinite(cell) || cell < 1 || cell > 9) return null;
+    const num = (key: string): number => {
+        const n = Number(raw[key]);
+        return typeof raw[key] === "number" && Number.isFinite(n) ? n : 0;
+    };
+    return {
+        行: num("行"),
+        短名: hubText(raw["短名"]),
+        角标: hubText(raw["角标"]),
+        格: Math.round(cell),
+        "x%": num("x%"),
+        "y%": num("y%"),
+        "w%": num("w%"),
+        "h%": num("h%"),
+        本卡: Boolean(raw["本卡"]),
+    };
+}
+
+/**
+ * 读层入口集中归一（项目硬约束 14 同款思路）：asset_cards 缺失/畸形不炸页面，逐字段兜底。
+ * export 供探针做「真实后端包 → normalize」字段保真核验（AT-10 C2），生产调用点不变。
+ */
+export function normalizeAssetCards(value: unknown): HubAssetCard[] {
     if (!Array.isArray(value)) return [];
     return value.map((raw) => {
         const item = (raw && typeof raw === "object" ? raw : {}) as JsonRecord;
         const spans = Array.isArray(item["出现时段"]) ? (item["出现时段"] as unknown[]) : [];
         const frames = Array.isArray(item["帧"]) ? (item["帧"] as unknown[]) : [];
+        const boxes = Array.isArray(item["帧内框"]) ? (item["帧内框"] as unknown[]) : [];
         const urls = Array.isArray(item["已传图"]) ? (item["已传图"] as unknown[]) : [];
         const twins = Array.isArray(item["同实体疑似"]) ? (item["同实体疑似"] as unknown[]) : [];
         const group = Array.isArray(item["同实体确认"]) ? (item["同实体确认"] as unknown[]) : [];
@@ -222,6 +298,12 @@ function normalizeAssetCards(value: unknown): HubAssetCard[] {
                 if (f["错误"] !== undefined && f["错误"] !== null) frame.错误 = hubText(f["错误"]);
                 return frame;
             }),
+            // AT-10 C2 新字段逐字段归一透传（旧 normalize 逐字段构造会丢未知键——C2 修的字段保真断链）
+            代表帧: normalizeRepresentativeFrame(item["代表帧"]),
+            自身框: Boolean(item["自身框"]),
+            帧内框: boxes
+                .map((box) => normalizeBox(box))
+                .filter((box): box is HubCardBox => box !== null),
             已传图: urls.map((url) => hubText(url)).filter(Boolean),
             描述: hubText(item["描述"]),
             同实体疑似: twins.map((x) => Number(x)).filter((x) => Number.isFinite(x) && x > 0),
