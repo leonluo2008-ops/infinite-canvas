@@ -15,6 +15,10 @@
 「模型看到什么」只写形态（颜色/形状/材质/轨迹），写盘前过一遍身份词清洗表；
 「锁什么」由类别给出中性条目；「建议」由意图建议按清单行号回填；「命名」「资产图」「用我的描述」由人工确认。
 
+「出现时段」不放表格列（人只看三列，机器要结构化）：生成清单时同步解析每行源资产的
+镜号 → 分镜表起止，落成 md 旁边的 `待确认清单.json`（n = 表格物理行序），并标注同实体疑似
+（AT-8 置换台的取帧依据）。解析不出时段的行留空数组，不抛错。
+
 用法：
     py -3 pipeline/reverse/confirm.py analysis/reverse/<id>/拆解.md
     py -3 pipeline/reverse/confirm.py --verify analysis/reverse/<id>/待确认清单.md
@@ -29,6 +33,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import sys
@@ -37,6 +42,8 @@ from pathlib import Path
 # ---------------------------------------------------------------- 常量
 
 CHECKLIST_NAME = "待确认清单.md"
+# 「出现时段」的结构化落点（AT-8 B1）：不占清单表格列，供置换台/取帧消费
+CHECKLIST_SPANS_NAME = "待确认清单.json"
 LAYER_SCENE = "一 场景"
 LAYER_PRODUCT = "二 产品"
 LAYER_MOTION = "三 运动"
@@ -279,12 +286,15 @@ def extract_subjects(layer: str) -> list:
     if not styles and len(product_items) >= 2:
         rows = []
         for label, text in product_items:
-            match = re.search(r"[（(]\s*([0-9]{1,2}:[0-9]{2}\s*[-–~]\s*[0-9]{1,2}:[0-9]{2})\s*[）)]", label)
+            # 时段可能不止一段（`（00:00-00:01，00:01-00:07）`）：全部收集交给出现时段解析
+            ranges = re.findall(
+                r"[0-9]{1,2}:[0-9]{2}\s*[-–—~～至]\s*[0-9]{1,2}:[0-9]{2}", label
+            )
             rows.append({
                 "类别": "主体",
                 "看到什么": sanitize(text),
                 "命名": "",
-                "出现于": match.group(1) if match else "",
+                "出现于": "，".join(ranges),
             })
         return rows
 
@@ -313,6 +323,7 @@ def extract_subjects(layer: str) -> list:
     if styles:
         rows = []
         for style in styles:
+            ranged = TIME_RANGE_RE.search(style)
             style = TIME_RANGE_RE.sub("", style).strip().rstrip("；;。，, ")
             name = COLOR_HEAD_RE.match(style)
             rows.append({
@@ -320,6 +331,9 @@ def extract_subjects(layer: str) -> list:
                 # shape 可能为空（只抓到款式），此时 f"{shape}；{style}" 会拼出「；熟制…」这种空壳
                 "看到什么": sanitize("；".join(x for x in (shape, style) if x)),
                 "命名": (name.group(1) + "款") if name else "",
+                # 编号款式括号里的时段（`1. 媒介产品（00:01-00:05）：…`）只留给「出现时段」解析，
+                # 不写进「出现于」——那条键参与九 资产 判重，改它的口径会动到既有行数
+                "源时间码": ranged.group(0).strip("（）() ") if ranged else "",
             })
         return rows
 
@@ -616,6 +630,292 @@ def extract_brand_visuals(closing_layer: str) -> list:
     }]
 
 
+# ---------------------------------------------------------------- 出现时段（AT-8 B1）
+
+# 计时口径：拆解.md 的分镜表与第十层都写成 `00:06-00:08` 这种**两段**计时，15 秒的片里
+# `00:12-00:15` 就是 12 秒到 15 秒（不是 12 分）。所以「出现时段」照抄同一口径输出 MM:SS，
+# 不做时/分换算：B2 取帧把「起」「止」直接按秒读，与数据合同里 `帧.秒` 同源。
+CLOCK_RE = re.compile(r"^(\d{1,3})\s*[:：]\s*(\d{1,2})(?:\s*[:：]\s*(\d{1,2}(?:\.\d+)?))?$")
+CLOCK_SPAN_RE = re.compile(
+    r"(\d{1,3}\s*[:：]\s*\d{1,2}(?:\s*[:：]\s*\d{1,2}(?:\.\d+)?)?)"
+    r"\s*[-–—~～至]\s*"
+    r"(\d{1,3}\s*[:：]\s*\d{1,2}(?:\s*[:：]\s*\d{1,2}(?:\.\d+)?)?)"
+)
+SHOT_LIST_RE = re.compile(
+    r"(?:镜次|镜号|镜)\s*[:：]?\s*((?:\d{1,3}(?:\s*[-–—~～至]\s*\d{1,3})?\s*[、,，;；/]?\s*)+)"
+)
+SPAN_SEP_RE = re.compile(r"[、,，;；/]")
+SHOT_NUMBER_SPAN_RE = re.compile(r"^(\d{1,3})\s*[-–—~～至]\s*(\d{1,3})$")
+# 同实体疑似阈值：首句（形态主语）覆盖率与整段覆盖率都过才认，只过一个说明是「顺带提到」
+TWIN_FIRST_MIN = 0.45
+TWIN_FULL_MIN = 0.30
+
+
+def clock_to_seconds(text: str):
+    """`00:10` / `0:87` / `00:00:00.87` → 秒；认不出返回 None。
+
+    两段按「分:秒」读。例外：模型有把 1 秒内的镜次写成 `00:87`（= 0.87 秒）的实测
+    （analysis/reverse/1：全片 7.50 秒，分镜写成 00:00-00:87、00:87-01:97、05:90-07:45），
+    秒位 ≥ 60 只有这种写法解释得通，按「分 + 秒位/100」读。
+    """
+    match = CLOCK_RE.match((text or "").strip())
+    if not match:
+        return None
+    head, tail, third = int(match.group(1)), int(match.group(2)), match.group(3)
+    if third is not None:
+        return head * 3600 + tail * 60 + float(third)
+    if tail >= 60:
+        return head + tail / 100.0
+    return head * 60 + tail
+
+
+def format_clock(seconds) -> str:
+    """秒 → `MM:SS` 两段计时（补零，与拆解.md 分镜表同口径）。"""
+    minutes, sec = divmod(int(round(max(0.0, float(seconds)))), 60)
+    return f"{minutes:02d}:{sec:02d}"
+
+
+def parse_shot_times(shots_layer: str) -> dict:
+    """七 分镜表 → {镜号: (起, 止)}，值都是 MM:SS。读不出时间码的行跳过。"""
+    header, rows = split_shots(shots_layer)
+    time_index = next(
+        (header[name] for name in ("起秒-止秒", "起秒", "时间码", "时间") if name in header), 1
+    )
+    times = {}
+    for cells in rows:
+        if len(cells) <= time_index:
+            continue
+        digits = re.sub(r"[^0-9]", "", cells[0])
+        if not digits:
+            continue
+        match = CLOCK_SPAN_RE.search(cells[time_index])
+        if not match:
+            continue
+        start, end = clock_to_seconds(match.group(1)), clock_to_seconds(match.group(2))
+        if start is None or end is None or end < start:
+            continue
+        times[str(int(digits))] = (format_clock(start), format_clock(end))
+    return times
+
+
+def whole_span(shot_times: dict) -> dict:
+    """全片时段 = 首镜起 → 末镜止（「出现于：全片」用）。"""
+    if not shot_times:
+        return {}
+    return {
+        "起": min(value[0] for value in shot_times.values()),
+        "止": max(value[1] for value in shot_times.values()),
+    }
+
+
+def shot_numbers(appear: str) -> list:
+    """`镜 1、3-8` → ['1','3','4',…,'8']（去重保序）；不是镜号写法返回 []。"""
+    match = SHOT_LIST_RE.search((appear or "").strip())
+    if not match:
+        return []
+    numbers = []
+    for part in SPAN_SEP_RE.split(match.group(1)):
+        part = part.strip()
+        if not part:
+            continue
+        between = SHOT_NUMBER_SPAN_RE.match(part)
+        if between:
+            first, last = sorted((int(between.group(1)), int(between.group(2))))
+            numbers.extend(str(index) for index in range(first, last + 1))
+        elif part.isdigit():
+            numbers.append(str(int(part)))
+    out = []
+    for number in numbers:
+        if number not in out:
+            out.append(number)
+    return out
+
+
+def merge_spans(pairs) -> list:
+    """[(起, 止)] → [{'起','止'}]：首尾相接或重叠的相邻段合成一段，其余按出现顺序保留。"""
+    merged = []
+    for start, end in pairs:
+        if merged and start <= merged[-1][1]:
+            if end > merged[-1][1]:
+                merged[-1] = (merged[-1][0], end)
+        else:
+            merged.append((start, end))
+    return [{"起": start, "止": end} for start, end in merged]
+
+
+def spans_from_text(text: str) -> list:
+    """正文里现成的时间码 → 时段数组（第十层品牌位一行多段、二 产品括号里的时段）。"""
+    pairs = []
+    for match in CLOCK_SPAN_RE.finditer(text or ""):
+        start, end = clock_to_seconds(match.group(1)), clock_to_seconds(match.group(2))
+        if start is None or end is None or end < start:
+            continue
+        pairs.append((format_clock(start), format_clock(end)))
+    return merge_spans(pairs)
+
+
+def spans_from_appearance(appear: str, shot_times: dict) -> list:
+    """「出现于」原文 → 时段数组：镜号走分镜表换算，`00:00-00:05` 直接用，`全片` 取整片。"""
+    numbers = shot_numbers(appear)
+    if numbers:
+        pairs = [shot_times[number] for number in numbers if number in shot_times]
+        return merge_spans(pairs)          # 镜号在分镜表没有行 → []，交给下一跳兜底
+    if "全片" in (appear or ""):
+        whole = whole_span(shot_times)
+        return [whole] if whole else []
+    return spans_from_text(appear)
+
+
+def asset_entries(assets_layer: str) -> list:
+    """九 资产 → [{类别, 名字, 出现于, 正文}]（空态行跳过）——时段解析的源资产表。"""
+    entries = []
+    for label, text in bullets(assets_layer):
+        if is_absent_state(f"{label}：{text}"):
+            continue
+        kind, name, appear = parse_asset_entry(label, text)
+        if not appear:
+            # 出现时段也可能落在正文侧（`**道具B**（出现于：镜 3-6）：…` 被拆成标签+正文）
+            found = re.search(r"[（(]\s*出现于[:：]?\s*([^）)]*)[）)]", f"{label}：{text}")
+            appear = found.group(1).strip() if found else ""
+        entries.append({"类别": kind, "名字": name, "出现于": appear, "正文": text})
+    return entries
+
+
+def span_key(text: str) -> str:
+    """比对用归一：去标点空白，去行首 `A：` 这类序号标记。"""
+    key = re.sub(r"[\s，。；、,.;:：（）()「」『』\"'`｜|*\-—–→…]", "", str(text or ""))
+    return re.sub(r"^[A-Za-zＡ-Ｚａ-ｚ]{1,2}(?=[\u4e00-\u9fa5])", "", key)
+
+
+def span_bigrams(text: str) -> set:
+    key = span_key(text)
+    if not key:
+        return set()
+    return {key[index:index + 2] for index in range(len(key) - 1)} or {key}
+
+
+def span_overlap(left: str, right: str) -> float:
+    """交集占较短一方的比例：同源描述即使长短悬殊（长行带细部、短行只留形态）也认得出。"""
+    left_grams, right_grams = span_bigrams(left), span_bigrams(right)
+    if not left_grams or not right_grams:
+        return 0.0
+    return len(left_grams & right_grams) / min(len(left_grams), len(right_grams))
+
+
+def first_clause(text: str) -> str:
+    """描述首句 = 形态主语所在（`细长圆柱形…，亮面…` → 前一句）。"""
+    return re.split(r"[，,；;。｜|]", str(text or ""), maxsplit=1)[0]
+
+
+def twin_candidates(left: str, right: str) -> bool:
+    """同实体只在「角色可换」的类别之间判：主体↔道具，或同一类别（主体↔主体除外）。"""
+    if left == right:
+        return left != "主体"          # 主体与主体是不同款式，按契约就是不同实体
+    return {left, right} == {"主体", "道具"}
+
+
+def mark_twin_entities(rows: list) -> list:
+    """同实体疑似：同一件东西被登记成两行（例：主体行与道具行写的是同一件产品）。
+
+    判据（两条都要过）：
+      ① 角色可换：见 twin_candidates；
+      ② 描述同源：首句覆盖率 ≥ TWIN_FIRST_MIN 且 整段覆盖率 ≥ TWIN_FULL_MIN。
+         整段闸门挡住「顺带提到」——一行末尾顺带描述的另一件东西不是同实体。
+    结果对称写进每行「同实体疑似」（对方行号 = 清单物理行序 n，升序）。
+    """
+    for row in rows:
+        row.setdefault("同实体疑似", [])
+    for index, row in enumerate(rows):
+        for other in rows[index + 1:]:
+            if not twin_candidates(row["类别"], other["类别"]):
+                continue
+            left, right = str(row.get("看到什么") or ""), str(other.get("看到什么") or "")
+            if span_overlap(first_clause(left), first_clause(right)) < TWIN_FIRST_MIN:
+                continue
+            if span_overlap(left, right) < TWIN_FULL_MIN:
+                continue
+            row["同实体疑似"].append(other["idx"])
+            other["同实体疑似"].append(row["idx"])
+    for row in rows:
+        row["同实体疑似"] = sorted(set(row["同实体疑似"]))
+    return rows
+
+
+def twin_asset_entry(row: dict, entries: list):
+    """清单行 → 九 资产 里同一件东西的条目；挑不出返回 None。"""
+    if not entries:
+        return None
+    category = row.get("类别")
+    pool = [entry for entry in entries if entry["类别"] == category]
+    if not pool:
+        pool = [entry for entry in entries
+                if entry["类别"] in ("主体", "道具") and category in ("主体", "道具")]
+    if not pool:
+        return entries[0] if len(entries) == 1 else None
+    if len(pool) == 1:
+        return pool[0]
+    text = str(row.get("看到什么") or "")
+    best, best_score = None, 0.0
+    for entry in pool:
+        body = f"{entry['名字']} {entry['正文']}"
+        score = (span_overlap(body, text)
+                 + span_overlap(first_clause(body), first_clause(text))) / 2
+        if score > best_score:
+            best, best_score = entry, score
+    return best if best_score >= TWIN_FULL_MIN else None
+
+
+def attach_appear_spans(rows: list, layers: dict) -> list:
+    """补齐每行「出现时段」+「同实体疑似」（不写进 md 表格）。
+
+    数据流：九 资产「出现于：镜 N-M」→ 七 分镜表「镜号 → 起秒-止秒」→ MM:SS 时段数组，
+    多时段全收集（首尾相接的合一段）。逐级兜底（数据合同 v3 兜底链前两跳）：
+      ① 行自带时段：镜号走分镜表；`00:04-00:15` 直接用；`全片` 取整片
+      ② 绑到九 资产 里同一件东西，用它的「出现于」
+      ③ 正文自带时间码（第十层品牌位一行多段）
+      ④ 都解析不出 → 空数组（B2 走中段帧兜底），这里不抛错
+    """
+    shot_times = parse_shot_times(layers.get(LAYER_SHOTS, ""))
+    entries = asset_entries(layers.get(LAYER_ASSETS, ""))
+    for row in rows:
+        raw = str(row.get("源时间码") or row.get("出现于") or "")
+        spans = spans_from_appearance(raw, shot_times)
+        source = f"出现于 {raw}" if spans else (f"未解析 出现于 {raw}" if raw else "")
+        if not spans:
+            entry = twin_asset_entry(row, entries)
+            if entry:
+                spans = spans_from_appearance(entry["出现于"], shot_times)
+                if spans:
+                    source = f"九 资产「{entry['名字'] or entry['类别']}」出现于 {entry['出现于']}"
+        if not spans:
+            spans = spans_from_text(row.get("看到什么") or "")
+            if spans:
+                source = "正文时间码"
+        row["出现时段"] = spans
+        row["时段来源"] = source
+    return mark_twin_entities(rows)
+
+
+def span_payload(video_id: str, rows: list) -> dict:
+    """清单行 → 结构化时段（AT-8 数据合同 v3 的 asset_cards 前置字段）。"""
+    return {
+        "schema": "at8-asset-spans-v1",
+        "video_id": video_id,
+        "source": "拆解.md",
+        "计时": "MM:SS（与拆解.md 分镜表同口径，B2 取帧按秒读）",
+        "rows": [
+            {
+                "n": row["idx"],
+                "类别": row["类别"],
+                "出现时段": list(row.get("出现时段") or []),
+                "同实体疑似": list(row.get("同实体疑似") or []),
+                "来源": row.get("时段来源") or "",
+            }
+            for row in rows
+        ],
+    }
+
+
 def build_rows(layers: dict) -> list:
     subjects = extract_subjects(layers.get(LAYER_PRODUCT, ""))
     props = extract_props(layers.get(LAYER_MOTION, ""))
@@ -642,6 +942,8 @@ def build_rows(layers: dict) -> list:
         row.setdefault("用我的描述", "")
         row["idx"] = index
         row["锁什么"] = row.get("锁什么") or LOCK_BY_CATEGORY[row["类别"]]
+    # AT-8 B1：出现时段 + 同实体疑似（清单行生成之后立刻解析，n 就是这里的物理行序）
+    attach_appear_spans(rows, layers)
     return rows
 
 
@@ -857,6 +1159,14 @@ def run(source: Path) -> int:
     print("计数：" + " / ".join(
         f"{name} {sum(1 for row in rows if row['类别'] == name)}" for name in CATEGORIES
     ))
+    spans_path = target.with_name(CHECKLIST_SPANS_NAME)
+    write_text(spans_path, json.dumps(span_payload(video_id, rows),
+                                     ensure_ascii=False, indent=2) + "\n")
+    located = sum(1 for row in rows if row.get("出现时段"))
+    twins = "、".join(f"#{row['idx']}↔{'/'.join(f'#{other}' for other in row['同实体疑似'])}"
+                     for row in rows
+                     if row.get("同实体疑似") and row["idx"] < min(row["同实体疑似"]))
+    print(f"写入 {spans_path}（出现时段 {located}/{len(rows)} 行；同实体疑似 {twins or '无'}）")
     if leaked:
         print(f"WARN 身份词漏网：{'、'.join(leaked)}", file=sys.stderr)
     return 0
