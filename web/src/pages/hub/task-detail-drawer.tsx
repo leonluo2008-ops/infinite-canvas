@@ -18,6 +18,7 @@ import {
     ungroupHubRows,
     uploadHubImage,
     type HubAssetCard,
+    type HubSelfCheckItem,
     type HubTaskDetail,
     type HubTaskSummary,
 } from "./hub-api";
@@ -142,7 +143,7 @@ export function TaskDetailDrawer({
         <Drawer
             open={open}
             onClose={onClose}
-            width="100vw"
+            width="100%"
             rootClassName="hub-detail-drawer"
             title={
                 <div className="flex min-w-0 flex-wrap items-center gap-2 pr-8">
@@ -425,7 +426,7 @@ function AssetSection({
         const emptyConfirm = !anyUploaded;
         setBusy("confirm");
         try {
-            const data = await confirmHubReplace(taskId, emptyConfirm);
+            const data = await confirmHubReplace(taskId, emptyConfirm, [...acked].sort((a, b) => a - b));
             message.success(data.全沿用 ? "已按全沿用确认，后台推进渲染" : "置换已确认，后台推进渲染；可关页等待");
             onConfirmed();
         } catch (error) {
@@ -912,7 +913,7 @@ function AssetUploadZone({
 
 // ---------------------------------------------------------------- 提示词段 + 审批/生成/成片段
 
-/** 提示词段：全文默认折叠可展开 + 自检结论占位『未检查』（B5 才有数据）。 */
+/** 提示词段：全文默认折叠可展开 + 自检结论（AT-9 B5：渲染完成自动跑；无文件=「未检查」）。 */
 function PromptSection({ detail }: { detail: HubTaskDetail }) {
     const prompt = detail.prompt_md || "";
     return (
@@ -922,7 +923,7 @@ function PromptSection({ detail }: { detail: HubTaskDetail }) {
                     <FileText className="size-4" />
                     提示词
                 </h2>
-                <Tag className="m-0">自检结论：未检查</Tag>
+                <SelfCheckBadge items={detail.自检 ?? null} />
             </div>
             {prompt ? (
                 <details className="mt-2 rounded-md border border-stone-200 dark:border-stone-800">
@@ -938,6 +939,50 @@ function PromptSection({ detail }: { detail: HubTaskDetail }) {
                 <div className="mt-2 rounded-md border border-dashed border-stone-300 px-3 py-4 text-sm text-stone-500 dark:border-stone-700 dark:text-stone-400">提示词尚未生成（确认置换后由后台渲染产出）。</div>
             )}
         </section>
+    );
+}
+
+/** 自检结论（AT-9 B5 数据合同）：✓N 项全绿；有异常 ⚠N/M 必显，可展开逐项证据。
+ *  FAIL 不拦截审批（可 override——图像内容是否真对仍属人工走查），但结论与证据必须可见。 */
+function SelfCheckBadge({ items }: { items: HubSelfCheckItem[] | null }) {
+    if (!items || !items.length) {
+        return (
+            <Tooltip title="这条任务渲染于自检上线前，没有自检结果文件（自检.json）。">
+                <Tag className="m-0">自检结论：未检查</Tag>
+            </Tooltip>
+        );
+    }
+    const failed = items.filter((item) => item.结论 !== "PASS");
+    return (
+        <details className="min-w-0">
+            <summary className="flex cursor-pointer list-none items-center [&::-webkit-details-marker]:hidden">
+                <Tag color={failed.length ? "red" : "green"} className="m-0">
+                    {failed.length
+                        ? `自检 ⚠ ${failed.length}/${items.length} 项异常（点开看证据）`
+                        : `自检 ✓ ${items.length} 项通过`}
+                </Tag>
+            </summary>
+            <div className="mt-2 w-[min(560px,80vw)] space-y-2 rounded-md border border-stone-200 bg-stone-50 p-2 text-left dark:border-stone-800 dark:bg-stone-900">
+                {items.map((item) => (
+                    <div key={item.项} className="text-xs leading-5">
+                        <div className="flex items-center gap-1.5">
+                            {item.结论 === "PASS" ? (
+                                <CheckCircle2 className="size-3.5 shrink-0 text-emerald-600" />
+                            ) : (
+                                <CircleAlert className="size-3.5 shrink-0 text-red-600" />
+                            )}
+                            <span className="font-medium">{item.项}</span>
+                            <Tag color={item.结论 === "PASS" ? "green" : "red"} className="mr-0 px-1 py-0 text-[10px]">
+                                {item.结论 === "PASS" ? "通过" : "异常"}
+                            </Tag>
+                        </div>
+                        {item.证据 ? (
+                            <div className="mt-0.5 break-words whitespace-pre-wrap pl-5 text-stone-500 dark:text-stone-400">{item.证据}</div>
+                        ) : null}
+                    </div>
+                ))}
+            </div>
+        </details>
     );
 }
 
@@ -1044,9 +1089,9 @@ function OutcomeSection({
     return null;
 }
 
-/** 重试（§四 failed 动作）：桥端尚无 /api/hub/retry 路由 → 失败按合同退化为「仅刷新任务状态」。 */
+/** 重试（§四 failed 动作）：POST /api/hub/task/<id>/retry（AT-9 B5 上桥）——failed → discussing
+ *  续跑，产物优先；非 failed 桥端 409，错误原文透出（不再吞错降级）。 */
 function RetryButton({ localId, busy, act }: { localId: string; busy: BusyKind; act: (kind: Exclude<BusyKind, null>, run: () => Promise<void>, okText?: string) => Promise<void> }) {
-    const { message } = App.useApp();
     return (
         <Button
             danger
@@ -1055,14 +1100,8 @@ function RetryButton({ localId, busy, act }: { localId: string; busy: BusyKind; 
             loading={busy === "retry"}
             onClick={() =>
                 void act("retry", async () => {
-                    try {
-                        await retryHubTask(localId);
-                        message.success("已触发重试");
-                    } catch {
-                        // 重试端点可能尚未上桥：按合同退化为「仅刷新任务状态」。
-                        message.info("已刷新任务状态");
-                    }
-                })
+                    await retryHubTask(localId);
+                }, "已触发重试（后台续跑，可关页等待）")
             }
         >
             重试

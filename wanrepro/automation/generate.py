@@ -93,7 +93,15 @@ def do_render(task_dir: Path, set_spec: str, verbose: bool = True) -> dict:
     state.transition(task_dir, "awaiting_approval",
                      extra={"gen_params": params, "approval_snapshot": snap},
                      note=f"预演就绪（模板 {DEFAULT_TEMPLATE}）")
+    # AT-9 B5：渲染完成即自动自检（三项→ 自检.json；检查器异常也不打断渲染主链，
+    # selfcheck 内部如实落 FAIL 记录）。CLI render 与 hub 渲染共用此处，合同一致。
+    from . import selfcheck
+    check_items = selfcheck.run_selfcheck(task_dir)
+    bad = [x for x in check_items if x.get("结论") != "PASS"]
     if verbose:
+        print(f"  自检：{len(check_items) - len(bad)}/{len(check_items)} 项通过 → {task_dir / selfcheck.SELFCHECK_NAME}")
+        for item in bad:
+            print(f"  [自检⚠] {item.get('项')}：{item.get('证据', '')[:200]}")
         print(f"[待审批] {task['local_id']} 预演参数: {json.dumps(params, ensure_ascii=False)}")
         print(f"  快照 {snap[:16]}…；提示词已落 {PROMPT_FILE}（{len(prompt)} 字）")
         print(f"  批准: py -3 -m automation.generate approve {task['local_id']}")

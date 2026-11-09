@@ -24,7 +24,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from automation import cards, discuss, frames, generate, ingest, replace, state  # noqa: E402
+from automation import cards, discuss, frames, generate, ingest, replace, selfcheck, state  # noqa: E402
 
 TASKS_DIR = ROOT / "automation" / "projects"
 VIDEO_FILE = "成片.mp4"
@@ -182,6 +182,8 @@ def get_task(local_id: str) -> dict:
         "summary_md": summary_md,
         "checklist_md": checklist_md,
         "prompt_md": _read(_prompt_path(task_dir, task)),
+        # AT-9 B5 自检合同：渲染完成时落盘的 自检.json 三条 {项,结论,证据}；无文件 → None（前端「未检查」）
+        "自检": selfcheck.load_selfcheck(task_dir),
         "pair_lines": task.get("pending_replace") or [],
         # AT-8 B2：置换台视觉包（合同 v3）。只读面——写路径见 set_asset。
         "asset_cards": cards.build(str(task.get("bridge_id") or ""), local_id),
@@ -222,7 +224,7 @@ def _spawn(job_kind: str, target, *args) -> dict:
     """统一异步：后台线程跑 target，HUB_JOBS 记状态，错误原文进 job。"""
     job_id = uuid.uuid4().hex[:12]
     HUB_JOBS[job_id] = {"status": "running", "kind": job_kind, "started": _now(),
-                        "local_id": args[0] if args else None}
+                        "local_id": _job_local_id(args[0]) if args else None}
 
     def wrap():
         try:
@@ -234,6 +236,12 @@ def _spawn(job_kind: str, target, *args) -> dict:
                                      "ended": _now()})
     threading.Thread(target=wrap, daemon=True, name=f"hub-{job_kind}-{job_id}").start()
     return {"job_id": job_id}
+
+
+def _job_local_id(value) -> str:
+    """删除守护按 local_id 字符串匹配排队 JOB；实参是任务目录 Path 时取目录名（B5 修正：原先存 Path
+    与字符串永不相等，运行中 JOB 的删除守护对真实后台任务形同虚设）。"""
+    return Path(value).name if isinstance(value, Path) else str(value)
 
 
 DISCUSS_LOG = "拆解日志.txt"
@@ -259,11 +267,10 @@ def _stage_recorder(task_dir: Path):
     return _emit
 
 
-def start_discuss(local_id: str) -> dict:
-    """拆解（1–3 分钟）——异步，阶段变化落 拆解日志.txt + lapian_stage，前端轮询可见。"""
-    task_dir = _task_dir(local_id)
+def _spawn_discuss(task_dir: Path, first_line: str) -> dict:
+    """拆解后台执行体（发起拆解与 failed 重试共用；重跑即续语义全在 discuss.run_discuss）。"""
     emit = _stage_recorder(task_dir)
-    emit("拆解启动")
+    emit(first_line)
 
     def _run(td: Path):
         try:
@@ -280,6 +287,25 @@ def start_discuss(local_id: str) -> dict:
     return _spawn("hub-discuss", _run, task_dir)
 
 
+def start_discuss(local_id: str) -> dict:
+    """拆解（1–3 分钟）——异步，阶段变化落 拆解日志.txt + lapian_stage，前端轮询可见。"""
+    return _spawn_discuss(_task_dir(local_id), "拆解启动")
+
+
+def start_retry(local_id: str) -> dict:
+    """POST /api/hub/task/{id}/retry —— failed 态续跑入口（§四：重试/环境级故障重跑即续）。
+
+    复用既有重跑即续语义：discuss.run_discuss 对 failed 先做 failed→discussing（状态机
+    唯一合法出口），随后产物优先——拆解产物齐就不重跑模型直接落 awaiting_assets，
+    未齐才真重发拆解。非 failed → 409（HubError 由 server 层转 409）。
+    """
+    task_dir = _task_dir(local_id)
+    task = state.load(task_dir)
+    if task["state"] != "failed":
+        raise HubError(f"重试需 failed 状态，当前 {task['state']}（只有失败任务可重试）")
+    return _spawn_discuss(task_dir, "人工重试：failed → discussing（重跑即续，产物优先）")
+
+
 def do_assets(local_id: str, image_paths: list[Path]) -> dict:
     """替换图上传回填（上传图床+回填清单+写待确认）。返回配对回显。"""
     task_dir = _task_dir(local_id)
@@ -292,17 +318,43 @@ def do_assets(local_id: str, image_paths: list[Path]) -> dict:
     return {"state": run, "filled": task.get("pending_replace") or []}
 
 
-def do_confirm(local_id: str, empty_confirm: bool = False) -> dict:
-    """确认置换 → rendering；empty_confirm=true = 全沿用（空置换显式确认，AT-9 §四）。"""
+def do_confirm(local_id: str, empty_confirm: bool = False,
+               ack_rows: list[int] | None = None) -> dict:
+    """确认置换 → rendering，并后台续跑渲染（§五：确认即推进，前端关页不负责执行）。
+
+    empty_confirm=true = 全沿用（空置换显式确认，AT-9 §四）。
+    ack_rows = 确认时点「知道，按原样」勾选的未换行号——落任务.json『按原样确认』，
+    是自检③锁点对账的确认时点记录（不自证）。
+    """
     task_dir = _task_dir(local_id)
     with _task_lock(local_id):
         try:
             st = replace.run_replace(task_dir, assets=None, map_spec=None, name_spec=None,
                                      confirm=True, verbose=False,
-                                     empty_confirm=empty_confirm)
+                                     empty_confirm=empty_confirm, ack_rows=ack_rows)
         except replace.ReplaceError as e:
             raise HubError(str(e)) from None
-    return {"state": st, "全沿用": bool(empty_confirm)}
+    # 确认后由后端触发渲染（AT-9 §五「确认后立即关闭 Drawer，渲染照常推进（后端触发）」）：
+    # rendering 态下后台跑 do_render → awaiting_approval + 自检；失败如实落 failed（可重试/删除）。
+    job = _spawn("hub-render", _render_and_advance, task_dir)
+    return {"state": st, "全沿用": bool(empty_confirm), "job_id": job.get("job_id")}
+
+
+def _render_and_advance(task_dir: Path) -> dict:
+    """后台渲染推进体：rendering → awaiting_approval（自检在 do_render 内自动跑）。
+
+    渲染失败 → 任务级失败如实落 failed（带原文），绝不把任务吊死在 rendering
+    （RUNNING_STATES 不可删不可重试，吊死即死锁）。
+    """
+    try:
+        return do_render(task_dir.name)
+    except Exception as e:  # noqa: BLE001
+        try:
+            if state.load(task_dir)["state"] == "rendering":
+                state.transition(task_dir, "failed", note=f"渲染失败（原文）：{e}")
+        except Exception:  # noqa: BLE001 —— 状态回写失败不吞掉原异常
+            pass
+        raise
 
 
 def do_rollback(local_id: str) -> dict:
@@ -318,7 +370,7 @@ def do_rollback(local_id: str) -> dict:
 
 # ---------------------------------------------------------------- 删除端点（AT-9 §六删除合同）
 
-DELETABLE_STATES = ("ingested", "failed", "completed")       # 免确认就能删的 idle 态
+DELETABLE_STATES = ("ingested", "failed", "done")             # 免确认就能删的 idle 态（done=状态机真实终态；「completed」不是状态机状态，2026-11-09 B5 修正）
 TEARDOWN_IDLE_STATES = ("awaiting_assets", "awaiting_approval")  # 拆解过但 idle：要任务名确认
 RUNNING_STATES = ("ingesting", "discussing", "rendering", "generating")  # 一律 409
 
@@ -372,7 +424,7 @@ def _uploads_video_shared(video_name: str, exclude: str) -> bool:
 def delete_task(local_id: str, *, confirm_name: str | None = None) -> dict:
     """POST /api/hub/task/{id}/delete —— AT-9 §六删除合同。
 
-    仅 idle 态可删：ingested/failed/completed 免确认；拆解过但 idle
+    仅 idle 态可删：ingested/failed/done 免确认；拆解过但 idle
     （awaiting_assets/awaiting_approval）请求体必须带 confirm_name=任务号（或任务名）。
     运行中（ingesting/discussing/rendering/generating）与排队 JOB → 409。
     删除范围=projects/<id>/ + 专属 analysis/reverse/<bridge_id>/（无其他任务引用才删）

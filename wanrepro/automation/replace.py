@@ -278,7 +278,7 @@ def parse_map(spec: str) -> list[tuple[int, str]]:
 
 def run_replace(task_dir: Path, *, assets: list[str] | None, map_spec: str | None,
                 name_spec: str | None, confirm: bool, verbose: bool = True,
-                empty_confirm: bool = False) -> str:
+                empty_confirm: bool = False, ack_rows: list[int] | None = None) -> str:
     task = state.load(task_dir)
     cur = task["state"]
     if confirm:
@@ -290,11 +290,17 @@ def run_replace(task_dir: Path, *, assets: list[str] | None, map_spec: str | Non
                                "全沿用=空置换，必须显式 empty_confirm=true）")
         # 全沿用（AT-9 §四/数据合同）：空置换显式确认也放行——rendering 停点守卫认
         # empty_confirm 标志（state.py），assets_confirmed 落 [] 供提交链消费。
+        acks = sorted({int(x) for x in (ack_rows or [])})
         if pending:
+            extra: dict = {"assets_confirmed": pending}
+            # 『按原样』勾选记录（AT-9 B5 锁点对账的数据源）：未换必换行逐行确认的落账，
+            # 自检③从这份确认时点快照核对（不自证）；空列表不落键（无记录=如实）。
+            if acks:
+                extra["按原样确认"] = {"rows": acks, "at": state._now()}
             state.transition(task_dir, "rendering",
                              require={"assets_confirmed": pending},
                              note="所有者确认置换",
-                             extra={"assets_confirmed": pending})
+                             extra=extra)
         else:
             state.transition(task_dir, "rendering",
                              require={"empty_confirm": True},

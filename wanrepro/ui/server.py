@@ -2045,9 +2045,16 @@ class Handler(BaseHTTPRequestHandler):
         m = re.fullmatch(r"/api/hub/confirm/([^/]+)", path)
         if m:
             # AT-9 B2：body 可带 empty_confirm:true = 全沿用（空置换显式确认 → rendering）
+            # AT-9 B5：body 可带 按原样:[行号] = 确认时点「知道，按原样」勾选（自检③锁点对账数据源）
             payload = self.read_json()
+            raw_acks = payload.get("按原样")
+            try:
+                ack_rows = sorted({int(x) for x in raw_acks}) if raw_acks else []
+            except (TypeError, ValueError):
+                raise ApiError(400, "按原样 必须是行号数组") from None
             self.send_json(hub_api.do_confirm(urllib.parse.unquote(m.group(1)),
-                                              empty_confirm=bool(payload.get("empty_confirm"))))
+                                              empty_confirm=bool(payload.get("empty_confirm")),
+                                              ack_rows=ack_rows))
             return
         m = re.fullmatch(r"/api/hub/render/([^/]+)", path)
         if m:
@@ -2084,6 +2091,12 @@ class Handler(BaseHTTPRequestHandler):
         if m:
             self.read_json()                    # 无字段，读掉请求体保持 keep-alive 干净
             self.send_json(hub_api.do_rollback(urllib.parse.unquote(m.group(1))))
+            return
+        m = re.fullmatch(r"/api/hub/task/([^/]+)/retry", path)
+        if m:
+            # AT-9 B5：failed 态续跑入口（重跑即续，产物优先）；非 failed → 409
+            self.read_json()                    # 无字段，读掉请求体保持 keep-alive 干净
+            self.send_json(hub_api.start_retry(urllib.parse.unquote(m.group(1))))
             return
         if path == "/api/hub/asset":
             # AT-8 B2 写路径（数据合同 v3）：{task_id,n,image_url} 覆盖 / {…,clear:true} 清空 / {…,text} 写命名

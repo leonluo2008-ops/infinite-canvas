@@ -92,10 +92,19 @@ export type HubAssetWriteResult = {
     rows?: { n: number; 已传图: string[]; 命名: string }[];
 };
 
+/** 自检结果单条（AT-9 B5 数据合同：projects/<id>/自检.json 每条 {项,结论,证据}；结论 PASS|FAIL）。 */
+export type HubSelfCheckItem = {
+    项: string;
+    结论: string;
+    证据: string;
+};
+
 export type HubTaskDetail = HubTaskSummary & {
     summary_md: string;
     checklist_md: string;
     prompt_md: string;
+    /** AT-9 B5 自检三项（渲染完成自动跑）；旧任务无文件 → null → 前端显「未检查」。 */
+    自检?: HubSelfCheckItem[] | null;
     /** 拆解实时阶段（bridge job stage 回写）；拆解中卡片显示。 */
     lapian_stage?: string;
     /** 拆解日志尾 15 行（排查留痕）。 */
@@ -165,7 +174,21 @@ export async function getHubTask(localId: string): Promise<HubTaskDetail> {
         pair_lines: Array.isArray(task.pair_lines) ? task.pair_lines : [],
         asset_cards: normalizeAssetCards(task.asset_cards),
         suggestions: normalizeSuggestions(task.suggestions),
+        自检: normalizeSelfCheck(task.自检),
     };
+}
+
+/** 自检归一：无文件/畸形 → null（「未检查」）；条目缺字段逐项兜底，结论非 PASS 一律按 ⚠ 显示。 */
+function normalizeSelfCheck(value: unknown): HubSelfCheckItem[] | null {
+    if (!Array.isArray(value) || !value.length) return null;
+    return value.map((raw) => {
+        const item = (raw && typeof raw === "object" ? raw : {}) as JsonRecord;
+        return {
+            项: hubText(item["项"]) || "未命名检查项",
+            结论: hubText(item["结论"]) || "FAIL",
+            证据: hubText(item["证据"]),
+        };
+    });
 }
 
 /** 读层入口集中归一（项目硬约束 14 同款思路）：asset_cards 缺失/畸形不炸页面，逐字段兜底。 */
@@ -263,14 +286,15 @@ export async function uploadHubAssets(localId: string, files: File[]): Promise<{
 }
 
 /**
- * 确认置换 → 后端直接推进 rendering（AT-9 §四：前端零执行责任，确认后前端只关界面）。
+ * 确认置换 → 后端直接推进 rendering 并后台续跑渲染（AT-9 §四/§五：前端零执行责任，确认后前端只关界面）。
  * empty_confirm=true = 全沿用（空置换显式确认；无任何上传时唯一放行通道，replace.py 硬拒空确认）。
+ * ackRows = 确认时点「知道，按原样」勾选的未换行号（自检③锁点对账的确认记录）。
  */
-export async function confirmHubReplace(localId: string, emptyConfirm = false): Promise<{ state?: string; 全沿用?: boolean }> {
-    return request<{ state?: string; 全沿用?: boolean }>(`/api/hub/confirm/${encodeURIComponent(localId)}`, {
+export async function confirmHubReplace(localId: string, emptyConfirm = false, ackRows: number[] = []): Promise<{ state?: string; 全沿用?: boolean; job_id?: string }> {
+    return request<{ state?: string; 全沿用?: boolean; job_id?: string }>(`/api/hub/confirm/${encodeURIComponent(localId)}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ empty_confirm: emptyConfirm }),
+        body: JSON.stringify({ empty_confirm: emptyConfirm, 按原样: ackRows }),
     });
 }
 
@@ -316,9 +340,9 @@ export async function submitHubTask(localId: string): Promise<{ job_id?: string 
     return request<{ job_id?: string }>(`/api/hub/submit/${encodeURIComponent(localId)}`, { method: "POST" });
 }
 
-/** 重试端点可能尚未上桥；调用方按「失败仅刷新」处理。 */
-export async function retryHubTask(localId: string): Promise<{ state?: string }> {
-    return request<{ state?: string }>(`/api/hub/retry/${encodeURIComponent(localId)}`, { method: "POST" });
+/** failed 态续跑入口（AT-9 B5：POST /api/hub/task/<id>/retry；非 failed 桥端 409，错误原文透出）。 */
+export async function retryHubTask(localId: string): Promise<{ state?: string; job_id?: string }> {
+    return request<{ state?: string; job_id?: string }>(`/api/hub/task/${encodeURIComponent(localId)}/retry`, { method: "POST" });
 }
 
 export function hubOutputUrl(localId: string) {

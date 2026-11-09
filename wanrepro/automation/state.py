@@ -148,6 +148,9 @@ def rollback_to_assets(task_dir: Path, *, note: str = "退回置换") -> dict:
     prompt_file = task_dir / "提示词.md"
     if prompt_file.is_file():
         prompt_file.unlink()                 # 丢弃当前提示词（合同：回退=丢弃）
+    selfcheck_file = task_dir / "自检.json"
+    if selfcheck_file.is_file():
+        selfcheck_file.unlink()             # 自检结论属于被丢弃的那次渲染，一并作废（B5）
     for key in ("approval", "approval_snapshot", "gen_params"):
         task.pop(key, None)                  # 预演参数/审批随提示词一起作废
     task["state"] = "awaiting_assets"
