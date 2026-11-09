@@ -29,9 +29,18 @@ ANALYSIS = ROOT / "analysis" / "reverse"
 CACHE_TOL = 0.5        # 数据合同 v3：±0.5s 内有缓存帧就用缓存
 MAX_WIDTH = 960        # 最大宽，与 build_asset_frame 同口径
 DERIVED_PREFIX = "at8-"
+SHOT_PREFIX = "at8-shot-"          # 代表镜帧（AT-10 C1）：at8-shot-<镜号>-<中点>.png
+FALLBACK_PREFIX = "at8-fallback-"  # 整片中段兜底帧：at8-fallback-<秒>.png
+EDGE_MARGIN = 0.05                 # 缓存复用/取帧点都排除镜右端这 0.05s（避切点）
 FRAME_SUFFIX = ".png"
 SAFE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,120}\.(?:png|jpg|jpeg)$", re.IGNORECASE)
-CLOCK_RE = re.compile(r"^(\d{1,4}):(\d{1,2})(?:\.(\d{1,3}))?$")
+CLOCK_RE = re.compile(
+    r"^(?P<first>\d{1,4})"
+    r"(?:\s*[:：]\s*(?P<second>\d{1,2}(?:\.\d+)?)"
+    r"(?:\s*[:：]\s*(?P<third>\d{1,2}(?:\.\d+)?))?"
+    r"|\.(?P<frac>\d+))?$"
+)
+CLOCK_UNIT_RE = re.compile(r"\s*(?:s|S|秒)\s*$")
 
 
 class FrameError(RuntimeError):
@@ -41,23 +50,32 @@ class FrameError(RuntimeError):
 # ---------------------------------------------------------------- 时间码
 
 def clock_seconds(text) -> float | None:
-    """`MM:SS` / `MM:SS.SS` / 纯秒 → 秒；读不出返回 None（不猜）。
+    """时间码 → 秒；读不出返回 None（不猜）。
 
+    认的格式族（AT-10 C1）：`12` / `2.03`（纯秒，含小数）、`2.03s` / `2.03秒`（带单位）、
+    `00:12` / `02:03`（MM:SS，两段整数按分:秒，与 confirm.clock_to_seconds 同口径）、
+    `00:02.03` / `0:02.03`（MM:SS.SS，保小数）、`00:00:02.03`（H:MM:SS.SS）。
     与拆解.md 分镜表同口径：`00:12` 是 12 秒，不是 12 分。
     """
-    raw = str(text if text is not None else "").strip()
+    raw = CLOCK_UNIT_RE.sub("", str(text if text is not None else "").strip()).strip()
     if not raw:
         return None
     match = CLOCK_RE.match(raw)
-    if match:
-        seconds = int(match.group(1)) * 60 + int(match.group(2))
-        if match.group(3):
-            seconds += float("0." + match.group(3))
-        return round(float(seconds), 3)
-    try:
-        return round(float(raw), 3)
-    except ValueError:
+    if not match:
         return None
+    first, second = int(match.group("first")), match.group("second")
+    third, frac = match.group("third"), match.group("frac")
+    if frac is not None:
+        return round(first + float("0." + frac), 3)
+    if third is not None:
+        return round(first * 3600 + float(second) * 60 + float(third), 3)
+    if second is not None:
+        tail = float(second)
+        if tail >= 60:
+            # `00:87` = 0.87 秒（与 confirm.clock_to_seconds 同一特例：秒位 ≥60 只有 ss:cs 解释得通）
+            return round(first + tail / 100.0, 3)
+        return round(first * 60 + tail, 3)
+    return float(first)
 
 
 def span_bounds(span: dict | None) -> tuple[float, float] | None:
@@ -241,6 +259,62 @@ def build_frame(bridge_id: str, local_id: str, n: int, span: dict | None,
                     "来源": "缓存", "定位": "精确"}
     return _derive(bridge_id, local_id, n, video, mid, True,
                    source="现抽", located="精确")
+
+
+def build_shot_frame(bridge_id: str, local_id: str, shot_no: int, start: float, end: float,
+                     cache: list[tuple[float, Path]] | None = None,
+                     video: Path | None = None) -> dict:
+    """代表镜 → 代表帧对象 {url, 秒, 镜次, 定位, 来源}（AT-10 C1）。
+
+    取帧点 = 镜中点 `round((start+end)/2, 2)`（避切点；pop-4 镜1/3 中点应为 1.01 / 5.44）。
+    缓存复用先筛镜内开区间 `start <= 秒 < end - EDGE_MARGIN`（右端 0.05s 排除，防取到切点画面），
+    再按既有 ±0.5s 就近；不跨镜取帧。未命中 → 现抽 `看帧/at8-shot-<镜号>-<中点>.png`
+    （文件名不带行号，同镜天然落同一个文件 → 组装层共享时只抽一次）。
+    中点越界 / 现抽失败 → 「未定位」（url 空、镜次 None）：**不许**拿首帧或他镜帧冒充。
+    """
+    mid = round((float(start) + float(end)) / 2, 2)
+    if video is None:
+        video = video_path(bridge_id)
+    total = duration(video)
+    if mid < 0 or (total > 0 and mid > total - EDGE_MARGIN):
+        return {"url": "", "秒": mid, "镜次": None, "定位": "未定位", "来源": "现抽",
+                "错误": f"取帧点 {mid:.2f}s 越界（片长 {total:.2f}s）"}
+    if cache is None:
+        cache = load_cache(bridge_id)
+    inside = [(sec, path) for sec, path in cache if start <= sec < end - EDGE_MARGIN + 1e-9]
+    hit = nearest(inside, mid)
+    if hit is not None:
+        sec, path = hit
+        return {"url": frame_url(local_id, path.name), "秒": sec, "镜次": shot_no,
+                "定位": "精确", "来源": "缓存"}
+    out_dir = frames_dir(bridge_id, create=True)
+    out = out_dir / f"{SHOT_PREFIX}{shot_no}-{mid:.2f}{FRAME_SUFFIX}"
+    ok, err = _ensure(video, mid, out)
+    if ok:
+        return {"url": frame_url(local_id, out.name), "秒": mid, "镜次": shot_no,
+                "定位": "精确", "来源": "现抽"}
+    return {"url": "", "秒": mid, "镜次": None, "定位": "未定位", "来源": "现抽",
+            "错误": err[:300]}
+
+
+def build_fallback_frame(bridge_id: str, local_id: str,
+                         video: Path | None = None) -> dict:
+    """整片中段兜底帧（代表镜都不可用时）：`看帧/at8-fallback-<秒>.png`。
+
+    定位一律「未定位」、镜次 None（合同：未定位不标镜次、不画框）；同片所有未定位行共享这一帧。
+    抽不出来 → url 空，同样「未定位」（禁静默换别的帧冒充）。
+    """
+    if video is None:
+        video = video_path(bridge_id)
+    at = round((duration(video) or 0.0) / 2, 2)
+    out_dir = frames_dir(bridge_id, create=True)
+    out = out_dir / f"{FALLBACK_PREFIX}{at:.2f}{FRAME_SUFFIX}"
+    ok, err = _ensure(video, at, out)
+    if ok:
+        return {"url": frame_url(local_id, out.name), "秒": at, "镜次": None,
+                "定位": "未定位", "来源": "中段兜底"}
+    return {"url": "", "秒": at, "镜次": None, "定位": "未定位", "来源": "中段兜底",
+            "错误": err[:300]}
 
 
 def _derive(bridge_id: str, local_id: str, n: int, video: Path | None,

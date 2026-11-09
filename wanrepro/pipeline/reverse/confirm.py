@@ -244,11 +244,17 @@ def first_by_label(items, names) -> str:
 
 
 def split_shots(body: str):
-    """分镜表 → (表头 {列名: 下标}, 行 [cells])；兼容管道表格与 `* 镜号01 | …` 列表。"""
+    """分镜表 → (表头 {列名: 下标}, 行 [cells])；兼容管道表格与 `* 镜号01 | …` 列表。
+
+    全半角都认（AT-10 C1）：`split_layers()` 的 `_norm_pipes()` 会把**不以 `|` 开头**的行里的
+    半角竖线转成全角 `｜`（其他下游依赖这个归一），而 pop-4 的分镜表正是「行首无 `|`、列间半角」，
+    于是整表一行都进不来。这里读之前把 `｜` 换回 `|`，只影响分镜表这一处读取口径。
+    """
     header = {}
     rows = []
     for line in body.splitlines():
         text = line.strip().lstrip("*").strip()
+        text = text.replace("｜", "|")
         if "|" not in text:
             continue
         cells = [cell.strip() for cell in text.strip("|").split("|")]
@@ -635,12 +641,29 @@ def extract_brand_visuals(closing_layer: str) -> list:
 # 计时口径：拆解.md 的分镜表与第十层都写成 `00:06-00:08` 这种**两段**计时，15 秒的片里
 # `00:12-00:15` 就是 12 秒到 15 秒（不是 12 分）。所以「出现时段」照抄同一口径输出 MM:SS，
 # 不做时/分换算：B2 取帧把「起」「止」直接按秒读，与数据合同里 `帧.秒` 同源。
-CLOCK_RE = re.compile(r"^(\d{1,3})\s*[:：]\s*(\d{1,2})(?:\s*[:：]\s*(\d{1,2}(?:\.\d+)?))?$")
-CLOCK_SPAN_RE = re.compile(
-    r"(\d{1,3}\s*[:：]\s*\d{1,2}(?:\s*[:：]\s*\d{1,2}(?:\.\d+)?)?)"
-    r"\s*[-–—~～至]\s*"
-    r"(\d{1,3}\s*[:：]\s*\d{1,2}(?:\s*[:：]\s*\d{1,2}(?:\.\d+)?)?)"
+# AT-10 C1 认全格式族：`2.03`（纯秒小数）/`2.03s`/`2.03秒`/`00:02.03`（MM:SS.SS）/
+# `00:00:02.03`（H:MM:SS.SS）/`00:12`（分:秒）/`02:03`（两段整数，**单 token 层按分:秒**，
+# 歧义只在整张分镜表层联合判断，见 parse_shot_times）。
+CLOCK_RE = re.compile(
+    r"^(?P<first>\d{1,3})"
+    r"(?:\s*[:：]\s*(?P<second>\d{1,2}(?:\.\d+)?)"
+    r"(?:\s*[:：]\s*(?P<third>\d{1,2}(?:\.\d+)?))?"
+    r"|\.(?P<frac>\d+))?$"
 )
+_CLOCK_UNIT_RE = re.compile(r"\s*(?:s|S|秒)\s*$")
+# 一个时间码 token：两段/三段冒号（末段可带小数）或纯秒小数，两端都认；尾部单位另容
+_CLOCK_TOKEN = (
+    r"\d{1,3}(?:\s*[:：]\s*\d{1,2}(?:\.\d+)?"
+    r"(?:\s*[:：]\s*\d{1,2}(?:\.\d+)?)?|\.\d+)?"
+)
+_CLOCK_UNIT = r"(?:\s*(?:s|S|秒))?"
+CLOCK_SPAN_RE = re.compile(
+    r"(" + _CLOCK_TOKEN + r")" + _CLOCK_UNIT
+    + r"\s*[-–—~～至]\s*"
+    + r"(" + _CLOCK_TOKEN + r")" + _CLOCK_UNIT
+)
+# 歧义两段整数 `NN:NN`：mm:ss = M*60+S，ss:cs = M + S/100（S≤99）
+AMBIGUOUS_CLOCK_RE = re.compile(r"^(\d{1,3})\s*[:：]\s*(\d{1,2})$")
 SHOT_LIST_RE = re.compile(
     r"(?:镜次|镜号|镜)\s*[:：]?\s*((?:\d{1,3}(?:\s*[-–—~～至]\s*\d{1,3})?\s*[、,，;；/]?\s*)+)"
 )
@@ -656,37 +679,68 @@ POSITION_RE = re.compile(
 )
 
 
-def clock_to_seconds(text: str):
-    """`00:10` / `0:87` / `00:00:00.87` → 秒；认不出返回 None。
+def strip_unit(text: str) -> str:
+    """时间码去掉尾部单位（`2.03s` / `2.03秒` → `2.03`）。"""
+    return _CLOCK_UNIT_RE.sub("", str(text if text is not None else "").strip()).strip()
 
-    两段按「分:秒」读。例外：模型有把 1 秒内的镜次写成 `00:87`（= 0.87 秒）的实测
+
+def clock_to_seconds(text: str):
+    """单个时间码 → 秒；读不出返回 None（不猜）。
+
+    认的格式族（AT-10 C1）：
+      `2.03` 纯秒小数 → 2.03；`2.03s` / `2.03秒` → 2.03；
+      `00:02.03` / `0:02.03`（MM:SS.SS）→ 2.03；`00:00:02.03`（H:MM:SS.SS）→ 2.03；
+      `00:12` → 12.0（分:秒口径）；`02:03` → 123.0（两段整数仍按分:秒，**不在这里一律按 ss:cs**）。
+
+    例外：模型有把 1 秒内的镜次写成 `00:87`（= 0.87 秒）的实测
     （analysis/reverse/1：全片 7.50 秒，分镜写成 00:00-00:87、00:87-01:97、05:90-07:45），
     秒位 ≥ 60 只有这种写法解释得通，按「分 + 秒位/100」读。
+
+    两段 `NN:NN` 的 mm:ss / ss:cs 歧义不在这里裁决——整张分镜表联合判断见 parse_shot_times。
     """
-    match = CLOCK_RE.match((text or "").strip())
+    raw = strip_unit(text)
+    if not raw:
+        return None
+    match = CLOCK_RE.match(raw)
     if not match:
         return None
-    head, tail, third = int(match.group(1)), int(match.group(2)), match.group(3)
+    first, second, third, frac = (
+        int(match.group("first")), match.group("second"),
+        match.group("third"), match.group("frac"),
+    )
+    if frac is not None:
+        return round(first + float("0." + frac), 3)
     if third is not None:
-        return head * 3600 + tail * 60 + float(third)
-    if tail >= 60:
-        return head + tail / 100.0
-    return head * 60 + tail
+        return round(first * 3600 + float(second) * 60 + float(third), 3)
+    if second is not None:
+        tail = float(second)
+        if tail >= 60:
+            return round(first + tail / 100.0, 3)
+        return round(first * 60 + tail, 3)
+    return float(first)
 
 
 def format_clock(seconds) -> str:
-    """秒 → `MM:SS` 两段计时（补零，与拆解.md 分镜表同口径）。"""
-    minutes, sec = divmod(int(round(max(0.0, float(seconds)))), 60)
+    """秒 → `MM:SS`（整秒）/ `MM:SS.ss`（有小数；保精度，AT-10 C1）。
+
+    `format_clock(5) == "00:05"`、`format_clock(2.03) == "00:02.03"`、`format_clock(6.8) == "00:06.80"`。
+    整秒输出不带小数，旧口径（清单/侧车的 `MM:SS`）与旧断言都不破。
+    """
+    cents = int(round(max(0.0, float(seconds)) * 100))
+    whole, fraction = divmod(cents, 100)
+    minutes, sec = divmod(whole, 60)
+    if fraction:
+        return f"{minutes:02d}:{sec:02d}.{fraction:02d}"
     return f"{minutes:02d}:{sec:02d}"
 
 
-def parse_shot_times(shots_layer: str) -> dict:
-    """七 分镜表 → {镜号: (起, 止)}，值都是 MM:SS。读不出时间码的行跳过。"""
+def _clock_span_rows(shots_layer: str) -> list[tuple[int, str, str]]:
+    """分镜表 → [(镜号, 起 token, 止 token)]（表序；读不出时间码的行跳过）。"""
     header, rows = split_shots(shots_layer)
     time_index = next(
         (header[name] for name in ("起秒-止秒", "起秒", "时间码", "时间") if name in header), 1
     )
-    times = {}
+    out: list[tuple[int, str, str]] = []
     for cells in rows:
         if len(cells) <= time_index:
             continue
@@ -696,11 +750,102 @@ def parse_shot_times(shots_layer: str) -> dict:
         match = CLOCK_SPAN_RE.search(cells[time_index])
         if not match:
             continue
-        start, end = clock_to_seconds(match.group(1)), clock_to_seconds(match.group(2))
+        out.append((int(digits), strip_unit(match.group(1)), strip_unit(match.group(2))))
+    return out
+
+
+def ambiguous_clock(token: str) -> bool:
+    """两段整数 `NN:NN` = 歧义 token（mm:ss 与 ss:cs 都解释得通）。"""
+    return bool(AMBIGUOUS_CLOCK_RE.match(strip_unit(token)))
+
+
+def _segment_seconds(token: str, mode: str):
+    """按指定全局模式解一个 token；读不出返回 None。
+
+    mode=`mm:ss` 两段整数读 M*60+S；mode=`ss:cs` 读 M + S/100（S≤99）。明确小数/三段不受模式影响。
+    """
+    token = strip_unit(token)
+    match = AMBIGUOUS_CLOCK_RE.match(token)
+    if match:
+        first, second = int(match.group(1)), int(match.group(2))
+        if mode == "ss:cs":
+            return round(first + second / 100.0, 3) if second <= 99 else None
+        return float(first * 60 + second)
+    return clock_to_seconds(token)
+
+
+def _spans_plausible(pairs: list[tuple[int, float | None, float | None]],
+                     duration: float | None) -> bool:
+    """整表可行性：段起止有序 + 按镜号单调 + 有片长时末段右端≈片长（±0.5s）。"""
+    if not pairs:
+        return False
+    for _, start, end in pairs:
+        if start is None or end is None:
+            return False
+        if start < 0 or end < start:
+            return False
+        if duration and end > duration + 0.5:
+            return False
+    ordered = sorted(pairs, key=lambda item: item[0])
+    for prev, nxt in zip(ordered, ordered[1:]):
+        if nxt[1] < prev[2] - 0.01:
+            return False
+    if duration:
+        if abs(ordered[-1][2] - duration) > 0.5:
+            return False
+    return True
+
+
+def parse_shot_times(shots_layer: str, duration: float | None = None) -> dict:
+    """七 分镜表 → {镜号: (起, 止)}；值按 format_clock（整秒 MM:SS，有小数带两位）。
+
+    时间码消歧 v2（数据合同；AT-10 C1）：明确小数（`02.03`）/ 三段 / 带单位的不歧义；
+    两段整数 `NN:NN` 是歧义 token，只有 mm:ss 与 ss:cs 两种解释。**不逐 token 猜**：
+      · 全表按 mm:ss 求一遍、按 ss:cs 求一遍，各自校验（段内 end≥start、按镜号段间单调、
+        有片长时末段右端与片长差 ≤0.5s 且不越界）；
+      · 只有一种过 → 用它；两种都过 → 用 mm:ss（兼容旧片/sidecar 口径，第十层 `00:05-00:07` 即 5~7s）；
+      · 都不过 → 只留不含歧义 token 的镜，歧义镜丢弃（消费端 → 未定位），不猜。
+    """
+    raw = _clock_span_rows(shots_layer)
+    if not raw:
+        return {}
+    evaluated = {}
+    for mode in ("mm:ss", "ss:cs"):
+        evaluated[mode] = [
+            (shot, _segment_seconds(start, mode), _segment_seconds(end, mode))
+            for shot, start, end in raw
+        ]
+    for mode in ("mm:ss", "ss:cs"):
+        if _spans_plausible(evaluated[mode], duration):
+            return {str(shot): (format_clock(start), format_clock(end))
+                    for shot, start, end in evaluated[mode]}
+    times = {}
+    for shot, start_token, end_token in raw:
+        if ambiguous_clock(start_token) or ambiguous_clock(end_token):
+            continue
+        start, end = clock_to_seconds(start_token), clock_to_seconds(end_token)
         if start is None or end is None or end < start:
             continue
-        times[str(int(digits))] = (format_clock(start), format_clock(end))
+        times[str(shot)] = (format_clock(start), format_clock(end))
     return times
+
+
+DURATION_HEAD_RE = re.compile(r"时长\s*[：:]\s*([0-9]+(?:\.[0-9]+)?)\s*(?:s|秒)?")
+DURATION_TAIL_RE = re.compile(r"·\s*([0-9]+(?:\.[0-9]+)?)\s*秒")
+
+
+def probe_duration(markdown: str) -> float | None:
+    """拆解头部取片长（`时长: 6.85s` / `· 6.85 秒`）；取不到 None（消歧时退化为不加片长校验）。"""
+    text = str(markdown or "")
+    for pattern in (DURATION_HEAD_RE, DURATION_TAIL_RE):
+        match = pattern.search(text)
+        if not match:
+            continue
+        try:
+            return round(float(match.group(1)), 3)
+        except ValueError:
+            continue
+    return None
 
 
 def whole_span(shot_times: dict) -> dict:
@@ -749,10 +894,18 @@ def merge_spans(pairs) -> list:
 
 
 def spans_from_text(text: str) -> list:
-    """正文里现成的时间码 → 时段数组（第十层品牌位一行多段、二 产品括号里的时段）。"""
+    """正文里现成的时间码 → 时段数组（第十层品牌位一行多段、二 产品括号里的时段）。
+
+    AT-10 C1：span 正则现在也认纯数字 token（`2.03`），散文里的「20-25 岁」会被它当成时段。
+    所以这里要求**起止 token 至少一个带 `:`/`：`/`.`** 才接受——时间是「有刻度」的写法，
+    裸整数区间是数量/年龄区间。
+    """
     pairs = []
     for match in CLOCK_SPAN_RE.finditer(text or ""):
-        start, end = clock_to_seconds(match.group(1)), clock_to_seconds(match.group(2))
+        start_token, end_token = match.group(1), match.group(2)
+        if not any(ch in start_token + end_token for ch in (":", "：", ".")):
+            continue
+        start, end = clock_to_seconds(start_token), clock_to_seconds(end_token)
         if start is None or end is None or end < start:
             continue
         pairs.append((format_clock(start), format_clock(end)))
@@ -886,7 +1039,7 @@ def twin_asset_entry(row: dict, entries: list):
     return best if best_score >= TWIN_FULL_MIN else None
 
 
-def attach_appear_spans(rows: list, layers: dict) -> list:
+def attach_appear_spans(rows: list, layers: dict, duration: float | None = None) -> list:
     """补齐每行「出现时段」+「同实体疑似」（不写进 md 表格）。
 
     数据流：九 资产「出现于：镜 N-M」→ 七 分镜表「镜号 → 起秒-止秒」→ MM:SS 时段数组，
@@ -896,7 +1049,7 @@ def attach_appear_spans(rows: list, layers: dict) -> list:
       ③ 正文自带时间码（第十层品牌位一行多段）
       ④ 都解析不出 → 空数组（B2 走中段帧兜底），这里不抛错
     """
-    shot_times = parse_shot_times(layers.get(LAYER_SHOTS, ""))
+    shot_times = parse_shot_times(layers.get(LAYER_SHOTS, ""), duration)
     entries = asset_entries(layers.get(LAYER_ASSETS, ""))
     for row in rows:
         raw = str(row.get("源时间码") or row.get("出现于") or "")
@@ -946,7 +1099,7 @@ def span_payload(video_id: str, rows: list) -> dict:
     }
 
 
-def build_rows(layers: dict) -> list:
+def build_rows(layers: dict, duration: float | None = None) -> list:
     subjects = extract_subjects(layers.get(LAYER_PRODUCT, ""))
     props = extract_props(layers.get(LAYER_MOTION, ""))
     rows = []
@@ -973,7 +1126,8 @@ def build_rows(layers: dict) -> list:
         row["idx"] = index
         row["锁什么"] = row.get("锁什么") or LOCK_BY_CATEGORY[row["类别"]]
     # AT-8 B1：出现时段 + 同实体疑似（清单行生成之后立刻解析，n 就是这里的物理行序）
-    attach_appear_spans(rows, layers)
+    # AT-10 C1：片长透传下去，给分镜表时间码做整表联合消歧（mm:ss vs ss:cs）
+    attach_appear_spans(rows, layers, duration)
     return rows
 
 
@@ -1174,7 +1328,7 @@ def run(source: Path) -> int:
         print(f"ERROR 缺层：{'、'.join(missing)}（清单要 一/二/三/七 四层）", file=sys.stderr)
         return 2
 
-    rows = build_rows(layers)
+    rows = build_rows(layers, probe_duration(markdown))
     if not rows:
         print("ERROR 一个实体都抽不到，未写清单", file=sys.stderr)
         return 3

@@ -234,14 +234,79 @@ def is_core(category: str, advice: str) -> bool:
 
 # ---------------------------------------------------------------- 组装
 
-def _layers(bridge_id: str) -> dict:
+def _summary_markdown(bridge_id: str) -> str:
+    """拆解.md 原文（读不出 → 空串）。代表帧要片长与分镜表，和层解析共用同一次读。"""
     path = ANALYSIS / bridge_id / SUMMARY_NAME
+    if not path.is_file():
+        return ""
+    try:
+        return path.read_text(encoding="utf-8-sig", errors="replace")
+    except OSError:
+        return ""
+
+
+def _split(markdown: str) -> dict:
+    if not str(markdown or "").strip():
+        return {}
+    try:
+        return _confirm().split_layers(markdown)
+    except Exception:
+        return {}
+
+
+def _layers(bridge_id: str) -> dict:
+    return _split(_summary_markdown(bridge_id))
+
+
+# ---------------------------------------------------------------- 意图建议（AT-10 C1）
+
+INTENT_NAME = "意图建议.md"
+
+_INTENT: list = []
+
+
+def _intent():
+    """复用 pipeline/reverse/intent.py 的建议解析件（它不是包，按文件加载；顶层无网络调用）。"""
+    if not _INTENT:
+        path = ROOT / "pipeline" / "reverse" / "intent.py"
+        spec = importlib.util.spec_from_file_location("wanrepro_reverse_intent", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _INTENT.append(module)
+    return _INTENT[0]
+
+
+def load_suggested_shots(bridge_id: str) -> dict[int, list[int]]:
+    """`意图建议.md` → {清单行号: [镜次…]}（同 confirm 的意图建议读写口径）。
+
+    只读建议文本，不调模型。三节全读（必须换 → 建议准备 → 可沿用），行号按 ITEM_RE 取，
+    镜次复用 confirm.shot_numbers（`镜 1、3` / `镜 1-3` 都能展开）。无文件/无匹配 → {}。
+    """
+    if not bridge_id:
+        return {}
+    path = ANALYSIS / bridge_id / INTENT_NAME
     if not path.is_file():
         return {}
     try:
-        return _confirm().split_layers(path.read_text(encoding="utf-8-sig", errors="replace"))
+        text = path.read_text(encoding="utf-8-sig", errors="replace")
     except OSError:
         return {}
+    intent, cf = _intent(), _confirm()
+    out: dict[int, list[int]] = {}
+    for name in intent.SECTION_NAMES:
+        for line in intent._section_bodies(text).get(name) or []:
+            match = intent.ITEM_RE.match(line)
+            if not match:
+                continue
+            try:
+                row = int(match.group("row"))
+            except (TypeError, ValueError):
+                continue
+            for shot in cf.shot_numbers(f"镜{match.group('shots')}"):
+                number = int(shot)
+                if number not in out.setdefault(row, []):
+                    out[row].append(number)
+    return out
 
 
 def build(bridge_id: str, local_id: str) -> list[dict]:
@@ -256,13 +321,49 @@ def build(bridge_id: str, local_id: str) -> list[dict]:
     if not rows:
         return []
     spans, spans_note = load_spans(bridge_id)
-    layers = _layers(bridge_id)
+    markdown = _summary_markdown(bridge_id)
+    layers = _split(markdown)
     twins = {no: (payload.get("同实体疑似") or []) for no, payload in spans.items()}
     positions = {no: payload.get("画面位置") for no, payload in spans.items()}
     # AT-9 B2 确认组（sidecar 顶层『同实体确认』，写端点生产；疑似≠确认，疑似不联动）
     groups = replace.load_groups(bridge_id)
     names = short_names(rows, layers, twins, positions) if layers else {}
     cache = frames.load_cache(bridge_id)
+    # ---- AT-10 C1 代表帧：分镜表时段 → 代表镜（位置键典型镜 → 意图建议镜）→ 同镜共享帧
+    video = frames.video_path(bridge_id)
+    total = frames.duration(video) or (_confirm().probe_duration(markdown) or 0.0)
+    bounds: dict[int, tuple[float, float]] = {}
+    shots_layer = layers.get("七 分镜表", "")
+    if shots_layer:
+        shot_times = _confirm().parse_shot_times(shots_layer, total or None)
+        for shot, (start_text, end_text) in shot_times.items():
+            start, end = frames.clock_seconds(start_text), frames.clock_seconds(end_text)
+            if start is None or end is None or end <= start:
+                continue
+            try:
+                bounds[int(shot)] = (start, end)
+            except (TypeError, ValueError):
+                continue
+    suggested = load_suggested_shots(bridge_id)
+    shared: dict[tuple, dict] = {}      # 组装级去重：("shot", 镜号) / ("fallback", 中段秒) → 同一帧对象
+
+    def representative(no: int, payload: dict) -> dict:
+        """该行代表帧：① 画面位置键所指镜 ② 意图建议里第一个可用镜 ③ 整片中段兜底。"""
+        pos = payload.get("画面位置")
+        shot = pos.get("镜次") if isinstance(pos, dict) else None
+        if not (isinstance(shot, int) and shot in bounds):
+            shot = next((cand for cand in suggested.get(no) or [] if cand in bounds), None)
+        if shot is None:
+            key: tuple = ("fallback", round((total or 0.0) / 2, 2))
+            if key not in shared:
+                shared[key] = frames.build_fallback_frame(bridge_id, local_id, video)
+            return shared[key]
+        key = ("shot", shot)
+        if key not in shared:
+            start, end = bounds[shot]
+            shared[key] = frames.build_shot_frame(bridge_id, local_id, shot, start, end, cache, video)
+        return shared[key]
+
     cards: list[dict] = []
     for row in sorted(rows, key=lambda r: r["no"]):
         no = row["no"]
@@ -276,6 +377,14 @@ def build(bridge_id: str, local_id: str) -> list[dict]:
             located = "未定位"
         elif any(frame.get("定位") == "未精确定位" for frame in shots):
             located = "未精确定位"
+        rep_frame = representative(no, payload)
+        # AT-10 C1 自身框标志：本行画面位置键正指代表帧所属镜（键的典型镜 = 代表镜）→ C2 才画本卡框；
+        # 键镜秒不可用回退到意图镜 / 无键 / 未定位 → False（回退镜没有该资产位置证据，只给帧不画框）
+        pos = payload.get("画面位置")
+        own_box = bool(isinstance(pos, dict) and rep_frame.get("定位") == "精确"
+                       and isinstance(rep_frame.get("镜次"), int)
+                       and isinstance(pos.get("镜次"), int)
+                       and int(pos["镜次"]) == int(rep_frame["镜次"]))
         cards.append({
             "n": no,
             "类别": row.get("cat") or "",
@@ -284,6 +393,10 @@ def build(bridge_id: str, local_id: str) -> list[dict]:
             "核心": is_core(row.get("cat") or "", row.get("advice") or ""),
             "出现时段": spans_now,
             "帧": shots,
+            # AT-10 C1 代表帧（数据合同：{url, 秒, 镜次, 定位}；未定位时镜次 null、不画框不标镜次）
+            # 自身框：见上方 own_box 注释——C2 帧内框的「本卡」判定依据，探针断言 #7=False
+            "代表帧": rep_frame,
+            "自身框": own_box,
             "已传图": split_urls(row.get("cur_assets") or ""),
             "描述": row.get("desc") or "",
             "画面位置": payload.get("画面位置"),
