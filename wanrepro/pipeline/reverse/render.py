@@ -125,6 +125,11 @@ HAND_KEYS = ("手持", "手握", "手拿", "握住", "握着", "举着", "持瓶
 CORE_TAIL_RE = re.compile(r"必须锁住.*$")      # 「必须锁住…」是要求，不是名字
 PAREN_RE = re.compile(r"[（(][^）)]*[）)]")      # 括号里是补充说明
 CORE_SPLIT_RE = re.compile(r"[；;。，,、：:]")    # 核心短语只取第一个分句
+# 颜色/材质修饰词（AT-9 B2 残留清扫用；与 replace_uploaded_asset_refs 的 mod 同词表）
+COLOR_MATERIAL_RE = re.compile(
+    r"(?:[红橙黄绿青蓝紫黑白灰金银粉棕][色]?|荧光|金属|塑料|玻璃|磨砂|亮面|哑光|透明|反光|细长|圆柱)")
+UPLOADED_REF_SPLIT_RE = re.compile(r"(@图片\d+)")   # 捕获组：文本段 / 图号 交替
+CJK_TAIL_RE = re.compile(r"[一-龥]+$")
 CJK_RE = re.compile(r"[\u4e00-\u9fff]")
 MIN_SUFFIX_CJK = 2                             # 后缀至少 2 个汉字，再短就只剩通用词
 MAX_TAGS_PER_LINE = 3                          # 一行最多挂 3 个图号，多了是噪声不是信息
@@ -617,7 +622,8 @@ def assemble_shot_line(cells: list[str], header: list[str], cols: list[str],
     if "速度" in header:
         sv = cells[header.index("速度")].strip() if header.index("速度") < len(cells) else ""
         if sv and sv not in SHOT_SKIP_VALUES and not sv.startswith("—"):
-            speed = sanitize(replace_uploaded_asset_refs(apply_naming(sv, ents), ents))
+            speed = sanitize(strip_core_residue(
+                replace_uploaded_asset_refs(apply_naming(sv, ents), ents), ents))
     bits: list[str] = []
     for name in cols:
         idx = resolve_shot_column(name, header, sec)
@@ -629,7 +635,8 @@ def assemble_shot_line(cells: list[str], header: list[str], cols: list[str],
             continue
         if bare == "情绪/表演" and value.startswith("无可见表情"):
             continue                      # 备注，不是画面内容
-        text = sanitize(replace_uploaded_asset_refs(apply_naming(value, ents), ents))
+        text = sanitize(strip_core_residue(
+            replace_uploaded_asset_refs(apply_naming(value, ents), ents), ents))
         if not text:
             continue
         if bare in ("运动主体", "主体"):
@@ -1190,6 +1197,76 @@ def replace_uploaded_asset_refs(line: str, ents: list[Entity], dimension: str = 
     return line
 
 
+def entity_noun_core(ent: "Entity") -> str:
+    """实体名（AT-9 B2 残留修复）：命名优先；否则「模型看到什么」去字母/数字前缀后取第一个分句，只留汉字。
+
+    #1 `双耳奖杯造型香水小物体。表面为…` → `双耳奖杯造型香水小物体`
+    #11 `C：双耳奖杯形态玻璃香水小物体，…` → `双耳奖杯形态玻璃香水小物体`（去 `C：` 前缀）
+    """
+    base = ent.name or ent.seen
+    base = re.sub(r"^[A-Za-zＡ-Ｚ0-9]{1,3}\s*[：:]\s*", "", base)
+    base = CORE_TAIL_RE.sub("", base)
+    base = PAREN_RE.sub("", base)
+    noun = CORE_SPLIT_RE.split(base)[0]
+    return re.sub(r"[^一-龥]", "", noun)
+
+
+def _noun_grams(noun: str) -> frozenset:
+    """实体名的 2-3 字组（特征词组）：残留清扫的可匹配词集。"""
+    out: set[str] = set()
+    for n in (2, 3):
+        out.update(noun[i:i + n] for i in range(len(noun) - n + 1))
+    return frozenset(out)
+
+
+def _strip_modifier_run(run: str, grams: frozenset) -> str:
+    """从右往左吃掉紧邻图号的「修饰词+实体名」链：颜色材质词或实体名 2-3 字组才吃，别的（动词/别实体词）即停。
+
+    `取出黑色奖杯香水@图片1` 的 run=`取出黑色奖杯香水`：香水✓→奖杯✓→黑色(颜色)✓→取出✗停
+    → 保留 `取出`，吃掉 `黑色奖杯香水`（L1 P129 残留的确切形态）。
+    """
+    i = len(run)
+    while i > 0:
+        for n in (3, 2):
+            if i - n < 0:
+                continue
+            tok = run[i - n:i]
+            if tok in grams or COLOR_MATERIAL_RE.fullmatch(tok):
+                i -= n
+                break
+        else:
+            break
+    return run[:i]
+
+
+def strip_core_residue(line: str, ents: list["Entity"]) -> str:
+    """绑图行残留清扫（AT-9 B2，判据=L1 P129 场景修复后零残留）。
+
+    已传图行(@图片N)左侧**紧邻**的原物核心词——「黑色奖杯香水」挂在 @图片1 前——按
+    实体名 2-3 字组 + 颜色材质词从右往左吃掉；未传图的行一字不动（借创意参考描述本就保留）。
+    只认实体名词组与颜色词，不加模型调用；图号自身与「素材：@图片N」这类行首/标点邻接不受影响。
+    """
+    uploaded: dict[int, frozenset] = {}
+    for e in ents:
+        if e.no and e.has_asset_image:
+            uploaded[e.no] = _noun_grams(entity_noun_core(e))
+    if not uploaded:
+        return line
+    segs = UPLOADED_REF_SPLIT_RE.split(line)
+    out: list[str] = []
+    for i, seg in enumerate(segs):
+        if i % 2 == 1:                          # 捕获组 = 「@图片N」整段
+            grams = uploaded.get(int(seg[3:]))
+            if grams and out:
+                m = CJK_TAIL_RE.search(out[-1])
+                if m:
+                    out[-1] = out[-1][:m.start()] + _strip_modifier_run(m.group(0), grams)
+            out.append(seg)
+        else:
+            out.append(seg)
+    return "".join(out)
+
+
 def header_facts(disc: str) -> dict[str, str]:
     """从拆解头注释读全片参数（时长）；拆解层里没有的字段不编。"""
     facts: dict[str, str] = {}
@@ -1738,9 +1815,9 @@ def render_prompt(fm: dict[str, str], secs: list[Section], layers: dict[str, str
                     continue                      # 维度对不上本段
                 if not want and not b.label:
                     continue
-                lines = [sanitize_with_user_desc(
+                lines = [sanitize_with_user_desc(strip_core_residue(
                     replace_uploaded_asset_refs(apply_naming(x, ents), ents, b.dim, b.layer), ents
-                ) for x in b.lines]
+                ), ents) for x in b.lines]
                 if (sec.field("字样置换").strip() not in ("", "否", "false")
                         and (b.layer == "十" or b.dim == "收束")):
                     # 第十层照抄的参考片字样 → 客户占位（借创意不复刻品牌）：
@@ -1804,7 +1881,9 @@ def render_prompt(fm: dict[str, str], secs: list[Section], layers: dict[str, str
         if not body and re.search(r"首帧|第\s*0\s*秒|起始帧|开场帧", sec.field("写什么")):
             first_shot = next((b for b in blocks.get("七", []) if b.dim == "分镜"), None)
             if first_shot is not None and first_shot.lines:
-                body = [sanitize_with_user_desc("首帧：" + apply_naming(first_shot.lines[0], ents), ents)]
+                body = [sanitize_with_user_desc("首帧：" + strip_core_residue(
+                    replace_uploaded_asset_refs(apply_naming(first_shot.lines[0], ents),
+                                                ents, first_shot.dim, first_shot.layer), ents), ents)]
 
         bodies.append(body)
 

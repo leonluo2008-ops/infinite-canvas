@@ -15,9 +15,13 @@
   · busy 返回 = 排队，不是 failed（AT-6 调度职责，此处只提供状态语义）。
 
 迁移守卫（不可绕过的停点）：
-  · rendering 只能从 awaiting_assets 进（置换确认后）；
+  · rendering 只能从 awaiting_assets 进（置换确认或全沿用显式确认后）；
   · approved 只能从 awaiting_approval 进且必须带审批快照；
   · generating 只能从 approved 进。
+
+AT-9 增量（数据合同 B0，仅此两条）：
+  · 受控回退边 awaiting_approval → awaiting_assets（rollback_to_assets，退回置换）；
+  · 全沿用：awaiting_assets → rendering 允许空置换，前提 empty_confirm:true。
 """
 import hashlib
 import json
@@ -64,10 +68,10 @@ def snapshot_hash(prompt: str, params: dict) -> str:
 
 
 # 停点内建守卫：引擎层强制，不靠调用方自觉（审计路1 B2「不可绕过」）
-#   rendering ← awaiting_assets：必须带置换确认
-#   approved  ← awaiting_approval：必须带审批快照（approval.snapshot_sha256）
+#   rendering ← awaiting_assets：必须带置换确认（assets_confirmed）**或**全沿用显式确认
+#   （empty_confirm，AT-9 数据合同状态机增量 2：空置换显式确认也放行）；
+#   approved ← awaiting_approval：必须带审批快照（approval.snapshot_sha256）
 _BUILTIN_GUARDS: dict[str, list[tuple[str, str]]] = {
-    "rendering": [("assets_confirmed", "置换确认")],
     "approved": [("approval", "审批快照（approval.snapshot_sha256）")],
 }
 
@@ -98,6 +102,11 @@ def transition(task_dir: Path, to_: str, *, note: str = "",
         if not v:
             raise StateError(f"{cur} → {to_} 必须带 {k}（停点守卫，不可绕过）")
         _deep_set(task, k, v)
+    # rendering 停点守卫（引擎内建，二选一）：正常置换确认 或 全沿用显式确认（AT-9 增量 2）
+    if to_ == "rendering" and not (_dig(task, "assets_confirmed") or _dig(task, "empty_confirm")):
+        raise StateError(
+            f"{cur} → rendering 缺置换确认（assets_confirmed）或全沿用确认（empty_confirm）"
+            "——停点守卫（引擎内建，不可绕过）")
     for key, why in _BUILTIN_GUARDS.get(to_, []):
         if not _dig(task, key):
             raise StateError(f"{cur} → {to_} 缺{why}——停点守卫（引擎内建，不可绕过）")
@@ -124,6 +133,28 @@ def _deep_set(d: dict, dotted: str, value) -> None:
     for p in parts[:-1]:
         cur = cur.setdefault(p, {})
     cur[parts[-1]] = value
+
+
+def rollback_to_assets(task_dir: Path, *, note: str = "退回置换") -> dict:
+    """受控回退边（AT-9 数据合同状态机增量 1）：awaiting_approval → awaiting_assets。
+
+    动作「退回置换」：丢弃当前提示词（提示词.md 删除，审批/预演参数一并作废），
+    note 记进 history。这是唯一一条非 forward 的合法迁移——不走 transition（那里只有
+    逐级前进），守卫在函数内：只有 awaiting_approval 能退。
+    """
+    task = load(task_dir)
+    if task["state"] != "awaiting_approval":
+        raise StateError(f"退回置换需 awaiting_approval，当前 {task['state']}")
+    prompt_file = task_dir / "提示词.md"
+    if prompt_file.is_file():
+        prompt_file.unlink()                 # 丢弃当前提示词（合同：回退=丢弃）
+    for key in ("approval", "approval_snapshot", "gen_params"):
+        task.pop(key, None)                  # 预演参数/审批随提示词一起作废
+    task["state"] = "awaiting_assets"
+    task.setdefault("history", []).append({"at": _now(), "from": "awaiting_approval",
+                                           "to": "awaiting_assets", "note": note})
+    save(task_dir, task)
+    return task
 
 
 def approval_stale(task_dir: Path, current_snapshot: str) -> bool:

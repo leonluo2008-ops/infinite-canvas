@@ -1741,6 +1741,16 @@ class Handler(BaseHTTPRequestHandler):
             raise ApiError(400, "请求体必须是 JSON 对象")
         return payload
 
+    def _rows_param(self, payload: dict) -> list[int]:
+        """确认组端点的 rows 参数：非空整数数组（清单行号）。"""
+        raw = (payload or {}).get("rows")
+        if not isinstance(raw, list) or not raw:
+            raise ApiError(400, "rows 必须是非空数组（待确认清单的行号）")
+        try:
+            return sorted({int(x) for x in raw})
+        except (TypeError, ValueError):
+            raise ApiError(400, "rows 必须是整数数组") from None
+
     # -- 路由 ------------------------------------------------------
     def do_GET(self) -> None:
         self.dispatch("GET")
@@ -2034,7 +2044,10 @@ class Handler(BaseHTTPRequestHandler):
             return
         m = re.fullmatch(r"/api/hub/confirm/([^/]+)", path)
         if m:
-            self.send_json(hub_api.do_confirm(urllib.parse.unquote(m.group(1))))
+            # AT-9 B2：body 可带 empty_confirm:true = 全沿用（空置换显式确认 → rendering）
+            payload = self.read_json()
+            self.send_json(hub_api.do_confirm(urllib.parse.unquote(m.group(1)),
+                                              empty_confirm=bool(payload.get("empty_confirm"))))
             return
         m = re.fullmatch(r"/api/hub/render/([^/]+)", path)
         if m:
@@ -2047,6 +2060,30 @@ class Handler(BaseHTTPRequestHandler):
         m = re.fullmatch(r"/api/hub/submit/([^/]+)", path)
         if m:
             self.send_json(hub_api.start_submit(urllib.parse.unquote(m.group(1))))
+            return
+        # ---- AT-9 B2：任务级 REST（确认组 / 回退 / 删除，路径参数非模板变量） ----
+        m = re.fullmatch(r"/api/hub/task/([^/]+)/delete", path)
+        if m:
+            payload = self.read_json()
+            confirm_name = payload.get("confirm_name")
+            self.send_json(hub_api.delete_task(urllib.parse.unquote(m.group(1)),
+                                               confirm_name=None if confirm_name is None
+                                               else str(confirm_name)))
+            return
+        m = re.fullmatch(r"/api/hub/task/([^/]+)/group", path)
+        if m:
+            self.send_json(hub_api.group_rows(urllib.parse.unquote(m.group(1)),
+                                              self._rows_param(self.read_json())))
+            return
+        m = re.fullmatch(r"/api/hub/task/([^/]+)/ungroup", path)
+        if m:
+            self.send_json(hub_api.ungroup_rows(urllib.parse.unquote(m.group(1)),
+                                                self._rows_param(self.read_json())))
+            return
+        m = re.fullmatch(r"/api/hub/task/([^/]+)/rollback", path)
+        if m:
+            self.read_json()                    # 无字段，读掉请求体保持 keep-alive 干净
+            self.send_json(hub_api.do_rollback(urllib.parse.unquote(m.group(1))))
             return
         if path == "/api/hub/asset":
             # AT-8 B2 写路径（数据合同 v3）：{task_id,n,image_url} 覆盖 / {…,clear:true} 清空 / {…,text} 写命名

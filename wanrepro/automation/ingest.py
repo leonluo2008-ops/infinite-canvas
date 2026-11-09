@@ -21,6 +21,7 @@ import argparse
 import hashlib
 import io
 import json
+import re
 import sys
 import zipfile
 from datetime import datetime, timezone
@@ -145,11 +146,43 @@ def _existing_by_sha() -> dict[str, Path]:
     return out
 
 
+TOMBSTONE_NAME = ".tombstones.json"      # 删除墓碑（AT-9 数据合同 B0）：projects/.tombstones.json
+
+
+def tombstone_file() -> Path:
+    return config.PROJECTS_DIR / TOMBSTONE_NAME
+
+
+def load_tombstones() -> list[dict]:
+    """墓碑 → [{id,时间}]；文件缺/坏 → []（坏条目跳过，不挡摄取）。"""
+    f = tombstone_file()
+    if not f.is_file():
+        return []
+    try:
+        data = json.loads(f.read_text(encoding="utf-8-sig"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    if not isinstance(data, list):
+        return []
+    return [item for item in data if isinstance(item, dict) and str(item.get("id") or "").strip()]
+
+
+def _tombstoned_nums() -> set[int]:
+    out: set[int] = set()
+    for item in load_tombstones():
+        m = re.fullmatch(r"auto-(\d+)", str(item.get("id") or ""))
+        if m:
+            out.add(int(m.group(1)))
+    return out
+
+
 def _next_local_id() -> str:
     ensure = config.PROJECTS_DIR
     ensure.mkdir(parents=True, exist_ok=True)
     nums = [int(p.name.split("-")[1]) for p in ensure.glob("auto-*")
             if p.is_dir() and p.name.split("-")[1].isdigit()]
+    # 编号跳过墓碑（AT-9 删除合同）：删掉的任务号不复用，防旧引用/旧产物错接到新任务
+    nums.extend(_tombstoned_nums())
     return f"auto-{max(nums, default=0) + 1:04d}"
 
 

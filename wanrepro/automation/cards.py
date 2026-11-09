@@ -144,16 +144,74 @@ def _base_short_name(category: str, text: str, candidates: list[dict]) -> str:
     return f"{category}{letter.group(1)}" if letter else str(category)
 
 
-def short_names(rows: list[dict], layers: dict, twins: dict[int, list[int]]) -> dict[int, str]:
-    """{清单行号: 短名}：条目名 + 同实体括注（`核心产品（道具）`）。"""
+# ---------------------------------------------------------------- 短名映射表（AT-9 B2）
+# 人话短名映射表初版（合同：人工维护、不加模型调用）：
+#   · 核心产品 → 本品主体（所有者口径：产品在正文/卡片上只叫「本品」）
+#   · 道具C 等  → 按实体名（九 资产 条目名，A/B/C 字母档位保留）
+#   · 人物     → 按描述特征（波波头短发 / 马尾卷发…，同一人物两张登记一眼是同一个人）
+#   · 全不中   → 退路「几何称呼+行号」（画面位置九宫格方位 + 清单行号）
+# 旧『对方类别括注』逻辑（`核心产品（道具）`）废弃：跨类别同实体改用联名「·同件对方短名」，
+# 不再产出任何括注；同类别疑似（#3↔#5 两人物）不加任何标注，靠特征词区分。
+
+CORE_PRODUCT_SHORT = "本品主体"
+CROSS_TWIN_MARK = "·同件{}"
+GRID_NAMES = {1: "左上", 2: "上方", 3: "右上", 4: "左侧", 5: "中央",
+              6: "右侧", 7: "左下", 8: "下方", 9: "右下"}
+PERSON_FEATURES = ("波波头", "短发", "马尾", "卷发", "长发", "直发", "男性", "女性",
+                   "青年", "中年", "胡茬", "光头")
+
+
+def _is_core_product(category: str, text: str, candidates: list[dict]) -> bool:
+    """主体行是否「核心产品」：匹配到的实体名带「核心」（如条目名就叫核心产品）。"""
+    pool = [c for c in candidates if c["类别"] == "主体"]
+    scored = sorted(((_score(c, text), c["名字"]) for c in pool), key=lambda x: -x[0])
+    matched = [name for score, name in scored if score >= MATCH_MIN and name]
+    return bool(matched and "核心" in matched[0])
+
+
+def _person_short_name(text: str) -> str:
+    """人物 → 按描述特征：描述里按出现顺序取前两个特征词拼「XX人物」。"""
+    feats = [w for w in PERSON_FEATURES if w in str(text or "")][:2]
+    return ("".join(feats) + "人物") if feats else "人物"
+
+
+def _grid_fallback(no: int, pos) -> str:
+    """退路：几何称呼+行号。画面位置（九宫格 1-9）在场 → 「左侧位·行12」；不在 → 「行12」。"""
+    grid = pos.get("格") if isinstance(pos, dict) else None
+    name = GRID_NAMES.get(grid) if isinstance(grid, int) else None
+    return f"{name}位·行{no}" if name else f"行{no}"
+
+
+def short_names(rows: list[dict], layers: dict, twins: dict[int, list[int]],
+                positions: dict[int, dict] | None = None) -> dict[int, str]:
+    """{清单行号: 人话短名}（AT-9 B2 映射表初版，无括注）。
+
+    跨类别同实体（疑似面，只做展示提示；写联动只认确认组）联名「·同件对方短名」，
+    两张卡一眼分得开——at8 的 #2/#7（主体↔道具）各带对方称呼。
+    """
     candidates = _candidates(layers)
-    twins_of = {row["no"]: [int(x) for x in (twins.get(row["no"]) or [])] for row in rows}
+    positions = positions or {}
     cat_of = {row["no"]: row.get("cat") or "" for row in rows}
     out: dict[int, str] = {}
     for row in rows:
-        base = _base_short_name(cat_of[row["no"]], row.get("desc") or "", candidates)
-        others = sorted({cat_of.get(t) or "" for t in twins_of[row["no"]]} - {""})
-        out[row["no"]] = base + "".join(f"（{other}）" for other in others)
+        no, cat, text = row["no"], row.get("cat") or "", row.get("desc") or ""
+        if cat == "主体":
+            base = CORE_PRODUCT_SHORT if _is_core_product(cat, text, candidates) \
+                else _base_short_name(cat, text, candidates)
+        elif cat == "人物":
+            base = _person_short_name(text)
+        else:
+            base = _base_short_name(cat, text, candidates)
+        if base == cat:                      # 映射全不中（裸类别）→ 退路：几何称呼+行号
+            base = _grid_fallback(no, positions.get(no))
+        out[no] = base
+    base_only = dict(out)                    # 联名前快照：联名只引对方短名，不嵌对方的联名
+    for row in rows:                         # 跨类别同实体联名（非括注形态）
+        no = row["no"]
+        marks = [base_only.get(t) or f"行{t}" for t in sorted({int(x) for x in (twins.get(no) or [])})
+                 if cat_of.get(t) and cat_of.get(t) != cat_of[no]]
+        if marks:
+            out[no] = out[no] + "".join(CROSS_TWIN_MARK.format(m) for m in marks)
     return out
 
 
@@ -200,7 +258,10 @@ def build(bridge_id: str, local_id: str) -> list[dict]:
     spans, spans_note = load_spans(bridge_id)
     layers = _layers(bridge_id)
     twins = {no: (payload.get("同实体疑似") or []) for no, payload in spans.items()}
-    names = short_names(rows, layers, twins) if layers else {}
+    positions = {no: payload.get("画面位置") for no, payload in spans.items()}
+    # AT-9 B2 确认组（sidecar 顶层『同实体确认』，写端点生产；疑似≠确认，疑似不联动）
+    groups = replace.load_groups(bridge_id)
+    names = short_names(rows, layers, twins, positions) if layers else {}
     cache = frames.load_cache(bridge_id)
     cards: list[dict] = []
     for row in sorted(rows, key=lambda r: r["no"]):
@@ -227,6 +288,8 @@ def build(bridge_id: str, local_id: str) -> list[dict]:
             "描述": row.get("desc") or "",
             "画面位置": payload.get("画面位置"),
             "同实体疑似": payload.get("同实体疑似") or [],
+            # AT-9 B2 确认组：该行所属组（升序）；无组 = []（合同：空数组行为同现状）
+            "同实体确认": next((list(g) for g in groups if no in g), []),
             # 定位状态（合同 v3 审计「字段缺：定位状态」）：精确 / 未精确定位 / 未定位
             "定位": located,
             "时段来源": payload.get("来源") or spans_note or ("无侧车（旧任务）" if not spans else ""),

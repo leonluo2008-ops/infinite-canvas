@@ -18,6 +18,7 @@ P1（置换场所）所有者挂起中：本模块是「输入面 A=交 Agent」
 缺省映射：按「必须换」行优先、其余配「主体」行序，回显供确认。
 """
 import argparse
+import json
 import re
 import sys
 from pathlib import Path
@@ -126,6 +127,115 @@ def set_row(bridge_id: str, no: int, *, image_urls: list[str] | None = None,
     return row
 
 
+# ---------------------------------------------------------------- 同实体确认组（AT-9 B2）
+
+GROUPS_KEY = "同实体确认"          # sidecar 顶层键：[[1,11],...]（数据合同 B0）
+
+
+def sidecar_path(bridge_id: str) -> Path:
+    return (Path(__file__).resolve().parent.parent / "analysis" / "reverse"
+            / bridge_id / "待确认清单.json")
+
+
+def load_groups(bridge_id: str) -> list[list[int]]:
+    """sidecar 顶层『同实体确认』→ [[1,11],...]；无 sidecar/无键/坏值 → []（合同：空=无组，行为同现状）。"""
+    path = sidecar_path(bridge_id)
+    if not path.is_file():
+        return []
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    raw = payload.get(GROUPS_KEY) if isinstance(payload, dict) else None
+    out: list[list[int]] = []
+    for group in raw or []:
+        if isinstance(group, list) and len(group) >= 2 \
+                and all(isinstance(x, int) and x >= 1 for x in group):
+            out.append(sorted(set(group)))
+    return out
+
+
+def save_groups(bridge_id: str, groups: list[list[int]]) -> list[list[int]]:
+    """规范后整组写回 sidecar（保留其它键不动）：行去重升序、共员组合并、<2 的组剔除。"""
+    merged: list[list[int]] = []
+    for group in groups:
+        cur = sorted({int(x) for x in group})
+        touch = [g for g in merged if set(g) & set(cur)]
+        for g in touch:
+            merged.remove(g)
+            cur = sorted(set(cur) | set(g))
+        if len(cur) >= 2:
+            merged.append(cur)
+    merged.sort()
+    path = sidecar_path(bridge_id)
+    payload: dict = {}
+    if path.is_file():
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8-sig"))
+            if isinstance(loaded, dict):
+                payload = loaded
+        except (OSError, json.JSONDecodeError):
+            payload = {}                     # 坏 sidecar：保留键失败就只写组键（组是本函数的责权）
+    payload[GROUPS_KEY] = merged
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    tmp.replace(path)
+    return merged
+
+
+def group_members(bridge_id: str, no: int) -> list[int]:
+    """含 no 的确认组（升序）；无组 → []（调用方走单行路径）。"""
+    for group in load_groups(bridge_id):
+        if no in group:
+            return list(group)
+    return []
+
+
+def set_group_write(task_dir: Path, no: int, *, image_url: str | None = None,
+                    clear: bool = False, text: str | None = None) -> dict:
+    """确认组写路径**单点**（AT-9 §六层3）：校验组存在 → 整组写清单 → 同步上传流水 → 写后回显组内全行。
+
+    同实体疑似**不联动**（组里没有就抛错，调用方走单行路径）；任一行写失败如实抛
+    ReplaceError（错误不报整组成功）；调用方持任务级串行锁。
+    """
+    task = state.load(task_dir)
+    bridge = str(task.get("bridge_id") or "")
+    members = group_members(bridge, no)
+    if len(members) < 2:
+        raise ReplaceError(f"第 {no} 行不在任何确认组里（疑似不联动，先在详情页成组）")
+    rows: list[dict] = []
+    for m in members:
+        try:
+            if image_url is not None:
+                rows.append(set_row(bridge, m, image_urls=[image_url], overwrite=True))
+            elif clear:
+                rows.append(set_row(bridge, m, image_urls=[], overwrite=True))
+            else:
+                rows.append(set_row(bridge, m, name=str(text or "")))
+        except ReplaceError as e:
+            raise ReplaceError(f"组 {members} 写清单在第 {m} 行失败（不报整组成功）: {e}") from None
+    # 同步上传流水（语义同 _record_pending：清=撤流水；传图=落流水；命名=改已有流水）
+    pending = [dict(x) for x in (task.get("pending_replace") or []) if isinstance(x, dict)]
+    descs = {r["no"]: r.get("desc") or "" for r in rows}
+    for m in members:
+        if clear:
+            pending = [x for x in pending if x.get("no") != m]
+        elif image_url is not None:
+            entry = next((x for x in pending if x.get("no") == m), None)
+            if entry is None:
+                entry = {"no": m, "img": "", "url": "", "name": "",
+                         "desc": str(descs.get(m, ""))[:40]}
+                pending.append(entry)
+            entry["url"] = image_url
+        elif text is not None:
+            entry = next((x for x in pending if x.get("no") == m), None)
+            if entry is not None:
+                entry["name"] = text
+    pending.sort(key=lambda x: x.get("no") or 0)
+    state.save(task_dir, {**task, "pending_replace": pending})
+    return {"members": members, "rows": rows}
+
+
 def collect_images(src: str) -> list[Path]:
     p = Path(src)
     if p.is_file():
@@ -167,20 +277,33 @@ def parse_map(spec: str) -> list[tuple[int, str]]:
 
 
 def run_replace(task_dir: Path, *, assets: list[str] | None, map_spec: str | None,
-                name_spec: str | None, confirm: bool, verbose: bool = True) -> str:
+                name_spec: str | None, confirm: bool, verbose: bool = True,
+                empty_confirm: bool = False) -> str:
     task = state.load(task_dir)
     cur = task["state"]
     if confirm:
         if cur != "awaiting_assets":
             raise ReplaceError(f"确认置换需 awaiting_assets，当前 {cur}")
         pending = task.get("pending_replace")
-        if not pending:
-            raise ReplaceError("没有待确认的置换（先跑 --assets 回填再 --confirm）")
-        state.transition(task_dir, "rendering",
-                         require={"assets_confirmed": True},
-                         note="所有者确认置换", extra={"assets_confirmed": pending})
+        if not pending and not empty_confirm:
+            raise ReplaceError("没有待确认的置换（先跑 --assets 回填再 --confirm；"
+                               "全沿用=空置换，必须显式 empty_confirm=true）")
+        # 全沿用（AT-9 §四/数据合同）：空置换显式确认也放行——rendering 停点守卫认
+        # empty_confirm 标志（state.py），assets_confirmed 落 [] 供提交链消费。
+        if pending:
+            state.transition(task_dir, "rendering",
+                             require={"assets_confirmed": pending},
+                             note="所有者确认置换",
+                             extra={"assets_confirmed": pending})
+        else:
+            state.transition(task_dir, "rendering",
+                             require={"empty_confirm": True},
+                             note="所有者确认全沿用（空置换，empty_confirm）",
+                             extra={"assets_confirmed": [], "empty_confirm": True,
+                                    "全沿用": {"at": state._now()}})
         if verbose:
-            print(f"[OK] {task['local_id']}: 置换已确认 → rendering（回填 {len(pending)} 行）")
+            how = f"回填 {len(pending)} 行" if pending else "全沿用（空置换）"
+            print(f"[OK] {task['local_id']}: 置换已确认 → rendering（{how}）")
         return "rendering"
 
     if cur != "awaiting_assets":
@@ -238,6 +361,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--map", help="显式配对：1=a.png,2=b.png")
     ap.add_argument("--name", help="命名回填：1=我们的产品")
     ap.add_argument("--confirm", action="store_true", help="确认置换 → rendering")
+    ap.add_argument("--empty-confirm", action="store_true",
+                    help="全沿用：空置换显式确认（AT-9 §四），与 --confirm 同用 → rendering")
     ap.add_argument("--bridge")
     args = ap.parse_args(argv)
     if args.bridge:
@@ -248,7 +373,8 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit(f"找不到任务 {args.local_id}")
     try:
         run_replace(tdir, assets=args.assets, map_spec=args.map,
-                    name_spec=args.name, confirm=args.confirm)
+                    name_spec=args.name, confirm=args.confirm,
+                    empty_confirm=args.empty_confirm)
         return 0
     except (ReplaceError, bridge.BridgeError, state.StateError) as e:
         print(f"[FAIL] {e}", file=sys.stderr)
