@@ -73,8 +73,11 @@ def load_spans(bridge_id: str) -> tuple[dict[int, dict], str]:
             n = int(row.get("n"))
         except (TypeError, ValueError):
             continue
+        pos = row.get("画面位置")
         out[n] = {
             "出现时段": [span for span in (row.get("出现时段") or []) if isinstance(span, dict)],
+            # AT-9 B1 读侧透传：{"格":1-9,"镜次":N}，旧 sidecar / 缺值 → None（消费端标「未能标注」）
+            "画面位置": pos if isinstance(pos, dict) else None,
             "同实体疑似": [int(x) for x in (row.get("同实体疑似") or [])],
             "来源": str(row.get("来源") or ""),
         }
@@ -222,6 +225,7 @@ def build(bridge_id: str, local_id: str) -> list[dict]:
             "帧": shots,
             "已传图": split_urls(row.get("cur_assets") or ""),
             "描述": row.get("desc") or "",
+            "画面位置": payload.get("画面位置"),
             "同实体疑似": payload.get("同实体疑似") or [],
             # 定位状态（合同 v3 审计「字段缺：定位状态」）：精确 / 未精确定位 / 未定位
             "定位": located,

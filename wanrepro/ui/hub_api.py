@@ -49,11 +49,46 @@ def _task_dir(local_id: str) -> Path:
     return d
 
 
+def _intent_mod():
+    """按路径加载 pipeline/reverse/intent.py（它不是包，同 cards._confirm 的加载法）。
+
+    建议合同（AT-9 B1）：意图建议的结构化解析**复用 intent.py 规范解析**（parse_suggestions
+    三节校验/全半角竖线/行号与镜次校验都有），禁新写解析器。
+    """
+    import importlib.util
+    path = ROOT / "pipeline" / "reverse" / "intent.py"
+    spec = importlib.util.spec_from_file_location("wanrepro_reverse_intent", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _replaced_count(bridge_id: str) -> str:
+    """已换数=已传图行数/必换行数（数据合同：实时计算，不落盘）；清单还没有（未拆解）→ 空串。"""
+    if not bridge_id:
+        return ""
+    path = ROOT / "analysis" / "reverse" / bridge_id / "待确认清单.md"
+    if not path.is_file():
+        return ""
+    rows = replace.parse_rows(path.read_text(encoding="utf-8-sig", errors="replace"))
+    if not rows:
+        return ""
+    filled = sum(1 for r in rows if (r.get("cur_assets") or "").strip())
+    must = sum(1 for r in rows if "必须换" in (r.get("advice") or ""))
+    return f"{filled}/{must}"
+
+
 def _summary(task: dict, task_dir: Path) -> dict:
     out = (task_dir / VIDEO_FILE).is_file()
+    # AT-9 B1 表格摘要三字段（数据合同）：任务名/阶段/已换数——列表页不拉详情
+    task_name = f"{task['local_id']}·{(task.get('ingestion') or {}).get('video_name', '')}"
+    stage = str(task.get("lapian_stage") or "") if task["state"] == "discussing" else ""
     return {
         "local_id": task["local_id"],
         "bridge_id": task.get("bridge_id"),
+        "task_name": task_name,
+        "stage": stage,
+        "replaced": _replaced_count(str(task.get("bridge_id") or "")),
         "state": task["state"],
         "intent": task.get("intent", ""),
         "created_at": task.get("created_at"),
@@ -83,6 +118,38 @@ def _read(path: Path | None) -> str:
         return ""
 
 
+SUGGESTION_NAME = "意图建议.md"
+
+
+def _suggestions(raw: str, checklist_md: str, disc_md: str) -> list[dict]:
+    """AT-9 B1 建议合同：意图建议.md 原文 → intent.py 规范解析 → 按当前清单行透出。
+
+    [{n, 档位, 理由, 镜次, 待核对}]：清单每一行一条。缺文件（raw 空）/ 解析失败 / 行号与
+    当前清单对不上 → 该行 待核对=True 且 档位 恒空（**禁自动归「可沿用」**——那是替换判断，
+    只能人给）。行号交叉核对、镜次校验、三节完整性全部复用 intent.parse_suggestions，这里只做编排。
+    """
+    rows = replace.parse_rows(checklist_md) if checklist_md.strip() else []
+    items: dict[int, dict] = {}
+    if raw.strip() and rows and disc_md.strip():
+        intent = _intent_mod()
+        try:
+            normalized, _inv, _dup, _bad = intent.parse_suggestions(raw, disc_md, checklist_md)
+        except intent.IntentError:
+            normalized = ""                       # 解析失败 → 全部行待核对，不猜
+        for section, lines in intent._section_bodies(normalized).items():
+            for line in lines:
+                match = intent.ITEM_RE.match(line)
+                if not match:
+                    continue
+                n = int(match.group("row"))
+                items[n] = {"n": n, "档位": section, "理由": match.group("reason"),
+                            "镜次": [int(x) for x in re.findall(r"\d+", match.group("shots"))],
+                            "待核对": False}
+    return [items.get(row["no"])
+            or {"n": row["no"], "档位": "", "理由": "", "镜次": [], "待核对": True}
+            for row in sorted(rows, key=lambda r: r["no"])]
+
+
 def _checklist_path(bridge_id: str) -> Path:
     return ROOT / "analysis" / "reverse" / bridge_id / "待确认清单.md"
 
@@ -95,13 +162,19 @@ def get_task(local_id: str) -> dict:
     task_dir = _task_dir(local_id)
     task = state.load(task_dir)
     d = _summary(task, task_dir)
+    summary_md = _read(ROOT / "analysis" / "reverse" / str(task.get("bridge_id")) / "拆解.md")
+    checklist_md = _read(_checklist_path(str(task.get("bridge_id"))))
     d.update({
-        "summary_md": _read(ROOT / "analysis" / "reverse" / str(task.get("bridge_id")) / "拆解.md"),
-        "checklist_md": _read(_checklist_path(str(task.get("bridge_id")))),
+        "summary_md": summary_md,
+        "checklist_md": checklist_md,
         "prompt_md": _read(_prompt_path(task_dir, task)),
         "pair_lines": task.get("pending_replace") or [],
         # AT-8 B2：置换台视觉包（合同 v3）。只读面——写路径见 set_asset。
         "asset_cards": cards.build(str(task.get("bridge_id") or ""), local_id),
+        # AT-9 B1 建议合同：意图建议结构化透出（复用 intent.py 解析，缺/坏/行号不匹配 → 待核对）
+        "suggestions": _suggestions(
+            _read(ROOT / "analysis" / "reverse" / str(task.get("bridge_id") or "") / SUGGESTION_NAME),
+            checklist_md, summary_md),
         "error": (task.get("history") or [{}])[-1].get("note", "")
         if task["state"] == "failed" else "",
         "gen": task.get("gen") or {},

@@ -649,6 +649,11 @@ SHOT_NUMBER_SPAN_RE = re.compile(r"^(\d{1,3})\s*[-–—~～至]\s*(\d{1,3})$")
 # 同实体疑似阈值：首句（形态主语）覆盖率与整段覆盖率都过才认，只过一个说明是「顺带提到」
 TWIN_FIRST_MIN = 0.45
 TWIN_FULL_MIN = 0.30
+# 「画面位置：九宫格N·镜M」（AT-9 B1 注入的九 资产 条目尾段 → sidecar 新键，数据合同 v3）
+# 分隔符宽容：模型可能写 `九宫格5·镜2` / `九宫格 5，镜 2` / `九宫格5:镜2`，锚点（画面位置/九宫格/镜）必须齐
+POSITION_RE = re.compile(
+    r"画面位置\s*[：:]\s*九宫格\s*(\d{1,2})\s*[·•・.。,，;；:：\s]*镜\s*(\d{1,3})"
+)
 
 
 def clock_to_seconds(text: str):
@@ -766,8 +771,23 @@ def spans_from_appearance(appear: str, shot_times: dict) -> list:
     return spans_from_text(appear)
 
 
+def entry_position(label: str, body: str = "") -> dict | None:
+    """条目里的「画面位置：九宫格N·镜M」→ {"格": N, "镜次": M}；没写/格不在 1–9 → None。
+
+    AT-9 B1：生产者=拆解任务书【§9·画面位置】注入，模型在每条九 资产 条目末尾带这一段；
+    旧拆解（没有这一段）自然落 None，消费端按「未能标注」兜底——合同不要求补写。
+    """
+    match = POSITION_RE.search(f"{label or ''}：{body or ''}")
+    if not match:
+        return None
+    cell, shot = int(match.group(1)), int(match.group(2))
+    if not 1 <= cell <= 9 or shot <= 0:
+        return None
+    return {"格": cell, "镜次": shot}
+
+
 def asset_entries(assets_layer: str) -> list:
-    """九 资产 → [{类别, 名字, 出现于, 正文}]（空态行跳过）——时段解析的源资产表。"""
+    """九 资产 → [{类别, 名字, 出现于, 画面位置, 正文}]（空态行跳过）——时段解析的源资产表。"""
     entries = []
     for label, text in bullets(assets_layer):
         if is_absent_state(f"{label}：{text}"):
@@ -777,7 +797,8 @@ def asset_entries(assets_layer: str) -> list:
             # 出现时段也可能落在正文侧（`**道具B**（出现于：镜 3-6）：…` 被拆成标签+正文）
             found = re.search(r"[（(]\s*出现于[:：]?\s*([^）)]*)[）)]", f"{label}：{text}")
             appear = found.group(1).strip() if found else ""
-        entries.append({"类别": kind, "名字": name, "出现于": appear, "正文": text})
+        entries.append({"类别": kind, "名字": name, "出现于": appear,
+                        "画面位置": entry_position(label, text), "正文": text})
     return entries
 
 
@@ -893,6 +914,14 @@ def attach_appear_spans(rows: list, layers: dict) -> list:
                 source = "正文时间码"
         row["出现时段"] = spans
         row["时段来源"] = source
+    # AT-9 B1：画面位置（九宫格 1–9 + 所属镜次）——九 资产 条目带的尾段随同实体匹配带到清单行；
+    # 匹配不到条目的行保持 None（合同「旧任务缺值 → 前端描述首句常驻+未能标注」同款兜底）。
+    for row in rows:
+        if row.get("画面位置"):
+            continue
+        entry = twin_asset_entry(row, entries)
+        if entry and entry.get("画面位置"):
+            row["画面位置"] = entry["画面位置"]
     return mark_twin_entities(rows)
 
 
@@ -908,6 +937,7 @@ def span_payload(video_id: str, rows: list) -> dict:
                 "n": row["idx"],
                 "类别": row["类别"],
                 "出现时段": list(row.get("出现时段") or []),
+                "画面位置": row.get("画面位置"),          # AT-9 B1 新键：{"格":1-9,"镜次":N} 或 None
                 "同实体疑似": list(row.get("同实体疑似") or []),
                 "来源": row.get("时段来源") or "",
             }
