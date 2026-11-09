@@ -3,6 +3,8 @@ import { App, Button, Checkbox, Drawer, Empty, Image as AntdImage, Input, Progre
 import { useCallback, useEffect, useRef, useState, type DragEvent } from "react";
 import { Streamdown } from "streamdown";
 
+import { badgeFits, boxRect, containRect, frameCaption, frameState, layoutLegend, otherBoxCount, stageSize } from "@/lib/hub/frame-overlay";
+
 import {
     approveHubTask,
     confirmHubReplace,
@@ -390,6 +392,9 @@ function AssetSection({
     const { message, modal } = App.useApp();
     const taskId = detail.local_id;
     const cards = [...detail.asset_cards].sort((a, b) => a.n - b.n);
+    // 影响镜次（AT-10 C05 信息下沉）：意图建议的镜次，纯透出，不新增识别调用。
+    const shotMap = new Map<number, number[]>(detail.suggestions.map((item) => [item.n, [...item.镜次].sort((a, b) => a - b)]));
+    const shotsOf = (rows: number[]) => [...new Set(rows.flatMap((n) => shotMap.get(n) || []))].sort((a, b) => a - b);
 
     // 确认组：同实体确认 ≥2 行的成员归到一组；一卡展示，一传全组联动（后端单点写）。
     const groupMap = new Map<string, HubAssetCard[]>();
@@ -494,6 +499,7 @@ function AssetSection({
                     key={`group-${bucket.map((c) => c.n).join("-")}`}
                     bucket={bucket}
                     color={OVERLAY_COLORS[index % OVERLAY_COLORS.length]}
+                    shots={shotsOf(bucket.map((card) => card.n))}
                     busy={busy}
                     setBusy={setBusy}
                     taskId={taskId}
@@ -510,6 +516,7 @@ function AssetSection({
                         key={card.n}
                         card={card}
                         color={OVERLAY_COLORS[(groups.length + index) % OVERLAY_COLORS.length]}
+                        shots={shotsOf([card.n])}
                         busy={busy}
                         setBusy={setBusy}
                         taskId={taskId}
@@ -567,6 +574,7 @@ function AssetSection({
 function GroupCard({
     bucket,
     color,
+    shots,
     busy,
     setBusy,
     taskId,
@@ -575,6 +583,7 @@ function GroupCard({
 }: {
     bucket: HubAssetCard[];
     color: string;
+    shots: number[];
     busy: BusyKind;
     setBusy: (kind: BusyKind) => void;
     taskId: string;
@@ -584,19 +593,24 @@ function GroupCard({
     const representative = bucket[0];
     const uploadedAll = [...new Set(bucket.flatMap((card) => card.已传图))];
     return (
-        <div className="mt-3 rounded-lg border-2 border-dashed border-emerald-300 bg-emerald-50/40 p-3 dark:border-emerald-700 dark:bg-emerald-950/20">
+        <div
+            className="mt-3 rounded-lg border-2 border-dashed border-emerald-300 bg-emerald-50/40 p-3 dark:border-emerald-700 dark:bg-emerald-950/20"
+            style={{ borderLeft: `4px solid ${color.replace(/0\.30\)$/, "0.85)")}` }}
+        >
             <div className="flex flex-wrap items-center gap-2">
                 <Tag color="success" className="m-0">同一件东西·共{bucket.length}行</Tag>
                 <span className="text-sm font-semibold">{representative.短名 || `#${representative.n}`}</span>
                 {representative.建议 === "必须换" ? <Tag color="red" className="m-0">必须换</Tag> : null}
                 <span className="font-mono text-xs text-stone-400 dark:text-stone-500">#{bucket.map((card) => card.n).join("、#")}</span>
+                {shots.length ? <span className="text-xs text-stone-400 dark:text-stone-500">影响镜次：第{shots.join("、")}镜</span> : null}
                 <Button size="small" className="ml-auto" loading={busy === "ungroup"} disabled={busy !== null} onClick={onUngroup}>
                     解组
                 </Button>
             </div>
             <div className="mt-1 text-xs text-emerald-700 dark:text-emerald-400">组内一行换图 = 全组生效（清单、流水、提交次序三处同步，由后端单点完成）。</div>
             <div className="mt-2 flex flex-wrap items-stretch gap-2">
-                <FrameWithPosition card={representative} color={color} className="w-56 shrink-0" />
+                <FrameWithPosition card={representative} shots={shots} className="shrink-0" />
+
                 {uploadedAll.length ? <ArrowRight className="mx-0.5 size-5 shrink-0 self-center text-stone-300 dark:text-stone-600" /> : null}
                 <AssetUploadZone
                     taskId={taskId}
@@ -624,6 +638,7 @@ function GroupCard({
 function AssetCardUnit({
     card,
     color,
+    shots,
     busy,
     setBusy,
     taskId,
@@ -632,6 +647,7 @@ function AssetCardUnit({
 }: {
     card: HubAssetCard;
     color: string;
+    shots: number[];
     busy: BusyKind;
     setBusy: (kind: BusyKind) => void;
     taskId: string;
@@ -658,17 +674,24 @@ function AssetCardUnit({
     };
 
     return (
-        <div className="rounded-lg border border-stone-200 p-3 dark:border-stone-800">
+        <div
+            className="rounded-lg border border-stone-200 p-3 dark:border-stone-800"
+            style={{ borderLeft: `4px solid ${color.replace(/0\.30\)$/, "0.85)")}` }}
+        >
             <header className="flex flex-wrap items-center gap-2">
                 {card.建议 === "必须换" ? <Tag color="red" className="m-0">必须换</Tag> : card.建议 === "建议准备" ? <Tag color="blue" className="m-0">建议准备</Tag> : null}
                 <span className="text-sm font-semibold">{card.短名 || `#${card.n}`}</span>
                 <span className="font-mono text-xs text-stone-400 dark:text-stone-500">#{card.n}</span>
                 <span className="text-xs text-stone-400 dark:text-stone-500">{card.类别}</span>
-                {card.已传图.length ? <Tag color="success" className="m-0">已换图</Tag> : null}
+                {card.已传图.length ? <Tag color="success" className="m-0">已换图</Tag> : <Tag className="m-0">未换·沿用原片</Tag>}
+                {card.同实体确认.length >= 2 ? (
+                    <Tag color="cyan" className="m-0">确认组 #{card.同实体确认.join("、#")}</Tag>
+                ) : null}
+                {shots.length ? <span className="text-xs text-stone-400 dark:text-stone-500">影响镜次：第{shots.join("、")}镜</span> : null}
             </header>
 
             <div className="mt-2 flex flex-wrap items-stretch gap-2">
-                <FrameWithPosition card={card} color={color} className="w-56 shrink-0" />
+                <FrameWithPosition card={card} shots={shots} className="shrink-0" />
                 {card.已传图.length ? <ArrowRight className="mx-0.5 size-5 shrink-0 self-center text-stone-300 dark:text-stone-600" /> : null}
                 <AssetUploadZone taskId={taskId} n={card.n} uploaded={card.已传图} busy={busy} setBusy={setBusy} onWritten={onWritten} />
             </div>
@@ -706,66 +729,239 @@ function AssetCardUnit({
     );
 }
 
+/** 角标（建议列原文）配色：与 AT-8 卡片角标同源，禁新增识别调用。 */
+const BOX_ACCENT: Record<string, string> = {
+    必须换: "rgb(225,29,72)",
+    建议准备: "rgb(37,99,235)",
+    可沿用: "rgb(120,113,108)",
+};
+const accentOf = (label: string) => BOX_ACCENT[label] || BOX_ACCENT["可沿用"];
+
 /**
- * 原片帧 + 九宫格粗标 overlay（§六层1）：半透明色框落在「格」，标『基于第N镜·AI粗标』；
- * 位置缺失 → 描述首句常驻 + 『未能标注』。不承诺精确物体框，只做辨认引导。
+ * 共享帧 + 同帧多红框（AT-10 C3）：overlay 与图片共用 contain 后**实际内容盒**（不是外框），
+ * 九宫格百分比直接落内容盒；全部框保留红色边界，本卡加粗实红、其他行红半透明；
+ * 图例 rail 逐行号排布（行号·短名·角标），引线汇聚到各自框——同格多框也逐行号可见可分。
+ * 三态诚实：未定位→不画框不标镜次+「未能定位到该资产出现的镜头·暂用整片画面」；
+ * 无自身位置→帧与镜次照给、他人框照画、描述首句+「未能标注位置」。旧字段（帧[]/画面位置）仍驱动 legacy 分支。
  */
-function FrameWithPosition({ card, color, className = "" }: { card: HubAssetCard; color: string; className?: string }) {
-    const frames = card.帧.filter((item) => item.url);
-    const pos = card.画面位置;
+function FrameWithPosition({ card, className = "", shots = [] }: { card: HubAssetCard; className?: string; shots?: number[] }) {
+    const state = frameState(card);
+    const legacyUrl = card.帧.map((frame) => (frame.url || "").trim()).find(Boolean) || "";
+    const url = (card.代表帧.url || "").trim() || legacyUrl;
+    const [ratio, setRatio] = useState<number | null>(null);
+    const [hoverRow, setHoverRow] = useState<number | null>(null);
+
+    const stage = stageSize(ratio);
+    const content = containRect(ratio, stage);
+    // 未定位态：不画任何框（合同：帧内框=[] 时也不画）；legacy 只画旧字段那一格。
+    const boxes = state === "precise" || state === "no-own-box" ? card.帧内框 : [];
+    const laid = boxes
+        .map((box) => ({ box, rect: boxRect(box, content) }))
+        .sort((a, b) => Number(a.box.本卡) - Number(b.box.本卡));
+    const legend = layoutLegend(laid.map(({ box, rect }) => ({ 行: box.行, box: rect })), stage);
+
+    const legacyPosition = state === "legacy" ? card.画面位置 : null;
+    const legacyRect =
+        legacyPosition && legacyPosition.格 >= 1 && legacyPosition.格 <= 9
+            ? boxRect(
+                  {
+                      "x%": ((legacyPosition.格 - 1) % 3) * (100 / 3),
+                      "y%": Math.floor((legacyPosition.格 - 1) / 3) * (100 / 3),
+                      "w%": 100 / 3,
+                      "h%": 100 / 3,
+                  },
+                  content,
+              )
+            : null;
+
+    const caption = frameCaption(card, state);
     const firstDesc = firstSentence(card.描述);
+    const others = otherBoxCount(laid.map(({ box }) => box));
+    const shotText = shots.length ? `第${shots.join("、")}镜` : "";
+    const wrapperW = legend.chips.length ? legend.x + legend.w : stage.w;
+    const wrapperH = Math.max(stage.h, legend.height);
 
     return (
-        <div className={className}>
-            <div className="relative overflow-hidden rounded-md border border-stone-200 bg-stone-100 dark:border-stone-800 dark:bg-stone-900">
-                <div className="flex aspect-video items-center justify-center">
-                    {frames.length ? (
-                        <AntdImage src={frames[0].url} alt={`#${card.n} 原片帧`} className="size-full object-contain" />
+        <div className={className} data-hub-frame-state={state}>
+            <div className="relative flex items-start" style={{ width: wrapperW, height: wrapperH }}>
+                {/* 舞台：尺寸按帧真实宽高比定（竖屏窄、横屏宽）；overflow 只裁图片圆角，标签全在舞台之外 */}
+                <div
+                    className="relative shrink-0 overflow-hidden rounded-md border border-stone-200 bg-stone-100 dark:border-stone-800 dark:bg-stone-900"
+                    style={{ width: stage.w, height: stage.h }}
+                    data-hub-frame-stage
+                    data-hub-frame-state={state}
+                >
+                    {url ? (
+                        <AntdImage
+                            src={url}
+                            width={stage.w}
+                            height={stage.h}
+                            style={{ objectFit: "contain", display: "block" }}
+                            alt={`#${card.n} 原片帧`}
+                            onLoad={(event) => {
+                                const image = event.currentTarget;
+                                if (image.naturalWidth > 0 && image.naturalHeight > 0) setRatio(image.naturalWidth / image.naturalHeight);
+                            }}
+                        />
                     ) : (
                         <div className="flex size-full flex-col items-center justify-center gap-1 px-2 text-center text-xs text-stone-400 dark:text-stone-500">
                             <ImageOff className="size-4" />
                             <span>未定位（无可用帧）</span>
                         </div>
                     )}
-                </div>
-                {pos ? (
-                    <>
+
+                    {/* 内容盒：与 contain 后图片实际内容区重合，框百分比只落在它里面 */}
+                    {url ? (
                         <div
-                            aria-hidden
-                            className="pointer-events-none absolute border-2"
-                            style={{
-                                left: `${((pos.格 - 1) % 3) * (100 / 3)}%`,
-                                top: `${Math.floor((pos.格 - 1) / 3) * (100 / 3)}%`,
-                                width: `${100 / 3}%`,
-                                height: `${100 / 3}%`,
-                                borderColor: color.replace(/0\.30\)$/, "0.85)"),
-                                backgroundColor: color,
-                            }}
+                            className="pointer-events-none absolute"
+                            style={{ left: content.x, top: content.y, width: content.w, height: content.h }}
+                            data-hub-frame-content-box
                         >
-                            <span className="absolute left-0.5 top-0.5 rounded bg-black/55 px-1 py-0.5 text-[10px] leading-3 text-white">
-                                {pos.镜次 > 0 ? `基于第${pos.镜次}镜·AI粗标` : "AI粗标"}
-                            </span>
+                            {/* 九宫格参考线（极淡，帮助读格） */}
+                            <div aria-hidden className="absolute inset-0">
+                                <div className="absolute inset-y-0 left-1/3 w-px bg-white/25" />
+                                <div className="absolute inset-y-0 left-2/3 w-px bg-white/25" />
+                                <div className="absolute inset-x-0 top-1/3 h-px bg-white/25" />
+                                <div className="absolute inset-x-0 top-2/3 h-px bg-white/25" />
+                            </div>
+
+                            {laid.map(({ box, rect }) => {
+                                const active = hoverRow === box.行;
+                                return (
+                                    <div
+                                        key={box.行}
+                                        data-hub-box-row={box.行}
+                                        data-hub-box-own={box.本卡 ? "1" : "0"}
+                                        className="absolute rounded-[2px]"
+                                        style={{
+                                            left: rect.x,
+                                            top: rect.y,
+                                            width: rect.w,
+                                            height: rect.h,
+                                            border: box.本卡 ? "2px solid rgb(225,29,72)" : "1px solid rgba(244,63,94,0.45)",
+                                            backgroundColor: box.本卡 ? "rgba(244,63,94,0.14)" : "rgba(244,63,94,0.06)",
+                                            outline: active ? "2px solid rgba(225,29,72,0.6)" : undefined,
+                                            opacity: active || box.本卡 ? 1 : 0.8,
+                                            zIndex: active ? 30 : box.本卡 ? 20 : 10,
+                                        }}
+                                    >
+                                        {badgeFits(rect) ? (
+                                            <span
+                                                className="absolute left-0.5 top-0.5 rounded px-1 text-[10px] leading-4"
+                                                style={
+                                                    box.本卡
+                                                        ? { backgroundColor: "rgb(225,29,72)", color: "#fff" }
+                                                        : { backgroundColor: "rgba(255,255,255,0.9)", color: "rgb(190,18,60)" }
+                                                }
+                                            >
+                                                #{box.行}
+                                            </span>
+                                        ) : null}
+                                    </div>
+                                );
+                            })}
+
+                            {legacyRect ? (
+                                <div
+                                    aria-hidden
+                                    className="absolute border-2"
+                                    style={{
+                                        left: legacyRect.x,
+                                        top: legacyRect.y,
+                                        width: legacyRect.w,
+                                        height: legacyRect.h,
+                                        borderColor: "rgba(244,63,94,0.85)",
+                                        backgroundColor: "rgba(244,63,94,0.30)",
+                                    }}
+                                />
+                            ) : null}
                         </div>
-                        {/* 九宫格参考线（极淡，帮助读格） */}
-                        <div aria-hidden className="pointer-events-none absolute inset-0">
-                            <div className="absolute inset-y-0 left-1/3 w-px bg-white/25" />
-                            <div className="absolute inset-y-0 left-2/3 w-px bg-white/25" />
-                            <div className="absolute inset-x-0 top-1/3 h-px bg-white/25" />
-                            <div className="absolute inset-x-0 top-2/3 h-px bg-white/25" />
-                        </div>
+                    ) : null}
+                </div>
+
+                {/* 图例 rail + 引线：同一格的多行各占一条，不按格去重身份 */}
+                {legend.chips.length ? (
+                    <>
+                        <svg className="pointer-events-none absolute inset-0" width={wrapperW} height={wrapperH} aria-hidden data-hub-frame-links>
+                            {legend.links.map((link) => (
+                                <line
+                                    key={link.行}
+                                    x1={link.x1}
+                                    y1={link.y1}
+                                    x2={link.x2}
+                                    y2={link.y2}
+                                    stroke="rgba(225,29,72,0.45)"
+                                    strokeWidth={1}
+                                    strokeDasharray="3 2"
+                                />
+                            ))}
+                        </svg>
+                        <ul className="absolute flex flex-col gap-1" style={{ left: legend.x, top: 0, width: legend.w }} data-hub-frame-legend>
+                            {legend.chips.map((chip) => {
+                                const item = laid.find(({ box }) => box.行 === chip.行);
+                                if (!item) return null;
+                                const { box } = item;
+                                return (
+                                    <li
+                                        key={chip.行}
+                                        data-hub-box-row={chip.行}
+                                        data-hub-box-own={box.本卡 ? "1" : "0"}
+                                        onMouseEnter={() => setHoverRow(box.行)}
+                                        onMouseLeave={() => setHoverRow(null)}
+                                        className={`flex cursor-default flex-col justify-center overflow-hidden rounded border px-1 leading-tight ${
+                                            box.本卡
+                                                ? "border-rose-500 bg-rose-50 text-rose-700 dark:border-rose-400 dark:bg-rose-950/40 dark:text-rose-200"
+                                                : "border-stone-200 bg-white/85 text-stone-500 dark:border-stone-700 dark:bg-stone-900/70 dark:text-stone-400"
+                                        }`}
+                                        style={{ height: chip.rect.h, opacity: box.本卡 ? 1 : 0.85 }}
+                                        title={`#${box.行} ${box.短名}｜${box.角标}`}
+                                    >
+                                        <span className="flex items-center gap-1">
+                                            <span className={`font-mono text-[10px] ${box.本卡 ? "font-bold" : ""}`}>#{box.行}</span>
+                                            <span className={`truncate ${chip.compact ? "text-[10px]" : "text-[11px]"} ${box.本卡 ? "font-semibold" : ""}`}>
+                                                {box.短名 || "（未命名）"}
+                                            </span>
+                                            <span
+                                                aria-hidden
+                                                className="ml-auto size-1.5 shrink-0 rounded-full"
+                                                style={{ backgroundColor: accentOf(box.角标) }}
+                                            />
+                                        </span>
+                                        {chip.compact ? null : (
+                                            <span className="truncate text-[10px]" style={{ color: accentOf(box.角标) }}>
+                                                {box.角标}
+                                            </span>
+                                        )}
+                                    </li>
+                                );
+                            })}
+                        </ul>
                     </>
                 ) : null}
             </div>
-            {pos ? (
-                <div className="mt-1 text-center text-[11px] text-stone-400 dark:text-stone-500">
-                    原片画面 · 九宫格第{pos.格}格{pos.镜次 > 0 ? `·基于第${pos.镜次}镜` : ""}·AI粗标（点图放大）
-                </div>
-            ) : (
-                <div className="mt-1 text-center text-[11px] text-stone-400 dark:text-stone-500">
-                    {firstDesc ? <span className="line-clamp-2">{firstDesc}</span> : <span>原片画面</span>}
-                    <Tag color="warning" className="m-0 ml-1 !text-[10px]">未能标注</Tag>
-                </div>
-            )}
+
+            <div className="mt-1 max-w-full px-0.5 text-left text-[11px] text-stone-500 dark:text-stone-400">
+                {state === "unlocated" ? (
+                    <span className="text-amber-700 dark:text-amber-300">{caption.main}</span>
+                ) : (
+                    <>
+                        <div>
+                            {caption.main}
+                            {caption.hint ? <span className="text-stone-400 dark:text-stone-500">（{caption.hint}）</span> : null}
+                        </div>
+                        {caption.honest ? (
+                            <Tag color="warning" className="m-0 mt-0.5 !text-[10px]">
+                                {caption.honest}
+                            </Tag>
+                        ) : null}
+                        {state === "no-own-box" && firstDesc ? (
+                            <div className="line-clamp-2 text-stone-400 dark:text-stone-500">{firstDesc}</div>
+                        ) : null}
+                        {others ? <div className="text-stone-400 dark:text-stone-500">同画面其他资产 {others} 项（图上红框，非本行换图对象）</div> : null}
+                        {shotText ? <div className="text-stone-400 dark:text-stone-500">影响镜次：{shotText}</div> : null}
+                    </>
+                )}
+            </div>
         </div>
     );
 }
