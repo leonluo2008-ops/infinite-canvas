@@ -609,7 +609,7 @@ function GroupCard({
             </div>
             <div className="mt-1 text-xs text-emerald-700 dark:text-emerald-400">组内一行换图 = 全组生效（清单、流水、提交次序三处同步，由后端单点完成）。</div>
             <div className="mt-2 flex flex-wrap items-stretch gap-2">
-                <FrameWithPosition card={representative} shots={shots} className="shrink-0" />
+                <FrameWithPosition card={representative} className="shrink-0" />
 
                 {uploadedAll.length ? <ArrowRight className="mx-0.5 size-5 shrink-0 self-center text-stone-300 dark:text-stone-600" /> : null}
                 <AssetUploadZone
@@ -691,7 +691,7 @@ function AssetCardUnit({
             </header>
 
             <div className="mt-2 flex flex-wrap items-stretch gap-2">
-                <FrameWithPosition card={card} shots={shots} className="shrink-0" />
+                <FrameWithPosition card={card} className="shrink-0" />
                 {card.已传图.length ? <ArrowRight className="mx-0.5 size-5 shrink-0 self-center text-stone-300 dark:text-stone-600" /> : null}
                 <AssetUploadZone taskId={taskId} n={card.n} uploaded={card.已传图} busy={busy} setBusy={setBusy} onWritten={onWritten} />
             </div>
@@ -744,7 +744,7 @@ const accentOf = (label: string) => BOX_ACCENT[label] || BOX_ACCENT["可沿用"]
  * 三态诚实：未定位→不画框不标镜次+「未能定位到该资产出现的镜头·暂用整片画面」；
  * 无自身位置→帧与镜次照给、他人框照画、描述首句+「未能标注位置」。旧字段（帧[]/画面位置）仍驱动 legacy 分支。
  */
-function FrameWithPosition({ card, className = "", shots = [] }: { card: HubAssetCard; className?: string; shots?: number[] }) {
+function FrameWithPosition({ card, className = "" }: { card: HubAssetCard; className?: string }) {
     const state = frameState(card);
     const legacyUrl = card.帧.map((frame) => (frame.url || "").trim()).find(Boolean) || "";
     const url = (card.代表帧.url || "").trim() || legacyUrl;
@@ -777,7 +777,6 @@ function FrameWithPosition({ card, className = "", shots = [] }: { card: HubAsse
     const caption = frameCaption(card, state);
     const firstDesc = firstSentence(card.描述);
     const others = otherBoxCount(laid.map(({ box }) => box));
-    const shotText = shots.length ? `第${shots.join("、")}镜` : "";
     const wrapperW = legend.chips.length ? legend.x + legend.w : stage.w;
     const wrapperH = Math.max(stage.h, legend.height);
 
@@ -786,7 +785,7 @@ function FrameWithPosition({ card, className = "", shots = [] }: { card: HubAsse
             <div className="relative flex items-start" style={{ width: wrapperW, height: wrapperH }}>
                 {/* 舞台：尺寸按帧真实宽高比定（竖屏窄、横屏宽）；overflow 只裁图片圆角，标签全在舞台之外 */}
                 <div
-                    className="relative shrink-0 overflow-hidden rounded-md border border-stone-200 bg-stone-100 dark:border-stone-800 dark:bg-stone-900"
+                    className="relative shrink-0 overflow-hidden rounded-md bg-stone-100 dark:bg-stone-900"
                     style={{ width: stage.w, height: stage.h }}
                     data-hub-frame-stage
                     data-hub-frame-state={state}
@@ -958,7 +957,6 @@ function FrameWithPosition({ card, className = "", shots = [] }: { card: HubAsse
                             <div className="line-clamp-2 text-stone-400 dark:text-stone-500">{firstDesc}</div>
                         ) : null}
                         {others ? <div className="text-stone-400 dark:text-stone-500">同画面其他资产 {others} 项（图上红框，非本行换图对象）</div> : null}
-                        {shotText ? <div className="text-stone-400 dark:text-stone-500">影响镜次：{shotText}</div> : null}
                     </>
                 )}
             </div>
