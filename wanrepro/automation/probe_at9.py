@@ -5,8 +5,9 @@
 要求桥已重启到本批代码——retry 路由/自检钩子/done 删除都在新代码里）。
 判据全对才 exit 0，任何一步失败如实 FAIL 并 exit 1（判 returncode，禁子串判通过）。
 
-七组判据（AT-9.md §六层4、§七 B5、§六删除合同；数据合同 B0「自检结果」）：
-  ⓪ 摘要 replaced 列（B5③查修）：真实任务 auto-0003（只读）的 replaced = 已传图行数/必换行数
+七组判据（AT-9.md §六层4、§七 B5、§六删除合同；数据合同 B0「自检结果」；C4 收口：夹具全部自建，
+禁依赖真实任务产物——auto-0003/ai-3-2-2 被 UI 删除即断链的教训）：
+  ⓪ 摘要 replaced 列（B5③查修）：自建任务 auto-9167（临时夹具）的 replaced = 已传图行数/必换行数
     且与清单实算一致、非空——「表格全显—」在桥端摘要与前端渲染两层都对得上。
   ① 自检正例：必换行全传图 → 三项全 PASS 不误红；get_task 透出 自检 三条 {项,结论,证据}。
   ② 自检反例：必换行无图+非必换行有图 → 锁点对账必红、次序对账不误红；乱序提交快照 →
@@ -19,7 +20,7 @@
     200 且后台重跑即续（failed→discussing→awaiting_assets，不重发模型）。
   ⑥ 确认后关闭前端渲染仍推进：只 POST confirm（带 按原样 勾选记录），不调任何渲染接口 →
     状态 rendering→awaiting_approval 自行推进，自检.json 自动落盘且三项全 PASS。
-探针临时任务（auto-916x）与临时目录用完清理，真任务 auto-0001/0002/0003 只读不碰。
+探针临时任务（auto-916x）与临时目录用完清理；渲染/续跑夹具用仓库自建件 tests/fixtures/at9-probe。
 """
 from __future__ import annotations
 
@@ -54,14 +55,16 @@ PROJECTS = config.PROJECTS_DIR
 NOW_TS = str(int(time.time()))
 
 # 固定临时任务号（高于真实任务；探针尾全部清理，含自己的墓碑条目）
-T_POS, T_NEG, T_LNK, T_DONE, T_RETRY, T_FLOW = (
-    "auto-9161", "auto-9162", "auto-9163", "auto-9164", "auto-9165", "auto-9166")
-PROBE_IDS = {T_POS, T_NEG, T_LNK, T_DONE, T_RETRY, T_FLOW}
+T_POS, T_NEG, T_LNK, T_DONE, T_RETRY, T_FLOW, T_SUM = (
+    "auto-9161", "auto-9162", "auto-9163", "auto-9164", "auto-9165", "auto-9166", "auto-9167")
+PROBE_IDS = {T_POS, T_NEG, T_LNK, T_DONE, T_RETRY, T_FLOW, T_SUM}
 BRIDGE_POS = "probe-at9b5-pos"          # 正/反例与续跑流共用一批夹具桥目录
 BRIDGE_LNK = "probe-at9b5-lnk"          # 疑似不联动夹具
 BRIDGE_FLOW = "probe-at9b5-flow"        # ⑥ 确认续跑夹具（带产物三件套）
 BRIDGE_DONE = "probe-at9b5-done"        # ④ done 删除夹具（专属桥目录验证删除范围）
-AUDIT_SCENE = ANALYSIS / "ai-3-2-2"     # 真拆样本（只读，B1/B2 探针同款参照）
+BRIDGE_SUM = "probe-at9b5-sum"          # ⓪ replaced 摘要夹具（自建任务，不依赖真实任务）
+# 渲染/续跑夹具：仓库自建件（版本受控，不随任务删除失效——AT-10 C4 裁定）
+AUDIT_SCENE = ROOT / "tests" / "fixtures" / "at9-probe"
 URL1 = "https://h.uguu.se/b5-u1.png"
 URL11 = "https://h.uguu.se/b5-u11.png"
 
@@ -128,7 +131,7 @@ def write_checklist(bridge: str, text: str) -> Path:
 
 
 def render_fixture_prompt(bridge: str, uploads: dict[int, str]) -> tuple[str, list[tuple[int, int]]]:
-    """B2 同源渲染夹具：ai-3-2-2 真拆解 + 指定绑图集合 → 提示词全文与发号映射（stdout 静音）。"""
+    """B2 同源渲染夹具：自建夹具拆解 + 指定绑图集合 → 提示词全文与发号映射（stdout 静音）。"""
     ck_path = ANALYSIS / bridge / "待确认清单.md"
     disc = (AUDIT_SCENE / "拆解.md").read_text(encoding="utf-8-sig")
     layers, _order = render.parse_layers(disc)
@@ -176,24 +179,27 @@ def items_by_name(items: list[dict]) -> dict[str, dict]:
     return {x.get("项"): x for x in items}
 
 
-# ---------------------------------------------------------------- ⓪ replaced 摘要列（真任务只读）
+# ---------------------------------------------------------------- ⓪ replaced 摘要列（自建任务）
 def probe_replaced_summary() -> None:
-    print("0) 摘要 replaced 列（auto-0003 只读）：已传图行数/必换行数 非空且与清单实算一致")
+    print("0) 摘要 replaced 列（自建任务 auto-9167）：已传图行数/必换行数 非空且与清单实算一致")
+    make_task(T_SUM, "awaiting_assets", BRIDGE_SUM)
+    # 必换行 #1/#11 都填图（与 ① 正例同形态）→ 实算 2/2
+    write_checklist(BRIDGE_SUM, CK_FULL.format(bridge=BRIDGE_SUM, name1="", img1=URL1, img11=URL11))
+    ck_rows = replace.parse_rows(
+        (ANALYSIS / BRIDGE_SUM / "待确认清单.md").read_text(encoding="utf-8-sig"))
+    filled = sum(1 for r in ck_rows if (r.get("cur_assets") or "").strip())
+    must = sum(1 for r in ck_rows if "必须换" in (r.get("advice") or ""))
     status, body = req("/api/hub/tasks")
     rows = {t.get("local_id"): t for t in (body.get("tasks") or [])} if status == 200 else {}
     check("GET /api/hub/tasks → 200", status == 200, str(status))
-    t = rows.get("auto-0003")
-    if not check("真实任务 auto-0003 在列表（只读参照）", bool(t), str(list(rows))[:160]):
+    t = rows.get(T_SUM)
+    if not check(f"自建任务 {T_SUM} 在列表（摘要覆盖临时任务）", bool(t), str(list(rows))[:160]):
         return
-    ck_rows = replace.parse_rows(
-        (ANALYSIS / str(t.get("bridge_id")) / "待确认清单.md").read_text(encoding="utf-8-sig"))
-    filled = sum(1 for r in ck_rows if (r.get("cur_assets") or "").strip())
-    must = sum(1 for r in ck_rows if "必须换" in (r.get("advice") or ""))
     got = str(t.get("replaced") or "")
     check(f"replaced 非空且 = 已传图行数/必换行数（清单实算 {filled}/{must}）",
           got == f"{filled}/{must}" and filled > 0, f"got={got!r}")
-    check("auto-0003 详情接口同值（摘要与详情两层面一致）",
-          str(req(f"/api/hub/task/auto-0003")[1].get("task", {}).get("replaced") or "") == got, got)
+    check(f"{T_SUM} 详情接口同值（摘要与详情两层面一致）",
+          str(req(f"/api/hub/task/{T_SUM}")[1].get("task", {}).get("replaced") or "") == got, got)
 
 
 # ---------------------------------------------------------------- ① 正例 ② 反例（进程内，判定器本身）
@@ -290,15 +296,15 @@ def lnk_sidecar(bridge: str) -> None:
 
 def probe_suspect_no_autolink() -> None:
     print("3) #3↔#5 疑似不自动联动：疑似≠已组；写路径只认确认组，贴图不波及疑似行")
-    cs = {c["n"]: c for c in cards.build("ai-3-2-2", "auto-0003")}
-    check("真样本（只读）疑似互连：#3↔#5", cs[3]["同实体疑似"] == [5] and cs[5]["同实体疑似"] == [3],
-          f"{cs[3]['同实体疑似']}/{cs[5]['同实体疑似']}")
-    check("真样本确认组为空（默认不联动）",
-          cs[3]["同实体确认"] == [] and cs[5]["同实体确认"] == [],
-          f"{cs[3]['同实体确认']}/{cs[5]['同实体确认']}")
     make_task(T_LNK, "awaiting_assets", BRIDGE_LNK)
     write_checklist(BRIDGE_LNK, CK_LNK.format(bridge=BRIDGE_LNK))
     lnk_sidecar(BRIDGE_LNK)
+    cs = {c["n"]: c for c in cards.build(BRIDGE_LNK, T_LNK)}
+    check("自建夹具疑似互连：#3↔#5", cs[3]["同实体疑似"] == [5] and cs[5]["同实体疑似"] == [3],
+          f"{cs[3]['同实体疑似']}/{cs[5]['同实体疑似']}")
+    check("自建夹具确认组为空（默认不联动）",
+          cs[3]["同实体确认"] == [] and cs[5]["同实体确认"] == [],
+          f"{cs[3]['同实体确认']}/{cs[5]['同实体确认']}")
     status, body = req("/api/hub/asset", "POST",
                        {"task_id": T_LNK, "n": 5, "image_url": URL11})
     md = (ANALYSIS / BRIDGE_LNK / "待确认清单.md").read_text(encoding="utf-8-sig")
@@ -467,7 +473,7 @@ def probe_confirm_render_flow() -> None:
 def cleanup_fixtures() -> None:
     for tid in PROBE_IDS:
         shutil.rmtree(PROJECTS / tid, ignore_errors=True)
-    for b in (BRIDGE_POS, BRIDGE_LNK, BRIDGE_FLOW, BRIDGE_DONE):
+    for b in (BRIDGE_POS, BRIDGE_LNK, BRIDGE_FLOW, BRIDGE_DONE, BRIDGE_SUM):
         shutil.rmtree(ANALYSIS / b, ignore_errors=True)
     tfile = PROJECTS / ".tombstones.json"
     if tfile.is_file():
@@ -484,9 +490,9 @@ def cleanup_fixtures() -> None:
 
 
 def main() -> int:
-    print(f"[probe-at9] 目标 {BASE}；临时任务 {sorted(PROBE_IDS)} 用完清理；真任务只读")
+    print(f"[probe-at9] 目标 {BASE}；临时任务 {sorted(PROBE_IDS)} 用完清理；夹具自建不碰真实任务")
     if not AUDIT_SCENE.is_dir():
-        check("ai-3-2-2 真拆样本在场（渲染夹具依赖）", False, str(AUDIT_SCENE))
+        check("自建夹具在场（tests/fixtures/at9-probe）", False, str(AUDIT_SCENE))
         return 1
     try:
         probe_replaced_summary()

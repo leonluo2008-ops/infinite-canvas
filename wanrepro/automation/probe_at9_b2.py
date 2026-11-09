@@ -4,8 +4,9 @@
 跑法：wanrepro/ 下 `python -m automation.probe_at9_b2 [port]`（默认 8776 常驻工作台，
 判据全对才 exit 0，任何一步失败如实 FAIL 并 exit 1——判 returncode，禁子串判通过）。
 
-六组判据（AT-9.md §六层2/层3/层4、§四操作合同、§六删除合同；数据合同 B0）：
-  ① 渲染残留：ai-3-2-2 内存夹具复现 L1 P129 场景（#1/#11 绑图）——已传图行原物核心词
+六组判据（AT-9.md §六层2/层3/层4、§四操作合同、§六删除合同；数据合同 B0；C4 收口：夹具全部自建，
+禁依赖真实任务产物——auto-0003/ai-3-2-2 被 UI 删除即断链的教训）：
+  ① 渲染残留：仓库自建夹具（tests/fixtures/at9-probe）复现 L1 P129 场景（#1/#11 绑图）——已传图行原物核心词
     固定词表零残留；未绑图场景原描述一字不动（不误伤）；绑图行 row→图号发号分离断言。
   ② 确认组：成组/解组端点写 sidecar『同实体确认』；组联动=replace.set_group_write 单点
     （清单+上传流水+回显三处一致）；任务级串行锁；『同实体疑似』不联动（#3↔#5 反例）。
@@ -15,7 +16,7 @@
   ⑤ 删除：REST /api/hub/task/{id}/delete；运行中与排队 JOB 409；拆解过但 idle 需任务名确认；
     删除范围=任务目录+专属 analysis 目录+uploads 视频；墓碑 .tombstones.json 防编号复用。
   ⑥ 短名映射表：核心产品→本品主体/道具→按实体名/人物→按描述特征/退路几何+行号；
-    无括注；跨类别同实体联名（at8 #2/#7 兼容）。
+    无括注；跨类别同实体联名（at8 #2/#7 兼容）；AI 样本侧用仓库自建夹具桥（tests/fixtures/at9-probe）。
 探针临时任务（auto-910x/auto-9199）与临时目录用完清理，不留垃圾（真拆产物不涉及）。
 """
 from __future__ import annotations
@@ -157,7 +158,7 @@ def cleanup_fixtures() -> None:
     """探针尾清理：临时任务目录、临时 bridge 目录、自己的墓碑条目、uploads 夹具视频。"""
     for tid in PROBE_IDS:
         shutil.rmtree(PROJECTS / tid, ignore_errors=True)
-    for b in (BRIDGE_GRP, BRIDGE_DEL):
+    for b in (BRIDGE_GRP, BRIDGE_DEL, BRIDGE_AI):
         shutil.rmtree(ANALYSIS / b, ignore_errors=True)
     (UPLOADS / PROBE_VIDEO).unlink(missing_ok=True)
     tfile = PROJECTS / ".tombstones.json"
@@ -177,7 +178,9 @@ def cleanup_fixtures() -> None:
 # ---------------------------------------------------------------- ① 渲染残留
 FIX_WORDS_UPLOADED = ("黑色奖杯香水瓶", "奖杯香水", "双耳奖杯", "黑透渐变",
                       "香水小物体", "尖顶雕花圆盖")
-AUDIT_SCENE = ROOT / "analysis" / "reverse" / "ai-3-2-2"
+# 渲染夹具 + AI 样本短名夹具：仓库自建件（版本受控，不随任务删除失效——AT-10 C4 裁定）
+AUDIT_SCENE = ROOT / "tests" / "fixtures" / "at9-probe"
+BRIDGE_AI = "probe-at9b2-ai"            # ⑥ 短名 AI 样本侧的自建夹具桥（探针尾清理）
 
 
 def render_case(uploads: set[int]) -> tuple[str, list[tuple[int, int]]]:
@@ -196,7 +199,8 @@ def render_case(uploads: set[int]) -> tuple[str, list[tuple[int, int]]]:
     import io
     with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
         prompt = render.render_prompt(fm, sections, layers, ents,
-                                      {"时长": "22", "画幅": "9:16"}, "ai-3-2-2", "seedance-flow")
+                                      {"时长": "22", "画幅": "9:16"}, "at9-probe-fixture",
+                                      "seedance-flow")
     mapping = [(e.row_no, e.no) for e in ents if e.image]
     return prompt, mapping
 
@@ -204,7 +208,7 @@ def render_case(uploads: set[int]) -> tuple[str, list[tuple[int, int]]]:
 def probe_residue() -> None:
     print("1) 渲染残留修复（L1 P129 场景：#1/#11 绑图 → 原物核心词零残留）")
     if not AUDIT_SCENE.is_dir():
-        check("ai-3-2-2 参考夹具在场", False, str(AUDIT_SCENE))
+        check("自建夹具在场（tests/fixtures/at9-probe）", False, str(AUDIT_SCENE))
         return
     prompt, mapping = render_case({1, 11})
     residual = {w: prompt.count(w) for w in FIX_WORDS_UPLOADED if w in prompt}
@@ -431,8 +435,15 @@ def _task_dir_safe(local_id: str) -> Path:
 
 # ---------------------------------------------------------------- ⑥ 短名映射表
 def probe_short_names() -> None:
-    print("6) 短名映射表：本品主体/实体名/描述特征/几何退路，无括注")
-    for bridge, tid, label in (("pop-3--7", "auto-0002", "pop 样本"), ("ai-3-2-2", "auto-0003", "ai 样本")):
+    print("6) 短名映射表：本品主体/实体名/描述特征/几何退路，无括号（pop 真样本 + AI 自建夹具桥）")
+    if not AUDIT_SCENE.is_dir():
+        check("自建夹具在场（tests/fixtures/at9-probe）", False, str(AUDIT_SCENE))
+        return
+    shutil.rmtree(ANALYSIS / BRIDGE_AI, ignore_errors=True)
+    shutil.copytree(AUDIT_SCENE, ANALYSIS / BRIDGE_AI,
+                    ignore=shutil.ignore_patterns("提示词-probe.md"))
+    samples = (("pop-3--7", "auto-0002", "pop 样本"), (BRIDGE_AI, "auto-9100", "ai 夹具样本"))
+    for bridge, tid, label in samples:
         cs = cards.build(bridge, tid)
         if not check(f"{label} asset_cards 非空（{bridge}）", bool(cs), f"{len(cs)} 张"):
             return
@@ -449,14 +460,14 @@ def probe_short_names() -> None:
           f"{pop[2]['短名']} / {pop[7]['短名']}")
     check("联名不带括号形态（·同件X）", "·同件" in pop[2]["短名"] and "（" not in pop[2]["短名"],
           pop[2]["短名"])
-    ai = {c["n"]: c for c in cards.build("ai-3-2-2", "auto-0003")}
-    check("人物 → 按描述特征（#3 波波头…/#5 马尾…，特征可区分）",
-          "波波头" in ai[3]["短名"] and "马尾" in ai[5]["短名"] and ai[3]["短名"] != ai[5]["短名"],
-          f"{ai[3]['短名']} / {ai[5]['短名']}")
-    check("同类别疑似不加标注（#3↔#5 疑似在场、确认组为空——疑似≠已组）",
-          ai[3]["同实体疑似"] == [5] and ai[5]["同实体疑似"] == [3]
-          and ai[3]["同实体确认"] == [] and ai[5]["同实体确认"] == [],
-          f"疑似={ai[3]['同实体疑似']}/{ai[5]['同实体疑似']} 确认={ai[3]['同实体确认']}/{ai[5]['同实体确认']}")
+    ai = {c["n"]: c for c in cards.build(BRIDGE_AI, "auto-9100")}
+    check("人物 → 按描述特征（#2 波波头…/#3 马尾…，特征可区分）",
+          "波波头" in ai[2]["短名"] and "马尾" in ai[3]["短名"] and ai[2]["短名"] != ai[3]["短名"],
+          f"{ai[2]['短名']} / {ai[3]['短名']}")
+    check("同类别疑似不加标注（#2↔#3 疑似在场、确认组为空——疑似≠已组）",
+          ai[2]["同实体疑似"] == [3] and ai[3]["同实体疑似"] == [2]
+          and ai[2]["同实体确认"] == [] and ai[3]["同实体确认"] == [],
+          f"疑似={ai[2]['同实体疑似']}/{ai[3]['同实体疑似']} 确认={ai[2]['同实体确认']}/{ai[3]['同实体确认']}")
     check("道具 → 按实体名（ai #9 道具A / #10 道具B）",
           ai[9]["短名"] == "道具A" and ai[10]["短名"] == "道具B",
           f"{ai[9]['短名']}/{ai[10]['短名']}")
