@@ -29,6 +29,40 @@ export type HubPairLine = {
     url?: string;
 };
 
+/** 资产卡帧对象（automation/frames.build_frame）。url 空串 = 连首帧兜底都拿不到，前端直接出「未定位」占位块。 */
+export type HubCardFrame = {
+    url: string;
+    秒: number;
+    来源: string;
+    定位: string;
+    错误?: string;
+};
+
+/** 资产卡（数据合同 v3，B2：GET /api/hub/task/<id> 的 asset_cards[]；字段名与桥端中文键一一对应）。 */
+export type HubAssetCard = {
+    n: number;
+    类别: string;
+    短名: string;
+    建议: string;
+    核心: boolean;
+    出现时段: { 起: string; 止: string }[];
+    帧: HubCardFrame[];
+    已传图: string[];
+    描述: string;
+    同实体疑似: number[];
+    定位: string;
+    时段来源: string;
+};
+
+/** POST /api/hub/asset 的返回（写清单后回显真源列）。 */
+export type HubAssetWriteResult = {
+    ok?: boolean;
+    task_id?: string;
+    n?: number;
+    已传图?: string[];
+    命名?: string;
+};
+
 export type HubTaskDetail = HubTaskSummary & {
     summary_md: string;
     checklist_md: string;
@@ -38,6 +72,10 @@ export type HubTaskDetail = HubTaskSummary & {
     /** 拆解日志尾 15 行（排查留痕）。 */
     log_tail?: string;
     pair_lines: HubPairLine[];
+    /** 资产卡（数据合同 v3）；旧 bridge 无此字段 → 归一为 [] → 前端退化回文字配对表。 */
+    asset_cards: HubAssetCard[];
+    /** 本会话有无置换写入（换图/沿用/品牌文字）；仅参考，前端以 asset_cards 已传图为准。 */
+    has_pending_replace?: boolean;
     error: string;
     gen?: Record<string, unknown>;
 };
@@ -84,7 +122,51 @@ export async function getHubTask(localId: string): Promise<HubTaskDetail> {
     const data = await request<{ task?: HubTaskDetail } & Partial<HubTaskDetail>>(`/api/hub/task/${encodeURIComponent(localId)}`);
     const task = (data.task || (data as unknown as HubTaskDetail)) as HubTaskDetail;
     if (!task || !task.local_id) throw new Error("任务详情为空");
-    return { ...task, pair_lines: Array.isArray(task.pair_lines) ? task.pair_lines : [] };
+    return { ...task, pair_lines: Array.isArray(task.pair_lines) ? task.pair_lines : [], asset_cards: normalizeAssetCards(task.asset_cards) };
+}
+
+/** 读层入口集中归一（项目硬约束 14 同款思路）：asset_cards 缺失/畸形不炸页面，逐字段兜底。 */
+function normalizeAssetCards(value: unknown): HubAssetCard[] {
+    if (!Array.isArray(value)) return [];
+    return value.map((raw) => {
+        const item = (raw && typeof raw === "object" ? raw : {}) as JsonRecord;
+        const spans = Array.isArray(item["出现时段"]) ? (item["出现时段"] as unknown[]) : [];
+        const frames = Array.isArray(item["帧"]) ? (item["帧"] as unknown[]) : [];
+        const urls = Array.isArray(item["已传图"]) ? (item["已传图"] as unknown[]) : [];
+        const twins = Array.isArray(item["同实体疑似"]) ? (item["同实体疑似"] as unknown[]) : [];
+        const card: HubAssetCard = {
+            n: Number(item.n) || 0,
+            类别: hubText(item["类别"]),
+            短名: hubText(item["短名"]),
+            建议: hubText(item["建议"]),
+            核心: Boolean(item["核心"]),
+            出现时段: spans.map((span) => {
+                const s = (span && typeof span === "object" ? span : {}) as JsonRecord;
+                return { 起: hubText(s["起"]), 止: hubText(s["止"]) };
+            }),
+            帧: frames.map((shot) => {
+                const f = (shot && typeof shot === "object" ? shot : {}) as JsonRecord;
+                const frame: HubCardFrame = {
+                    url: hubText(f.url),
+                    秒: typeof f["秒"] === "number" && Number.isFinite(f["秒"]) ? f["秒"] : 0,
+                    来源: hubText(f["来源"]),
+                    定位: hubText(f["定位"]),
+                };
+                if (f["错误"] !== undefined && f["错误"] !== null) frame.错误 = hubText(f["错误"]);
+                return frame;
+            }),
+            已传图: urls.map((url) => hubText(url)).filter(Boolean),
+            描述: hubText(item["描述"]),
+            同实体疑似: twins.map((x) => Number(x)).filter((x) => Number.isFinite(x) && x > 0),
+            定位: hubText(item["定位"]),
+            时段来源: hubText(item["时段来源"]),
+        };
+        return card;
+    });
+}
+
+function hubText(value: unknown): string {
+    return typeof value === "string" ? value : value === null || value === undefined ? "" : String(value);
 }
 
 export async function ingestVideo(video: File, intent: string): Promise<{ local_id: string; bridge_id: string }> {
@@ -110,6 +192,36 @@ export async function uploadHubAssets(localId: string, files: File[]): Promise<{
 
 export async function confirmHubReplace(localId: string): Promise<{ state?: string }> {
     return request<{ state?: string }>(`/api/hub/confirm/${encodeURIComponent(localId)}`, { method: "POST" });
+}
+
+/**
+ * 置换台逐卡定向写（POST /api/hub/asset，数据合同 v3 写合同）：
+ *  - {n, image_url} 换图（重传覆盖）；image_url 必须是公网 HTTPS（先走 uploadHubImage）
+ *  - {n, clear:true} 「沿用」= 清空该行绑定
+ *  - {n, text}       品牌视觉卡的文字，写清单「命名」列
+ */
+export async function postHubAsset(localId: string, payload: { n: number; image_url?: string; clear?: boolean; text?: string }): Promise<HubAssetWriteResult> {
+    return request<HubAssetWriteResult>("/api/hub/asset", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ task_id: localId, ...payload }),
+    });
+}
+
+/**
+ * 单图 → 图床公网 HTTPS 直链（POST /api/asset/upload）。
+ * 通道收原始字节 + X-Filename 头（非 multipart），与 services/api/video.ts 的 SDGF 参考图同一条桥端路由。
+ */
+export async function uploadHubImage(file: File): Promise<string> {
+    const name = encodeURIComponent(file.name || `ref-${Date.now()}.png`);
+    const data = await request<{ url?: string }>("/api/asset/upload", {
+        method: "POST",
+        headers: { "X-Filename": name, "Content-Type": "application/octet-stream" },
+        body: file,
+    });
+    const url = typeof data.url === "string" ? data.url : "";
+    if (!/^https:\/\//.test(url)) throw new Error(`图床未返回公网 HTTPS 直链：${JSON.stringify(data).slice(0, 120)}`);
+    return url;
 }
 
 export async function renderHubTask(localId: string): Promise<{ state?: string; preview?: HubRenderPreview | null; prompt_md?: string }> {
