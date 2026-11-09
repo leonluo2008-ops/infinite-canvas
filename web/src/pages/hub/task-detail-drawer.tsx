@@ -3,7 +3,7 @@ import { App, Button, Checkbox, Drawer, Empty, Image as AntdImage, Input, Progre
 import { useCallback, useEffect, useRef, useState, type DragEvent } from "react";
 import { Streamdown } from "streamdown";
 
-import { badgeFits, boxRect, containRect, frameCaption, frameState, layoutLegend, otherBoxCount, stageSize } from "@/lib/hub/frame-overlay";
+import { badgeFits, boxRect, containRect, frameCaption, frameState, layoutLegend, otherBoxCount, ratioFromImage, stageSize } from "@/lib/hub/frame-overlay";
 
 import {
     approveHubTask,
@@ -750,6 +750,35 @@ function FrameWithPosition({ card, className = "" }: { card: HubAssetCard; class
     const url = (card.代表帧.url || "").trim() || legacyUrl;
     const [ratio, setRatio] = useState<number | null>(null);
     const [hoverRow, setHoverRow] = useState<number | null>(null);
+    const stageRef = useRef<HTMLDivElement | null>(null);
+
+    /**
+     * 帧真实宽高比（C4 修 C3 真机缺陷）：只靠 onLoad 必挂——antd Image（@rc-component/image）内部 `<img>`
+     * 只吃 COMMON_PROPS 白名单（无 onLoad）＋自己的 srcAndOnload，外部 onLoad 根本不透传；命中缓存时
+     * load 事件又早于 React 挂载。两种情形 ratio 恒 null → 竖屏帧按 16:9 画，框落到 letterbox 黑边。
+     * 所以挂载/换图时主动查一次：① DOM 里已渲染的 img（缓存命中 immediate complete）；
+     * ② 自带 Image 探针（未命中时由 probe.onload 回来，命中时同 URL 亦走缓存）。
+     */
+    useEffect(() => {
+        setRatio(null);
+        if (!url) return;
+        let alive = true;
+        const apply = (img: HTMLImageElement | null) => {
+            const next = ratioFromImage(img);
+            if (alive && next !== null) setRatio(next);
+        };
+        apply(stageRef.current?.querySelector("img") ?? null);
+        const probe = new Image();
+        probe.onload = () => apply(probe);
+        probe.onerror = () => apply(null);
+        probe.src = url;
+        apply(probe);
+        return () => {
+            alive = false;
+            probe.onload = null;
+            probe.onerror = null;
+        };
+    }, [url]);
 
     const stage = stageSize(ratio);
     const content = containRect(ratio, stage);
@@ -785,6 +814,7 @@ function FrameWithPosition({ card, className = "" }: { card: HubAssetCard; class
             <div className="relative flex items-start" style={{ width: wrapperW, height: wrapperH }}>
                 {/* 舞台：尺寸按帧真实宽高比定（竖屏窄、横屏宽）；overflow 只裁图片圆角，标签全在舞台之外 */}
                 <div
+                    ref={stageRef}
                     className="relative shrink-0 overflow-hidden rounded-md bg-stone-100 dark:bg-stone-900"
                     style={{ width: stage.w, height: stage.h }}
                     data-hub-frame-stage
@@ -797,10 +827,6 @@ function FrameWithPosition({ card, className = "" }: { card: HubAssetCard; class
                             height={stage.h}
                             style={{ objectFit: "contain", display: "block" }}
                             alt={`#${card.n} 原片帧`}
-                            onLoad={(event) => {
-                                const image = event.currentTarget;
-                                if (image.naturalWidth > 0 && image.naturalHeight > 0) setRatio(image.naturalWidth / image.naturalHeight);
-                            }}
                         />
                     ) : (
                         <div className="flex size-full flex-col items-center justify-center gap-1 px-2 text-center text-xs text-stone-400 dark:text-stone-500">

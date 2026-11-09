@@ -5,7 +5,7 @@
  * 跑法：cd web && node scripts/probe-at10-c3.mjs   （失败 rc=1）
  */
 import { createRequire } from "node:module";
-import { rmSync, mkdirSync } from "node:fs";
+import { readFileSync, rmSync, mkdirSync } from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 
@@ -204,6 +204,46 @@ const cardB = { 帧内框: [{ 行: 1, 本卡: false }, { 行: 5, 本卡: true }]
 const setOf = (card) => card.帧内框.map((box) => box.行).sort((a, b) => a - b).join(",");
 check("共享帧：两卡框集合相同", setOf(cardA) === setOf(cardB), `${setOf(cardA)} vs ${setOf(cardB)}`);
 check("共享帧：本卡标记各自唯一", cardA.帧内框.filter((b) => b.本卡).length === 1 && cardB.帧内框.filter((b) => b.本卡).length === 1);
+
+// ---------------------------------------------------------------- C4 回归：缓存命中挂载（onLoad 不触发）
+// 真机实锤（auto-0012/pop-4）：antd Image 不透传 onLoad，且缓存命中的 load 早于 React 挂载
+// → ratio 恒 null、竖屏帧按 16:9 画、框落到 letterbox 黑边上。以下断言锁死「挂载期主动查 complete」这条路。
+const cachedImg = { complete: true, naturalWidth: 960, naturalHeight: 1678 }; // 真机竖图 960×1678
+const cachedRatio = mod.ratioFromImage(cachedImg);
+check("缓存命中：complete=true 即刻给出真实比例", cachedRatio !== null && near(cachedRatio, 960 / 1678, 1e-9), String(cachedRatio));
+
+const cachedStage = mod.stageSize(cachedRatio);
+check(
+    "缓存命中：竖屏舞台宽<高（119×208 型，不是 240×135 横盒）",
+    cachedStage.h === 208 && cachedStage.w < cachedStage.h && cachedStage.w === Math.round(208 * (960 / 1678)),
+    JSON.stringify(cachedStage),
+);
+const cachedContent = mod.containRect(cachedRatio, cachedStage);
+check(
+    "缓存命中：内容盒=舞台（框百分比落在真实像素区）",
+    near(cachedContent.x, 0) && near(cachedContent.y, 0) && near(cachedContent.w, cachedStage.w) && near(cachedContent.h, cachedStage.h),
+    JSON.stringify(cachedContent),
+);
+const cachedGrid8 = mod.boxRect(gridBox(8), cachedContent);
+check(
+    "缓存命中：格8 框完整落在内容盒内（不再飘到 letterbox 外）",
+    cachedGrid8.y >= -1e-9 && cachedGrid8.y + cachedGrid8.h <= cachedContent.y + cachedContent.h + 1e-9,
+    JSON.stringify(cachedGrid8),
+);
+
+check("未加载完成（complete=false）不臆测比例", mod.ratioFromImage({ complete: false, naturalWidth: 0, naturalHeight: 0 }) === null);
+check("坏图（complete=true 但自然尺寸 0）不给比例", mod.ratioFromImage({ complete: true, naturalWidth: 0, naturalHeight: 0 }) === null);
+check("缺元素/空值安全", mod.ratioFromImage(null) === null && mod.ratioFromImage(undefined) === null);
+
+// 缺陷特征对照：旧实现 ratio 恒 null 时舞台就是 240×135 横盒——上面的断言正是在抓这个态。
+const buggyStage = mod.stageSize(null);
+check("缺陷特征对照：ratio=null 时舞台横向（旧实现即此态）", buggyStage.w === mod.STAGE_MAX_W && buggyStage.w > buggyStage.h, JSON.stringify(buggyStage));
+
+// 接线护栏（源码级）：组件必须走「挂载期查 complete」，且不得再依赖 antd Image 的 onLoad（该链路不透传）。
+const drawerSrc = readFileSync(path.resolve("src/pages/hub/task-detail-drawer.tsx"), "utf8");
+check("drawer 已接线 ratioFromImage（挂载/换图期判定比例）", /ratioFromImage\(/.test(drawerSrc));
+check("drawer 自带 Image 探针兜底（new Image() 在 effect 内）", /new Image\(\)/.test(drawerSrc));
+check("drawer 不再给 AntdImage 传 onLoad（antd 不透传，写了也是死代码）", !/<AntdImage[\s\S]{0,300}?onLoad=\{/.test(drawerSrc));
 
 rmSync(outDir, { recursive: true, force: true });
 

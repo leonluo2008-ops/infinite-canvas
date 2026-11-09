@@ -28,6 +28,23 @@ export const LEGEND_CHIP_GAP = 4;
 export const BADGE_MIN_W = 30;
 export const BADGE_MIN_H = 16;
 
+/** 图片元素的最小可判定面（HTMLImageElement / new Image() 都满足）：只读 complete + 自然尺寸。 */
+export type ImageLike = { complete?: boolean; naturalWidth?: number; naturalHeight?: number };
+
+/**
+ * 从图片元素取真实宽高比：只有「已加载完成且自然尺寸有效」才返回，否则 null（= 仍需等 load 事件）。
+ * 为什么不能只靠 onLoad：① antd Image（@rc-component/image）根本不透传 onLoad——内部 `<img>` 只吃
+ * COMMON_PROPS 白名单（不含 onLoad）+ 自己的 srcAndOnload；② 命中浏览器缓存时 load 事件早于 React 挂载。
+ * 两种情形下 onLoad 都永不触发，ratio 恒 null → 舞台退回 16:9，竖屏帧的框就落到 letterbox 黑边上。
+ * 所以挂载期必须主动查一次 complete（本函数就是这次查询的唯一判定口）。
+ */
+export function ratioFromImage(img?: ImageLike | null): number | null {
+    if (!img || !img.complete) return null;
+    const w = img.naturalWidth || 0;
+    const h = img.naturalHeight || 0;
+    return w > 0 && h > 0 ? w / h : null;
+}
+
 /** 比例兜底：非有限正数/缺值 → 16:9。 */
 export function safeRatio(ratio?: number | null): number {
     return typeof ratio === "number" && Number.isFinite(ratio) && ratio > 0 ? ratio : FALLBACK_RATIO;
