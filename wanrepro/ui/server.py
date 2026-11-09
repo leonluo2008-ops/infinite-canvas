@@ -50,6 +50,8 @@ ROOT = Path(__file__).resolve().parents[1]
 _NOWINDOW_DIR = str(ROOT / "pipeline" / "_nowindow")
 if _NOWINDOW_DIR not in sys.path:
     sys.path.insert(0, _NOWINDOW_DIR)
+
+import hub_api  # noqa: E402 —— 自动化工作台业务层（内部自行把 wanrepro/ 加进 sys.path）
 os.environ["PYTHONPATH"] = _NOWINDOW_DIR + (os.pathsep + os.environ["PYTHONPATH"] if os.environ.get("PYTHONPATH") else "")
 import sitecustomize  # noqa: E402  （_nowindow 目录；import 即安装 subprocess 无窗口补丁）
 
@@ -1823,6 +1825,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.route_post(path)
         except ApiError as err:
             self.send_json({"error": err.msg}, err.status)
+        except hub_api.HubError as e:      # 工作台业务错（状态不对/文件缺失）→ 4xx，原文给员工看
+            self.send_json({"error": str(e)}, 409)
         except subprocess.TimeoutExpired:
             self.send_json({"error": "子进程超时"}, 500)
         except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
@@ -1837,6 +1841,27 @@ class Handler(BaseHTTPRequestHandler):
                 self.close_connection = True
 
     def route_get(self, path: str) -> None:
+        # ---- 自动化工作台（hub）：任务列表/详情/成片/job 轮询 ----
+        if path == "/api/hub/tasks":
+            self.send_json({"tasks": hub_api.list_tasks()})
+            return
+        m = re.fullmatch(r"/api/hub/task/([^/]+)", path)
+        if m:
+            self.send_json({"task": hub_api.get_task(urllib.parse.unquote(m.group(1)))})
+            return
+        m = re.fullmatch(r"/api/hub/file/([^/]+)", path)
+        if m:
+            f = hub_api.output_file(urllib.parse.unquote(m.group(1)))
+            self.send_body_bytes_or_file(f)
+            return
+        m = re.fullmatch(r"/api/hub/job/([^/]+)", path)
+        if m:
+            self.send_json(hub_api.job_status(urllib.parse.unquote(m.group(1))))
+            return
+        m = re.fullmatch(r"/api/hub/render/([^/]+)", path)
+        if m:
+            self.send_json(hub_api.do_render(urllib.parse.unquote(m.group(1))))
+            return
         # ---- 图床直链（M4）：https://vc-t.aistar.work/vc/<key> → uploads/vc/<key> ----
         if path.startswith("/vc/"):
             rel = path[len("/vc/"):]
@@ -1987,6 +2012,34 @@ class Handler(BaseHTTPRequestHandler):
         raise ApiError(404, f"没有这个地址：{path}")
 
     def route_post(self, path: str) -> None:
+        # ---- 自动化工作台（hub）：建任务/拆解/置换/确认/渲染/批准/提交 ----
+        if path == "/api/hub/ingest":
+            self.do_hub_ingest()
+            return
+        m = re.fullmatch(r"/api/hub/discuss/([^/]+)", path)
+        if m:
+            self.send_json(hub_api.start_discuss(urllib.parse.unquote(m.group(1))))
+            return
+        m = re.fullmatch(r"/api/hub/assets/([^/]+)", path)
+        if m:
+            self.do_hub_assets(urllib.parse.unquote(m.group(1)))
+            return
+        m = re.fullmatch(r"/api/hub/confirm/([^/]+)", path)
+        if m:
+            self.send_json(hub_api.do_confirm(urllib.parse.unquote(m.group(1))))
+            return
+        m = re.fullmatch(r"/api/hub/render/([^/]+)", path)
+        if m:
+            self.send_json(hub_api.do_render(urllib.parse.unquote(m.group(1))))
+            return
+        m = re.fullmatch(r"/api/hub/approve/([^/]+)", path)
+        if m:
+            self.send_json(hub_api.do_approve(urllib.parse.unquote(m.group(1))))
+            return
+        m = re.fullmatch(r"/api/hub/submit/([^/]+)", path)
+        if m:
+            self.send_json(hub_api.start_submit(urllib.parse.unquote(m.group(1))))
+            return
         if path == "/api/asset/upload":
             self.do_asset_upload()
             return
@@ -2096,6 +2149,82 @@ class Handler(BaseHTTPRequestHandler):
                 written += len(chunk)
                 left -= len(chunk)
         return written
+
+    def do_hub_ingest(self) -> None:
+        """POST /api/hub/ingest —— multipart(video=<文件>, intent=<文本>) → 建任务。
+
+        收完落临时文件转 automation.ingest（幂等键=视频 sha，同片重传命中同任务）。
+        """
+        length = int(self.headers.get("Content-Length") or 0)
+        ctype = (self.headers.get("Content-Type") or "").lower()
+        if not ctype.startswith("multipart/") or length <= 0:
+            raise ApiError(400, "hub/ingest 要 multipart：video=<文件> intent=<文本>")
+        if length > 64 * 1024 * 1024:
+            raise ApiError(413, f"浏览器直传上限 64 MB（收到 {length / 1048576:.1f} MB）")
+        bm = re.search(r"boundary=([^;]+)", self.headers.get("Content-Type") or "", re.IGNORECASE)
+        if not bm:
+            raise ApiError(400, "multipart 缺 boundary")
+        fields, files = parse_multipart(self.read_body(), bm.group(1).strip().strip('"'))
+        if "video" not in files:
+            raise ApiError(400, "multipart 里没有 video 字段（文件放 video 字段）")
+        name, blob = files["video"]
+        UPLOADS.mkdir(parents=True, exist_ok=True)
+        stem, ext = clean_video_name(name)
+        suffix = f".{ext}".lower() if ext else Path(name).suffix.lower()
+        if suffix not in {".mp4", ".mov", ".webm"}:
+            raise ApiError(400, f"参考视频只收 mp4/mov/webm（收到 {suffix or '无扩展名'}）")
+        # 两段式：临时目录+原始名——video_name/桥任务 id 都来自文件名，不能让 .hub-incoming 泄进去
+        tdir = UPLOADS / f".hub-incoming-{os.getpid()}-{int(time.time() * 1000)}"
+        tdir.mkdir(parents=True, exist_ok=True)
+        temp = tdir / f"{stem}{suffix}"
+        try:
+            temp.write_bytes(blob)
+            if temp.stat().st_size <= 0:
+                raise ApiError(400, "视频是空的（0 字节）")
+            res = hub_api.do_ingest(temp, fields.get("intent", ""))
+        finally:
+            for p in tdir.iterdir():
+                p.unlink(missing_ok=True)
+            if tdir.is_dir():
+                tdir.rmdir()
+        self.send_json(res)
+
+    def do_hub_assets(self, local_id: str) -> None:
+        """POST /api/hub/assets/<local_id> —— multipart 多图（file / file0 / file1 …）。
+
+        parse_multipart 同名字段会覆盖，所以多图用 file、file0、file1… 任意组合。
+        """
+        length = int(self.headers.get("Content-Length") or 0)
+        ctype = (self.headers.get("Content-Type") or "").lower()
+        if not ctype.startswith("multipart/") or length <= 0:
+            raise ApiError(400, "hub/assets 要 multipart：file=<图片>（多图用 file0/file1…）")
+        if length > 20 * 1024 * 1024:
+            raise ApiError(413, f"图太大（{length / 1048576:.1f} MB），单次上限 20 MB")
+        bm = re.search(r"boundary=([^;]+)", self.headers.get("Content-Type") or "", re.IGNORECASE)
+        if not bm:
+            raise ApiError(400, "multipart 缺 boundary")
+        _fields, files = parse_multipart(self.read_body(), bm.group(1).strip().strip('"'))
+        items = sorted((k, v) for k, v in files.items() if k == "file" or k.startswith("file"))
+        if not items:
+            raise ApiError(400, "multipart 里没有图（文件放 file 字段，多图 file0/file1…）")
+        paths: list[Path] = []
+        try:
+            for i, (_k, (name, blob)) in enumerate(items):
+                suffix = Path(name).suffix.lower()
+                if suffix not in {".png", ".jpg", ".jpeg", ".webp"}:
+                    raise ApiError(400, f"替换图只收 png/jpg/webp（{name} 是 {suffix or '无扩展名'}）")
+                p = UPLOADS / f".hub-asset-{local_id}-{int(time.time() * 1000)}-{i}{suffix}"
+                p.write_bytes(blob)
+                paths.append(p)
+            res = hub_api.do_assets(local_id, paths)
+        finally:
+            for p in paths:
+                p.unlink(missing_ok=True)
+        self.send_json(res)
+
+    def send_body_bytes_or_file(self, f: Path) -> None:
+        """成片发送：小文件整读；带 Range 支持的流式留给后续（当前成片 ≤ 数 MB）。"""
+        self.send_body(f.read_bytes(), 200, "video/mp4")
 
     def do_asset_upload(self) -> None:
         """POST /api/asset/upload —— 参考图字节 → 本地备份 + 转传 uguu → 公网 HTTPS 直链。
@@ -2961,10 +3090,11 @@ def analyze_video(video: str, intent: str = "", requested_task_id: str = "",
         pass
 
     try:
+        # 1800s：输入不限长度（本期范围），长片大拆解实测可超 10 分钟；提前完成自然提前返回
         code, out, err = run_py(analyze_argv(rel, task_id, intent, extra_args),
-                                timeout=600, extra_env=extra_env)
+                                timeout=1800, extra_env=extra_env)
     except subprocess.TimeoutExpired:
-        raise ApiError(500, "analyze.py 超过 600s 没跑完") from None
+        raise ApiError(500, "analyze.py 超过 1800s 没跑完（长片超引擎上限，需拆段输入）") from None
     finally:
         with WRITE_LOCK:
             ANALYZING.discard(task_id)

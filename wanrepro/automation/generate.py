@@ -117,8 +117,12 @@ def do_approve(task_dir: Path, verbose: bool = True) -> str:
     return "approved"
 
 
-def do_submit(task_dir: Path, verbose: bool = True) -> str:
-    """approved → generating →（轮询）→ done；成片落任务目录。"""
+def do_submit(task_dir: Path, verbose: bool = True,
+              on_progress=None) -> str:
+    """approved → generating →（轮询）→ done；成片落任务目录。
+
+    on_progress: 可选回调 (pct:int|None, waited:int)——Notion 中控台用它回写进度。
+    """
     task = state.load(task_dir)
     if task["state"] == "generating":
         print(f"[续跑] {task['local_id']}: 上次提交中断，重查（产物优先）")
@@ -185,6 +189,11 @@ def do_submit(task_dir: Path, verbose: bool = True) -> str:
             state.transition(task_dir, "failed", note=str(rec.get("error"))[:500])
             raise GenError(f"生成失败（原文）: {rec.get('error')}")
         pct = rec.get("progress")
+        if on_progress is not None:
+            try:
+                on_progress(pct if isinstance(pct, (int, float)) else None, waited)
+            except Exception:  # noqa: BLE001 —— 进度回写失败不拖垮生成主链
+                pass
         if verbose and pct is not None and waited % 30 == 0:
             print(f"  生成中 {pct}%（{waited}s）")
         time.sleep(GEN_POLL_INTERVAL)

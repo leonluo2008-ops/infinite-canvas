@@ -56,6 +56,23 @@ def run() -> int:
             except StateError:
                 ok &= check(f"ingested→{bad} 拒", True)
 
+        print("[2b] failed 唯一出口=人工重试拆解（2026-11-09）")
+        t2b = new_task(tmp, 7)
+        transition(t2b, "failed", note="模拟失败")
+        try:
+            transition(t2b, "discussing", note="人工重试拆解")
+            ok &= check("failed→discussing 过（人工重试）", True)
+        except StateError as e:
+            ok &= check(f"failed→discussing 应过: {e}", False)
+        for i, bad in enumerate(["awaiting_assets", "rendering", "done"]):
+            t2c = new_task(tmp, 10 + i)
+            transition(t2c, "failed", note="模拟失败")
+            try:
+                transition(t2c, bad)
+                ok &= check(f"failed→{bad} 应拒", False)
+            except StateError:
+                ok &= check(f"failed→{bad} 拒", True)
+
         print("[3] 审批停点守卫：approved 不带快照被拒（未确认直接续跑负例）")
         t3 = new_task(tmp, 3)
         for s in ["discussing", "awaiting_assets"]:

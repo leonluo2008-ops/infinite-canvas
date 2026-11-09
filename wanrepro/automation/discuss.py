@@ -21,7 +21,7 @@ sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 POLL_INTERVAL = 3        # 秒
-POLL_MAX_SECONDS = 900   # 拆解常规 1-3 分钟，上限 15 分钟
+POLL_MAX_SECONDS = 1800  # 与桥端 analyze 子进程上限一致：长片大拆解实测可超 10 分钟
 BUSY_RETRY_MAX = 60      # 409 排队：最多等 60 次 × 5s = 5 分钟
 BUSY_RETRY_INTERVAL = 5
 
@@ -35,8 +35,19 @@ def _products_ready(bridge_id: str) -> bool:
     return bool(p and p["has_disc"] and p["has_check"] and p["has_prompt"])
 
 
-def start_and_wait(task: dict) -> str:
-    """POST lapian/run（409 排队重试）→ 轮询 job 至 done/error。返回 job id。"""
+def start_and_wait(task: dict, on_stage=None) -> str:
+    """POST lapian/run（409 排队重试）→ 轮询 job 至 done/error。返回 job id。
+
+    on_stage(msg)：阶段回调（排队/提交/每次 stage 变化）——hub 工作台用它落
+    拆解日志.txt 并回写任务.json 的 lapian_stage；CLI 模式不传。
+    """
+    def _emit(msg: str) -> None:
+        if on_stage:
+            try:
+                on_stage(msg)
+            except Exception:  # noqa: BLE001 —— 进度回调失败不拖垮拆解主链
+                pass
+
     for attempt in range(BUSY_RETRY_MAX):
         try:
             out = bridge.post_json("/api/lapian/run",
@@ -47,14 +58,17 @@ def start_and_wait(task: dict) -> str:
             break
         except bridge.BridgeError as e:
             if "HTTP 409" in str(e):
+                _emit(f"拆解槽忙，排队重试（{attempt + 1}/{BUSY_RETRY_MAX}，{BUSY_RETRY_INTERVAL}s 后）")
                 print(f"  [排队] 桥忙（{BUSY_RETRY_INTERVAL}s 后重试 {attempt + 1}/{BUSY_RETRY_MAX}）")
                 time.sleep(BUSY_RETRY_INTERVAL)
                 continue
             raise
     else:
         raise DiscussError(f"桥持续忙 {BUSY_RETRY_MAX} 次，放弃（任务未失败，重跑本命令续）")
+    _emit(f"已提交拆解（job={job}），通常 1–3 分钟，远程模型慢时会更久")
 
     waited = 0
+    last_stage = ""
     while waited < POLL_MAX_SECONDS:
         try:
             rec = bridge.get(f"/api/job/{job}")
@@ -68,16 +82,24 @@ def start_and_wait(task: dict) -> str:
             raise
         st = rec.get("status")
         if st == "done":
+            _emit(f"拆解完成（耗时 {rec.get('elapsed', '?')}s）")
             return job
         if st == "error":
+            _emit(f"失败：{rec.get('error')}")
             raise DiscussError(f"桥侧拆解失败（原文）: {rec.get('error')}")
+        stage = str(rec.get("stage") or "")
+        if stage and stage != last_stage:
+            last_stage = stage
+            _emit(f"{stage}（已 {rec.get('elapsed', waited)}s）")
         time.sleep(POLL_INTERVAL)
         waited += POLL_INTERVAL
     raise DiscussError(f"拆解超 {POLL_MAX_SECONDS}s 未完成（job={job}）——不判失败，可重跑续查")
 
 
-def run_discuss(task_dir: Path, *, verbose: bool = True) -> str:
+def run_discuss(task_dir: Path, *, verbose: bool = True, on_stage=None) -> str:
     """执行拆解到 awaiting_assets。返回终态。
+
+    on_stage(msg)：阶段回调透传给 start_and_wait（hub 工作台落日志/回写状态）。
 
     失败语义分级（审计 WARN「busy=排队不记 failed」同类）：
       · 任务级失败（桥报 error / done 但产物缺 / job 丢失且产物未齐）
@@ -89,6 +111,11 @@ def run_discuss(task_dir: Path, *, verbose: bool = True) -> str:
     cur = task["state"]
     if cur == "ingested":
         pass
+    elif cur == "failed":
+        # 人工重跑（CLI 重跑/工作台重试按钮都是人工动作）：failed 不判死，重跑即续
+        state.transition(task_dir, "discussing", note="人工重试拆解")
+        if verbose:
+            print(f"[重试] {task['local_id']}: failed → discussing（人工重试）")
     elif cur == "discussing":
         if verbose:
             print(f"[续跑] {task['local_id']}: 上次拆解中断（discussing），重查产物后续跑")
@@ -111,7 +138,7 @@ def run_discuss(task_dir: Path, *, verbose: bool = True) -> str:
     if cur == "ingested":
         state.transition(task_dir, "discussing", note="拆解启动")
     try:
-        job = start_and_wait(task)
+        job = start_and_wait(task, on_stage=on_stage)
         # done 后核产物（失败即失败：桥说 done 但产物缺 → 如实报）
         if not _products_ready(task["bridge_id"]):
             raise DiscussError("桥报 done 但 has_disc/has_check/has_prompt 不全——如实记失败")

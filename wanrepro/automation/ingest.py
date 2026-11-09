@@ -95,6 +95,29 @@ class IngestError(RuntimeError):
     """摄取校验失败——message 面向人（工作人员能看懂缺什么）。"""
 
 
+def ingest_media(video: Path, intent: str, *, images: list[Path] | None = None,
+                 source_note: str = "") -> dict:
+    """直连摄取入口（Notion 中控台用）：视频文件 + 意图文本 + 可选图，不经 zip。
+
+    幂等键=视频内容 sha256（与 zip 路径共用 projects/*/任务.json 的 ingestion.zip_sha256
+    字段——同视频无论从 zip 还是 Notion 来都命中同一条）。
+    """
+    if not video.is_file() or video.stat().st_size <= 0:
+        raise IngestError(f"视频文件不可用（不存在或 0 字节）: {video}")
+    if video.suffix.lower() not in config.VIDEO_EXTS:
+        raise IngestError(f"不认的视频格式 {video.suffix}（支持 {'/'.join(sorted(config.VIDEO_EXTS))}）")
+    sha = _sha256_file(video)
+    existing = _existing_by_sha().get(sha)
+    if existing:
+        d = json.loads((existing / "任务.json").read_text(encoding="utf-8"))
+        return {"local_id": d["local_id"], "bridge_id": d.get("bridge_id"),
+                "result": "HIT", "note": f"同视频已摄取过（{d['local_id']}），未重复建任务"}
+    return _create_task(video_name=video.name, video_bytes=video.read_bytes(),
+                        intent=intent.strip(), assets=[p.name for p in (images or [])],
+                        ignored=[], sha=sha,
+                        source=source_note or f"media:{video.name}")
+
+
 def _iter_zips(target: Path) -> list[Path]:
     if target.is_file() and target.suffix.lower() == ".zip":
         return [target]
@@ -130,6 +153,39 @@ def _next_local_id() -> str:
     return f"auto-{max(nums, default=0) + 1:04d}"
 
 
+def _create_task(*, video_name: str, video_bytes: bytes, intent: str, assets: list[str],
+                 ignored: list[str], sha: str, source: str) -> dict:
+    """共同建任务路径（zip / Notion 直连两入口收敛于此——同一动作单一实现）。"""
+    local_id = _next_local_id()
+    tdir = config.PROJECTS_DIR / local_id
+    inbox = tdir / "inbox"
+    inbox.mkdir(parents=True, exist_ok=True)
+    (inbox / video_name).write_bytes(video_bytes)
+
+    up = bridge.upload_video(inbox / video_name)
+    if not bridge.task_exists(up["id"]):
+        raise IngestError(f"上传回了 id={up['id']} 但 /api/tasks 里查不到——桥任务未建成")
+
+    task = {
+        "local_id": local_id,
+        "bridge_id": up["id"],
+        "created_at": _now(),
+        "state": "ingested",
+        "history": [{"at": _now(), "from": None, "to": "ingested",
+                     "note": f"摄取自 {source}"}],
+        "intent": intent,
+        "assets": assets,
+        "ingestion": {"zip_sha256": sha, "zip_name": source,
+                      "video_name": video_name, "text_name": "",
+                      "ignored": ignored},
+    }
+    (tdir / "任务.json").write_text(
+        json.dumps(task, ensure_ascii=False, indent=2), encoding="utf-8")
+    return {"local_id": local_id, "bridge_id": up["id"], "result": "OK",
+            "note": f"视频 {video_name} 已建桥任务 {up['id']}；"
+                    f"资产图 {len(assets)} 张待置换；意图 {len(intent)} 字"}
+
+
 def ingest_one(zip_path: Path, *, dry_run: bool = False) -> dict:
     """摄取单个 zip → 任务摘要 dict（local_id/bridge_id/状态/说明）。"""
     sha = _sha256_file(zip_path)
@@ -144,35 +200,17 @@ def ingest_one(zip_path: Path, *, dry_run: bool = False) -> dict:
         return {"local_id": None, "bridge_id": None, "result": "DRY-OK",
                 "note": f"校验通过：视频 {spec['video_name']}，资产图 {len(spec['assets'])} 张，"
                         f"意图 {len(spec['intent'])} 字——未上传（--dry-run）"}
+    # 幂等键=视频内容 sha（不是 zip 文件 sha）：同片无论打 zip 还是从工作台直传都命中同一条
+    sha = hashlib.sha256(spec["video_bytes"]).hexdigest()
+    existing = _existing_by_sha().get(sha)
+    if existing:
+        d = json.loads((existing / "任务.json").read_text(encoding="utf-8"))
+        return {"local_id": d["local_id"], "bridge_id": d.get("bridge_id"),
+                "result": "HIT", "note": f"同视频已摄取过（{d['local_id']}），未重复建任务"}
 
-    local_id = _next_local_id()
-    tdir = config.PROJECTS_DIR / local_id
-    inbox = tdir / "inbox"
-    inbox.mkdir(parents=True, exist_ok=True)
-    (inbox / spec["video_name"]).write_bytes(spec["video_bytes"])
-
-    up = bridge.upload_video(inbox / spec["video_name"])
-    if not bridge.task_exists(up["id"]):
-        raise IngestError(f"上传回了 id={up['id']} 但 /api/tasks 里查不到——桥任务未建成")
-
-    task = {
-        "local_id": local_id,
-        "bridge_id": up["id"],
-        "created_at": _now(),
-        "state": "ingested",
-        "history": [{"at": _now(), "from": None, "to": "ingested",
-                     "note": f"摄取自 {zip_path.name}"}],
-        "intent": spec["intent"],
-        "assets": spec["assets"],
-        "ingestion": {"zip_sha256": sha, "zip_name": zip_path.name,
-                      "video_name": spec["video_name"], "text_name": spec["text_name"],
-                      "ignored": spec["ignored"]},
-    }
-    (tdir / "任务.json").write_text(
-        json.dumps(task, ensure_ascii=False, indent=2), encoding="utf-8")
-    return {"local_id": local_id, "bridge_id": up["id"], "result": "OK",
-            "note": f"视频 {spec['video_name']} 已建桥任务 {up['id']}；"
-                    f"资产图 {len(spec['assets'])} 张待置换；意图 {len(spec['intent'])} 字"}
+    return _create_task(video_name=spec["video_name"], video_bytes=spec["video_bytes"],
+                        intent=spec["intent"], assets=spec["assets"],
+                        ignored=spec["ignored"], sha=sha, source=zip_path.name)
 
 
 def main(argv: list[str] | None = None) -> int:

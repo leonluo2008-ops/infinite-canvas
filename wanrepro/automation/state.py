@@ -86,6 +86,8 @@ def transition(task_dir: Path, to_: str, *, note: str = "",
     elif to_ == "done":
         if cur != "generating":
             raise StateError(f"done 只能从 generating 进，当前 {cur}")
+    elif cur == "failed" and to_ == "discussing":
+        pass  # 人工重试拆解（工作台重试按钮 / CLI 重跑，2026-11-09）——failed 唯一合法出口
     else:
         if cur not in _ORDER or to_ not in _ORDER:
             raise StateError(f"未知状态: {cur} → {to_}")
