@@ -1,11 +1,42 @@
 import { ArrowRight, CheckCircle2, CircleAlert, Download, FileText, ImageOff, LoaderCircle, MoreHorizontal, RefreshCw, Sparkles, Type, Upload } from "lucide-react";
-import { App, Button, Checkbox, Drawer, Dropdown, Empty, Image as AntdImage, Input, Modal, Progress, Radio, Select, Tag, Tooltip } from "antd";
+import { App, Button, Checkbox, Drawer, Dropdown, Empty, Image as AntdImage, Input, Modal, Radio, Select, Slider, Tag, Tooltip } from "antd";
 import { useCallback, useEffect, useMemo, useRef, useState, type DragEvent } from "react";
 import { Streamdown } from "streamdown";
 
+import { ModelPicker } from "@/components/model-picker";
 import { badgeFits, boxRect, containRect, formatSeconds, frameCaption, frameState, layoutLegend, otherBoxCount, ratioFromImage, stageSize } from "@/lib/hub/frame-overlay";
+import {
+    buildApproveConfig,
+    clearApprovedSignature,
+    defaultGenDraft,
+    findGenChannel,
+    genApproveIssues,
+    genDefaultChannelId,
+    genDraftSignature,
+    genDraftStaleNote,
+    genDraftSummary,
+    genFailureHint,
+    genFamily,
+    genIssue,
+    genModelRows,
+    genNeedsReapproval,
+    genRatioRows,
+    genResolutionRows,
+    genSizeNote,
+    genSubmitIssues,
+    genUiFlags,
+    readGenDraft,
+    saveApprovedSignature,
+    saveGenDraft,
+    GEN_CANVAS_ONLY_TAG,
+    GEN_DURATION_MAX,
+    GEN_DURATION_MIN,
+    type GenChannelDesc,
+    type GenDraft,
+} from "@/lib/hub/gen-settings";
 import { mergeBadge, mergeBarText, mergeImageBranch, mergeMembershipChanged, mergeSelectable, mergeShotUnion, groupBoxRow, pruneSelection, toggleMergeRow } from "@/lib/hub/merge-mode";
 import { activeCards, decisionBadgeText, decisionErrorText, decisionFeedback, lockCounters, lockRows, originRowNumbers, originStripLabel, rowDecisionAction, type RowDecisionAction } from "@/lib/hub/row-decision";
+import { useConfigStore, type AiConfig } from "@/stores/use-config-store";
 
 import {
     approveHubTask,
@@ -16,6 +47,7 @@ import {
     hubOutputUrl,
     postHubAsset,
     retryHubTask,
+    revokeHubTask,
     rollbackHubTask,
     startLapianRun,
     submitHubTask,
@@ -43,7 +75,7 @@ const OVERLAY_COLORS = [
 
 const POST_DECOMPOSE_STATES = ["awaiting_assets", "rendering", "awaiting_approval", "approved", "generating", "done", "failed"];
 
-type BusyKind = "upload" | "confirm" | "empty" | "approve" | "submit" | "retry" | "rollback" | "group" | "ungroup" | "discuss" | "decision" | "dismiss-batch" | null;
+type BusyKind = "upload" | "confirm" | "empty" | "approve" | "submit" | "retry" | "rollback" | "revoke" | "group" | "ungroup" | "discuss" | "decision" | "dismiss-batch" | null;
 
 /**
  * 任务详情全屏 Drawer（AT-9 §五）：头部 → Agent 建议 → 资产置换 → 提示词 → 审批/生成/成片。
@@ -1784,62 +1816,9 @@ function OutcomeSection({
     const state = detail.state;
     const localId = detail.local_id;
 
-    const progress = typeof detail.gen_progress === "number" && Number.isFinite(detail.gen_progress) ? Math.max(0, Math.min(100, Math.round(detail.gen_progress))) : null;
-
-    if (state === "awaiting_approval") {
-        return (
-            <section className="rounded-lg border border-stone-200 bg-card p-4 dark:border-stone-800">
-                <div className="text-sm text-stone-500 dark:text-stone-400">提示词已出（上方可展开全文）。批准后将自动提交生成——生成会调用付费接口。</div>
-                <ApprovalActions detail={detail} busy={busy} act={act} />
-            </section>
-        );
-    }
-
-    if (state === "approved") {
-        return (
-            <section className="rounded-lg border border-stone-200 bg-card p-4 dark:border-stone-800">
-                <div className="flex flex-wrap items-center justify-between gap-2">
-                    <span className="text-sm text-stone-500 dark:text-stone-400">已批准，等待提交生成。</span>
-                    <Button
-                        type="primary"
-                        loading={busy === "submit"}
-                        disabled={busy !== null}
-                        onClick={() =>
-                            void act(
-                                "submit",
-                                async () => {
-                                    await submitHubTask(localId);
-                                },
-                                "已提交生成，等待成片",
-                            )
-                        }
-                    >
-                        提交生成
-                    </Button>
-                </div>
-            </section>
-        );
-    }
-
-    if (state === "generating") {
-        return (
-            <section className="rounded-lg border border-stone-200 bg-card p-4 dark:border-stone-800">
-                <div className="flex flex-wrap items-center justify-between gap-2 text-sm">
-                    <span className="flex items-center gap-1.5 text-stone-500 dark:text-stone-400">
-                        <LoaderCircle className="size-3.5 animate-spin" />
-                        生成中，云端通常 5 分钟以上；前端超时≠云端失败，重查可找回成片。
-                    </span>
-                    <span className="text-stone-600 dark:text-stone-300">{progress !== null ? `${progress}%` : "等待进度"}</span>
-                </div>
-                {progress !== null ? (
-                    <Progress percent={progress} showInfo={false} size="small" status="active" className="mt-2" />
-                ) : (
-                    <div className="mt-2 h-1.5 w-full overflow-hidden rounded-full bg-stone-200 dark:bg-stone-800">
-                        <div className="h-full w-1/3 animate-pulse rounded-full bg-indigo-500" />
-                    </div>
-                )}
-            </section>
-        );
+    // AT-13 B3：待批准 / 已批准 / 生成中一律走「生成设置」段（配置面板 + 提交链阻断 UI）
+    if (state === "awaiting_approval" || state === "approved" || state === "generating") {
+        return <GenSettingsSection detail={detail} busy={busy} act={act} />;
     }
 
     if (state === "done") {
@@ -1858,16 +1837,31 @@ function OutcomeSection({
     }
 
     if (state === "failed") {
+        const issue = genIssue(detail);
         return (
-            <section className="rounded-lg border border-red-200 bg-red-50 p-4 dark:border-red-950 dark:bg-red-950/20">
-                <div className="flex items-start gap-2 text-sm text-red-700 dark:text-red-300">
-                    <CircleAlert className="mt-0.5 size-4 shrink-0" />
-                    <div className="min-w-0 break-words">{detail.error || "任务失败，错误原文未返回。"}</div>
-                </div>
-                <div className="mt-2 flex justify-end">
-                    <RetryButton localId={localId} busy={busy} act={act} />
-                </div>
-            </section>
+            <>
+                {/* 失败红条 + 阻断面板（原文由 GenIssueSection 出，避免与本段重复） */}
+                <GenIssueSection detail={detail} busy={busy} act={act} />
+                <section className="rounded-lg border border-stone-200 bg-card p-4 dark:border-stone-800">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                        <span className="min-w-0 break-words text-xs text-stone-500 dark:text-stone-400">
+                            {detail.gen_error ? "失败原文见上（已脱敏）。" : detail.error ? "" : "任务失败，错误原文未返回。"}重试=重跑拆解与渲染（产物优先保留）。
+                        </span>
+                        <div className="flex flex-wrap items-center justify-end gap-2">
+                            {/* 阻断态（未知收单/在途）下不许重试：会重复建单扣费（§2.3） */}
+                            {issue.blocksRetry ? (
+                                <Tooltip title={`${issue.title}——先按上方指引核对 / 续查，解除阻断后才能重试`}>
+                                    <span>
+                                        <RetryButton localId={localId} busy={busy} act={act} disabled />
+                                    </span>
+                                </Tooltip>
+                            ) : (
+                                <RetryButton localId={localId} busy={busy} act={act} />
+                            )}
+                        </div>
+                    </div>
+                </section>
+            </>
         );
     }
 
@@ -1875,14 +1869,17 @@ function OutcomeSection({
 }
 
 /** 重试（§四 failed 动作）：POST /api/hub/task/<id>/retry（AT-9 B5 上桥）——failed → discussing
- *  续跑，产物优先；非 failed 桥端 409，错误原文透出（不再吞错降级）。 */
-function RetryButton({ localId, busy, act }: { localId: string; busy: BusyKind; act: (kind: Exclude<BusyKind, null>, run: () => Promise<void>, okText?: string) => Promise<void> }) {
+ *  续跑，产物优先；非 failed 桥端 409，错误原文透出（不再吞错降级）。
+ *  AT-13 B3：阻断态（未知收单 / 在途）一律 disabled——重试会再次触发创建，重复扣费。 */
+function RetryButton({ localId, busy, act, disabled = false }: { localId: string; busy: BusyKind; act: (kind: Exclude<BusyKind, null>, run: () => Promise<void>, okText?: string) => Promise<void>; disabled?: boolean }) {
     return (
         <Button
             danger
             size="small"
             icon={<RefreshCw className="size-3.5" />}
             loading={busy === "retry"}
+            disabled={disabled || busy !== null}
+            data-hub-gen-retry
             onClick={() =>
                 void act("retry", async () => {
                     await retryHubTask(localId);
@@ -1894,25 +1891,224 @@ function RetryButton({ localId, busy, act }: { localId: string; busy: BusyKind; 
     );
 }
 
-/** awaiting_approval 的两条动作（§四）：批准出片（付费停点）/ 退回置换（确认弹窗）。 */
-function ApprovalActions({ detail, busy, act }: { detail: HubTaskDetail; busy: BusyKind; act: (kind: Exclude<BusyKind, null>, run: () => Promise<void>, okText?: string) => Promise<void> }) {
+// ---------------------------------------------------------------- AT-13 B3：生成设置 + 提交链 UI
+
+/** 画布 AiConfig.channels → 纯渠道描述（lib 不吃 store，探针直接断言纯函数）。 */
+function genChannelsOf(config: AiConfig): GenChannelDesc[] {
+    return (config.channels || []).map((channel) => ({
+        id: channel.id,
+        name: channel.name,
+        baseUrl: channel.baseUrl,
+        apiKey: channel.apiKey,
+        apiFormat: channel.apiFormat,
+        models: (channel.models || []).map((model) => ({
+            name: model.name,
+            capability: model.capability,
+            hasScript: Boolean(String(model.script || "").trim()),
+        })),
+    }));
+}
+
+/** 生成渠道/模型的默认种子（只读画布全局默认，不回写 videoModel / videoSeconds）。 */
+function genSeedOf(config: AiConfig) {
+    return {
+        videoSeconds: config.videoSeconds,
+        vquality: config.vquality,
+        size: config.size,
+        videoMode: config.videoMode,
+        videoGenerateAudio: config.videoGenerateAudio,
+    };
+}
+
+/**
+ * 提交链提示段（§2.3/§2.4）：失败红条（gen_error 已脱敏原文）+ 阻断/在途/孤儿引导。
+ * 三种块各有 data-hub-gen-* 钩子，供 B5 真机 DOM 断言。
+ */
+function GenIssueSection({ detail, busy, act }: { detail: HubTaskDetail; busy: BusyKind; act: (kind: Exclude<BusyKind, null>, run: () => Promise<void>, okText?: string) => Promise<void> }) {
+    const config = useConfigStore((state) => state.config);
+    const issue = genIssue(detail);
+    const channel = findGenChannel(genChannelsOf(config), readGenDraft(detail.local_id)?.channelId || "");
+    const genError = String(detail.gen_error || "").trim();
+
+    if (!genError && issue.kind === "none") return null;
+
+    const resume = () => {
+        const draft = readGenDraft(detail.local_id);
+        const target = findGenChannel(genChannelsOf(config), draft?.channelId || "") || channel;
+        const key = genFamily(target?.apiFormat) === "wan" ? "" : String(target?.apiKey || "").trim();
+        void act("submit", async () => {
+            await submitHubTask(detail.local_id, key);
+        }, "已按云端 taskId 续查（只查不重提）");
+    };
+
+    return (
+        <div className="space-y-2">
+            {genError ? (
+                <div className="flex items-start gap-2 rounded-lg border border-red-200 bg-red-50 px-4 py-2.5 text-sm text-red-700 dark:border-red-950 dark:bg-red-950/20 dark:text-red-300" data-hub-gen-error>
+                    <CircleAlert className="mt-0.5 size-4 shrink-0" />
+                    <div className="min-w-0 break-words">{genError}</div>
+                </div>
+            ) : null}
+
+            {issue.kind !== "none" ? (
+                <div
+                    className={
+                        issue.kind === "active"
+                            ? "rounded-lg border border-indigo-200 bg-indigo-50 p-4 dark:border-indigo-950 dark:bg-indigo-950/20"
+                            : "rounded-lg border border-amber-200 bg-amber-50 p-4 dark:border-amber-950 dark:bg-amber-950/20"
+                    }
+                    data-hub-gen-issue={issue.kind}
+                >
+                    <div className="flex items-start gap-2">
+                        <CircleAlert className="mt-0.5 size-4 shrink-0 text-amber-600 dark:text-amber-400" />
+                        <div className="min-w-0 flex-1">
+                            <div className="text-sm font-semibold text-stone-800 dark:text-stone-100">{issue.title}</div>
+                            {issue.detail ? <div className="mt-1 break-words text-sm text-stone-600 dark:text-stone-300">{issue.detail}</div> : null}
+                            <ol className="mt-2 list-decimal space-y-1 pl-5 text-xs text-stone-600 dark:text-stone-300">
+                                {issue.steps.map((step) => (
+                                    <li key={step} className="break-words">{step}</li>
+                                ))}
+                            </ol>
+                            {issue.cloudTaskId ? (
+                                <div className="mt-2 font-mono text-xs text-stone-500 dark:text-stone-400" data-hub-gen-cloud-id>云端 taskId：{issue.cloudTaskId}</div>
+                            ) : null}
+                            {issue.canResume ? (
+                                <div className="mt-2 flex justify-end">
+                                    <Button size="small" loading={busy === "submit"} disabled={busy !== null} onClick={resume} data-hub-gen-resume>
+                                        按云端 taskId 续查（只查不重提）
+                                    </Button>
+                                </div>
+                            ) : null}
+                        </div>
+                    </div>
+                </div>
+            ) : null}
+
+            {genError ? (
+                <div className="text-xs text-stone-500 dark:text-stone-400" data-hub-gen-hint>
+                    {genFailureHint(channel, detail.state)}
+                </div>
+            ) : null}
+        </div>
+    );
+}
+
+/**
+ * 生成设置（§2.1/§2.2/§2.10）：
+ *  - 渠道 + 模型（复用 ModelPicker(capability=video)）→ 按「渠道+模型引用」存任务草稿（不写全局 videoModel）
+ *  - 协议矩阵：只列 SDGF / 万相可选，gemini/openai/模型脚本标「画布专用」禁选
+ *  - wan 如实 UI：固定 wan3.0 · 自动多图参考，model / mode 控件不渲染
+ *  - 参数面板枚举与画布同源（media-size.ts）；渠道不接的值照列 + 显式提示
+ *  - 批准带 config（无 key）；提交带 key（一次性）；改配置＝快照失效需重批（撤销批准）
+ */
+function GenSettingsSection({ detail, busy, act }: { detail: HubTaskDetail; busy: BusyKind; act: (kind: Exclude<BusyKind, null>, run: () => Promise<void>, okText?: string) => Promise<void> }) {
     const { message, modal } = App.useApp();
+    const config = useConfigStore((state) => state.config);
     const localId = detail.local_id;
+    const state = detail.state;
+    const readOnly = state !== "awaiting_approval";
     const promptReady = Boolean(detail.prompt_md);
 
-    const approveAndSubmit = () =>
+    const channels = useMemo(() => genChannelsOf(config), [config]);
+    const configRef = useRef(config);
+    configRef.current = config;
+
+    const [draft, setDraft] = useState<GenDraft | null>(null);
+    const initRef = useRef("");
+
+    // 草稿按任务加载（切任务重读；轮询不重置输入）。全局 videoModel 只作默认值参考，从不回写。
+    useEffect(() => {
+        if (!localId || initRef.current === localId) return;
+        initRef.current = localId;
+        const configNow = configRef.current;
+        const list = genChannelsOf(configNow);
+        const stored = readGenDraft(localId);
+        const preferred = configNow.videoModel ? configNow.videoModel.split("::")[0] : "";
+        const channel = stored ? findGenChannel(list, stored.channelId) : findGenChannel(list, genDefaultChannelId(list, preferred));
+        setDraft(stored ?? defaultGenDraft(channel, genSeedOf(configNow)));
+    }, [localId]);
+
+    const channel = draft ? findGenChannel(channels, draft.channelId) : null;
+    const ui = genUiFlags(channel);
+    const staleNote = genDraftStaleNote(draft, channels);
+    const needsReapproval = draft && readOnly ? genNeedsReapproval(localId, draft, channel) : false;
+
+    const update = (patch: Partial<GenDraft>) => {
+        setDraft((prev) => {
+            const next = { ...(prev as GenDraft), ...patch };
+            saveGenDraft(localId, next);
+            return next;
+        });
+    };
+
+    const pickChannel = (channelId: string) => {
+        const next = findGenChannel(channels, channelId);
+        const rows = genModelRows(next);
+        update({
+            channelId,
+            model: genFamily(next?.apiFormat) === "sdgf" ? rows.find((row) => row.selectable)?.name || "" : "",
+            mode: genFamily(next?.apiFormat) === "sdgf" ? draft?.mode || "frames" : "",
+        });
+    };
+
+    const pickModel = (value: string) => update({ model: value.includes("::") ? value.slice(value.indexOf("::") + 2) : value });
+
+    const apiKey = String(channel?.apiKey || "").trim();
+    const ratioRows = genRatioRows(channel);
+    const resolutionRows = genResolutionRows();
+    const pixels = draft ? parsePixelSizeOf(draft.size) : null;
+
+    // 批准 = 固化配置（无 key）+ 算 v2 快照 → 立刻提交（key 一次性透传）
+    const approveAndSubmit = () => {
+        if (!draft) return;
+        const issues = genApproveIssues(draft, channel);
+        if (issues.length) {
+            message.error(issues[0]);
+            return;
+        }
         void act(
             "approve",
             async () => {
-                await approveHubTask(localId);
+                const result = await approveHubTask(localId, buildApproveConfig(draft, channel));
+                saveApprovedSignature(localId, genDraftSignature(draft, channel));
                 try {
-                    await submitHubTask(localId);
-                    message.success("已批准并提交生成，等待成片");
+                    await submitHubTask(localId, apiKey);
+                    message.success(`已批准并提交生成（快照 v${result.snapshot_version ?? 2}），等待成片`);
                 } catch (error) {
                     message.warning(`已批准，但提交生成失败：${errorText(error)}。可在「提交生成」重试`);
                 }
             },
         );
+    };
+
+    const submitOnly = () => {
+        if (!draft) return;
+        const issues = genSubmitIssues(draft, channel, apiKey);
+        if (issues.length) {
+            message.error(issues[0]);
+            return;
+        }
+        void act(
+            "submit",
+            async () => {
+                await submitHubTask(localId, apiKey);
+            },
+            "已提交生成，等待成片",
+        );
+    };
+
+    const revoke = () => {
+        modal.confirm({
+            title: "撤销批准？（改配置后重批）",
+            content: "撤销后回到待批准，改完配置再批准一次（新配置会重算快照）。资产与提示词都保留。",
+            okText: "撤销批准",
+            onOk: () =>
+                act("revoke", async () => {
+                    await revokeHubTask(localId);
+                    clearApprovedSignature(localId);
+                }, "已撤销批准，改完配置再批准一次"),
+        });
+    };
 
     const rollback = () => {
         modal.confirm({
@@ -1926,16 +2122,286 @@ function ApprovalActions({ detail, busy, act }: { detail: HubTaskDetail; busy: B
         });
     };
 
+    if (!draft) {
+        return (
+            <section className="rounded-lg border border-stone-200 bg-card p-4 dark:border-stone-800">
+                <div className="flex items-center gap-2 text-sm text-stone-500 dark:text-stone-400">
+                    <LoaderCircle className="size-4 animate-spin" /> 正在读取生成设置…
+                </div>
+            </section>
+        );
+    }
+
+    const blocked = genIssue(detail);
+
     return (
-        <div className="mt-2 flex flex-wrap items-center justify-end gap-2">
-            <Button danger ghost loading={busy === "rollback"} disabled={busy !== null} onClick={rollback}>
-                退回置换
-            </Button>
-            <Button type="primary" icon={<Sparkles className="size-4" />} loading={busy === "approve"} disabled={!promptReady || busy !== null} onClick={approveAndSubmit}>
-                批准出片
-            </Button>
-        </div>
+        <>
+            <GenIssueSection detail={detail} busy={busy} act={act} />
+
+            <section className="rounded-lg border border-stone-200 bg-card p-4 dark:border-stone-800" data-hub-gen-settings data-hub-gen-readonly={readOnly ? "1" : "0"}>
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                    <h2 className="text-sm font-semibold">生成设置</h2>
+                    <span className="text-xs text-stone-500 dark:text-stone-400">
+                        {readOnly ? "已随批准固化（快照 v2）；要改先撤销批准" : "与会话画布同源；批准时固化本次配置"}
+                    </span>
+                </div>
+                <div className="mt-1 text-xs text-stone-500 dark:text-stone-400">
+                    {state === "generating"
+                        ? `已提交的配置由服务端快照固化；本地草稿口径：${genDraftSummary(draft, channel)}`
+                        : "改任一有效字段（渠道身份 / 模型 / 模式 / 参数）＝快照失效，需重新批准；只换 key 不失效。"}
+                </div>
+
+                {staleNote ? (
+                    <div className="mt-2 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-700 dark:border-amber-950 dark:bg-amber-950/20 dark:text-amber-300" data-hub-gen-stale>
+                        {staleNote}
+                    </div>
+                ) : null}
+
+                {/* 渠道（协议矩阵：SDGF / 万相可选，其余「画布专用」禁选） */}
+                <div className="mt-3 grid gap-3 md:grid-cols-2">
+                    <label className="space-y-1.5">
+                        <span className="text-xs font-medium text-stone-500 dark:text-stone-400">渠道</span>
+                        <Select
+                            className="w-full"
+                            disabled={readOnly}
+                            value={draft.channelId || undefined}
+                            placeholder="选 SDGF / 万相渠道"
+                            onChange={pickChannel}
+                            data-hub-gen-channel
+                            options={channels.map((row) => ({
+                                value: row.id,
+                                disabled: genFamily(row.apiFormat) === "canvas-only",
+                                label: (
+                                    <span className="flex min-w-0 items-center gap-2">
+                                        <span className="truncate">{row.name || row.id}</span>
+                                        <span className="shrink-0 text-[10px] text-stone-400">{row.apiFormat}</span>
+                                        {genFamily(row.apiFormat) === "canvas-only" ? <Tag className="m-0">{GEN_CANVAS_ONLY_TAG}</Tag> : null}
+                                    </span>
+                                ),
+                            }))}
+                        />
+                    </label>
+
+                    {/* 模型：wan 族不渲染（固定 wan3.0），SDGF 族走 ModelPicker(capability=video) */}
+                    {ui.showModel ? (
+                        <div className="space-y-1.5">
+                            <span className="text-xs font-medium text-stone-500 dark:text-stone-400">模型</span>
+                            {readOnly ? (
+                                <div className="flex h-8 items-center rounded-full border border-input px-3 text-sm">{draft.model || "未选模型"}</div>
+                            ) : (
+                                <ModelPicker
+                                    config={config}
+                                    value={channel && draft.model ? `${channel.id}::${draft.model}` : ""}
+                                    onChange={pickModel}
+                                    capability="video"
+                                    fullWidth
+                                    placeholder="选视频模型"
+                                    options={genModelRows(channel).map((row) => row.value)}
+                                    optionDisabled={(value) => !(genModelRows(channel).find((row) => row.value === value)?.selectable ?? true)}
+                                    optionSuffix={(value) => genModelRows(channel).find((row) => row.value === value)?.note || ""}
+                                />
+                            )}
+                        </div>
+                    ) : (
+                        <div className="space-y-1.5">
+                            <span className="text-xs font-medium text-stone-500 dark:text-stone-400">模型</span>
+                            <div className="flex h-8 items-center rounded-full border border-dashed border-stone-300 px-3 text-sm text-stone-600 dark:border-stone-700 dark:text-stone-300" data-hub-gen-fixed>
+                                {ui.fixedNote}
+                            </div>
+                        </div>
+                    )}
+                </div>
+
+                {/* 画幅（枚举同源 media-size.videoRatioOptions：含 21:9 / 自适应 / 自定义 W×H） */}
+                <div className="mt-3 space-y-1.5">
+                    <span className="text-xs font-medium text-stone-500 dark:text-stone-400">画幅</span>
+                    <div className="flex flex-wrap gap-1.5">
+                        {ratioRows.map((row) => (
+                            <button
+                                key={row.value}
+                                type="button"
+                                disabled={readOnly}
+                                data-hub-gen-ratio={row.value}
+                                data-hub-gen-ratio-accepted={row.accepted ? "1" : "0"}
+                                className={`h-8 rounded-full border px-3 text-sm transition disabled:cursor-not-allowed disabled:opacity-50 ${
+                                    draft.size === row.value ? "border-stone-900 text-stone-900 dark:border-stone-100 dark:text-stone-100" : "border-stone-300 text-stone-600 dark:border-stone-700 dark:text-stone-300"
+                                }`}
+                                onClick={() => update({ size: row.value })}
+                            >
+                                {row.label}
+                            </button>
+                        ))}
+                        <label className="flex h-8 items-center gap-1.5 rounded-full border border-stone-300 px-2 text-xs text-stone-600 dark:border-stone-700 dark:text-stone-300">
+                            <Input
+                                size="small"
+                                type="number"
+                                className="w-16"
+                                disabled={readOnly}
+                                value={pixels?.width ?? ""}
+                                placeholder="W"
+                                data-hub-gen-width
+                                onChange={(event) => {
+                                    const width = Math.floor(Number(event.target.value) || 0);
+                                    const height = pixels?.height || 0;
+                                    if (width > 0 && height > 0) update({ size: `${width}x${height}` });
+                                }}
+                            />
+                            ×
+                            <Input
+                                size="small"
+                                type="number"
+                                className="w-16"
+                                disabled={readOnly}
+                                value={pixels?.height ?? ""}
+                                placeholder="H"
+                                data-hub-gen-height
+                                onChange={(event) => {
+                                    const height = Math.floor(Number(event.target.value) || 0);
+                                    const width = pixels?.width || 0;
+                                    if (width > 0 && height > 0) update({ size: `${width}x${height}` });
+                                }}
+                            />
+                        </label>
+                    </div>
+                    {genSizeNote(draft.size, channel) ? (
+                        <div className="text-xs text-amber-600 dark:text-amber-400" data-hub-gen-size-note>
+                            {genSizeNote(draft.size, channel)}
+                        </div>
+                    ) : null}
+                </div>
+
+                {/* 清晰度 / 时长 / 声音（与画布同源） */}
+                <div className="mt-3 grid gap-3 md:grid-cols-3">
+                    <div className="space-y-1.5">
+                        <span className="text-xs font-medium text-stone-500 dark:text-stone-400">清晰度</span>
+                        <div className="flex flex-wrap gap-1.5">
+                            {resolutionRows.map((row) => (
+                                <button
+                                    key={row.value}
+                                    type="button"
+                                    disabled={readOnly}
+                                    data-hub-gen-resolution={row.value}
+                                    className={`h-8 rounded-full border px-3 text-sm transition disabled:cursor-not-allowed disabled:opacity-50 ${
+                                        draft.vquality === row.value ? "border-stone-900 text-stone-900 dark:border-stone-100 dark:text-stone-100" : "border-stone-300 text-stone-600 dark:border-stone-700 dark:text-stone-300"
+                                    }`}
+                                    onClick={() => update({ vquality: row.value })}
+                                >
+                                    {row.label}
+                                </button>
+                            ))}
+                        </div>
+                    </div>
+                    <div className="space-y-1.5">
+                        <span className="text-xs font-medium text-stone-500 dark:text-stone-400">时长</span>
+                        <div className="flex items-center gap-2">
+                            <Slider
+                                className="min-w-0 flex-1"
+                                min={GEN_DURATION_MIN}
+                                max={GEN_DURATION_MAX}
+                                step={1}
+                                value={draft.duration}
+                                disabled={readOnly}
+                                onChange={(value) => update({ duration: Array.isArray(value) ? value[0] : value })}
+                                data-hub-gen-duration
+                            />
+                            <span className="w-8 shrink-0 text-sm">{draft.duration}s</span>
+                        </div>
+                    </div>
+                    <div className="space-y-1.5">
+                        <span className="text-xs font-medium text-stone-500 dark:text-stone-400">声音</span>
+                        <label className="flex h-8 items-center gap-2 text-sm">
+                            <Checkbox checked={draft.audio} disabled={readOnly} data-hub-gen-audio onChange={(event) => update({ audio: event.target.checked })}>
+                                带声音（渠道支持才生效）
+                            </Checkbox>
+                        </label>
+                    </div>
+                </div>
+
+                {/* 模式：仅 SDGF 族（wan 自动多图参考，无 mode） */}
+                {ui.showMode ? (
+                    <div className="mt-3 space-y-1.5">
+                        <span className="text-xs font-medium text-stone-500 dark:text-stone-400">模式</span>
+                        <Radio.Group
+                            value={draft.mode || "frames"}
+                            disabled={readOnly}
+                            onChange={(event) => update({ mode: event.target.value === "reference" ? "reference" : "frames" })}
+                        >
+                            <Radio.Button value="frames" data-hub-gen-mode="frames">
+                                首尾帧
+                            </Radio.Button>
+                            <Radio.Button value="reference" data-hub-gen-mode="reference">
+                                多图参考
+                            </Radio.Button>
+                        </Radio.Group>
+                        <div className="text-xs text-stone-400 dark:text-stone-500">两图时切首尾帧 / 多图参考会随提交体 mode 字段变化。</div>
+                    </div>
+                ) : null}
+
+                {needsReapproval ? (
+                    <div className="mt-3 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-700 dark:border-amber-950 dark:bg-amber-950/20 dark:text-amber-300" data-hub-gen-reapproval>
+                        批准后配置变过（渠道身份 / 模型 / 模式 / 参数）——快照已作废：先「撤销批准」，改完再批准一次。
+                    </div>
+                ) : null}
+
+                <div className="mt-3 flex flex-wrap items-center justify-end gap-2">
+                    {state === "awaiting_approval" ? (
+                        <>
+                            <Button danger ghost loading={busy === "rollback"} disabled={busy !== null} onClick={rollback}>
+                                退回置换
+                            </Button>
+                            <Tooltip title={promptReady ? "" : "提示词还没出（等渲染完成）"}>
+                                <span>
+                                    <Button
+                                        type="primary"
+                                        icon={<Sparkles className="size-4" />}
+                                        loading={busy === "approve"}
+                                        disabled={!promptReady || busy !== null || blocked.blocksRetry}
+                                        onClick={approveAndSubmit}
+                                        data-hub-gen-approve
+                                    >
+                                        批准出片（固化配置并提交）
+                                    </Button>
+                                </span>
+                            </Tooltip>
+                        </>
+                    ) : null}
+
+                    {state === "approved" ? (
+                        <>
+                            <Button ghost loading={busy === "revoke"} disabled={busy !== null} onClick={revoke} data-hub-gen-revoke>
+                                撤销批准（改配置）
+                            </Button>
+                            <Button
+                                type="primary"
+                                loading={busy === "submit"}
+                                disabled={busy !== null || needsReapproval || blocked.blocksRetry}
+                                onClick={submitOnly}
+                                data-hub-gen-submit
+                            >
+                                提交生成
+                            </Button>
+                        </>
+                    ) : null}
+
+                    {state === "generating" ? (
+                        <span className="flex items-center gap-1.5 text-xs text-stone-500 dark:text-stone-400">
+                            <LoaderCircle className="size-3.5 animate-spin" />
+                            生成中：云端通常 5 分钟以上；前端超时 ≠ 云端失败，按 taskId 可续查找回成片。
+                        </span>
+                    ) : null}
+                </div>
+            </section>
+        </>
     );
+}
+
+/** 画幅里的自定义 W×H（"1920x1080"）；比例字面值 → null。 */
+function parsePixelSizeOf(size: string): { width: number; height: number } | null {
+    const match = /^(\d+)\s*[x×*]\s*(\d+)$/.exec(String(size || "").trim());
+    if (!match) return null;
+    const width = Number(match[1]);
+    const height = Number(match[2]);
+    return width > 0 && height > 0 ? { width, height } : null;
 }
 
 /** 描述首句（位置缺失时常驻展示）。 */

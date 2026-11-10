@@ -185,6 +185,56 @@ export type HubTaskDetail = HubTaskSummary & {
     has_pending_replace?: boolean;
     error: string;
     gen?: Record<string, unknown>;
+    // ---- AT-13 B2/B3 提交链透出（§2.3/§2.4/§三；旧 bridge 缺 → 归一为空/false） ----
+    /** 失败/未知原因原文（服务端已脱敏）；与 error 分开：error 是 failed 态的 history 尾注。 */
+    gen_error?: string;
+    /** 未知收单持久阻断标记（非状态）：{at,reason,dispatch}；未阻断 → null。 */
+    submit_unknown?: HubSubmitUnknown | null;
+    /** 提交意图阶段标记：prepared → dispatched → confirmed/cleared。 */
+    dispatch?: HubDispatch | null;
+    /** 云端任务号（wan=记录.json.taskId，SDGF=渠道 id）；续查/找回只认它。 */
+    cloud_task_id?: string;
+    /** 该任务是否有活跃提交占用（HUB_JOBS 运行中）——孤儿三步第①步。 */
+    active_submit?: boolean;
+    /** 疑似孤儿三步判定结果（服务端 diagnose，只判定不动状态）。 */
+    submit_lost?: HubSubmitLost | null;
+};
+
+/** 提交意图标记（AT-13 §2.3；兼容早期扁平字符串写法）。 */
+export type HubDispatch = { phase?: string; at?: string; note?: string; job?: string; carrier?: string };
+
+/** 未知收单阻断标记（AT-13 §2.3）。 */
+export type HubSubmitUnknown = { at?: string; reason?: string; dispatch?: string };
+
+/** 疑似孤儿三步判定（AT-13 §2.4）。 */
+export type HubSubmitLost = {
+    state?: string;
+    apiFormat?: string;
+    active_submit?: boolean;
+    cloud_task_id?: string;
+    cloud_in_flight?: boolean;
+    has_video?: boolean;
+    dispatch?: string;
+    submit_unknown?: boolean;
+    /** 1=提交进行中（禁重试）/ 2=有云端 taskId 或成片（续查）/ 3=无在途证据（阻断+核对）。 */
+    step?: number;
+    submit_lost?: boolean;
+    reason?: string;
+};
+
+/** approve 携带的画布配置（§2.1/§三；**无 key**）：批准时固化并算 v2 快照。 */
+export type HubApproveConfig = {
+    渠道身份: { baseUrl: string; apiFormat: string; 渠道名: string };
+    model: string;
+    mode: string;
+    params: { duration: number; size: string; vquality: string; audio: boolean };
+};
+
+export type HubApproveResult = {
+    state?: string;
+    snapshot_version?: number;
+    gen_params?: Record<string, unknown>;
+    gen_channel?: Record<string, unknown>;
 };
 
 export type HubRenderPreview = {
@@ -242,6 +292,53 @@ export async function getHubTask(localId: string): Promise<HubTaskDetail> {
         asset_cards: normalizeAssetCards(task.asset_cards),
         suggestions: normalizeSuggestions(task.suggestions),
         自检: normalizeSelfCheck(task.自检),
+        // AT-13 B3：提交链字段逐字段归一（旧 bridge / 畸形值一律兜底，不让读层炸页面）
+        gen_error: hubText(task.gen_error),
+        submit_unknown: normalizeSubmitUnknown(task.submit_unknown),
+        dispatch: normalizeDispatch(task.dispatch),
+        cloud_task_id: hubText(task.cloud_task_id),
+        active_submit: Boolean(task.active_submit),
+        submit_lost: normalizeSubmitLost(task.submit_lost),
+    };
+}
+
+/** 未知收单标记归一：只有真对象/true 才算（字符串/空 → null，UI 视为未阻断）。 */
+function normalizeSubmitUnknown(value: unknown): HubSubmitUnknown | null {
+    if (value === true) return { at: "", reason: "", dispatch: "" };
+    if (!value || typeof value !== "object") return null;
+    const raw = value as JsonRecord;
+    return { at: hubText(raw.at), reason: hubText(raw.reason), dispatch: hubText(raw.dispatch) };
+}
+
+/** 提交意图标记归一：兼容早期扁平字符串（"prepared"）→ {phase}。 */
+function normalizeDispatch(value: unknown): HubDispatch | null {
+    if (typeof value === "string") return value ? { phase: value } : null;
+    if (!value || typeof value !== "object") return null;
+    const raw = value as JsonRecord;
+    const phase = hubText(raw.phase);
+    if (!phase) return null;
+    return { phase, at: hubText(raw.at), note: hubText(raw.note), job: hubText(raw.job), carrier: hubText(raw.carrier) };
+}
+
+/** 孤儿三步判定归一：只保留 step 1-3 的合法值（其余 → null，UI 不摆假引导）。 */
+function normalizeSubmitLost(value: unknown): HubSubmitLost | null {
+    if (!value || typeof value !== "object") return null;
+    const raw = value as JsonRecord;
+    const step = Number(raw.step);
+    const reason = hubText(raw.reason);
+    if (!Number.isFinite(step) && !reason) return null;
+    return {
+        state: hubText(raw.state),
+        apiFormat: hubText(raw.apiFormat),
+        active_submit: Boolean(raw.active_submit),
+        cloud_task_id: hubText(raw.cloud_task_id),
+        cloud_in_flight: Boolean(raw.cloud_in_flight),
+        has_video: Boolean(raw.has_video),
+        dispatch: hubText(raw.dispatch),
+        submit_unknown: Boolean(raw.submit_unknown),
+        step: Number.isFinite(step) ? Math.round(step) : undefined,
+        submit_lost: Boolean(raw.submit_lost),
+        reason,
     };
 }
 
@@ -479,12 +576,33 @@ export async function renderHubTask(localId: string): Promise<{ state?: string; 
     return request<{ state?: string; preview?: HubRenderPreview | null; prompt_md?: string }>(`/api/hub/render/${encodeURIComponent(localId)}`);
 }
 
-export async function approveHubTask(localId: string): Promise<{ state?: string }> {
-    return request<{ state?: string }>(`/api/hub/approve/${encodeURIComponent(localId)}`, { method: "POST" });
+export async function approveHubTask(localId: string, config?: HubApproveConfig): Promise<HubApproveResult> {
+    // AT-13 §2.2/§三：body 带 config（渠道身份/model/mode/params，**无 key**）→ 服务端固化 + v2 快照。
+    // 不带 config 仍是旧语义（v1 快照，老任务/CLI）——但 B3 的 UI 一律带，改任一有效字段＝需重新批准。
+    return request<HubApproveResult>(`/api/hub/approve/${encodeURIComponent(localId)}`, {
+        method: "POST",
+        ...(config
+            ? { headers: { "Content-Type": "application/json" }, body: JSON.stringify({ config }) }
+            : {}),
+    });
 }
 
-export async function submitHubTask(localId: string): Promise<{ job_id?: string }> {
-    return request<{ job_id?: string }>(`/api/hub/submit/${encodeURIComponent(localId)}`, { method: "POST" });
+export async function submitHubTask(localId: string, key?: string | null): Promise<{ job_id?: string }> {
+    // AT-13 §三：key 一次性透传（不落盘、不进 argv/URL/日志）；wan 允许空 key。
+    return request<{ job_id?: string }>(`/api/hub/submit/${encodeURIComponent(localId)}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ key: String(key || "").trim() }),
+    });
+}
+
+/** 撤销批准（AT-13 §2.2/§2.4：approved → awaiting_approval 受控回退，改配置后重批用；不自动重批）。 */
+export async function revokeHubTask(localId: string, note?: string): Promise<{ ok?: boolean; state?: string; note?: string }> {
+    return request<{ ok?: boolean; state?: string; note?: string }>(`/api/hub/task/${encodeURIComponent(localId)}/revoke`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ note: note || "撤销批准（改配置后重批）" }),
+    });
 }
 
 /** failed 态续跑入口（AT-9 B5：POST /api/hub/task/<id>/retry；非 failed 桥端 409，错误原文透出）。 */

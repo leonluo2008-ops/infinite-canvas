@@ -16,13 +16,30 @@ type ModelPickerProps = {
     fullWidth?: boolean;
     placeholder?: string;
     onMissingConfig?: () => void;
+    /** 显式选项清单（AT-13 B3：hub 生成设置只列当前渠道的模型，默认仍按 capability 派生）。 */
+    options?: string[];
+    /** 单条禁选（AT-13 B3：带模型脚本的模型＝画布专用，列出来但不让选）。 */
+    optionDisabled?: (model: string) => boolean;
+    /** 单条后缀标注（如「画布专用（模型脚本）」）。 */
+    optionSuffix?: (model: string) => string;
 };
 
-export function ModelPicker({ config, value, onChange, capability, className, fullWidth = false, placeholder, onMissingConfig }: ModelPickerProps) {
+export function ModelPicker({ config, value, onChange, capability, className, fullWidth = false, placeholder, onMissingConfig, options: optionsOverride, optionDisabled, optionSuffix }: ModelPickerProps) {
     const { t } = useTranslation();
     const pickerId = useId();
     const [open, setOpen] = useState(false);
-    const options = useMemo(() => Array.from(new Set([...(config.channelMode === "local" && !capability ? [value] : []), ...selectableModelsByCapability(config, capability)].filter((model): model is string => Boolean(model)))), [capability, config, value]);
+    const options = useMemo(
+        () =>
+            Array.from(
+                new Set(
+                    [
+                        ...(config.channelMode === "local" && !capability ? [value] : []),
+                        ...(optionsOverride ?? selectableModelsByCapability(config, capability)),
+                    ].filter((model): model is string => Boolean(model)),
+                ),
+            ),
+        [capability, config, optionsOverride, value],
+    );
     const current = value || "";
     const pickerPlaceholder = placeholder || t("settingsPanels.model.select");
 
@@ -71,8 +88,8 @@ export function ModelPicker({ config, value, onChange, capability, className, fu
             >
                 {options.length ? (
                     options.map((model) => (
-                        <SelectItem key={model} value={model} textValue={modelOptionLabel(config, model)}>
-                            <ModelLabel config={config} model={model} />
+                        <SelectItem key={model} value={model} disabled={optionDisabled?.(model) ?? false} textValue={modelOptionLabel(config, model)}>
+                            <ModelLabel config={config} model={model} suffix={optionSuffix?.(model) || ""} />
                         </SelectItem>
                     ))
                 ) : (
@@ -91,11 +108,12 @@ function emptyModelLabel(config: AiConfig, capability?: ModelCapability) {
     return config.models.length ? i18n.t("settingsPanels.model.noMatch", { capability: label }) : i18n.t("settingsPanels.model.addFirst");
 }
 
-function ModelLabel({ config, model }: { config: AiConfig; model: string }) {
+function ModelLabel({ config, model, suffix = "" }: { config: AiConfig; model: string; suffix?: string }) {
     return (
         <span className="flex min-w-0 items-center gap-2">
             <ModelIcon model={model} />
-            <span className="truncate">{modelOptionLabel(config, model)}</span>
+            <span className={cn("truncate", suffix ? "opacity-60" : "")}>{modelOptionLabel(config, model)}</span>
+            {suffix ? <span className="shrink-0 rounded bg-stone-200 px-1 text-[10px] text-stone-600 dark:bg-stone-700 dark:text-stone-300">{suffix}</span> : null}
         </span>
     );
 }
