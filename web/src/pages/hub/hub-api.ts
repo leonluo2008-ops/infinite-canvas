@@ -7,7 +7,12 @@
  * - 所有请求走同域相对路径（vite proxy / 隧道统一转发到 bridge）。
  */
 
+import type { IngestOutcome } from "@/lib/hub/ingest-hit";
+
 export type HubTaskState = "ingested" | "discussing" | "awaiting_assets" | "rendering" | "awaiting_approval" | "approved" | "generating" | "done" | "failed";
+
+/** 摄取（建任务）结果形状：AT-10 C5 起后端带回 hit_existing/result/video_name。 */
+export type { IngestOutcome };
 
 export type HubTaskSummary = {
     local_id: string;
@@ -346,11 +351,11 @@ function hubText(value: unknown): string {
     return typeof value === "string" ? value : value === null || value === undefined ? "" : String(value);
 }
 
-export async function ingestVideo(video: File, intent: string): Promise<{ local_id: string; bridge_id: string }> {
+export async function ingestVideo(video: File, intent: string): Promise<IngestOutcome> {
     const body = new FormData();
     body.append("video", video);
     body.append("intent", intent);
-    return request<{ local_id: string; bridge_id: string }>("/api/hub/ingest", { method: "POST", body });
+    return request<IngestOutcome>("/api/hub/ingest", { method: "POST", body });
 }
 
 /** 建任务后立即触发拆解（hub 专用：内部走 automation 状态机 ingested→awaiting_assets，非裸 lapian/run）。 */

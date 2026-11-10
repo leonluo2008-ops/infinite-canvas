@@ -8,6 +8,10 @@
 
 幂等：zip 内容 sha256 为幂等键——同 zip 重发返回已有任务，不重复建桥任务。
 
+返回契约（AT-10 C5）：所有入口都带回 `hit_existing`（True=命中已有任务未新建、False=新建）
++ `result`（HIT / OK / DRY-OK）+ `video_name`——前端据此弹「该视频已有任务 auto-00xx」并
+打开该任务，而不是重走建任务/拆解（旧字段保留，调用方零破坏）。
+
 产物：projects/auto-<N>/任务.json（AT-2 状态机的载体，state 恒从 ingested 起）。
 
 CLI：
@@ -112,7 +116,9 @@ def ingest_media(video: Path, intent: str, *, images: list[Path] | None = None,
     if existing:
         d = json.loads((existing / "任务.json").read_text(encoding="utf-8"))
         return {"local_id": d["local_id"], "bridge_id": d.get("bridge_id"),
-                "result": "HIT", "note": f"同视频已摄取过（{d['local_id']}），未重复建任务"}
+                "result": "HIT", "hit_existing": True,
+                "video_name": (d.get("ingestion") or {}).get("video_name", ""),
+                "note": f"同视频已摄取过（{d['local_id']}），未重复建任务"}
     return _create_task(video_name=video.name, video_bytes=video.read_bytes(),
                         intent=intent.strip(), assets=[p.name for p in (images or [])],
                         ignored=[], sha=sha,
@@ -215,6 +221,7 @@ def _create_task(*, video_name: str, video_bytes: bytes, intent: str, assets: li
     (tdir / "任务.json").write_text(
         json.dumps(task, ensure_ascii=False, indent=2), encoding="utf-8")
     return {"local_id": local_id, "bridge_id": up["id"], "result": "OK",
+            "hit_existing": False, "video_name": video_name,
             "note": f"视频 {video_name} 已建桥任务 {up['id']}；"
                     f"资产图 {len(assets)} 张待置换；意图 {len(intent)} 字"}
 
@@ -226,11 +233,14 @@ def ingest_one(zip_path: Path, *, dry_run: bool = False) -> dict:
     if existing:
         d = json.loads((existing / "任务.json").read_text(encoding="utf-8"))
         return {"local_id": d["local_id"], "bridge_id": d.get("bridge_id"),
-                "result": "HIT", "note": f"同 zip 已摄取过（{d['local_id']}），未重复建任务"}
+                "result": "HIT", "hit_existing": True,
+                "video_name": (d.get("ingestion") or {}).get("video_name", ""),
+                "note": f"同 zip 已摄取过（{d['local_id']}），未重复建任务"}
 
     spec = inspect_zip(zip_path)
     if dry_run:
         return {"local_id": None, "bridge_id": None, "result": "DRY-OK",
+                "hit_existing": False, "video_name": spec["video_name"],
                 "note": f"校验通过：视频 {spec['video_name']}，资产图 {len(spec['assets'])} 张，"
                         f"意图 {len(spec['intent'])} 字——未上传（--dry-run）"}
     # 幂等键=视频内容 sha（不是 zip 文件 sha）：同片无论打 zip 还是从工作台直传都命中同一条
@@ -239,7 +249,9 @@ def ingest_one(zip_path: Path, *, dry_run: bool = False) -> dict:
     if existing:
         d = json.loads((existing / "任务.json").read_text(encoding="utf-8"))
         return {"local_id": d["local_id"], "bridge_id": d.get("bridge_id"),
-                "result": "HIT", "note": f"同视频已摄取过（{d['local_id']}），未重复建任务"}
+                "result": "HIT", "hit_existing": True,
+                "video_name": (d.get("ingestion") or {}).get("video_name", ""),
+                "note": f"同视频已摄取过（{d['local_id']}），未重复建任务"}
 
     return _create_task(video_name=spec["video_name"], video_bytes=spec["video_bytes"],
                         intent=spec["intent"], assets=spec["assets"],

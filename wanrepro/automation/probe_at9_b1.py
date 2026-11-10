@@ -11,7 +11,9 @@
   · ingest_media（经 bridge 建任务）→ run_discuss（真多模态拆解，1–3 分钟）→ 断言：
     拆解.md 十层标题逐层在场（红线：注入不撕结构）＋ 九 资产 每条资产条目带
     「画面位置：九宫格N·镜M」＋ sidecar（待确认清单.json）每行有「画面位置」新键。
-  · 真拆任务与桥侧分析产物**保留在盘上**（那是真证据，不是探针垃圾）；生成的临时 mp4 删掉。
+  · 真拆任务与桥侧分析产物**跑完即删**（AT-10 C5：回归探针不留任务——原先「留盘当证据」导致
+    projects/ 里堆积 13 条探针任务；现在断言全部跑完后调删除合同（POST /api/hub/task/{id}/delete，
+    confirm_name=任务号）清掉任务目录+专属 analysis 目录+uploads 视频，并在尾部断言「跑后列表零新增」）。
 """
 from __future__ import annotations
 
@@ -39,11 +41,15 @@ from automation.discuss import run_discuss  # noqa: E402
 from automation.ingest import ingest_media  # noqa: E402
 from automation.state import load  # noqa: E402
 
+import hub_api  # noqa: E402  （ui/ 已在 sys.path：删除合同直调兜底）
+
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 8776
 BASE = f"http://127.0.0.1:{PORT}"
 OP = urllib.request.build_opener(urllib.request.ProxyHandler({}))   # 红线：本机直连不走代理
 ANALYSIS = ROOT / "analysis" / "reverse"
 TASK2, BRIDGE2 = "auto-0002", "pop-3--7"            # AT-8 既有样本任务（回归参照）
+PROJECTS = config.PROJECTS_DIR
+PROJECTS_BEFORE: set[str] = set()                   # 跑前任务号集合（尾部「零新增」对账）
 
 
 def _load(name: str, path: Path):
@@ -149,7 +155,9 @@ def make_unique_video(dst: Path) -> bool:
 
 def probe_real_teardown() -> tuple[str, str]:
     print("2) 真拆：换新视频 → bridge 建任务 → 拆解（已授权）→ 产物断言")
+    global PROJECTS_BEFORE
     projects_before = {p.name for p in config.PROJECTS_DIR.glob("auto-*")}
+    PROJECTS_BEFORE = set(projects_before)
     tmp = Path(tempfile.mkdtemp(prefix="probe-at9b1-"))
     video = tmp / f"probe-at9b1-{int(time.time())}.mp4"
     if not make_unique_video(video):
@@ -158,6 +166,9 @@ def probe_real_teardown() -> tuple[str, str]:
                                          "每条资产带九宫格位置；产品保留原片节奏")
     check("ingest_media → OK（幂等键=视频 sha，新素材必不 HIT）",
           result.get("result") == "OK" and result.get("local_id") and result.get("bridge_id"),
+          json.dumps(result, ensure_ascii=False)[:160])
+    check("新建路径返回 hit_existing=False（AT-10 C5 命中标记不误报）",
+          result.get("hit_existing") is False,
           json.dumps(result, ensure_ascii=False)[:160])
     local_id, bridge_id = result.get("local_id") or "", str(result.get("bridge_id") or "")
     check("新任务目录在 projects 下且此前不存在", local_id not in projects_before and
@@ -298,15 +309,67 @@ def probe_suggestions(new_task: str) -> None:
               f"{len(sug)} 条")
 
 
+def probe_cleanup(local_id: str, bridge_id: str) -> None:
+    """AT-10 C5：探针自清理——断言全跑完后删掉本次真拆任务，回归不留任务。
+
+    删除走生产删除合同（POST /api/hub/task/{id}/delete，confirm_name=任务号）：
+    任务目录 + 专属 analysis/reverse/<bridge_id>/ + uploads 视频一并清掉，写墓碑防号复用；
+    bridge 没起时直调 automation 层 delete_task（同一实现，不另写删除逻辑）。
+    """
+    print("5) 探针自清理：删掉本次真拆任务（回归不留任务）")
+    deleted: dict = {}
+    status, body = req(f"/api/hub/task/{local_id}/delete", "POST", {"confirm_name": local_id})
+    via_http = status == 200 and isinstance(body, dict) and body.get("ok") is True
+    if via_http:
+        deleted = body
+    else:
+        try:
+            deleted = hub_api.delete_task(local_id, confirm_name=local_id)
+            via_http = bool(deleted.get("ok"))
+        except Exception as exc:  # noqa: BLE001 —— 失败原文进断言，不静默
+            check("删除合同执行成功（HTTP 或 automation 直调）", False,
+                  f"HTTP {status} {str(body)[:120]} / 直调 {type(exc).__name__}: {exc}")
+            return
+    check("删除合同执行成功（状态 awaiting_assets → confirm_name 确认后删）", via_http,
+          str(deleted)[:200])
+    check("任务目录已删除（projects/<id> 不在盘上）", not (PROJECTS / local_id).exists(),
+          str(PROJECTS / local_id))
+    check("专属 analysis 产物随任务删除（不留在 analysis/reverse 下）",
+          not (ANALYSIS / bridge_id).exists() if bridge_id else False, bridge_id)
+    status, body = req("/api/hub/tasks")
+    tasks = body.get("tasks") if isinstance(body, dict) else None
+    check("列表端点已不含探针任务（GET /api/hub/tasks 无该条）",
+          status == 200 and isinstance(tasks, list)
+          and all(t.get("local_id") != local_id for t in tasks),
+          f"{status} / {str([t.get('local_id') for t in (tasks or [])])[:160]}")
+    after = {p.name for p in PROJECTS.glob("auto-*")}
+    check("跑后 projects/ 任务号集合与跑前完全一致（回归零新增）",
+          after == PROJECTS_BEFORE,
+          f"新增={sorted(after - PROJECTS_BEFORE)} 消失={sorted(PROJECTS_BEFORE - after)}")
+    try:
+        tombs = json.loads((PROJECTS / ".tombstones.json").read_text(encoding="utf-8-sig"))
+        tomb_ids = {str(x.get("id")) for x in tombs if isinstance(x, dict)}
+    except (OSError, json.JSONDecodeError):
+        tomb_ids = set()
+    check("删除写了墓碑（.tombstones.json 含本次任务号，编号不复用）", local_id in tomb_ids, local_id)
+
+
 def main() -> int:
-    print(f"[probe-at9-b1] 目标 {BASE}；真拆会建一条新任务并保留（真证据）")
-    probe_injection()
-    new_task, _bridge = probe_real_teardown()
-    probe_summary(new_task)
-    probe_suggestions(new_task)
+    print(f"[probe-at9-b1] 目标 {BASE}；真拆会建一条新任务，跑完自清理（回归零新增）")
+    new_task, new_bridge = "", ""
+    try:
+        probe_injection()
+        new_task, new_bridge = probe_real_teardown()
+        probe_summary(new_task)
+        probe_suggestions(new_task)
+    finally:
+        if new_task:
+            probe_cleanup(new_task, new_bridge)
     fails = [r for r in RESULTS if not r[1]]
     print(f"\n[probe-at9-b1] {len(RESULTS) - len(fails)}/{len(RESULTS)} PASS"
-          + (f"（新任务 {new_task} 保留在 projects）" if new_task else ""))
+          + (f"（探针任务 {new_task} 已自清理）" if new_task else ""))
+    for name, ok, detail in fails:
+        print(f"  FAIL 汇总: {name} —— {detail}")
     return 1 if fails else 0
 
 

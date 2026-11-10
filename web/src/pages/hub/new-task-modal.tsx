@@ -3,6 +3,7 @@ import { App, Button, Input, Modal } from "antd";
 import { useRef, useState, type DragEvent } from "react";
 
 import { formatBytes } from "@/lib/image-utils";
+import { ingestCreatedMessage, ingestHitMessage, isIngestHit } from "@/lib/hub/ingest-hit";
 import { errorText, ingestVideo, startLapianRun } from "./hub-api";
 
 const VIDEO_PATTERN = /\.(mp4|mov|webm|mkv|avi|m4v)$/i;
@@ -10,8 +11,10 @@ const VIDEO_PATTERN = /\.(mp4|mov|webm|mkv|avi|m4v)$/i;
 /**
  * 「新建任务」弹窗（AT-9 B3 表格视图顶部入口）。
  * 复用 new-task-card 的建任务逻辑：选/拖参考视频 + 意图 → ingest → 自动触发拆解。
+ * AT-10 C5：ingest 幂等命中已有任务（同视频 sha）时不再静默/不再重触发拆解——
+ * 弹「该视频已有任务 auto-00xx」并让上层直接打开该任务详情（onCreated(localId, hit=true)）。
  */
-export function NewTaskModal({ open, onClose, onCreated }: { open: boolean; onClose: () => void; onCreated: (localId: string) => void }) {
+export function NewTaskModal({ open, onClose, onCreated }: { open: boolean; onClose: () => void; onCreated: (localId: string, hit: boolean) => void }) {
     const { message } = App.useApp();
     const inputRef = useRef<HTMLInputElement>(null);
     const dragDepthRef = useRef(0);
@@ -42,14 +45,23 @@ export function NewTaskModal({ open, onClose, onCreated }: { open: boolean; onCl
         setBusy(true);
         try {
             const created = await ingestVideo(file, text);
-            if (!created.local_id || !created.bridge_id) throw new Error("建任务返回缺少 local_id / bridge_id");
+            if (!created.local_id) throw new Error("建任务返回缺少 local_id");
+            // 幂等命中（同视频已有任务）：点名提示 + 打开该任务，绝不重触发拆解。
+            if (isIngestHit(created)) {
+                message.info(ingestHitMessage(created.local_id, created.video_name || file.name));
+                onCreated(created.local_id, true);
+                reset();
+                onClose();
+                return;
+            }
+            if (!created.bridge_id) throw new Error("建任务返回缺少 local_id / bridge_id");
             try {
                 await startLapianRun(created.local_id, text);
-                message.success(`任务 ${created.local_id} 已建立，开始拆解`);
+                message.success(ingestCreatedMessage(created.local_id));
             } catch (error) {
                 message.warning(`任务 ${created.local_id} 已建立，但触发拆解失败：${errorText(error)}`);
             }
-            onCreated(created.local_id);
+            onCreated(created.local_id, false);
             reset();
             onClose();
         } catch (error) {

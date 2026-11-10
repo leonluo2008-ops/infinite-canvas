@@ -1,5 +1,5 @@
 import { History, LoaderCircle, Plus, RefreshCw } from "lucide-react";
-import { App, Button, Table, Tag, Tooltip, type TableColumnsType } from "antd";
+import { Button, Table, Tag, Tooltip, type TableColumnsType } from "antd";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 
@@ -23,7 +23,6 @@ export default function HubPage() {
 }
 
 function HubTableView() {
-    const { message } = App.useApp();
     const [tasks, setTasks] = useState<HubTaskSummary[]>([]);
     const [loading, setLoading] = useState(true);
     const [refreshing, setRefreshing] = useState(false);
@@ -220,9 +219,10 @@ function HubTableView() {
             <NewTaskModal
                 open={createOpen}
                 onClose={() => setCreateOpen(false)}
-                onCreated={(localId) => {
-                    message.success(`任务 ${localId} 已建立`);
+                onCreated={(localId, hit) => {
                     void load(true);
+                    // AT-10 C5：幂等命中已有任务 → 直接把它的详情打开（提示文案由弹窗点名给出）
+                    if (hit) setOpenId(localId);
                 }}
             />
 
