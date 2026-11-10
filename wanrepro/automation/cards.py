@@ -473,4 +473,45 @@ def build(bridge_id: str, local_id: str) -> list[dict]:
             "定位": located,
             "时段来源": payload.get("来源") or spans_note or ("无侧车（旧任务）" if not spans else ""),
         })
+
+    # ---- AT-11 M1 组卡投影（§3.1.2 单帧单框，B4 闭合）：成员卡挂同一『组』投影对象 ----
+    # 主行=『组元数据』落盘值（无 → 成员最小行，M2 确认窗可改）；代表帧与唯一框**同源自主行**
+    # ——组卡只投影主行代表帧+主行自身框；主行无自身框 → 单框=None+单框降级=True（诚实降级，
+    # 绝不搬组内其他行的框充数）。镜次并集=成员位置键镜次 ∪ 意图建议镜次（evidence 级）。
+    decisions = replace.load_row_decisions(bridge_id)
+    meta = replace.load_group_meta(bridge_id)
+    by_no_cards = {card["n"]: card for card in cards}
+    for card in cards:
+        card["组"] = None
+        card["决策"] = decisions.get(card["n"], "")
+    for group in groups:
+        key = replace.group_key(group)
+        gm = meta.get(key) or {}
+        primary = gm.get("主行")
+        if not (isinstance(primary, int) and primary in group and primary in by_no_cards):
+            primary = min(n for n in group if n in by_no_cards) if any(n in by_no_cards for n in group) else None
+        if primary is None:
+            continue                        # 成员都不在清单（坏组）：不投影，不猜
+        pcard = by_no_cards[primary]
+        own_box = next((dict(b) for b in (pcard.get("帧内框") or []) if b.get("本卡")), None)
+        shot_union: set[int] = set()
+        for no in group:
+            pos_no = positions.get(no)
+            if isinstance(pos_no, dict) and isinstance(pos_no.get("镜次"), int) \
+                    and not isinstance(pos_no.get("镜次"), bool):
+                shot_union.add(int(pos_no["镜次"]))
+            shot_union |= {int(s) for s in (suggested.get(no) or []) if isinstance(s, int)}
+        proj = {
+            "键": key,
+            "成员": list(group),
+            "主行": primary,
+            "组名": str(gm.get("组名") or ""),
+            "代表帧": pcard.get("代表帧"),
+            "单框": own_box,
+            "单框降级": own_box is None,
+            "镜次并集": sorted(shot_union),
+        }
+        for no in group:
+            if no in by_no_cards:
+                by_no_cards[no]["组"] = dict(proj)
     return cards

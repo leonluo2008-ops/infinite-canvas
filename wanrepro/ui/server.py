@@ -2099,18 +2099,21 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(hub_api.start_retry(urllib.parse.unquote(m.group(1))))
             return
         if path == "/api/hub/asset":
-            # AT-8 B2 写路径（数据合同 v3）：{task_id,n,image_url} 覆盖 / {…,clear:true} 清空 / {…,text} 写命名
+            # AT-8 B2 写路径（数据合同 v3）：{task_id,n,image_url} 覆盖 / {…,clear:true} 清空 /
+            # {…,text} 写命名；AT-11 §3.5 扩展：{…,decision} 行决策（keep_origin/restore，与上互斥）
             payload = self.read_json()
             try:
                 n = int(payload.get("n"))
             except (TypeError, ValueError):
                 raise ApiError(400, "n 必须是整数（待确认清单的行号）") from None
             text = payload.get("text")
+            decision = payload.get("decision")
             self.send_json(hub_api.set_asset(
                 str(payload.get("task_id") or ""), n,
                 image_url=(str(payload.get("image_url") or "").strip() or None),
                 clear=bool(payload.get("clear")),
                 text=None if text is None else str(text),
+                decision=str(decision) if decision else None,
             ))
             return
         if path == "/api/asset/upload":

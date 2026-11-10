@@ -9,7 +9,7 @@
 禁依赖真实任务产物——auto-0003/ai-3-2-2 被 UI 删除即断链的教训）：
   ⓪ 摘要 replaced 列（B5③查修）：自建任务 auto-9167（临时夹具）的 replaced = 已传图行数/必换行数
     且与清单实算一致、非空——「表格全显—」在桥端摘要与前端渲染两层都对得上。
-  ① 自检正例：必换行全传图 → 三项全 PASS 不误红；get_task 透出 自检 三条 {项,结论,证据}。
+  ① 自检正例：必换行全传图 → 四项全 PASS 不误红；get_task 透出 自检 四条 {项,结论,证据}（含 AT-11 组绑定一致性）。
   ② 自检反例：必换行无图+非必换行有图 → 锁点对账必红、次序对账不误红；乱序提交快照 →
     次序对账必红；已传图行特征词人工植入正文 → 残留必红（三项各自可能 FAIL）。
   ③ #3↔#5 疑似不自动联动：疑似在场、确认组为空（疑似≠已组）；不在确认组的行写路径单行、
@@ -214,8 +214,8 @@ def probe_selfcheck_cases() -> None:
                           submitted=[{"no": 1, "url": URL1}, {"no": 11, "url": URL11}])
     items = selfcheck.run_selfcheck(tdir)
     by = items_by_name(items)
-    check("自检恰三条（次序对账/绑图行残留/锁点对账）",
-          list(by) == ["次序对账", "绑图行残留", "锁点对账"], str(list(by)))
+    check("自检恰四项（次序对账/绑图行残留/锁点对账/组绑定一致性——AT-11 第4项）",
+          list(by) == ["次序对账", "绑图行残留", "锁点对账", "组绑定一致性"], str(list(by)))
     check("正例三项全 PASS（不误红）",
           all(x.get("结论") == "PASS" for x in items), json.dumps(items, ensure_ascii=False)[:300])
     check("次序对账证据给出 row→图号→提交次序三方（非行号==图号字面比较）",
@@ -225,8 +225,8 @@ def probe_selfcheck_cases() -> None:
           all(set(x.keys()) == {"项", "结论", "证据"} for x in items), str([set(x.keys()) for x in items]))
     check("自检.json 落盘 projects/<id>/自检.json", (tdir / "自检.json").is_file(), str(tdir))
     detail = hub_api.get_task(T_POS)
-    check("get_task 透出 自检（三条全 PASS）",
-          isinstance(detail.get("自检"), list) and len(detail["自检"]) == 3
+    check("get_task 透出 自检（四项全 PASS）",
+          isinstance(detail.get("自检"), list) and len(detail["自检"]) == 4
           and all(x["结论"] == "PASS" for x in detail["自检"]),
           str(detail.get("自检"))[:160])
 
@@ -460,9 +460,9 @@ def probe_confirm_render_flow() -> None:
           (task.get("按原样确认") or {}).get("rows") == [11], str(task.get("按原样确认")))
     detail = hub_api.get_task(T_FLOW)
     items = detail.get("自检") or []
-    check("渲染完成自检自动跑：get_task 透出三条 {项,结论,证据}",
-          len(items) == 3 and all(set(x) == {"项", "结论", "证据"} for x in items), str(items)[:200])
-    check("全链正例三项全 PASS（1 张图 + 1 行按原样）",
+    check("渲染完成自检自动跑：get_task 透出四项 {项,结论,证据}",
+          len(items) == 4 and all(set(x) == {"项", "结论", "证据"} for x in items), str(items)[:200])
+    check("全链正例四项全 PASS（1 张图 + 1 行按原样）",
           all(x["结论"] == "PASS" for x in items), json.dumps(items, ensure_ascii=False)[:300])
     check("锁点证据反映确认时点记录（未换=[11] 且有记录）",
           "未换=[11]" in (items_by_name(items).get("锁点对账", {}).get("证据") or ""),

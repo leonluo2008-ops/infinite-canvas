@@ -191,6 +191,97 @@ def group_members(bridge_id: str, no: int) -> list[int]:
     return []
 
 
+def group_key(members: list[int]) -> str:
+    """组键（AT-11 §四）：成员升序连字，如 [1,3,5] → "1-3-5"（『组元数据』的键）。"""
+    return "-".join(str(n) for n in sorted({int(m) for m in members}))
+
+
+def row_unit(no: int, groups: list[list[int]]) -> tuple:
+    """行 → 发号/去重单位（AT-11 B1 同一映射的公共口径）：
+    组成员 → ("g", 组下标)（整组一个单位）；组外行 → ("s", 行号)（独立单位，同 URL 也不合并）。"""
+    for gi, group in enumerate(groups):
+        if no in group:
+            return ("g", gi)
+    return ("s", int(no))
+
+
+def load_sidecar_payload(bridge_id: str) -> dict:
+    """sidecar 顶层 payload（容错：无文件/坏 JSON/非对象 → {}）。组/决策/元数据读写共用。"""
+    path = sidecar_path(bridge_id)
+    if not path.is_file():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _save_sidecar_key(bridge_id: str, key: str, value) -> None:
+    """写 sidecar 单个顶层键，其它键原样保留（原子写，同 save_groups）。"""
+    payload = load_sidecar_payload(bridge_id)
+    payload[key] = value
+    tmp = sidecar_path(bridge_id).with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    tmp.replace(sidecar_path(bridge_id))
+
+
+# ---------------------------------------------------------------- 组元数据 + 行决策覆盖（AT-11 §四）
+
+GROUP_META_KEY = "组元数据"          # {"1-3-5": {"主行": 1, "组名": "紫色管状产品"}}
+DECISIONS_KEY = "行决策覆盖"        # {"1": "keep_origin"}（目前唯一合法值）
+
+
+def load_group_meta(bridge_id: str) -> dict[str, dict]:
+    """『组元数据』→ {组键: {主行, 组名}}；无/坏 → {}（合同：空=无元数据，主行走缺省最小行）。"""
+    raw = load_sidecar_payload(bridge_id).get(GROUP_META_KEY)
+    out: dict[str, dict] = {}
+    if isinstance(raw, dict):
+        for key, value in raw.items():
+            if isinstance(key, str) and isinstance(value, dict):
+                out[key] = value
+    return out
+
+
+def save_group_meta(bridge_id: str, meta: dict[str, dict]) -> dict[str, dict]:
+    """整键规范写回『组元数据』（保留 sidecar 其它键）；组键=group_key(成员)。"""
+    clean = {str(k): dict(v) for k, v in meta.items() if isinstance(v, dict)}
+    _save_sidecar_key(bridge_id, GROUP_META_KEY, clean)
+    return clean
+
+
+def sync_group_meta(bridge_id: str, groups: list[list[int]]) -> dict[str, dict]:
+    """组表变化后对账『组元数据』：组键不再对应任何现存组 → 该键删除（AT-11 §3.7 解组清理）。
+    『行决策覆盖』不动（行级覆盖不因解组无故清——那是行自身的决策，不是组的）。"""
+    live = {group_key(g) for g in groups}
+    meta = load_group_meta(bridge_id)
+    stale = [k for k in meta if k not in live]
+    if stale:
+        for key in stale:
+            meta.pop(key)
+        _save_sidecar_key(bridge_id, GROUP_META_KEY, meta)
+    return meta
+
+
+def load_row_decisions(bridge_id: str) -> dict[int, str]:
+    """『行决策覆盖』→ {行号: "keep_origin"}；无/坏/未知值 → 丢弃（合同：只认白名单值）。"""
+    raw = load_sidecar_payload(bridge_id).get(DECISIONS_KEY)
+    out: dict[int, str] = {}
+    if isinstance(raw, dict):
+        for key, value in raw.items():
+            if str(key).isdigit() and value == "keep_origin":
+                out[int(key)] = "keep_origin"
+    return out
+
+
+def save_row_decisions(bridge_id: str, decisions: dict[int, str]) -> dict[int, str]:
+    """整键规范写回『行决策覆盖』（保留 sidecar 其它键）；值白名单=keep_origin。"""
+    clean = {int(n): str(d) for n, d in decisions.items() if str(d) == "keep_origin"}
+    _save_sidecar_key(bridge_id, DECISIONS_KEY,
+                      {str(n): d for n, d in sorted(clean.items())})
+    return clean
+
+
 def set_group_write(task_dir: Path, no: int, *, image_url: str | None = None,
                     clear: bool = False, text: str | None = None) -> dict:
     """确认组写路径**单点**（AT-9 §六层3）：校验组存在 → 整组写清单 → 同步上传流水 → 写后回显组内全行。
@@ -284,29 +375,55 @@ def run_replace(task_dir: Path, *, assets: list[str] | None, map_spec: str | Non
     if confirm:
         if cur != "awaiting_assets":
             raise ReplaceError(f"确认置换需 awaiting_assets，当前 {cur}")
-        pending = task.get("pending_replace")
-        if not pending and not empty_confirm:
-            raise ReplaceError("没有待确认的置换（先跑 --assets 回填再 --confirm；"
-                               "全沿用=空置换，必须显式 empty_confirm=true）")
-        # 全沿用（AT-9 §四/数据合同）：空置换显式确认也放行——rendering 停点守卫认
-        # empty_confirm 标志（state.py），assets_confirmed 落 [] 供提交链消费。
+        pending = [dict(x) for x in (task.get("pending_replace") or [])
+                   if isinstance(x, dict)]
+        bridge_id = str(task.get("bridge_id") or "")
+        # AT-11 §3.4（B2）：同一确认动作内先算有效决策——keep_origin 在发号/组装有效上传清单
+        # 之前胜出；原值（清单图列/命名/流水）不动，restore 后原样回来。
+        ko_rows = {n for n, d in load_row_decisions(bridge_id).items() if d == "keep_origin"}
+        groups = load_groups(bridge_id)
+        effective = [x for x in pending if int(x.get("no") or 0) not in ko_rows]
+        # 组内 N 行一图 = 一个图号一条提交：确认快照按组去重（组外同 URL 保持独立，不全局去重）。
+        seen_units: set[tuple] = set()
+        confirmed: list[dict] = []
+        for entry in sorted(effective, key=lambda x: int(x.get("no") or 0)):
+            unit = row_unit(int(entry.get("no") or 0), groups)
+            if unit in seen_units:
+                continue
+            seen_units.add(unit)
+            confirmed.append(entry)
         acks = sorted({int(x) for x in (ack_rows or [])})
-        if pending:
-            extra: dict = {"assets_confirmed": pending}
+        ko_snap = sorted(ko_rows)
+        if confirmed:
+            extra: dict = {"assets_confirmed": confirmed}
             # 『按原样』勾选记录（AT-9 B5 锁点对账的数据源）：未换必换行逐行确认的落账，
             # 自检③从这份确认时点快照核对（不自证）；空列表不落键（无记录=如实）。
             if acks:
                 extra["按原样确认"] = {"rows": acks, "at": state._now()}
+            # 『按原片』行决策快照（AT-11 B2）：与 assets_confirmed 同一确认时点落账，
+            # 自检③只读这份快照（不读 live 覆盖表自证）；确认后覆盖表锁定（set_asset 校验 awaiting_assets）。
+            if ko_snap:
+                extra["按原片确认"] = {"rows": ko_snap, "at": state._now()}
             state.transition(task_dir, "rendering",
-                             require={"assets_confirmed": pending},
+                             require={"assets_confirmed": confirmed},
                              note="所有者确认置换",
                              extra=extra)
         else:
+            if not ko_snap and not empty_confirm:
+                raise ReplaceError("没有待确认的置换（先跑 --assets 回填再 --confirm；"
+                                   "全沿用=空置换，必须显式 empty_confirm=true）")
+            # 有效图为空（无 pending，或 pending 全被 keep_origin 屏蔽）→ 走 empty_confirm
+            # 既有合同落账；keep_origin 是显式行决策（等价确认），『按原片确认』同快照留痕。
+            extra = {"assets_confirmed": [], "empty_confirm": True,
+                     "全沿用": {"at": state._now()}}
+            note = "所有者确认全沿用（空置换，empty_confirm）"
+            if ko_snap:
+                extra["按原片确认"] = {"rows": ko_snap, "at": state._now()}
+                note = "所有者确认按原片（keep_origin 屏蔽全部有效图，empty_confirm 合同落账）"
             state.transition(task_dir, "rendering",
                              require={"empty_confirm": True},
-                             note="所有者确认全沿用（空置换，empty_confirm）",
-                             extra={"assets_confirmed": [], "empty_confirm": True,
-                                    "全沿用": {"at": state._now()}})
+                             note=note,
+                             extra=extra)
         if verbose:
             how = f"回填 {len(pending)} 行" if pending else "全沿用（空置换）"
             print(f"[OK] {task['local_id']}: 置换已确认 → rendering（{how}）")

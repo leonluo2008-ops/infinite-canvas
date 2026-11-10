@@ -81,6 +81,23 @@ export type HubCardBox = {
     本卡: boolean;
 };
 
+/** AT-11 M1 组卡投影（§3.1.2 单帧单框）：成员卡挂同一对象；无组 → null。 */
+export type HubCardGroup = {
+    /** 组键（成员升序连字，如 "1-5"，= sidecar『组元数据』的键）。 */
+    键: string;
+    成员: number[];
+    /** 主行（『组元数据』落盘值；无 → 成员最小行）。代表帧/单框同源自主行。 */
+    主行: number;
+    /** 『组元数据』组名（确认窗可改；空=未命名）。 */
+    组名: string;
+    代表帧: HubCardRepresentativeFrame;
+    /** 主行自身框（单帧单框）；null+单框降级=true = 主行未定位（诚实降级，不搬他人框）。 */
+    单框: HubCardBox | null;
+    单框降级: boolean;
+    /** 成员位置键镜次 ∪ 意图建议镜次（升序）。 */
+    镜次并集: number[];
+};
+
 /** 资产卡（数据合同 v3，B2：GET /api/hub/task/<id> 的 asset_cards[]；字段名与桥端中文键一一对应）。 */
 export type HubAssetCard = {
     n: number;
@@ -105,6 +122,10 @@ export type HubAssetCard = {
     画面位置: HubCardPosition | null;
     定位: string;
     时段来源: string;
+    /** AT-11 M1 组卡投影；无组 → null。 */
+    组: HubCardGroup | null;
+    /** AT-11 行决策覆盖：keep_origin（按原片）或 ""（无覆盖）。 */
+    决策: string;
 };
 
 /** 意图建议（AT-9 B1，复用 intent.py 解析；清单每行一条）。 */
@@ -128,6 +149,10 @@ export type HubAssetWriteResult = {
     /** 组写入时：组内行号列表 + 全组行回显。 */
     组?: number[];
     rows?: { n: number; 已传图: string[]; 命名: string }[];
+    /** AT-11 行决策回显：keep_origin | restore + 全量覆盖表 + 锁点剩余必换行。 */
+    决策?: string;
+    覆盖?: Record<string, string>;
+    锁点剩余?: number[];
 };
 
 /** 自检结果单条（AT-9 B5 数据合同：projects/<id>/自检.json 每条 {项,结论,证据}；结论 PASS|FAIL）。 */
@@ -268,6 +293,32 @@ function normalizeBox(value: unknown): HubCardBox | null {
     };
 }
 
+/** AT-11 组卡投影归一：非对象 → null；单框逐字段复用 normalizeBox；畸形成员丢弃不猜。 */
+function normalizeGroup(value: unknown): HubCardGroup | null {
+    if (!value || typeof value !== "object") return null;
+    const raw = value as JsonRecord;
+    const primary = Number(raw["主行"]);
+    const frame = normalizeRepresentativeFrame(raw["代表帧"]);
+    const members = Array.isArray(raw["成员"])
+        ? (raw["成员"] as unknown[]).map((x) => Number(x)).filter((x) => Number.isFinite(x) && x > 0)
+        : [];
+    if (!members.length || !Number.isFinite(primary) || primary <= 0) return null;
+    const box = normalizeBox(raw["单框"]);
+    const shots = Array.isArray(raw["镜次并集"])
+        ? (raw["镜次并集"] as unknown[]).map((x) => Number(x)).filter((x) => Number.isFinite(x) && x > 0)
+        : [];
+    return {
+        键: hubText(raw["键"]),
+        成员: members,
+        主行: Math.round(primary),
+        组名: hubText(raw["组名"]),
+        代表帧: frame,
+        单框: box,
+        单框降级: Boolean(raw["单框降级"]),
+        镜次并集: [...new Set(shots)].sort((a, b) => a - b),
+    };
+}
+
 /**
  * 读层入口集中归一（项目硬约束 14 同款思路）：asset_cards 缺失/畸形不炸页面，逐字段兜底。
  * export 供探针做「真实后端包 → normalize」字段保真核验（AT-10 C2），生产调用点不变。
@@ -316,6 +367,9 @@ export function normalizeAssetCards(value: unknown): HubAssetCard[] {
             画面位置: normalizePosition(item["画面位置"]),
             定位: hubText(item["定位"]),
             时段来源: hubText(item["时段来源"]),
+            // AT-11 M1 新键逐字段透传（防逐字段构造丢新键——同 C2 教训）
+            组: normalizeGroup(item["组"]),
+            决策: hubText(item["决策"]),
         };
         return card;
     });

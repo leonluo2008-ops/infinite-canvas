@@ -23,7 +23,7 @@ import sys
 import time
 from pathlib import Path
 
-from . import bridge, config, state
+from . import bridge, config, replace, state
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 sys.stderr.reconfigure(encoding="utf-8", errors="replace")
@@ -155,7 +155,22 @@ def do_submit(task_dir: Path, verbose: bool = True,
 
     if task["state"] == "approved":
         state.transition(task_dir, "generating", note="提交生成")
-        images = [f["url"] for f in (task.get("assets_confirmed") or [])]
+        # AT-11 B1：提交图片按组去重——组内 N 行一图只提交一条（与发号映射同一 row_unit 口径）；
+        # 组外同 URL 保持独立条目（禁全局 URL 去重）。确认快照已在确认时按组归一，
+        # 这里兜底旧任务/外部写入的逐行快照，保证提交清单=发号单位。
+        groups = replace.load_groups(str(task.get("bridge_id") or ""))
+        entries = sorted((f for f in (task.get("assets_confirmed") or []) if isinstance(f, dict)),
+                         key=lambda f: int(f.get("no") or 0))
+        seen_units: set[tuple] = set()
+        images: list[str] = []
+        for f in entries:
+            unit = replace.row_unit(int(f.get("no") or 0), groups)
+            if unit in seen_units:
+                continue
+            seen_units.add(unit)
+            url = str(f.get("url") or "")
+            if url:
+                images.append(url)
         body = {"prompt": prompt, "duration": params["duration"],
                 "ratio": params["ratio"], "resolution": params["resolution"],
                 "audio": params["audio"], "confirm": True,

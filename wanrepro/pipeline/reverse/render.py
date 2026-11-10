@@ -1245,13 +1245,24 @@ def strip_core_residue(line: str, ents: list["Entity"]) -> str:
     已传图行(@图片N)左侧**紧邻**的原物核心词——「黑色奖杯香水」挂在 @图片1 前——按
     实体名 2-3 字组 + 颜色材质词从右往左吃掉；未传图的行一字不动（借创意参考描述本就保留）。
     只认实体名词组与颜色词，不加模型调用；图号自身与「素材：@图片N」这类行首/标点邻接不受影响。
+
+    AT-11 合并组扩展（§六.2 零旧描述残留）：同一图号被**多个实体**共用（组内 N 行一图号）
+    = 这些行是同一件东西——成员实体的核心词组在本行**任何位置**都是旧物残留（既有左邻
+    清扫吃不到分镜行中段的细节词，如「…慢动作，银色金属圆柱盖特写，…」）。仅对「同号
+    多实体」的行启用整段清扫；单行绑图行为一字不变（零回归面）。
     """
     uploaded: dict[int, frozenset] = {}
+    claimed: dict[int, int] = {}
     for e in ents:
         if e.no and e.has_asset_image:
-            uploaded[e.no] = _noun_grams(entity_noun_core(e))
+            uploaded[e.no] = (uploaded.get(e.no, frozenset())
+                              | _noun_grams(entity_noun_core(e)))
+            claimed[e.no] = claimed.get(e.no, 0) + 1
     if not uploaded:
         return line
+    # AT-11：同号被 ≥2 个实体认领 = 合并组；整段清扫只认这批图号的词组（不限行内有无
+    # 图号——分镜单元格组装层先于挂图号，成员旧物细节词就落在无 token 的文本里）。
+    shared = {no: grams for no, grams in uploaded.items() if claimed[no] >= 2}
     segs = UPLOADED_REF_SPLIT_RE.split(line)
     out: list[str] = []
     for i, seg in enumerate(segs):
@@ -1262,9 +1273,29 @@ def strip_core_residue(line: str, ents: list["Entity"]) -> str:
                 if m:
                     out[-1] = out[-1][:m.start()] + _strip_modifier_run(m.group(0), grams)
             out.append(seg)
+        elif shared and seg:
+            out.append(_drop_shared_runs(seg, shared))
         else:
             out.append(seg)
     return "".join(out)
+
+
+def _drop_shared_runs(text: str, shared: dict[int, frozenset]) -> str:
+    """合并组整段清扫（AT-11）：CJK 串**以合并成员词组开头** → 该串是旧物细节短语
+    （「银色金属圆柱盖特写」这类逗号界定的细节描述），整段去掉并顺手吃掉紧邻的一个逗号。
+    只认「串首命中 ≥3 字词组」且串长 ≤30（细节短语形态），不做全文子串删除（不过度清扫）。"""
+    grams = frozenset().union(*shared.values()) if shared else frozenset()
+    ordered = sorted((g for g in grams if len(g) >= 3), key=len, reverse=True)
+    parts = re.split(r"([一-龥]+)", text)
+    for i in range(1, len(parts), 2):           # 捕获组 = CJK 串
+        run = parts[i]
+        if len(run) <= 30 and any(run.startswith(g) for g in ordered):
+            parts[i] = ""
+            if i + 1 < len(parts):
+                parts[i + 1] = re.sub(r"^，", "", parts[i + 1], count=1)
+            else:
+                parts[i - 1] = re.sub(r"，$", "", parts[i - 1], count=1)
+    return "".join(parts)
 
 
 def header_facts(disc: str) -> dict[str, str]:
@@ -1499,23 +1530,67 @@ def parse_checklist(path: Path) -> list[Entity]:
     return rows
 
 
-def assign_numbers(ents: list[Entity]) -> list[Entity]:
-    """只给「备了图」的资产发 @图片N，按清单顺序连续编号。
+def assign_numbers(ents: list[Entity], groups: list[list[int]] | None = None,
+                   decisions: dict[int, str] | None = None) -> list[Entity]:
+    """给「备了图」的资产发 @图片N——AT-11 B1 起**组感知**：行号→组/单体→唯一图号。
 
-    2026-10-31 审计实测：一张图都没传时，提示词里也挂着 @图片3（人物），
-    用户拿去生成时那个图号根本不存在。没备图的资产不进提示词、不占号。
+    · 组内行共用一个图号（组=一个发号单位）；组外不同行共用 URL 保持**独立图号**
+      （禁全局 URL 去重偷改语义）。
+    · decisions（『行决策覆盖』）里 keep_origin 的行在发号**之前**胜出（§3.4）：已有图/
+      命名/自填描述的**有效视图**被屏蔽（该行按原片描述渲染、无 @图片N），原值留在
+      清单/覆盖表里供 restore——这里只改内存副本，不动盘面。
+    · 不传 groups/decisions 时行为与旧版逐行发号完全一致（旧调用方零破坏）。
     """
+    units = [sorted({int(x) for x in g}) for g in (groups or [])]
+    ko_rows = {int(n) for n, d in (decisions or {}).items() if d == "keep_origin"}
     seq = 0
+    seen: dict[tuple, int] = {}
     for ent in ents:
         if ent.kind.startswith("品牌视觉"):
             ent.no = 0          # 置换位不是备图资产（B4）：即便误绑了图也不占号、不进提示词
             continue
-        if ent.image:
-            seq += 1
-            ent.no = seq
-        else:
+        has_img = bool(ent.image)
+        if ent.row_no in ko_rows:
+            has_img = False
+            ent.name = ""       # 「按原片」屏蔽命名的有效视图（照抄原描述文字）
+            ent.my_desc = ""    # 自填描述同屏蔽（§3.4-2）；盘面原值不动
+        if not has_img:
             ent.no = 0
+            continue
+        unit = next((("g", gi) for gi, g in enumerate(units) if ent.row_no in g),
+                    ("s", ent.row_no))
+        if unit not in seen:
+            seq += 1
+            seen[unit] = seq
+        ent.no = seen[unit]
     return ents
+
+
+def load_merge_overlay(sidecar_path) -> tuple[list[list[int]], dict[int, str]]:
+    """读 sidecar『同实体确认』+『行决策覆盖』（AT-11）。
+
+    pipeline 不 import automation（render 保持独立可运行），按同一 JSON 合同容错直读；
+    无文件/坏 JSON/坏值 → ([], {})（行为同无组无覆盖，逐行发号）。行号→图号必须与
+    automation.replace.load_groups / load_row_decisions 读出的完全一致（同一数据源）。
+    """
+    try:
+        payload = json.loads(Path(sidecar_path).read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return [], {}
+    if not isinstance(payload, dict):
+        return [], {}
+    groups: list[list[int]] = []
+    for group in payload.get("同实体确认") or []:
+        if isinstance(group, list) and len(group) >= 2 \
+                and all(isinstance(x, int) and x >= 1 for x in group):
+            groups.append(sorted(set(group)))
+    decisions: dict[int, str] = {}
+    raw = payload.get("行决策覆盖")
+    if isinstance(raw, dict):
+        for key, value in raw.items():
+            if str(key).isdigit() and value == "keep_origin":
+                decisions[int(key)] = "keep_origin"
+    return groups, decisions
 
 
 def apply_naming(line: str, ents: list[Entity]) -> str:
@@ -2141,8 +2216,10 @@ def main(argv: list[str] | None = None) -> int:
         if len(order) != 10:
             print(f"[WARN] 拆解只解析出 {len(order)} 层，模板用到的层都在，继续。", file=sys.stderr)
 
-        # 4) 待确认清单（可选）
-        ents = assign_numbers(parse_checklist(id_path / "待确认清单.md"))
+        # 4) 待确认清单（可选）——发号读组/行决策覆盖（AT-11 §3.3/§3.4，同一 sidecar 数据源）
+        checklist_md_path = id_path / "待确认清单.md"
+        groups, ko_decisions = load_merge_overlay(id_path / "待确认清单.json")
+        ents = assign_numbers(parse_checklist(checklist_md_path), groups, ko_decisions)
         if not ents:
             print("[WARN] 没有可用的待确认清单，命名替换跳过（原样用模型看到的描述）。", file=sys.stderr)
 

@@ -86,8 +86,19 @@ def main() -> int:
     s, d = req("/api/hub/submit/auto-0001", "POST", b"{}")
     check("未批准 submit → 409 + 人话错误", s == 409 and "approved" in str(d.get("error", "")),
           f"{s} {str(d)[:100]}")
-    s, d = req("/api/hub/confirm/auto-0001", "POST", b"{}")
-    check("无可确认置换 confirm → 409", s == 409, f"{s} {str(d)[:100]}")
+    # 「无可确认置换」负例只在 auto-0001 真处于 awaiting_assets 且无 pending 时成立；
+    # 真实任务可能被所有者退回置换留了 pending（2026-11-10 实况）——此时盲发 confirm 会
+    # 真确认推进真实任务（探针红线：真实任务只读）。先读状态，前置不满足 → 如实跳过不发包。
+    s, d = req("/api/hub/task/auto-0001")
+    t0001 = (d.get("task") or {}) if isinstance(d, dict) else {}
+    st0001, pending0001 = t0001.get("state"), bool(t0001.get("pair_lines"))
+    if st0001 == "awaiting_assets" and not pending0001:
+        s, d = req("/api/hub/confirm/auto-0001", "POST", b"{}")
+        check("无可确认置换 confirm → 409", s == 409, f"{s} {str(d)[:100]}")
+    else:
+        check(f"无可确认置换 confirm → 409（auto-0001 当前 {st0001}"
+              f"{'有 pending' if pending0001 else ''}，前置不满足，不发确认防误推进）",
+              True, "真实任务状态依赖断言，按当前状态如实跳过")
 
     # ── 3. 摄取幂等（真建一条→复投 HIT→清理） ─────────────────
     print("3) 摄取/幂等")

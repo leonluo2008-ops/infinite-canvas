@@ -506,29 +506,100 @@ def _record_pending(task_dir: Path, n: int, *, image_url: str | None,
     state.save(task_dir, {**task, "pending_replace": pending})
 
 
-def set_asset(local_id: str, n: int, *, image_url: str | None = None,
-              clear: bool = False, text: str | None = None) -> dict:
-    """POST /api/hub/asset —— 置换台逐卡定向写（数据合同 v3 写合同）。
+def _must_rows(bridge: str) -> set[int]:
+    """清单必换行集合（锁点计算用；清单读不了 → 空集）。"""
+    try:
+        md = replace.checklist_path(bridge).read_text(encoding="utf-8-sig")
+    except (replace.ReplaceError, OSError):
+        return set()
+    return {int(r["no"]) for r in replace.parse_rows(md) if "必须换" in (r.get("advice") or "")}
 
-    {task_id, n, image_url}   重传 = 覆盖该行资产图（fill_row 覆盖模式，不追加）
-    {task_id, n, clear: true} 「沿用」= 清空该行绑定
-    {task_id, n, text}        品牌视觉卡的文字，写清单「命名」列
+
+def _row_has_image(bridge: str, no: int) -> bool:
+    """清单该行「资产图」列是否非空（真源=清单 md，不是 pending 流水）。"""
+    try:
+        md = replace.checklist_path(bridge).read_text(encoding="utf-8-sig")
+    except (replace.ReplaceError, OSError):
+        return False
+    row = next((r for r in replace.parse_rows(md) if r["no"] == no), None)
+    return bool(row and (row.get("cur_assets") or "").strip())
+
+
+def lock_remaining(bridge: str) -> list[int]:
+    """锁点剩余（AT-11 §四）：必换行 −(已传图行 ∪ 组已传图的组成员 ∪ keep_origin 行)。
+
+    必换行 ∈ 组且组已传图 → 整组被那张图换掉，不锁；行有 keep_origin → 按原片，不锁。
+    返回仍锁着的必换行号（前端「锁点剩余」徽标与 set_asset 回显共用此口径）。
+    """
+    must = _must_rows(bridge)
+    if not must:
+        return []
+    free: set[int] = set(replace.load_row_decisions(bridge))
+    groups = replace.load_groups(bridge)
+    for no in sorted(must):
+        if _row_has_image(bridge, no):
+            free.add(no)
+    for group in groups:
+        if any(_row_has_image(bridge, n) for n in group):
+            free |= set(group)
+    return sorted(must - free)
+
+
+def set_asset(local_id: str, n: int, *, image_url: str | None = None,
+              clear: bool = False, text: str | None = None,
+              decision: str | None = None) -> dict:
+    """POST /api/hub/asset —— 置换台逐卡定向写（数据合同 v3 写合同 + AT-11 §3.5 扩展）。
+
+    {task_id, n, image_url}     重传 = 覆盖该行资产图（fill_row 覆盖模式，不追加）
+    {task_id, n, clear: true}   「沿用」= 清空该行绑定
+    {task_id, n, text}          品牌视觉卡的文字，写清单「命名」列
+    {task_id, n, decision}      AT-11 行决策：keep_origin（这行不换了，按原片）/ restore（恢复）
     回显真源是清单 md（不是 pending_replace）。
-    该行在确认组里（sidecar『同实体确认』）→ 走 replace.set_group_write 单点整组联动；
+    该行在确认组里（sidecar『同实体确认』）→ 图/文走 replace.set_group_write 单点整组联动；
+    decision 走行级路径且**拒绝组内行**（组=原子单位，组内单行降级先拆开——AT-11 §3.2）；
+    decision 需 awaiting_assets（确认后覆盖表锁定不可改——B2 次序合同）；
     疑似（同实体疑似）**不联动**——单行照常，别的行一个字不动。
+
+    B5 复用说明：不新建端点——既有 set_asset 已有任务锁/行号校验/前端 postHubAsset 传输层；
+    既有 clear 只清图片列+流水、无恢复语义与行决策状态，故加 decision 参数而非塞 clear。
     """
     task_dir = _task_dir(local_id)
     bridge = _bridge_of(task_dir)
-    if image_url and clear:
+    if decision is not None:
+        if decision not in ("keep_origin", "restore"):
+            raise HubError(f"decision 只能是 keep_origin / restore，收到 {decision!r}")
+        if image_url or clear or text is not None:
+            raise HubError("decision 与 image_url / clear / text 互斥，只能给一个")
+    elif image_url and clear:
         raise HubError("image_url 与 clear 只能给一个")
-    if not image_url and not clear and text is None:
-        raise HubError("请求要有 image_url / clear:true / text 之一")
+    if not image_url and not clear and text is None and decision is None:
+        raise HubError("请求要有 image_url / clear:true / text / decision 之一")
     url = None
     if image_url:
         url = str(image_url).strip()
         if not url.startswith("https://"):
             raise HubError(f"image_url 必须是公网 HTTPS（SDGF 只收公网图）：{image_url!r}")
     with _task_lock(local_id):
+        if decision is not None:
+            # ---- AT-11 §3.2/§3.5：单行降级/恢复（行决策覆盖） ----
+            task = state.load(task_dir)
+            if task["state"] != "awaiting_assets":
+                raise HubError(f"行决策需 awaiting_assets（确认后覆盖表锁定不可改），"
+                               f"当前 {task['state']}")
+            members = replace.group_members(bridge, n)
+            if len(members) >= 2:
+                raise HubError(f"第 {n} 行在确认组 {members} 里（组=原子单位，"
+                               f"不可单行降级，先拆开合并）")
+            decisions = replace.load_row_decisions(bridge)
+            if decision == "keep_origin":
+                decisions[n] = "keep_origin"
+            else:
+                if decisions.pop(n, None) is None:
+                    raise HubError(f"第 {n} 行没有『按原片』决策，无需恢复")
+            saved = replace.save_row_decisions(bridge, decisions)
+            return {"ok": True, "task_id": local_id, "n": n, "决策": decision,
+                    "覆盖": {str(k): v for k, v in sorted(saved.items())},
+                    "锁点剩余": lock_remaining(bridge)}
         try:
             members = replace.group_members(bridge, n)
             if len(members) >= 2:
@@ -556,7 +627,12 @@ def set_asset(local_id: str, n: int, *, image_url: str | None = None,
 # ---------------------------------------------------------------- 确认组端点（AT-9 B2）
 
 def group_rows(local_id: str, rows: list[int]) -> dict:
-    """成组：校验行号在清单、≥2 行、都不在别的组 → 写 sidecar『同实体确认』。"""
+    """成组：校验行号在清单、≥2 行、都不在别的组 → 写 sidecar『同实体确认』。
+
+    AT-11 §3.1.1/§3.2 追加两拒绝：品牌视觉行不可入组（品牌位不读图不占号，
+    render.py 品牌分支）；行有 keep_origin 不可入组（先降级再合并会留半组替换，
+    先恢复再合并）。
+    """
     task_dir = _task_dir(local_id)
     bridge = _bridge_of(task_dir)
     rows = sorted({int(x) for x in rows})
@@ -567,10 +643,18 @@ def group_rows(local_id: str, rows: list[int]) -> dict:
             checklist = replace.checklist_path(bridge).read_text(encoding="utf-8-sig")
         except replace.ReplaceError as e:
             raise HubError(str(e)) from None
-        nos = {r["no"] for r in replace.parse_rows(checklist)}
-        missing = [n for n in rows if n not in nos]
+        by_no = {r["no"]: r for r in replace.parse_rows(checklist)}
+        missing = [n for n in rows if n not in by_no]
         if missing:
-            raise HubError(f"行号不在清单里: {missing}（现有 {sorted(nos)}）")
+            raise HubError(f"行号不在清单里: {missing}（现有 {sorted(by_no)}）")
+        brand = [n for n in rows if str(by_no[n].get("cat") or "").startswith("品牌视觉")]
+        if brand:
+            raise HubError(f"行 {brand} 是品牌视觉行（品牌位不读图不占号），"
+                           f"不可入组——品牌行单独处理")
+        ko = [n for n in rows if n in replace.load_row_decisions(bridge)]
+        if ko:
+            raise HubError(f"行 {ko} 已按原片（keep_origin），先恢复再合并"
+                           f"（先降级后合并会留半组替换）")
         groups = replace.load_groups(bridge)
         for g in groups:
             overlap = sorted(set(rows) & set(g))
@@ -581,7 +665,11 @@ def group_rows(local_id: str, rows: list[int]) -> dict:
 
 
 def ungroup_rows(local_id: str, rows: list[int]) -> dict:
-    """解组：把行从所在确认组摘出（<2 行的组剔除）；没组里的行如实报。"""
+    """解组：把行从所在确认组摘出（<2 行的组剔除）；没组里的行如实报。
+
+    AT-11 §3.7：解除联动后组名/主行元数据键随组清理（组键不再对应现存组 → 删）；
+    『行决策覆盖』不无故清（行级决策属于行自身，不是组的）。
+    """
     task_dir = _task_dir(local_id)
     bridge = _bridge_of(task_dir)
     rows = sorted({int(x) for x in rows})
@@ -594,7 +682,9 @@ def ungroup_rows(local_id: str, rows: list[int]) -> dict:
             raise HubError(f"行 {loose} 不在任何确认组里")
         rest = [[n for n in g if n not in rows] for g in groups]
         saved = replace.save_groups(bridge, rest)
-        return {"ok": True, "task_id": local_id, "解组": rows, "组": saved}
+        meta = replace.sync_group_meta(bridge, saved)
+        return {"ok": True, "task_id": local_id, "解组": rows, "组": saved,
+                "组元数据": meta}
 
 
 def frame_file(local_id: str, filename: str) -> Path:

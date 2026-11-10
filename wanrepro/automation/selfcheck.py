@@ -1,19 +1,22 @@
 # -*- coding: utf-8 -*-
-"""AT-9 B5 渲染自检三项——渲染完成时自动跑，结论落盘 projects/<id>/自检.json。
+"""AT-9 B5 渲染自检——渲染完成时自动跑，结论落盘 projects/<id>/自检.json。
 
 数据合同 B0「自检结果」：生产者=渲染后自检函数；存储=projects/<id>/自检.json，
 每条 {项,结论,证据}；消费者=详情页审批区（✓/⚠ 可见，FAIL 可 override 但必显）；
 旧任务无文件 → 前端显「未检查」。
 
-三项全部机械可判（AT-9.md §六层4，闭合 C02）：
+四项全部机械可判（AT-9.md §六层4 + AT-11 §3.3 第4项）：
   ① 次序对账：行号→图号→实际提交图片次序三方映射一致。发号用 render.assign_numbers
-    同源函数重算（清单行号与 @图片N 是两套编号，禁行号==图号字面比较），提交次序取
-    确认时点快照 任务.json assets_confirmed（列表序=提交序）。
+    同源函数重算（清单行号与 @图片N 是两套编号，禁行号==图号字面比较；组内 N 行共用
+    1 图号——AT-11 B1），提交次序取确认时点快照 任务.json assets_confirmed（列表序=提交序，
+    确认时已按组去重）。
   ② 绑图行残留：已传图行的原物核心词（该行实体名+特征词，复用 B2 strip_core_residue
     的词表思路：entity_noun_core + 2-3 字组）不得残留在提示词正文（附注/替换说明除外）。
-  ③ 锁点对账：必换未换集合 == 确认时点『按原样』勾选/empty_confirm 记录。独立从
-    任务.json 快照核对（不自证）：assets_confirmed/empty_confirm/按原样确认 都在确认
-    动作落账，这里只读比对。
+  ③ 锁点对账：必换未换集合 == 确认时点『按原样』/『按原片』/empty_confirm 记录。独立从
+    任务.json 快照核对（不自证）：assets_confirmed/empty_confirm/按原样确认/按原片确认
+    都在确认动作落账，这里只读比对。
+  ④ 组绑定一致性（AT-11）：确认组内行图号/URL 必须一致；同组两 URL→FAIL；同号不同
+    URL→FAIL。
 自检器自身异常 → 写一条 FAIL 记录如实落盘，绝不打断渲染主链（空响应不算成功的反面：
 检查器挂了也算「未通过」，不许静默当 PASS）。
 """
@@ -91,19 +94,24 @@ def _check_all(task_dir: Path) -> list[dict]:
 
     render = _load_render()
     ents = render.parse_checklist(ck_path)
-    render.assign_numbers(ents)
+    # AT-11 B1：发号同源重算带组/行决策覆盖（与 render 主入口同一 sidecar 数据源）
+    groups = replace.load_groups(bridge_id)
+    decisions = replace.load_row_decisions(bridge_id)
+    render.assign_numbers(ents, groups, decisions)
     row_to_no = {int(e.row_no): int(e.no) for e in ents if e.no}
 
     submitted = [(int(x.get("no") or 0), str(x.get("url") or ""))
                  for x in (task.get("assets_confirmed") or []) if isinstance(x, dict)]
     ack_rows = {int(x) for x in ((task.get("按原样确认") or {}).get("rows") or [])}
+    ko_rows = {int(x) for x in ((task.get("按原片确认") or {}).get("rows") or [])}   # AT-11 B2 确认时点快照
     empty_confirm = bool(task.get("empty_confirm"))
 
     body = _prompt_body(prompt)
     return [
-        _check_order(body, ents, row_to_no, submitted, ck_path),
+        _check_order(body, ents, row_to_no, submitted, ck_path, groups),
         _check_residue(body, ents, render),
-        _check_lock(rows, must_rows, submitted, ack_rows, empty_confirm),
+        _check_lock(rows, must_rows, submitted, ack_rows, empty_confirm, ko_rows, groups),
+        _check_groups(ents, row_to_no, submitted, groups),
     ]
 
 
@@ -128,23 +136,31 @@ def _prompt_body(prompt: str) -> str:
 
 
 def _check_order(body: str, ents, row_to_no: dict[int, int],
-                 submitted: list[tuple[int, str]], ck_path: Path) -> dict:
-    """① 次序对账：行号→图号（assign_numbers 同源重算）→ 提交次序（确认快照列表序）。"""
+                 submitted: list[tuple[int, str]], ck_path: Path,
+                 groups: list[list[int]] | None = None) -> dict:
+    """① 次序对账：行号→图号（assign_numbers 同源重算，组内 N 行共用 1 图号——AT-11 B1）
+    → 提交次序（确认快照列表序=提交序，确认时已按组去重）。"""
+    groups = groups or []
     refs = sorted({int(n) for n in re.findall(r"@图片(\d+)", body)})
     url_by_row = {int(e.row_no): [u.strip() for u in re.split(r"[,，]", e.image) if u.strip()]
                   for e in ents if e.image}
     if not row_to_no and not refs and not submitted:
         return {"项": "次序对账", "结论": PASS, "证据": "全沿用/无图：清单无绑图行、正文无 @图片N、提交快照为空——三方一致"}
     problems: list[str] = []
-    seq = sorted(row_to_no.values())
-    if seq != list(range(1, len(seq) + 1)):
+    nums = sorted(set(row_to_no.values()))          # 唯一图号集合（组内多行同号算一个）
+    if nums != list(range(1, len(nums) + 1)):
         problems.append(f"发号不连续: row→图号={row_to_no}")
-    if refs != seq:
-        problems.append(f"正文图号 {refs} ≠ 应发号 {seq}")
-    if len(submitted) != len(seq):
-        problems.append(f"提交快照 {len(submitted)} 条 ≠ 绑图行 {len(seq)} 行")
+    if refs != nums:
+        problems.append(f"正文图号 {refs} ≠ 应发号 {nums}")
+    if len(submitted) != len(nums):
+        problems.append(f"提交快照 {len(submitted)} 条 ≠ 发图单位 {len(nums)} 个（组内多行应只提交一条）")
     else:
+        seen_units: set[tuple] = set()
         for i, (no, url) in enumerate(submitted, 1):
+            unit = replace.row_unit(no, groups)
+            if unit in seen_units:
+                problems.append(f"提交第 {i} 张来自行 {no}，但该行所在单位已有提交（组内多行多提交）")
+            seen_units.add(unit)
             if row_to_no.get(no) != i:
                 problems.append(f"提交第 {i} 张来自行 {no}，但发号映射给该行的是图{row_to_no.get(no)}（应为图{i}）")
             if url and url not in url_by_row.get(no, []):
@@ -183,19 +199,75 @@ def _check_residue(body: str, ents, render) -> dict:
 
 def _check_lock(rows: list[dict], must_rows: list[int],
                 submitted: list[tuple[int, str]], ack_rows: set[int],
-                empty_confirm: bool) -> dict:
-    """③ 锁点对账：必换未换集合 == 确认时点『按原样』勾选/empty_confirm 记录（只读快照，不自证）。"""
+                empty_confirm: bool, ko_rows: set[int] | None = None,
+                groups: list[list[int]] | None = None) -> dict:
+    """③ 锁点对账：必换未换集合 == 确认时点『按原样』/『按原片』/empty_confirm 记录（只读快照，不自证）。
+
+    AT-11 §四锁点新规则：必换行 ∈ 组且组已传图（整组被那张图换掉）→ 不锁；
+    行有 keep_origin（按原片）→ 不锁——两者都不需要『按原样』勾选。
+    """
+    ko_rows = ko_rows or set()
+    groups = groups or []
     swapped = {no for no, _ in submitted}
+    for group in groups:                        # 组已传图 → 组内所有行视为已换
+        if any(no in swapped for no in group):
+            swapped |= set(group)
     unswapped = sorted(set(must_rows) - swapped)
-    covered = set(ack_rows) | ({int(r["no"]) for r in rows} if empty_confirm else set())
+    covered = (set(ack_rows) | ko_rows
+               | ({int(r["no"]) for r in rows} if empty_confirm else set()))
     missed = sorted(set(unswapped) - covered)
-    ghost = sorted((covered & set(must_rows)) - set(unswapped))   # 记录了按原样但快照里其实换了
+    ghost = sorted((covered & set(must_rows)) - set(unswapped))   # 记录了按原样/按原片但快照里其实换了
     ev = (f"必换={must_rows}；确认快照已传={sorted(swapped)}；未换={unswapped}；"
-          f"按原样记录={sorted(ack_rows)}；empty_confirm={empty_confirm}")
+          f"按原样记录={sorted(ack_rows)}；按原片记录={sorted(ko_rows)}；empty_confirm={empty_confirm}")
     problems: list[str] = []
     if missed:
-        problems.append(f"必换行 {missed} 未换且无『按原样』/empty_confirm 记录（锁点缺口）")
+        problems.append(f"必换行 {missed} 未换且无『按原样』/『按原片』/empty_confirm 记录（锁点缺口）")
     if ghost:
-        problems.append(f"行 {ghost} 记了按原样但确认快照里已传图（记录与快照矛盾）")
+        problems.append(f"行 {ghost} 记了按原样/按原片但确认快照里已传图（记录与快照矛盾）")
     return {"项": "锁点对账", "结论": FAIL if problems else PASS,
             "证据": ("；".join(problems) + "｜" + ev) if problems else "未换必换行都有确认时点记录｜" + ev}
+
+
+def _check_groups(ents, row_to_no: dict[int, int],
+                  submitted: list[tuple[int, str]],
+                  groups: list[list[int]]) -> dict:
+    """④ 组绑定一致性（AT-11 B1 新增）：组内行图号/URL 必须一致。
+
+    同组两 URL → FAIL；同号不同 URL → FAIL。次序对账读新映射后，这里只管「同组绑定
+    是否真的归一」：组内 N 行 1 图号 1 URL 才算合并成功。
+    """
+    url_by_row: dict[int, list[str]] = {}
+    for e in ents:
+        urls = [u.strip() for u in re.split(r"[,，]", e.image) if u.strip()]
+        if urls:
+            url_by_row[int(e.row_no)] = urls
+    problems: list[str] = []
+    for group in groups:
+        nums = sorted({row_to_no[n] for n in group if row_to_no.get(n)})
+        if not nums:
+            continue                            # 组内全无图：不占号不提交，合并仍成立（零图分支）
+        if len(nums) != 1:
+            problems.append(f"组 {group} 图号不一致: {[{n: row_to_no[n]} for n in group if row_to_no.get(n)]}")
+        urls = sorted({u for n in group for u in url_by_row.get(n, [])})
+        if len(urls) > 1:
+            problems.append(f"组 {group} 绑定了 {len(urls)} 个不同 URL（同组两 URL）: "
+                            + "、".join(u[:40] for u in urls[:3]))
+    num_urls: dict[int, set[str]] = {}
+    for no, urls in url_by_row.items():
+        num = row_to_no.get(no)
+        if num:
+            num_urls.setdefault(num, set()).update(urls)
+    for num in sorted(num_urls):
+        if len(num_urls[num]) > 1:
+            problems.append(f"图{num} 对应多个 URL（同号不同 URL）: "
+                            + "、".join(sorted(u[:40] for u in num_urls[num])[:3]))
+    seen: dict[tuple, str] = {}
+    for no, url in submitted:
+        unit = replace.row_unit(no, groups)
+        if unit in seen and seen[unit] != url:
+            problems.append(f"提交快照里同组两 URL（行 {no} 与行 "
+                            f"{next(n for n, u in submitted if replace.row_unit(n, groups) == unit and u == seen[unit])}）")
+        seen.setdefault(unit, url)
+    ev = (f"确认组={groups or '无'}；行→图号={row_to_no}；组内 URL 归一后提交 {len(submitted)} 条")
+    return {"项": "组绑定一致性", "结论": FAIL if problems else PASS,
+            "证据": ("；".join(problems) + "｜" + ev) if problems else "组内行同图号同 URL（无组或全组归一）｜" + ev}
