@@ -1,32 +1,57 @@
 /**
- * AT-11 M2 快速合并纯判定（无 React / 无 DOM / 无 fetch，可被 esbuild 打包探针直接断言）。
+ * AT-11 M2 / AT-12 N1 快速合并纯判定（无 React / 无 DOM / 无 fetch，可被 esbuild 打包探针直接断言）。
  *
- * 合同 = docs/nodes/AT-11.md v4 §3.1/§3.1.1/§3.6：
- * - 多选态只存**行号**（I2：轮询换 detail 对象不丢选中，合并成功清空、失败保留）；
- * - 已确认组卡置灰（先拆开）、品牌视觉行置灰（品牌行单独处理）——两处后端同样硬拒，前端只做先行拦截；
+ * 合同 = docs/nodes/AT-11.md v4 §3.1/§3.1.1/§3.6 + AT-12 N1（勾选式合并，替换模式切换）：
+ * - 勾选态只存**行号**（I2：轮询换 detail 对象不丢选中，合并成功清空、失败保留）；
+ * - 每张非组卡左上常驻 checkbox（不再有「进入/退出多选模式」）；已确认组卡不挂 checkbox、
+ *   品牌视觉行置灰并给出原因——两处后端同样硬拒，前端只做先行拦截；
+ * - 按原片行（dismissed / keep_origin）已从置换区折叠移除，不可勾选；
  * - 已传图三分支（B3）：零图 / 恰一张唯一图 / 多张不同图（多张必须用户点名保留一张，绝不悄悄任选）；
  * - 合并卡（单帧单框）：徽标「#1+#3+#5 已合并」、框恒=主行自身框那一枚；主行无框 → null（诚实降级，
  *   绝不搬组内其他行的框充数）。
  */
 
 import type { HubAssetCard, HubCardGroup } from "@/pages/hub/hub-api";
+import { isOriginDecision } from "@/lib/hub/row-decision";
 
-/** 一张卡在多选态里可选吗：selectable=false 时 reason 是给用户看的置灰原因（非空）。 */
+/** 一张卡在勾选态里可选吗：selectable=false 时 reason 是给用户看的置灰原因（非空）。 */
 export type MergeSelectable = { selectable: boolean; reason: string };
 
-/** 可选性判定（§3.1/§3.1.1）：已确认组 → 先拆开；品牌视觉行 → 品牌行单独处理。 */
-export function mergeSelectable(card: Pick<HubAssetCard, "类别" | "同实体确认">): MergeSelectable {
+/** 可选性判定（§3.1/§3.1.1 + AT-12）：按原片行 → 已折叠；已确认组 → 先拆开；品牌行 → 品牌行单独处理。 */
+export function mergeSelectable(card: Pick<HubAssetCard, "类别" | "同实体确认"> & { 决策?: string }): MergeSelectable {
+    if (isOriginDecision(card.决策)) return { selectable: false, reason: "已移除（按原片）·不参与合并" };
     if (card.同实体确认.length >= 2) return { selectable: false, reason: "已确认组·先拆开" };
     if (card.类别.includes("品牌视觉")) return { selectable: false, reason: "品牌行单独处理" };
     return { selectable: true, reason: "" };
 }
 
-/** 纯切换一行选中（返回新 Set，不改原集合；多选态=行号 Set，禁存卡对象引用）。 */
+/** 纯切换一行选中（返回新 Set，不改原集合；勾选态=行号 Set，禁存卡对象引用）。 */
 export function toggleMergeRow(selected: Set<number>, n: number): Set<number> {
     const next = new Set(selected);
     if (next.has(n)) next.delete(n);
     else next.add(n);
     return next;
+}
+
+/**
+ * 轮询收口（I2）：勾选集合只保留「仍存在且仍可选」的行；被成组/被移除/行消失的自动剔出
+ * （底部浮条计数诚实）。**没变化时返回原 Set 引用**——调用方可据此跳过 setState，避免轮询抖动。
+ */
+export function pruneSelection(
+    selected: Set<number>,
+    cards: (Pick<HubAssetCard, "n" | "类别" | "同实体确认"> & { 决策?: string })[],
+): Set<number> {
+    const keep = new Set<number>();
+    for (const card of cards) {
+        if (selected.has(card.n) && mergeSelectable(card).selectable) keep.add(card.n);
+    }
+    if (keep.size === selected.size && [...selected].every((n) => keep.has(n))) return selected;
+    return keep;
+}
+
+/** 底部浮条计数文案（AT-12：「合并勾选项(N)」）。 */
+export function mergeBarText(count: number): string {
+    return `合并勾选项(${count})`;
 }
 
 /** 已传图三分支（B3）判定结果。 */

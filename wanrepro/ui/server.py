@@ -2105,7 +2105,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/hub/asset":
             # AT-8 B2 写路径（数据合同 v3）：{task_id,n,image_url} 覆盖 / {…,clear:true} 清空 /
-            # {…,text} 写命名；AT-11 §3.5 扩展：{…,decision} 行决策（keep_origin/restore，与上互斥）
+            # {…,text} 写命名；AT-11/AT-12 扩展：{…,decision} 行决策（keep_origin/dismissed/restore，与上互斥）
             payload = self.read_json()
             try:
                 n = int(payload.get("n"))

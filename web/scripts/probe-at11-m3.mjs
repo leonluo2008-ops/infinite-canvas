@@ -54,9 +54,9 @@ const keepRow = { 建议: "可沿用", 决策: "", 同实体确认: [] };
 const unverifiedRow = { 建议: "", 决策: "", 同实体确认: [] };
 
 const a1 = mod.rowDecisionAction(mustRow);
-check("必换行 → keep_origin「这行不换了（按原片）」", a1 !== null && a1.action === "keep_origin" && a1.label === "这行不换了（按原片）", JSON.stringify(a1));
+check("必换行 → dismissed「移除（不需要替换，按原片处理）」", a1 !== null && a1.action === "dismissed" && a1.label === "移除（不需要替换，按原片处理）", JSON.stringify(a1));
 const a2 = mod.rowDecisionAction(prepareRow);
-check("建议准备行 → keep_origin 入口", a2 !== null && a2.action === "keep_origin");
+check("建议准备行 → dismissed 入口", a2 !== null && a2.action === "dismissed");
 check("可沿用行 → 无入口（null）", mod.rowDecisionAction(keepRow) === null);
 check("待核对行（建议空）→ 无入口", mod.rowDecisionAction(unverifiedRow) === null);
 const groupedMust = { 建议: "必须换", 决策: "", 同实体确认: [1, 5] };
@@ -103,10 +103,10 @@ const rowDecisionSrc = readFileSync(path.resolve("src/lib/hub/row-decision.ts"),
 check("降级走 postHubAsset decision 参数（M1 set_asset 合同）", /postHubAsset\(taskId, \{ n: card\.n, decision \}\)/.test(drawer));
 check("busy=\"decision\" 在途防重复点击（BusyKind + doDecide 守卫）", drawer.includes('"decision"') && /const doDecide = async[\s\S]*?if \(busy\) return;[\s\S]*?setBusy\("decision"\)/.test(drawer));
 check("「…」菜单入口 data-hub-decision-menu（非组卡）", drawer.includes("data-hub-decision-menu"));
-check("菜单项走 rowDecisionAction 纯判定（label 真源在 lib，接线落 decision.label）", drawer.includes("rowDecisionAction(card)") && drawer.includes("label: decision.label") && rowDecisionSrc.includes("这行不换了（按原片）"));
-check("多选态下降级菜单隐藏（mergeMode 不渲染）", /decision && !mergeMode && onDecide/.test(drawer));
+check("菜单项走 rowDecisionAction 纯判定（label 真源在 lib，接线落 decision.label）", drawer.includes("rowDecisionAction(card)") && drawer.includes("label: decision.label") && rowDecisionSrc.includes("移除（不需要替换，按原片处理）"));
+check("勾选态下菜单常驻（AT-12 无模式切换，不再有 mergeMode 隐藏）", /decision && onDecide/.test(drawer) && !drawer.includes("mergeMode"));
 check("降级徽标「按原片」灰·虚线 data-hub-decision-badge", drawer.includes("data-hub-decision-badge") && drawer.includes("decisionBadgeText(card)") && /dashed/.test(drawer));
-check("锁点计算接线 lockRows（keep_origin 豁免落在真派生）", drawer.includes("lockRows(cards)") && drawer.includes("lockCounters(cards)"));
+check("锁点计算接线 lockRows（按原片豁免落在真派生）", drawer.includes("lockRows(allCards)") && drawer.includes("lockCounters(allCards)"));
 check("计数行带「按原片 N」与 data-hub-lock-counters", drawer.includes("data-hub-lock-counters") && drawer.includes("按原片 ${counters.keptOrigin}"));
 check("成功反馈走 decisionFeedback（点名行号）", drawer.includes("decisionFeedback(card.n, decision)"));
 check("报错走 decisionErrorText（如实核对）", drawer.includes("decisionErrorText(errorText(error))"));

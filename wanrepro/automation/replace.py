@@ -229,7 +229,19 @@ def _save_sidecar_key(bridge_id: str, key: str, value) -> None:
 # ---------------------------------------------------------------- 组元数据 + 行决策覆盖（AT-11 §四）
 
 GROUP_META_KEY = "组元数据"          # {"1-3-5": {"主行": 1, "组名": "紫色管状产品"}}
-DECISIONS_KEY = "行决策覆盖"        # {"1": "keep_origin"}（目前唯一合法值）
+DECISIONS_KEY = "行决策覆盖"        # {"1": "keep_origin" | "dismissed"}
+
+# AT-12 N1 值域：keep_origin=「这行不换了（按原片）」（AT-11 旧值，历史数据继续读）、
+# dismissed=「已移除（不需要替换，按原片处理）」——两者在**渲染/发号/锁点/入组互斥**上语义完全
+# 相同（都是「按原片，不要替换」），前端折叠条把它们同归「已移除·按原片」，故后端统一用一个
+# 「按原片行」口径，避免两套豁免逻辑走偏。
+DECISION_VALUES = ("keep_origin", "dismissed")
+ORIGIN_DECISIONS = frozenset(DECISION_VALUES)
+
+
+def is_origin_decision(value: str | None) -> bool:
+    """该决策值是否「按原片」语义（keep_origin / dismissed 皆算）。"""
+    return value in ORIGIN_DECISIONS
 
 
 def load_group_meta(bridge_id: str) -> dict[str, dict]:
@@ -264,19 +276,19 @@ def sync_group_meta(bridge_id: str, groups: list[list[int]]) -> dict[str, dict]:
 
 
 def load_row_decisions(bridge_id: str) -> dict[int, str]:
-    """『行决策覆盖』→ {行号: "keep_origin"}；无/坏/未知值 → 丢弃（合同：只认白名单值）。"""
+    """『行决策覆盖』→ {行号: "keep_origin" | "dismissed"}；无/坏/未知值 → 丢弃（只认白名单值）。"""
     raw = load_sidecar_payload(bridge_id).get(DECISIONS_KEY)
     out: dict[int, str] = {}
     if isinstance(raw, dict):
         for key, value in raw.items():
-            if str(key).isdigit() and value == "keep_origin":
-                out[int(key)] = "keep_origin"
+            if str(key).isdigit() and value in ORIGIN_DECISIONS:
+                out[int(key)] = str(value)
     return out
 
 
 def save_row_decisions(bridge_id: str, decisions: dict[int, str]) -> dict[int, str]:
-    """整键规范写回『行决策覆盖』（保留 sidecar 其它键）；值白名单=keep_origin。"""
-    clean = {int(n): str(d) for n, d in decisions.items() if str(d) == "keep_origin"}
+    """整键规范写回『行决策覆盖』（保留 sidecar 其它键）；值白名单=keep_origin / dismissed。"""
+    clean = {int(n): str(d) for n, d in decisions.items() if str(d) in ORIGIN_DECISIONS}
     _save_sidecar_key(bridge_id, DECISIONS_KEY,
                       {str(n): d for n, d in sorted(clean.items())})
     return clean
@@ -378,9 +390,9 @@ def run_replace(task_dir: Path, *, assets: list[str] | None, map_spec: str | Non
         pending = [dict(x) for x in (task.get("pending_replace") or [])
                    if isinstance(x, dict)]
         bridge_id = str(task.get("bridge_id") or "")
-        # AT-11 §3.4（B2）：同一确认动作内先算有效决策——keep_origin 在发号/组装有效上传清单
-        # 之前胜出；原值（清单图列/命名/流水）不动，restore 后原样回来。
-        ko_rows = {n for n, d in load_row_decisions(bridge_id).items() if d == "keep_origin"}
+        # AT-11 §3.4（B2）：同一确认动作内先算有效决策——「按原片行」（keep_origin / AT-12 dismissed）
+        # 在发号/组装有效上传清单之前胜出；原值（清单图列/命名/流水）不动，restore 后原样回来。
+        ko_rows = {n for n, d in load_row_decisions(bridge_id).items() if is_origin_decision(d)}
         groups = load_groups(bridge_id)
         effective = [x for x in pending if int(x.get("no") or 0) not in ko_rows]
         # 组内 N 行一图 = 一个图号一条提交：确认快照按组去重（组外同 URL 保持独立，不全局去重）。

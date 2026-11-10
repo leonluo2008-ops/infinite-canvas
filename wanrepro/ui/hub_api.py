@@ -176,6 +176,8 @@ def get_task(local_id: str) -> dict:
     task_dir = _task_dir(local_id)
     task = state.load(task_dir)
     d = _summary(task, task_dir)
+    bridge_id = str(task.get("bridge_id") or "")
+    decisions = replace.load_row_decisions(bridge_id) if bridge_id else {}
     summary_md = _read(ROOT / "analysis" / "reverse" / str(task.get("bridge_id")) / "拆解.md")
     checklist_md = _read(_checklist_path(str(task.get("bridge_id"))))
     d.update({
@@ -187,6 +189,10 @@ def get_task(local_id: str) -> dict:
         "pair_lines": task.get("pending_replace") or [],
         # AT-8 B2：置换台视觉包（合同 v3）。只读面——写路径见 set_asset。
         "asset_cards": cards.build(str(task.get("bridge_id") or ""), local_id),
+        # AT-12 N1 行决策两集合（服务端真源）：按原片行 = keep_origin ∪ dismissed（置换区折叠归此），
+        # 已移除行 = dismissed（AT-12 语义「不需要替换→移除」，留痕供恢复）；逐卡真值仍在 asset_cards[].决策。
+        "按原片行": sorted(decisions),
+        "已移除行": sorted(n for n, value in decisions.items() if value == "dismissed"),
         # AT-9 B1 建议合同：意图建议结构化透出（复用 intent.py 解析，缺/坏/行号不匹配 → 待核对）
         "suggestions": _suggestions(
             _read(ROOT / "analysis" / "reverse" / str(task.get("bridge_id") or "") / SUGGESTION_NAME),
@@ -526,10 +532,10 @@ def _row_has_image(bridge: str, no: int) -> bool:
 
 
 def lock_remaining(bridge: str) -> list[int]:
-    """锁点剩余（AT-11 §四）：必换行 −(已传图行 ∪ 组已传图的组成员 ∪ keep_origin 行)。
+    """锁点剩余（AT-11 §四）：必换行 −(已传图行 ∪ 组已传图的组成员 ∪ 按原片行)。
 
-    必换行 ∈ 组且组已传图 → 整组被那张图换掉，不锁；行有 keep_origin → 按原片，不锁。
-    返回仍锁着的必换行号（前端「锁点剩余」徽标与 set_asset 回显共用此口径）。
+    必换行 ∈ 组且组已传图 → 整组被那张图换掉，不锁；行有决策（keep_origin / AT-12 dismissed）
+    → 按原片，不锁。返回仍锁着的必换行号（前端「锁点剩余」徽标与 set_asset 回显共用此口径）。
     """
     must = _must_rows(bridge)
     if not must:
@@ -553,7 +559,8 @@ def set_asset(local_id: str, n: int, *, image_url: str | None = None,
     {task_id, n, image_url}     重传 = 覆盖该行资产图（fill_row 覆盖模式，不追加）
     {task_id, n, clear: true}   「沿用」= 清空该行绑定
     {task_id, n, text}          品牌视觉卡的文字，写清单「命名」列
-    {task_id, n, decision}      AT-11 行决策：keep_origin（这行不换了，按原片）/ restore（恢复）
+    {task_id, n, decision}      AT-11/AT-12 行决策：keep_origin（这行不换了，按原片）/
+                                dismissed（已移除，不需要替换，按原片处理）/ restore（恢复，清键）
     回显真源是清单 md（不是 pending_replace）。
     该行在确认组里（sidecar『同实体确认』）→ 图/文走 replace.set_group_write 单点整组联动；
     decision 走行级路径且**拒绝组内行**（组=原子单位，组内单行降级先拆开——AT-11 §3.2）；
@@ -566,8 +573,8 @@ def set_asset(local_id: str, n: int, *, image_url: str | None = None,
     task_dir = _task_dir(local_id)
     bridge = _bridge_of(task_dir)
     if decision is not None:
-        if decision not in ("keep_origin", "restore"):
-            raise HubError(f"decision 只能是 keep_origin / restore，收到 {decision!r}")
+        if decision not in ("keep_origin", "dismissed", "restore"):
+            raise HubError(f"decision 只能是 keep_origin / dismissed / restore，收到 {decision!r}")
         if image_url or clear or text is not None:
             raise HubError("decision 与 image_url / clear / text 互斥，只能给一个")
     elif image_url and clear:
@@ -591,8 +598,8 @@ def set_asset(local_id: str, n: int, *, image_url: str | None = None,
                 raise HubError(f"第 {n} 行在确认组 {members} 里（组=原子单位，"
                                f"不可单行降级，先拆开合并）")
             decisions = replace.load_row_decisions(bridge)
-            if decision == "keep_origin":
-                decisions[n] = "keep_origin"
+            if decision in replace.ORIGIN_DECISIONS:
+                decisions[n] = decision
             else:
                 if decisions.pop(n, None) is None:
                     raise HubError(f"第 {n} 行没有『按原片』决策，无需恢复")
@@ -656,7 +663,7 @@ def group_rows(local_id: str, rows: list[int], primary: int | None = None,
                            f"不可入组——品牌行单独处理")
         ko = [n for n in rows if n in replace.load_row_decisions(bridge)]
         if ko:
-            raise HubError(f"行 {ko} 已按原片（keep_origin），先恢复再合并"
+            raise HubError(f"行 {ko} 已按原片/已移除（keep_origin/dismissed），先恢复再合并"
                            f"（先降级后合并会留半组替换）")
         groups = replace.load_groups(bridge)
         for g in groups:

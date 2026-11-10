@@ -204,7 +204,7 @@ def _check_lock(rows: list[dict], must_rows: list[int],
     """③ 锁点对账：必换未换集合 == 确认时点『按原样』/『按原片』/empty_confirm 记录（只读快照，不自证）。
 
     AT-11 §四锁点新规则：必换行 ∈ 组且组已传图（整组被那张图换掉）→ 不锁；
-    行有 keep_origin（按原片）→ 不锁——两者都不需要『按原样』勾选。
+    行有按原片决策（keep_origin / AT-12 dismissed）→ 不锁——两者都不需要『按原样』勾选。
     """
     ko_rows = ko_rows or set()
     groups = groups or []

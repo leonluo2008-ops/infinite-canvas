@@ -124,7 +124,7 @@ export type HubAssetCard = {
     时段来源: string;
     /** AT-11 M1 组卡投影；无组 → null。 */
     组: HubCardGroup | null;
-    /** AT-11 行决策覆盖：keep_origin（按原片）或 ""（无覆盖）。 */
+    /** AT-11/AT-12 行决策覆盖：keep_origin（旧·按原片）/ dismissed（已移除·按原片）或 ""（无覆盖）。 */
     决策: string;
 };
 
@@ -149,7 +149,7 @@ export type HubAssetWriteResult = {
     /** 组写入时：组内行号列表 + 全组行回显。 */
     组?: number[];
     rows?: { n: number; 已传图: string[]; 命名: string }[];
-    /** AT-11 行决策回显：keep_origin | restore + 全量覆盖表 + 锁点剩余必换行。 */
+    /** AT-11/AT-12 行决策回显：keep_origin | dismissed | restore + 全量覆盖表 + 锁点剩余必换行。 */
     决策?: string;
     覆盖?: Record<string, string>;
     锁点剩余?: number[];
@@ -175,6 +175,10 @@ export type HubTaskDetail = HubTaskSummary & {
     pair_lines: HubPairLine[];
     /** 资产卡（数据合同 v3）；旧 bridge 无此字段 → 归一为 [] → 前端退化回文字配对表。 */
     asset_cards: HubAssetCard[];
+    /** AT-12 N1：按原片行（keep_origin ∪ dismissed，置换区折叠归此）；旧 bridge 缺 → 前端由卡决策派生。 */
+    按原片行?: number[];
+    /** AT-12 N1：已移除行（dismissed，不需要替换）；旧 bridge 缺 → 前端由卡决策派生。 */
+    已移除行?: number[];
     /** 意图建议（AT-9 B1）；旧 bridge 无此字段 → 归一为 [] → 前端显式「尚无建议·待核对」。 */
     suggestions: HubSuggestion[];
     /** 本会话有无置换写入（换图/沿用/品牌文字）；仅参考，前端以 asset_cards 已传图为准。 */
@@ -444,7 +448,8 @@ export async function confirmHubReplace(localId: string, emptyConfirm = false, a
  *  - {n, image_url} 换图（重传覆盖）；image_url 必须是公网 HTTPS（先走 uploadHubImage）
  *  - {n, clear:true} 「沿用」= 清空该行绑定
  *  - {n, text}       品牌视觉卡的文字，写清单「命名」列
- *  - {n, decision}   AT-11 行决策：keep_origin（按原片）/ restore（恢复），与上三者互斥（M3 单行降级用）
+ *  - {n, decision}   AT-11/AT-12 行决策：keep_origin（旧·按原片）/ dismissed（移除，不需要替换）/
+ *                    restore（恢复，后端清键），与上三者互斥（单行降级/移除用）
  */
 export async function postHubAsset(localId: string, payload: { n: number; image_url?: string; clear?: boolean; text?: string; decision?: string }): Promise<HubAssetWriteResult> {
     return request<HubAssetWriteResult>("/api/hub/asset", {

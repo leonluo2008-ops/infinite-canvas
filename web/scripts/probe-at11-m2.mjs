@@ -122,12 +122,12 @@ function readUtf8(rel) {
     return require("node:fs").readFileSync(path.resolve(rel), "utf8");
 }
 
-check("常驻入口：合并资产按钮与退出多选成对", drawer.includes("data-hub-merge-enter") && drawer.includes("data-hub-merge-exit"));
+check("常驻 checkbox（替换 AT-12 勾选式合并，无模式入口）", drawer.includes("data-hub-check-row={card.n}") && !drawer.includes("data-hub-merge-enter") && !drawer.includes("data-hub-merge-exit"));
 check("多选态存行号 Set（useState<Set<number>>，不存卡对象）", drawer.includes("useState<Set<number>>(new Set())"));
-check("taskId 切换清理多选态（useEffect [taskId] 内清空）", /useEffect\(\(\) => \{[\s\S]*?setSelectedRows\(new Set\(\)\);[\s\S]*?\}, \[taskId\]\)/.test(drawer));
-check("浮条合同文案「已选 N 行 · 合并为一项」+取消", drawer.includes("已选 {mergeableSelected.length} 行 · 合并为一项") && drawer.includes("data-hub-merge-cancel"));
-check("合并按钮 <2 行禁用", /mergeableSelected\.length < 2/.test(drawer));
-check("合并成功清空选中、失败保留（catch 不动 selectedRows）", /setSelectedRows\(new Set\(\)\);\s*\n\s*setMergeMode\(false\);/.test(drawer) && /catch \(error\) \{[\s\S]*?其中一行已在他组[\s\S]*?return false;/.test(drawer));
+check("taskId 切换清理多选态（useEffect [taskId] 内清空）", /useEffect\(\(\) => \{[\s\S]*?setSelectedRows\(new Set\(\)\);[^\n]*[\s\S]*?\}, \[taskId\]\)/.test(drawer));
+check("浮条合同文案「合并勾选项(N)」+[清空]", drawer.includes("{mergeBarText(mergeableSelected.length)}") && drawer.includes("data-hub-merge-clear"));
+check("浮条勾≥2 才出现（少于 2 不出浮条）", drawer.includes("mergeableSelected.length >= 2"));
+check("合并成功清空选中、失败保留（catch 不动 selectedRows）", /message\.success\(`已合并[\s\S]*?setSelectedRows\(new Set\(\)\);/.test(drawer) && /catch \(error\) \{[\s\S]*?其中一行已在他组[\s\S]*?return false;/.test(drawer));
 check("409 撞他组 → 点名「其中一行已在他组，先拆开」", drawer.includes("其中一行已在他组，先拆开"));
 check("提交前复核成员未变（mergeMembershipChanged 接线）", drawer.includes("mergeMembershipChanged(opts.rows, detail.asset_cards)"));
 check("多图分支先清落选行再成组（组内清空会整组联动）", drawer.includes("opts.keepN !== null") && /postHubAsset\(taskId, \{ n: card\.n, clear: true \}\)/.test(drawer));
@@ -138,7 +138,11 @@ check("单帧单框：组卡走 GroupFrame（恰一枚 data-hub-box-row=主行�
 check("主行未定位诚实文案（不搬他人框）", drawer.includes("主行未定位"));
 check("合并卡徽标走 mergeBadge（#N 已合并）", drawer.includes("mergeBadge(members)"));
 check("拆开合并文案=已解除联动保留当前传图（M3 I1 收尾，不是历史撤销）", drawer.includes("拆开合并") && drawer.includes("解除联动，各行保留当前传图"));
-check("组卡置灰标记（mergeMode 下 data-hub-merge-disabled=先拆开）", drawer.includes('data-hub-merge-disabled={mergeMode ? "已确认组·先拆开" : ""}'));
+check("组卡不挂 checkbox（组=原子单位，勾选只挂非组卡）", (() => {
+    const start = drawer.indexOf("function GroupCard(");
+    const end = drawer.indexOf("function GroupFrame(");
+    return start > 0 && end > start && !drawer.slice(start, end).includes("data-hub-check-row");
+})());
 check("置灰行点卡只弹原因不入选（warning reason）", /if \(verdict && !verdict\.selectable\) \{\s*\n\s*message\.warning\(verdict\.reason\);/.test(drawer));
 
 // ---------------------------------------------------------------- 结果

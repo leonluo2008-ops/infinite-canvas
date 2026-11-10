@@ -82,7 +82,6 @@ REAL_SIDE = (POP4 / "待确认清单.json").read_text(encoding="utf-8-sig")
 
 TMP_TASK = Path(tempfile.mkdtemp(prefix="probe-at11-m1-task-"))
 READONLY_WATCH = [POP4 / "待确认清单.md", POP4 / "待确认清单.json",
-                  ROOT / "analysis" / "reverse" / "pop-4-variant" / "待确认清单.md",   # AT-11 M5 [7] 夹具源（只读复制）
                   REAL_TASK_DIR / "任务.json"]
 
 
@@ -125,6 +124,9 @@ def scenario(md: str | None = None, side_extra: dict | None = None):
     """重置夹具盘面 + 安装 state/hub 内存替身，返回 patches 列表（start/stop 自己管）。"""
     (FIXTURE_DIR / "待确认清单.md").write_text(md if md is not None else REAL_MD, encoding="utf-8")
     payload = json.loads(REAL_SIDE)
+    # 夹具自净：真实 pop-4 sidecar 的组/行决策是历史运行态（现已含 [[1,5]] 组），探针必须从干净合同
+    # 起跑，各判据只吃自己 side_extra 注入的状态（否则重跑即撞组，判据不再可复现）。
+    payload.update({"同实体确认": [], "行决策覆盖": {}, "组元数据": {}})
     payload.update(side_extra or {})
     (FIXTURE_DIR / "待确认清单.json").write_text(
         json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -160,6 +162,26 @@ def build_prompt(groups: list[list[int]], decisions: dict[int, str]) -> str:
     reasons = render.suggestion_reasons(FIXTURE_DIR / "意图建议.md")
     return render.render_prompt(fm, secs, layers, ents, render.header_facts(disc),
                                 FIXTURE_BRIDGE, "seedance-flow", reasons)
+
+
+def build_variant_md() -> str:
+    """M5 夹具自建（AT-10 C4 教训：不依赖可能被 UI 删掉的真实任务产物 pop-4-variant）：
+    pop-4 清单就地改造——#1 命名=参考片旧描述「有粉色标签款」、#5 复用 #1 的图（组内一图成立）。"""
+    url1 = next(r["cur_assets"].strip() for r in replace.parse_rows(REAL_MD) if r["no"] == 1)
+    lines: list[str] = []
+    for line in REAL_MD.splitlines():
+        cells = replace.row_cells(line)
+        if cells and re.fullmatch(r"\d+", cells[0] or ""):
+            while len(cells) < 8:
+                cells.append("")
+            no = int(cells[0])
+            if no == 1:
+                cells[3] = "有粉色标签款"
+            if no == 5:
+                cells[4] = url1
+            line = "| " + " | ".join(cells) + " |"
+        lines.append(line)
+    return "\n".join(lines)
 
 
 def run_confirm() -> dict:
@@ -294,7 +316,7 @@ def main() -> int:
                     hub.set_asset("probe-at11-m1", 5, **kwargs)
                     check(f"拒绝：{why}", False, "未拒绝")
                 except hub.HubError as e:
-                    check(f"拒绝：{why}", "互斥" in str(e) or "keep_origin / restore" in str(e), str(e))
+                    check(f"拒绝：{why}", "互斥" in str(e) or "keep_origin" in str(e), str(e))
             try:
                 hub.set_asset("probe-at11-m1", 5, decision="restore")
                 check("拒绝：restore 无决策", False, "未拒绝")
@@ -441,12 +463,11 @@ def main() -> int:
             replace.load_group_meta = saved_meta
 
         # ================================================= [7] M5 缺陷：roll call 合并组=纯图号引用
-        print("[7] M5：pop-4-variant 夹具成组 [[1,5]] → roll call 纯 @图片1（去旧命名 bit）；反例不成组保留命名")
-        VARIANT = ROOT / "analysis" / "reverse" / "pop-4-variant"
-        VARIANT_MD = (VARIANT / "待确认清单.md").read_text(encoding="utf-8-sig")
+        print("[7] M5：自建 variant 夹具成组 [[1,5]] → roll call 纯 @图片1（去旧命名 bit）；反例不成组保留命名")
+        VARIANT_MD = build_variant_md()
         with _Patches(scenario(md=VARIANT_MD, side_extra={"同实体确认": [[1, 5]]})):
-            for fname in ("拆解.md", "意图建议.md"):       # 夹具同源：variant 的拆解/意图建议副本
-                shutil.copy2(VARIANT / fname, FIXTURE_DIR / fname)
+            for fname in ("拆解.md", "意图建议.md"):       # 夹具同源：pop-4 的拆解/意图建议副本
+                shutil.copy2(POP4 / fname, FIXTURE_DIR / fname)
             install_task([])
             ents = render.parse_checklist(FIXTURE_DIR / "待确认清单.md")
             render.assign_numbers(ents, [[1, 5]], {})

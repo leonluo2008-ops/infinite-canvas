@@ -1548,19 +1548,22 @@ def parse_checklist(path: Path) -> list[Entity]:
     return rows
 
 
+# AT-12 N1：「按原片行」值白名单（与 automation.replace.DECISION_VALUES 同源；pipeline 不 import automation）
+ORIGIN_DECISIONS = frozenset({"keep_origin", "dismissed"})
+
 def assign_numbers(ents: list[Entity], groups: list[list[int]] | None = None,
                    decisions: dict[int, str] | None = None) -> list[Entity]:
     """给「备了图」的资产发 @图片N——AT-11 B1 起**组感知**：行号→组/单体→唯一图号。
 
     · 组内行共用一个图号（组=一个发号单位）；组外不同行共用 URL 保持**独立图号**
       （禁全局 URL 去重偷改语义）。
-    · decisions（『行决策覆盖』）里 keep_origin 的行在发号**之前**胜出（§3.4）：已有图/
-      命名/自填描述的**有效视图**被屏蔽（该行按原片描述渲染、无 @图片N），原值留在
+    · decisions（『行决策覆盖』）里「按原片行」（keep_origin / AT-12 dismissed）在发号**之前**胜出
+      （§3.4）：已有图/命名/自填描述的**有效视图**被屏蔽（该行按原片描述渲染、无 @图片N），原值留在
       清单/覆盖表里供 restore——这里只改内存副本，不动盘面。
     · 不传 groups/decisions 时行为与旧版逐行发号完全一致（旧调用方零破坏）。
     """
     units = [sorted({int(x) for x in g}) for g in (groups or [])]
-    ko_rows = {int(n) for n, d in (decisions or {}).items() if d == "keep_origin"}
+    ko_rows = {int(n) for n, d in (decisions or {}).items() if d in ORIGIN_DECISIONS}
     seq = 0
     seen: dict[tuple, int] = {}
     for ent in ents:
@@ -1590,6 +1593,7 @@ def load_merge_overlay(sidecar_path) -> tuple[list[list[int]], dict[int, str]]:
     pipeline 不 import automation（render 保持独立可运行），按同一 JSON 合同容错直读；
     无文件/坏 JSON/坏值 → ([], {})（行为同无组无覆盖，逐行发号）。行号→图号必须与
     automation.replace.load_groups / load_row_decisions 读出的完全一致（同一数据源）。
+    AT-12 N1：值白名单与 automation.replace.DECISION_VALUES 对齐（keep_origin / dismissed）。
     """
     try:
         payload = json.loads(Path(sidecar_path).read_text(encoding="utf-8-sig"))
@@ -1606,8 +1610,8 @@ def load_merge_overlay(sidecar_path) -> tuple[list[list[int]], dict[int, str]]:
     raw = payload.get("行决策覆盖")
     if isinstance(raw, dict):
         for key, value in raw.items():
-            if str(key).isdigit() and value == "keep_origin":
-                decisions[int(key)] = "keep_origin"
+            if str(key).isdigit() and value in ORIGIN_DECISIONS:
+                decisions[int(key)] = str(value)
     return groups, decisions
 
 

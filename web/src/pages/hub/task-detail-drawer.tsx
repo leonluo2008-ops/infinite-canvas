@@ -4,8 +4,8 @@ import { useCallback, useEffect, useMemo, useRef, useState, type DragEvent } fro
 import { Streamdown } from "streamdown";
 
 import { badgeFits, boxRect, containRect, formatSeconds, frameCaption, frameState, layoutLegend, otherBoxCount, ratioFromImage, stageSize } from "@/lib/hub/frame-overlay";
-import { mergeBadge, mergeImageBranch, mergeMembershipChanged, mergeSelectable, mergeShotUnion, groupBoxRow, toggleMergeRow } from "@/lib/hub/merge-mode";
-import { decisionBadgeText, decisionErrorText, decisionFeedback, lockCounters, lockRows, rowDecisionAction, type RowDecisionAction } from "@/lib/hub/row-decision";
+import { mergeBadge, mergeBarText, mergeImageBranch, mergeMembershipChanged, mergeSelectable, mergeShotUnion, groupBoxRow, pruneSelection, toggleMergeRow } from "@/lib/hub/merge-mode";
+import { activeCards, decisionBadgeText, decisionErrorText, decisionFeedback, lockCounters, lockRows, originRowNumbers, originStripLabel, rowDecisionAction, type RowDecisionAction } from "@/lib/hub/row-decision";
 
 import {
     approveHubTask,
@@ -394,10 +394,17 @@ function AssetSection({
 }) {
     const { message, modal } = App.useApp();
     const taskId = detail.local_id;
-    const cards = [...detail.asset_cards].sort((a, b) => a.n - b.n);
+    const allCards = [...detail.asset_cards].sort((a, b) => a.n - b.n);
     // 影响镜次（AT-10 C05 信息下沉）：意图建议的镜次，纯透出，不新增识别调用。
     const shotMap = new Map<number, number[]>(detail.suggestions.map((item) => [item.n, [...item.镜次].sort((a, b) => a - b)]));
     const shotsOf = (rows: number[]) => [...new Set(rows.flatMap((n) => shotMap.get(n) || []))].sort((a, b) => a - b);
+
+    // ---- AT-12 N1 按原片折叠（§2.2）：dismissed（已移除）与旧 keep_origin 都移出置换区，
+    // 归顶部「已移除 · 按原片 N 项」折叠条（展开可恢复）。服务端集合优先，旧 bridge 缺字段回落卡决策派生。
+    const originNs = detail.按原片行?.length ? [...detail.按原片行] : originRowNumbers(allCards);
+    const originSet = new Set(originNs);
+    const originRows = allCards.filter((card) => originSet.has(card.n));
+    const cards = activeCards(allCards);
 
     // 确认组：同实体确认 ≥2 行的成员归到一组；一卡展示，一传全组联动（后端单点写）。
     const groupMap = new Map<string, HubAssetCard[]>();
@@ -414,30 +421,37 @@ function AssetSection({
     const groups = [...groupMap.values()].map((bucket) => [...bucket].sort((a, b) => a.n - b.n));
     const singles = cards.filter((card) => !groupedNs.has(card.n));
 
-    const mustCards = cards.filter((card) => card.建议 === "必须换");
-    // ---- AT-11 M3 锁点（§3.2 keep_origin 豁免）：列表与计数走纯判定（与后端 lock_remaining 同口径），
-    // 降级/恢复成功后 onWritten() 回刷 detail 派生重算——无本地影子状态，轮询不闪回。
-    const counters = lockCounters(cards);
-    const lockNs = lockRows(cards);
+    const mustCards = allCards.filter((card) => card.建议 === "必须换");
+    // ---- AT-11 M3 锁点（§3.2 按原片豁免）：列表与计数走纯判定（与后端 lock_remaining 同口径，
+    // dismissed 与旧 keep_origin 同豁免），移除/恢复成功后 onWritten() 回刷 detail 派生重算——
+    // 无本地影子状态，轮询不闪回。
+    const counters = lockCounters(allCards);
+    const lockNs = lockRows(allCards);
     const unfilledMust = mustCards.filter((card) => lockNs.includes(card.n));
 
-    // ---- AT-11 M2 多选合并模式（§3.1/§3.6）：多选态=行号 Set（禁存卡对象引用） ----
-    const [mergeMode, setMergeMode] = useState(false);
+    // ---- AT-12 N1 勾选式合并（替换 AT-11 模式切换）：每张非组卡左上常驻 checkbox；勾选态=行号 Set
+    // （禁存卡对象引用）。勾≥2 → 底部浮条「合并勾选项(N)·[合并][清空]」。
     const [selectedRows, setSelectedRows] = useState<Set<number>>(new Set());
     const [confirmOpen, setConfirmOpen] = useState(false);
     const [confirmRows, setConfirmRows] = useState<HubAssetCard[]>([]);
-    // taskId 切换 → 多选态与选中一并清理（I2）；同任务 5 秒轮询不清（选中跨轮询保留）。
+    const [originOpen, setOriginOpen] = useState(false);
+    // taskId 切换 → 勾选态与确认窗一并清理（I2）；同任务 5 秒轮询不清（勾选跨轮询保留）。
     useEffect(() => {
-        setMergeMode(false);
         setSelectedRows(new Set());
         setConfirmOpen(false);
         setConfirmRows([]);
+        setOriginOpen(false);
     }, [taskId]);
+    // 轮询收口（I2）：被成组 / 被移除 / 行消失的勾选自动剔出，浮条计数诚实；
+    // pruneSelection 无变化时返回原 Set 引用 → setState 直接 bail，不引发重渲染抖动。
+    useEffect(() => {
+        setSelectedRows((prev) => pruneSelection(prev, detail.asset_cards));
+    }, [detail.asset_cards]);
 
-    // 逐卡可选性（已确认组置灰=先拆开；品牌视觉行置灰=品牌行单独处理）。
+    // 逐卡可选性（按原片行已折叠不在列；品牌视觉行置灰=品牌行单独处理）。
     const selectableMap = new Map<number, { selectable: boolean; reason: string }>();
     for (const card of cards) selectableMap.set(card.n, mergeSelectable(card));
-    // 合并候选=选中且仍可选的行（轮询中变为不可选的行不计入，浮条数字诚实）。
+    // 合并候选=勾选且仍可选的行（轮询中变为不可选的行不计入，浮条数字诚实）。
     const mergeableSelected = cards.filter((card) => selectedRows.has(card.n) && selectableMap.get(card.n)?.selectable);
     const toggleRow = (card: HubAssetCard) => {
         const verdict = selectableMap.get(card.n);
@@ -447,10 +461,7 @@ function AssetSection({
         }
         setSelectedRows((prev) => toggleMergeRow(prev, card.n));
     };
-    const exitMergeMode = () => {
-        setMergeMode(false);
-        setSelectedRows(new Set());
-    };
+    const clearSelection = () => setSelectedRows(new Set());
     const openConfirm = () => {
         // 打开确认小窗时拍快照（提交时复核组成员未变，§3.6）。
         setConfirmRows(mergeableSelected);
@@ -479,7 +490,6 @@ function AssetSection({
             await groupHubRows(taskId, opts.rows, { primary: opts.primary, name: opts.name });
             message.success(`已合并：#${opts.rows.join("、#")}（主行 #${opts.primary}，此后传一张全组生效）`);
             setSelectedRows(new Set());
-            setMergeMode(false);
             setConfirmOpen(false);
             setConfirmRows([]);
             onWritten();
@@ -502,7 +512,7 @@ function AssetSection({
             return next;
         });
 
-    const anyUploaded = cards.some((card) => card.已传图.length) || Boolean(detail.has_pending_replace);
+    const anyUploaded = allCards.some((card) => card.已传图.length) || Boolean(detail.has_pending_replace);
     const lockOk = unfilledMust.every((card) => acked.has(card.n));
 
     const confirmReplace = async () => {
@@ -524,7 +534,7 @@ function AssetSection({
     const emptyConfirmAll = () => {
         modal.confirm({
             title: "全部按原片沿用？",
-            content: `${cards.length} 项资产全部按原片沿用，不换任何图；确认后直接进入渲染（提示词由后台生成）。`,
+            content: `${allCards.length} 项资产全部按原片沿用，不换任何图；确认后直接进入渲染（提示词由后台生成）。`,
             okText: "确认全沿用",
             onOk: async () => {
                 try {
@@ -567,10 +577,10 @@ function AssetSection({
         }
     };
 
-    // ---- AT-11 M3 单行降级/恢复（§3.2/§3.5）：调 M1 set_asset decision（后端拒绝组内行/非 awaiting_assets，
-    // 报错原文如实透出）。成功 onWritten() 回刷——徽标/锁点全部派生自服务端 detail（sidecar『行决策覆盖』
-    // 透传字段），5 秒轮询回刷不闪回非降级态；busy="decision" 在途防重复点击。
-    const doDecide = async (card: HubAssetCard, decision: "keep_origin" | "restore") => {
+    // ---- AT-12 N1 单行资产决策（移除 dismissed / 旧按原片 keep_origin / 恢复 restore）：调 M1 set_asset
+    // decision（后端拒绝组内行/非 awaiting_assets，报错原文如实透出）。成功 onWritten() 回刷——折叠条/
+    // 锁点全部派生自服务端 detail，5 秒轮询回刷不闪回；busy="decision" 在途防重复点击。
+    const doDecide = async (card: HubAssetCard, decision: "dismissed" | "keep_origin" | "restore") => {
         if (busy) return;
         setBusy("decision");
         try {
@@ -590,18 +600,54 @@ function AssetSection({
                 <h2 className="text-sm font-semibold">资产置换</h2>
                 <div className="flex items-center gap-2">
                     <span className="text-xs text-stone-500 dark:text-stone-400">看原片帧 → 传我们的图（换图走图床公网直链）；没传的按原片沿用</span>
-                    {/* AT-11 §3.1 常驻入口：点开进入多选模式，多张同一件 → 合并为一项 */}
-                    {mergeMode ? (
-                        <Button size="small" type="primary" ghost onClick={exitMergeMode} data-hub-merge-exit>
-                            退出多选
-                        </Button>
-                    ) : (
-                        <Button size="small" onClick={() => setMergeMode(true)} data-hub-merge-enter>
-                            合并资产
-                        </Button>
-                    )}
+                    {/* AT-12 N1 勾选式合并：勾选状态常驻卡上可见，无模式切换 */}
+                    <span className="text-xs text-stone-400 dark:text-stone-500">勾选同一件资产的 ≥2 行 → 合并为一项</span>
                 </div>
             </div>
+
+            {/* AT-12 N1 已移除 · 按原片折叠条（§2.2）：dismissed 与旧 keep_origin 同归此处，展开可恢复 */}
+            {originRows.length ? (
+                <div className="mt-2 rounded-md border border-stone-200 bg-stone-50/70 px-2 py-1.5 dark:border-stone-800 dark:bg-stone-900/40" data-hub-origin-strip>
+                    <button
+                        type="button"
+                        className="flex w-full items-center gap-2 text-left text-xs text-stone-500 transition hover:text-stone-700 dark:text-stone-400 dark:hover:text-stone-200"
+                        onClick={() => setOriginOpen((prev) => !prev)}
+                        data-hub-origin-toggle
+                    >
+                        <span className="font-medium">{originStripLabel(originRows.length)}</span>
+                        <span className="text-stone-400 dark:text-stone-500">{originOpen ? "（收起）" : "（展开）"}</span>
+                    </button>
+                    {originOpen ? (
+                        <div className="mt-1.5 flex flex-col gap-1">
+                            {originRows.map((card) => (
+                                <div
+                                    key={card.n}
+                                    className="flex flex-wrap items-center gap-2 rounded border border-dashed border-stone-300 bg-card px-2 py-1 text-xs dark:border-stone-700"
+                                    data-hub-origin-row={card.n}
+                                    data-hub-origin-decision={card.决策}
+                                >
+                                    <span className="font-mono text-stone-400 dark:text-stone-500">#{card.n}</span>
+                                    <span className="text-stone-600 dark:text-stone-300">{card.短名 || card.描述.slice(0, 24)}</span>
+                                    <Tag className="m-0" style={{ color: "rgb(120,113,108)", borderColor: "rgb(168,162,158)", borderStyle: "dashed", background: "transparent" }}>
+                                        {card.决策 === "dismissed" ? "已移除 · 按原片" : "按原片"}
+                                    </Tag>
+                                    <Button
+                                        size="small"
+                                        type="link"
+                                        className="ml-auto !px-1"
+                                        loading={busy === "decision"}
+                                        disabled={busy !== null}
+                                        onClick={() => doDecide(card, "restore")}
+                                        data-hub-origin-restore
+                                    >
+                                        恢复
+                                    </Button>
+                                </div>
+                            ))}
+                        </div>
+                    ) : null}
+                </div>
+            ) : null}
 
             {/* 确认组：同一件东西·共N行（一卡展示，一传全组联动） */}
             {groups.map((bucket, index) => (
@@ -615,13 +661,16 @@ function AssetSection({
                     taskId={taskId}
                     onWritten={onWritten}
                     onUngroup={() => void doUngroup(bucket.map((card) => card.n))}
-                    mergeMode={mergeMode}
                 />
             ))}
 
             {/* 非组卡：逐卡置换 + 疑似组「可能是同一件？[成组]」（只提示不联动） */}
             <div className="mt-3 space-y-3">
-                {singles.length ? null : <div className="text-xs text-stone-400 dark:text-stone-500">所有行都已确认成组。</div>}
+                {singles.length ? null : (
+                    <div className="text-xs text-stone-400 dark:text-stone-500">
+                        {cards.length ? "所有行都已确认成组。" : "置换区没有待处理的行（都已移除或成组）。"}
+                    </div>
+                )}
                 {singles.map((card, index) => (
                     <AssetCardUnit
                         key={card.n}
@@ -634,26 +683,25 @@ function AssetSection({
                         onWritten={onWritten}
                         onGroup={() => void doGroup([card.n, ...card.同实体疑似])}
                         onDecide={doDecide}
-                        mergeMode={mergeMode}
-                        selected={selectedRows.has(card.n) && Boolean(selectableMap.get(card.n)?.selectable)}
-                        disabledReason={mergeMode ? selectableMap.get(card.n)?.reason || "" : ""}
-                        onToggleRow={() => toggleRow(card)}
+                        checked={selectedRows.has(card.n) && Boolean(selectableMap.get(card.n)?.selectable)}
+                        checkDisabledReason={selectableMap.get(card.n)?.reason || ""}
+                        onToggleCheck={() => toggleRow(card)}
                     />
                 ))}
             </div>
 
-            {/* 多选态底部浮条（§3.1：「已选 N 行 · 合并为一项 · [取消]」） */}
-            {mergeMode ? (
+            {/* 勾选式合并底部浮条（AT-12：勾≥2 →「合并勾选项(N)·[合并][清空]」） */}
+            {mergeableSelected.length >= 2 ? (
                 <div
                     className="fixed bottom-6 left-1/2 z-30 flex -translate-x-1/2 items-center gap-3 rounded-full border border-stone-200 bg-card px-5 py-2.5 shadow-lg dark:border-stone-700"
                     data-hub-merge-bar
                 >
-                    <span className="text-sm font-medium">已选 {mergeableSelected.length} 行 · 合并为一项</span>
-                    <Button size="small" type="primary" disabled={mergeableSelected.length < 2 || busy !== null} loading={busy === "group"} onClick={openConfirm} data-hub-merge-submit>
+                    <span className="text-sm font-medium">{mergeBarText(mergeableSelected.length)}</span>
+                    <Button size="small" type="primary" disabled={busy !== null} loading={busy === "group"} onClick={openConfirm} data-hub-merge-submit>
                         合并
                     </Button>
-                    <Button size="small" onClick={exitMergeMode} data-hub-merge-cancel>
-                        取消
+                    <Button size="small" onClick={clearSelection} data-hub-merge-clear>
+                        清空
                     </Button>
                 </div>
             ) : null}
@@ -728,7 +776,6 @@ function GroupCard({
     taskId,
     onWritten,
     onUngroup,
-    mergeMode = false,
 }: {
     bucket: HubAssetCard[];
     color: string;
@@ -738,7 +785,6 @@ function GroupCard({
     taskId: string;
     onWritten: () => void;
     onUngroup: () => void;
-    mergeMode?: boolean;
 }) {
     const { modal } = App.useApp();
     // 组卡投影（AT-11 M1）：成员卡挂同一『组』对象；代表卡=主行（投影缺省=最小行）。
@@ -760,10 +806,9 @@ function GroupCard({
 
     return (
         <div
-            className={`mt-3 rounded-lg border-2 border-dashed border-emerald-300 bg-emerald-50/40 p-3 dark:border-emerald-700 dark:bg-emerald-950/20 ${mergeMode ? "opacity-60" : ""}`}
+            className="mt-3 rounded-lg border-2 border-dashed border-emerald-300 bg-emerald-50/40 p-3 dark:border-emerald-700 dark:bg-emerald-950/20"
             style={{ borderLeft: `4px solid ${color.replace(/0\.30\)$/, "0.85)")}` }}
             data-hub-group-card={group ? group.键 : ""}
-            data-hub-merge-disabled={mergeMode ? "已确认组·先拆开" : ""}
         >
             <div className="flex flex-wrap items-center gap-2">
                 <Tag color="success" className="m-0" data-hub-group-badge>
@@ -779,8 +824,7 @@ function GroupCard({
                         影响镜次：第{unionShots.join("、")}镜
                     </span>
                 ) : null}
-                {mergeMode ? <Tag className="m-0">已确认组·先拆开（不可并入其他合并）</Tag> : null}
-                <Button size="small" className="ml-auto" loading={busy === "ungroup"} disabled={busy !== null || mergeMode} onClick={confirmUngroup} data-hub-group-ungroup>
+                <Button size="small" className="ml-auto" loading={busy === "ungroup"} disabled={busy !== null} onClick={confirmUngroup} data-hub-group-ungroup>
                     拆开合并
                 </Button>
             </div>
@@ -915,7 +959,7 @@ function GroupFrame({ group, className = "" }: { group: HubCardGroup; className?
 }
 
 /** 单卡置换单元：帧+overlay、传图/清空并排、疑似组提示按钮、品牌文字（品牌视觉卡）。
- *  AT-11 M2：多选态下整卡可点选（行号入 Set）；置灰行（确认组/品牌行）不可选并注明原因。 */
+ *  AT-12 N1：左上常驻 checkbox（勾选状态直接可见，无模式切换）；品牌行置灰并注明原因。 */
 function AssetCardUnit({
     card,
     color,
@@ -926,10 +970,9 @@ function AssetCardUnit({
     onWritten,
     onGroup,
     onDecide,
-    mergeMode = false,
-    selected = false,
-    disabledReason = "",
-    onToggleRow,
+    checked = false,
+    checkDisabledReason = "",
+    onToggleCheck,
 }: {
     card: HubAssetCard;
     color: string;
@@ -939,21 +982,21 @@ function AssetCardUnit({
     taskId: string;
     onWritten: () => void;
     onGroup: () => void;
-    /** AT-11 M3 单行降级/恢复（keep_origin/restore）；组卡不挂（组内行入口隐藏）。 */
-    onDecide?: (card: HubAssetCard, decision: "keep_origin" | "restore") => void;
-    mergeMode?: boolean;
-    selected?: boolean;
-    disabledReason?: string;
-    onToggleRow?: () => void;
+    /** AT-12 N1 单行资产决策（dismissed/restore）；组卡不挂（组内行入口隐藏）。 */
+    onDecide?: (card: HubAssetCard, decision: "dismissed" | "keep_origin" | "restore") => void;
+    /** 勾选式合并：本卡 checkbox 勾选态（行号 Set 派生，轮询不丢）。 */
+    checked?: boolean;
+    /** checkbox 置灰原因（品牌行等）；非空 → 置灰+tooltip。 */
+    checkDisabledReason?: string;
+    onToggleCheck?: () => void;
 }) {
     const { message } = App.useApp();
     const [brandText, setBrandText] = useState("");
     const brand = card.类别.includes("品牌视觉");
-    const clickBlocked = mergeMode && Boolean(disabledReason);
-    // AT-11 M3 降级菜单项（§3.2）：仅必换/建议准备行显示「这行不换了（按原片）」；已 keep_origin 行
-    // 显示「恢复替换」；组内行 null（组卡上不出现）。多选态下整个菜单隐藏（多选只管合并）。
+    // AT-12 N1 决策菜单项（§2.2）：仅必换/建议准备行显示「移除（不需要替换，按原片处理）」；
+    // 已按原片行显示「恢复替换」；组内行 null（组卡上不出现）。
     const decision: RowDecisionAction = rowDecisionAction(card);
-    const decisionMenu = decision && !mergeMode && onDecide
+    const decisionMenu = decision && onDecide
         ? [
               {
                   key: decision.action,
@@ -963,6 +1006,21 @@ function AssetCardUnit({
               },
           ]
         : [];
+    const checkbox = (
+        <Tooltip title={checkDisabledReason}>
+            <span className="inline-flex items-center" onClick={(event) => event.stopPropagation()}>
+                <Checkbox
+                    checked={checked}
+                    disabled={Boolean(checkDisabledReason) || busy !== null}
+                    onChange={() => onToggleCheck?.()}
+                    data-hub-check-row={card.n}
+                    data-hub-check-state={checkDisabledReason ? "disabled" : checked ? "checked" : "idle"}
+                >
+                    <span className="text-xs text-stone-500 dark:text-stone-400">选</span>
+                </Checkbox>
+            </span>
+        </Tooltip>
+    );
 
     const saveText = async () => {
         const text = brandText.trim();
@@ -981,35 +1039,13 @@ function AssetCardUnit({
 
     return (
         <div
-            role={mergeMode && !disabledReason ? "button" : undefined}
-            aria-disabled={mergeMode ? Boolean(disabledReason) : undefined}
-            onClick={mergeMode && !disabledReason ? onToggleRow : undefined}
-            className={`rounded-lg border p-3 dark:border-stone-800 ${
-                mergeMode
-                    ? disabledReason
-                        ? "cursor-not-allowed border-stone-200 opacity-60 dark:border-stone-800"
-                        : "cursor-pointer border-stone-200 transition hover:border-stone-400 dark:border-stone-800 dark:hover:border-stone-500"
-                    : ""
-            } ${selected ? "!border-indigo-500 ring-2 ring-indigo-200 dark:ring-indigo-900" : ""}`}
+            className={`rounded-lg border p-3 dark:border-stone-800 ${checked ? "!border-indigo-500 ring-2 ring-indigo-200 dark:ring-indigo-900" : ""}`}
             style={{ borderLeft: `4px solid ${color.replace(/0\.30\)$/, "0.85)")}` }}
-            data-hub-merge-row={mergeMode ? card.n : undefined}
-            data-hub-merge-selected={mergeMode && selected ? "1" : "0"}
-            data-hub-merge-disabled={mergeMode ? disabledReason : ""}
+            data-hub-card-row={card.n}
+            data-hub-merge-selected={checked ? "1" : "0"}
         >
             <header className="flex flex-wrap items-center gap-2">
-                {mergeMode ? (
-                    selected ? (
-                        <Tag color="geekblue" className="m-0" data-hub-merge-selected-tag>
-                            已选
-                        </Tag>
-                    ) : disabledReason ? (
-                        <Tag className="m-0" data-hub-merge-disabled-tag>
-                            {disabledReason}
-                        </Tag>
-                    ) : (
-                        <Tag className="m-0">点选参与合并</Tag>
-                    )
-                ) : null}
+                {checkbox}
                 {card.建议 === "必须换" ? <Tag color="red" className="m-0">必须换</Tag> : card.建议 === "建议准备" ? <Tag color="blue" className="m-0">建议准备</Tag> : null}
                 {decisionBadgeText(card) ? (
                     // 降级行徽标（§3.2）：灰·虚线，与必换红/建议蓝区分；文字=「按原片」，非空恒显。
@@ -1038,24 +1074,24 @@ function AssetCardUnit({
                 ) : null}
             </header>
 
-            <div className="mt-2 flex flex-wrap items-stretch gap-2" onClick={mergeMode ? (event) => event.stopPropagation() : undefined}>
+            <div className="mt-2 flex flex-wrap items-stretch gap-2">
                 <FrameWithPosition card={card} className="shrink-0" />
                 {card.已传图.length ? <ArrowRight className="mx-0.5 size-5 shrink-0 self-center text-stone-300 dark:text-stone-600" /> : null}
                 <AssetUploadZone taskId={taskId} n={card.n} uploaded={card.已传图} busy={busy} setBusy={setBusy} onWritten={onWritten} />
             </div>
 
-            {/* 疑似组：只提示 + 一键成组，绝不自动联动（#3↔#5 误连实证反例）；多选态下禁用（走浮条合并） */}
+            {/* 疑似组：只提示 + 一键成组，绝不自动联动（#3↔#5 误连实证反例）；要多行合一走勾选合并 */}
             {card.同实体疑似.length ? (
-                <div className="mt-2 flex flex-wrap items-center gap-2 rounded-md bg-amber-50/70 px-2 py-1.5 text-xs text-amber-700 dark:bg-amber-950/20 dark:text-amber-300" onClick={mergeMode ? (event) => event.stopPropagation() : undefined}>
+                <div className="mt-2 flex flex-wrap items-center gap-2 rounded-md bg-amber-50/70 px-2 py-1.5 text-xs text-amber-700 dark:bg-amber-950/20 dark:text-amber-300">
                     <span>可能是同一件？与 #{card.同实体疑似.join("、#")} 疑似同实体（现不联动，各自独立换图）</span>
-                    <Button size="small" loading={busy === "group"} disabled={busy !== null || clickBlocked} onClick={onGroup}>
+                    <Button size="small" loading={busy === "group"} disabled={busy !== null} onClick={onGroup}>
                         成组
                     </Button>
                 </div>
             ) : null}
 
             {brand ? (
-                <div className="mt-2 flex flex-wrap items-center gap-2" onClick={mergeMode ? (event) => event.stopPropagation() : undefined}>
+                <div className="mt-2 flex flex-wrap items-center gap-2">
                     <Type className="size-4 shrink-0 text-stone-400" />
                     <Input size="small" value={brandText} placeholder="品牌文字（品牌名 / 品类名 / slogan）" className="max-w-xs" disabled={busy !== null} onChange={(event) => setBrandText(event.target.value)} onPressEnter={() => void saveText()} />
                     <Button size="small" type="primary" ghost loading={busy === "upload"} onClick={() => void saveText()}>
