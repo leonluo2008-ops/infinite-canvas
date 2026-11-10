@@ -1106,6 +1106,20 @@ function MergeConfirmModal({
     const [name, setName] = useState(sortedRows[0]?.短名 || "");
     const [keepN, setKeepN] = useState<number | null>(branch.branch === "multi" ? branch.candidates[0].n : null);
     const [error, setError] = useState("");
+    const { message } = App.useApp();
+
+    // AT-11 M5 缺陷修复：本组件在 AssetSection 里常驻挂载（只靠 open 控显隐），
+    // Modal 的 destroyOnHidden 只销毁子 DOM、不重置组件 state——上面的 useState
+    // 初值只在首次挂载时算一次，而首挂载时 rows=[]（primary=0、name=""、keepN=null）。
+    // openConfirm 之后填入快照也不会重算 → 确认合并被 `!primary` 校验拦下（M4 ego 实测
+    // 3 秒后 sidecar 无组键）。这里在 open 变 true（或快照变化）时重派生全部初值。
+    useEffect(() => {
+        if (!open) return;
+        setPrimary(sortedRows[0]?.n ?? 0);
+        setName(sortedRows[0]?.短名 || "");
+        setKeepN(branch.branch === "multi" ? branch.candidates[0].n : null);
+        setError("");
+    }, [open, sortedRows, branch]);
 
     const shotUnion = mergeShotUnion(sortedRows.map((card) => shotMap.get(card.n) || []));
 
@@ -1113,10 +1127,12 @@ function MergeConfirmModal({
         if (!sortedRows.length) return;
         if (!primary || !sortedRows.some((card) => card.n === primary)) {
             setError("请选主行（主行必须是本次合并的行之一）");
+            message.warning("请选主行（主行必须是本次合并的行之一）");
             return;
         }
         if (branch.branch === "multi" && keepN === null) {
             setError("多张不同图：请点名保留哪一张，或取消合并");
+            message.warning("多张不同图：请点名保留哪一张，或取消合并");
             return;
         }
         setError("");

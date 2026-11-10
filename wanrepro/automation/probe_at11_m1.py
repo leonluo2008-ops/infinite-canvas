@@ -20,6 +20,11 @@
       键且『行决策覆盖』不无故清（不留半组替换的任何残留路径）。
   [6] cards 组卡投影（B4）：成员卡挂同一『组』投影（主行/代表帧/单框同源自主行，
       镜次并集）；主行无自身框 → 单框=None+单框降级（不搬他人框）；无组卡 组=None。
+  [7] M5 缺陷（roll call 组=纯图号）：pop-4-variant 夹具（#1 命名=参考片旧描述
+      「有粉色标签款」，#1/#5 同 URL）成组 [[1,5]] → 正文开头 roll call 恰为
+      「全程使用参考图中的@图片1。」（#1 命名核心词全扫零命中）、唯一图号恰 [1]、
+      自检四项全 PASS；反例：同夹具不成组 → roll call 仍保留命名（只清组、不越界
+      清洗单行）。
 
 真数据只读：pop-4 清单/sidecar、auto-0012 任务文件探针前后 SHA256 必须相同；
 夹具目录 analysis/reverse/probe-at11-m1/ 与临时任务目录用完即删（零残留）。
@@ -77,6 +82,7 @@ REAL_SIDE = (POP4 / "待确认清单.json").read_text(encoding="utf-8-sig")
 
 TMP_TASK = Path(tempfile.mkdtemp(prefix="probe-at11-m1-task-"))
 READONLY_WATCH = [POP4 / "待确认清单.md", POP4 / "待确认清单.json",
+                  ROOT / "analysis" / "reverse" / "pop-4-variant" / "待确认清单.md",   # AT-11 M5 [7] 夹具源（只读复制）
                   REAL_TASK_DIR / "任务.json"]
 
 
@@ -433,6 +439,55 @@ def main() -> int:
         finally:
             replace.load_groups = saved_groups
             replace.load_group_meta = saved_meta
+
+        # ================================================= [7] M5 缺陷：roll call 合并组=纯图号引用
+        print("[7] M5：pop-4-variant 夹具成组 [[1,5]] → roll call 纯 @图片1（去旧命名 bit）；反例不成组保留命名")
+        VARIANT = ROOT / "analysis" / "reverse" / "pop-4-variant"
+        VARIANT_MD = (VARIANT / "待确认清单.md").read_text(encoding="utf-8-sig")
+        with _Patches(scenario(md=VARIANT_MD, side_extra={"同实体确认": [[1, 5]]})):
+            for fname in ("拆解.md", "意图建议.md"):       # 夹具同源：variant 的拆解/意图建议副本
+                shutil.copy2(VARIANT / fname, FIXTURE_DIR / fname)
+            install_task([])
+            ents = render.parse_checklist(FIXTURE_DIR / "待确认清单.md")
+            render.assign_numbers(ents, [[1, 5]], {})
+            mapping = {e.row_no: e.no for e in ents if e.no}
+            check("夹具成立：组发号 {1:1, 5:1}，#1 命名=「有粉色标签款」（auto-0024 同源）在场",
+                  mapping == {1: 1, 5: 1} and next(e for e in ents if e.row_no == 1).name == "有粉色标签款",
+                  str(mapping))
+            prompt = build_prompt([[1, 5]], {})
+            body = selfcheck._prompt_body(prompt)
+            roll_exact = "全程使用参考图中的@图片1。"
+            # 流式正文连写为一段：roll call 是正文开头的精确前缀（auto-0024 现场同形态）。
+            check("正文开头 roll call 恰为「全程使用参考图中的@图片1。」（组内纯图号，无命名 bit）",
+                  body.startswith(roll_exact), body[:80])
+            ent1 = next(e for e in ents if e.row_no == 1)
+            core = render.entity_noun_core(ent1)
+            grams = sorted({core} | set(render._noun_grams(core)), key=len, reverse=True)
+            hits = [w for w in grams if w in body]
+            check("#1 命名核心词全扫零命中（旧描述不进正文任何位置，§六.2 零旧描述残留）",
+                  not hits, str(hits[:6]))
+            refs = sorted({int(n) for n in re.findall(r"@图片(\d+)", prompt)})
+            check("@图片N 唯一图号恰 [1]", refs == [1], f"refs={refs}")
+            url_v = next(r["cur_assets"].strip() for r in replace.parse_rows(VARIANT_MD) if r["no"] == 1)
+            t = TASKS[str(TMP_TASK)]
+            t["assets_confirmed"] = [{"no": 1, "url": url_v}]
+            (TMP_TASK / "提示词.md").write_text(prompt, encoding="utf-8")
+            by = selfcheck_items()
+            check("自检四项全 PASS（绑图行残留不再被 roll call 顶爆）",
+                  list(by) == ["次序对账", "绑图行残留", "锁点对账", "组绑定一致性"]
+                  and all(x["结论"] == "PASS" for x in by.values()),
+                  json.dumps(by, ensure_ascii=False)[:400])
+        with _Patches(scenario(md=VARIANT_MD)):
+            install_task([])
+            ents = render.parse_checklist(FIXTURE_DIR / "待确认清单.md")
+            render.assign_numbers(ents, [], {})        # 反例：不成组 → 各自独立发号
+            mapping = {e.row_no: e.no for e in ents if e.no}
+            roll = render.entity_roll_call(ents)
+            check("反例（防越界清洗）：不成组 roll call 保留命名「有粉色标签款」（只清组、单行零回归）",
+                  mapping.get(1) == 1 and mapping.get(5) == 2
+                  and "有粉色标签款" in roll and "@图片2" in roll,
+                  f"mapping={mapping} roll={roll[:80]}")
+
     finally:
         shutil.rmtree(FIXTURE_DIR, ignore_errors=True)
         shutil.rmtree(TMP_TASK, ignore_errors=True)

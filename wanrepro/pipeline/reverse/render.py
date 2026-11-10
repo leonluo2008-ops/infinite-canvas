@@ -685,9 +685,27 @@ def entity_roll_call(ents: list["Entity"]) -> str:
 
     每个实体只给一个 2–6 字的典型说明（命名优先，没有就退到类别词），
     外形 / 颜色 / 材质一律不写——细节交给图（`.hermes.md` 第 17 条）。
+
+    AT-11 M5（合并组=纯图号引用）：同一图号被 ≥2 个实体认领（判据与
+    strip_core_residue 的 claimed 口径一致）= 这些行是同一件东西，已被同一张图
+    整体替换——组内图号只出一个 bit，且说明词清空成纯 `@图片N`。组内任何成员的
+    命名都是旧物残留（方案 §六.2「零旧描述残留」）：auto-0024 里 #1 命名
+    「有粉色标签款」是参考片旧描述，若写进 roll call 就会绕过 strip_core_residue
+    的清扫、自检②绑图行残留直接 FAIL。非组行行为完全不变（命名优先、退类别词）。
     """
+    claimed: dict[int, int] = {}
+    for e in ents:
+        if e.no:
+            claimed[e.no] = claimed.get(e.no, 0) + 1
     bits: list[str] = []
+    seen_nos: set[int] = set()
     for ent in sorted((e for e in ents if e.no), key=lambda e: e.no):
+        if ent.no in seen_nos:      # 组内成员共用同一图号：只出一个 bit
+            continue
+        seen_nos.add(ent.no)
+        if claimed.get(ent.no, 0) >= 2:
+            bits.append(f"@图片{ent.no}")
+            continue
         desc = (ent.name or KIND_SHORT_LABEL.get(ent.kind, "")).strip()
         bits.append(f"@图片{ent.no}" + (f" {desc}" if desc else ""))
     if not bits:
