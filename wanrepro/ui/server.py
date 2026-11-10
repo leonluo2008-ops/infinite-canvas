@@ -2079,8 +2079,13 @@ class Handler(BaseHTTPRequestHandler):
             return
         m = re.fullmatch(r"/api/hub/task/([^/]+)/group", path)
         if m:
+            # AT-11 M2 确认小窗：可选 主行/组名 → 『组元数据』落盘（缺省仍=最小行）。
+            payload = self.read_json()
+            primary = payload.get("主行")
             self.send_json(hub_api.group_rows(urllib.parse.unquote(m.group(1)),
-                                              self._rows_param(self.read_json())))
+                                              self._rows_param(payload),
+                                              primary=payload.get("主行"),
+                                              name=payload.get("组名")))
             return
         m = re.fullmatch(r"/api/hub/task/([^/]+)/ungroup", path)
         if m:

@@ -1,9 +1,10 @@
 import { ArrowRight, CheckCircle2, CircleAlert, Download, FileText, ImageOff, LoaderCircle, RefreshCw, Sparkles, Type, Upload } from "lucide-react";
-import { App, Button, Checkbox, Drawer, Empty, Image as AntdImage, Input, Progress, Tag, Tooltip } from "antd";
-import { useCallback, useEffect, useRef, useState, type DragEvent } from "react";
+import { App, Button, Checkbox, Drawer, Empty, Image as AntdImage, Input, Modal, Progress, Radio, Select, Tag, Tooltip } from "antd";
+import { useCallback, useEffect, useMemo, useRef, useState, type DragEvent } from "react";
 import { Streamdown } from "streamdown";
 
-import { badgeFits, boxRect, containRect, frameCaption, frameState, layoutLegend, otherBoxCount, ratioFromImage, stageSize } from "@/lib/hub/frame-overlay";
+import { badgeFits, boxRect, containRect, formatSeconds, frameCaption, frameState, layoutLegend, otherBoxCount, ratioFromImage, stageSize } from "@/lib/hub/frame-overlay";
+import { mergeBadge, mergeImageBranch, mergeMembershipChanged, mergeSelectable, mergeShotUnion, groupBoxRow, toggleMergeRow } from "@/lib/hub/merge-mode";
 
 import {
     approveHubTask,
@@ -20,6 +21,7 @@ import {
     ungroupHubRows,
     uploadHubImage,
     type HubAssetCard,
+    type HubCardGroup,
     type HubSelfCheckItem,
     type HubTaskDetail,
     type HubTaskSummary,
@@ -413,6 +415,79 @@ function AssetSection({
 
     const mustCards = cards.filter((card) => card.建议 === "必须换");
     const unfilledMust = mustCards.filter((card) => !card.已传图.length);
+
+    // ---- AT-11 M2 多选合并模式（§3.1/§3.6）：多选态=行号 Set（禁存卡对象引用） ----
+    const [mergeMode, setMergeMode] = useState(false);
+    const [selectedRows, setSelectedRows] = useState<Set<number>>(new Set());
+    const [confirmOpen, setConfirmOpen] = useState(false);
+    const [confirmRows, setConfirmRows] = useState<HubAssetCard[]>([]);
+    // taskId 切换 → 多选态与选中一并清理（I2）；同任务 5 秒轮询不清（选中跨轮询保留）。
+    useEffect(() => {
+        setMergeMode(false);
+        setSelectedRows(new Set());
+        setConfirmOpen(false);
+        setConfirmRows([]);
+    }, [taskId]);
+
+    // 逐卡可选性（已确认组置灰=先拆开；品牌视觉行置灰=品牌行单独处理）。
+    const selectableMap = new Map<number, { selectable: boolean; reason: string }>();
+    for (const card of cards) selectableMap.set(card.n, mergeSelectable(card));
+    // 合并候选=选中且仍可选的行（轮询中变为不可选的行不计入，浮条数字诚实）。
+    const mergeableSelected = cards.filter((card) => selectedRows.has(card.n) && selectableMap.get(card.n)?.selectable);
+    const toggleRow = (card: HubAssetCard) => {
+        const verdict = selectableMap.get(card.n);
+        if (verdict && !verdict.selectable) {
+            message.warning(verdict.reason);
+            return;
+        }
+        setSelectedRows((prev) => toggleMergeRow(prev, card.n));
+    };
+    const exitMergeMode = () => {
+        setMergeMode(false);
+        setSelectedRows(new Set());
+    };
+    const openConfirm = () => {
+        // 打开确认小窗时拍快照（提交时复核组成员未变，§3.6）。
+        setConfirmRows(mergeableSelected);
+        setConfirmOpen(true);
+    };
+
+    // 确认合并提交：先复核成员未变（变了报错可重选）→ 多图分支先清空落选行（既有单行清空路径，
+    // 必须在成组前做——组内清空会整组联动）→ 既有 groupRows + 主行/组名落盘（『组元数据』）。
+    // 成功清空选中退出多选（I2）；失败保留选中可重选；撞他组（409 文案）点名「先拆开」。
+    const submitMerge = async (opts: { rows: number[]; primary: number; name: string; keepN: number | null }): Promise<boolean> => {
+        if (busy) return false;
+        const changed = mergeMembershipChanged(opts.rows, detail.asset_cards);
+        if (changed) {
+            message.error(`合并失败：${changed}`);
+            return false;
+        }
+        setBusy("group");
+        try {
+            if (opts.keepN !== null) {
+                for (const card of detail.asset_cards) {
+                    if (opts.rows.includes(card.n) && card.n !== opts.keepN && card.已传图.length) {
+                        await postHubAsset(taskId, { n: card.n, clear: true });
+                    }
+                }
+            }
+            await groupHubRows(taskId, opts.rows, { primary: opts.primary, name: opts.name });
+            message.success(`已合并：#${opts.rows.join("、#")}（主行 #${opts.primary}，此后传一张全组生效）`);
+            setSelectedRows(new Set());
+            setMergeMode(false);
+            setConfirmOpen(false);
+            setConfirmRows([]);
+            onWritten();
+            return true;
+        } catch (error) {
+            const text = errorText(error);
+            message.error(/已在他组|先解组|先拆开/.test(text) ? `其中一行已在他组，先拆开（${text}）` : `合并失败：${text}`);
+            return false;
+        } finally {
+            setBusy(null);
+        }
+    };
+
     const [acked, setAcked] = useState<Set<number>>(new Set());
     const toggleAck = (n: number, on: boolean) =>
         setAcked((prev) => {
@@ -490,7 +565,19 @@ function AssetSection({
         <section className="rounded-lg border border-stone-200 bg-card p-4 dark:border-stone-800">
             <div className="flex flex-wrap items-baseline justify-between gap-2">
                 <h2 className="text-sm font-semibold">资产置换</h2>
-                <span className="text-xs text-stone-500 dark:text-stone-400">看原片帧 → 传我们的图（换图走图床公网直链）；没传的按原片沿用</span>
+                <div className="flex items-center gap-2">
+                    <span className="text-xs text-stone-500 dark:text-stone-400">看原片帧 → 传我们的图（换图走图床公网直链）；没传的按原片沿用</span>
+                    {/* AT-11 §3.1 常驻入口：点开进入多选模式，多张同一件 → 合并为一项 */}
+                    {mergeMode ? (
+                        <Button size="small" type="primary" ghost onClick={exitMergeMode} data-hub-merge-exit>
+                            退出多选
+                        </Button>
+                    ) : (
+                        <Button size="small" onClick={() => setMergeMode(true)} data-hub-merge-enter>
+                            合并资产
+                        </Button>
+                    )}
+                </div>
             </div>
 
             {/* 确认组：同一件东西·共N行（一卡展示，一传全组联动） */}
@@ -505,6 +592,7 @@ function AssetSection({
                     taskId={taskId}
                     onWritten={onWritten}
                     onUngroup={() => void doUngroup(bucket.map((card) => card.n))}
+                    mergeMode={mergeMode}
                 />
             ))}
 
@@ -522,9 +610,39 @@ function AssetSection({
                         taskId={taskId}
                         onWritten={onWritten}
                         onGroup={() => void doGroup([card.n, ...card.同实体疑似])}
+                        mergeMode={mergeMode}
+                        selected={selectedRows.has(card.n) && Boolean(selectableMap.get(card.n)?.selectable)}
+                        disabledReason={mergeMode ? selectableMap.get(card.n)?.reason || "" : ""}
+                        onToggleRow={() => toggleRow(card)}
                     />
                 ))}
             </div>
+
+            {/* 多选态底部浮条（§3.1：「已选 N 行 · 合并为一项 · [取消]」） */}
+            {mergeMode ? (
+                <div
+                    className="fixed bottom-6 left-1/2 z-30 flex -translate-x-1/2 items-center gap-3 rounded-full border border-stone-200 bg-card px-5 py-2.5 shadow-lg dark:border-stone-700"
+                    data-hub-merge-bar
+                >
+                    <span className="text-sm font-medium">已选 {mergeableSelected.length} 行 · 合并为一项</span>
+                    <Button size="small" type="primary" disabled={mergeableSelected.length < 2 || busy !== null} loading={busy === "group"} onClick={openConfirm} data-hub-merge-submit>
+                        合并
+                    </Button>
+                    <Button size="small" onClick={exitMergeMode} data-hub-merge-cancel>
+                        取消
+                    </Button>
+                </div>
+            ) : null}
+
+            {/* 确认小窗（§3.1：名称/主行可改落盘 + 影响预览 + 已传图三分支） */}
+            <MergeConfirmModal
+                open={confirmOpen}
+                rows={confirmRows}
+                shotMap={shotMap}
+                submitting={busy === "group"}
+                onCancel={() => setConfirmOpen(false)}
+                onSubmit={submitMerge}
+            />
 
             {/* 锁点清单 + 确认动作（§六层3） */}
             <div className="mt-4 space-y-2 border-t border-stone-100 pt-3 dark:border-stone-800">
@@ -570,7 +688,12 @@ function AssetSection({
     );
 }
 
-/** 确认组一卡通：『同一件东西·共N行』；代表行上传 → 后端单点整组联动。 */
+/**
+ * 确认组一卡通（AT-11 M2 合并卡）：徽标「#1+#3+#5 已合并」+组名+镜次并集；
+ * 代表帧与唯一框**同源自主行**（组.代表帧/组.单框，单帧单框）——主行无框 → 诚实文案「主行未定位」，
+ * 绝不搬组内其他行的框；旧 bridge 无组投影 → 回退 AT-10 共享帧渲染。
+ * 「拆开合并」=解除联动，各行保留当前图与流水（§3.7，不是历史撤销）。
+ */
 function GroupCard({
     bucket,
     color,
@@ -580,6 +703,7 @@ function GroupCard({
     taskId,
     onWritten,
     onUngroup,
+    mergeMode = false,
 }: {
     bucket: HubAssetCard[];
     color: string;
@@ -589,27 +713,57 @@ function GroupCard({
     taskId: string;
     onWritten: () => void;
     onUngroup: () => void;
+    mergeMode?: boolean;
 }) {
-    const representative = bucket[0];
+    const { modal } = App.useApp();
+    // 组卡投影（AT-11 M1）：成员卡挂同一『组』对象；代表卡=主行（投影缺省=最小行）。
+    const group = bucket.find((card) => card.组)?.组 ?? null;
+    const members = group ? group.成员 : bucket.map((card) => card.n);
+    const representative = (group ? bucket.find((card) => card.n === group.主行) : undefined) ?? bucket[0];
     const uploadedAll = [...new Set(bucket.flatMap((card) => card.已传图))];
+    const unionShots = group && group.镜次并集.length ? group.镜次并集 : shots;
+    const groupName = group?.组名 || "";
+    const badge = group ? mergeBadge(members) : `同一件东西·共${bucket.length}行`;
+
+    const confirmUngroup = () =>
+        modal.confirm({
+            title: `拆开合并 #${members.join("、#")}？`,
+            content: "解除联动，各行保留当前图与流水（不是恢复合并前的历史值）。",
+            okText: "拆开合并",
+            onOk: onUngroup,
+        });
+
     return (
         <div
-            className="mt-3 rounded-lg border-2 border-dashed border-emerald-300 bg-emerald-50/40 p-3 dark:border-emerald-700 dark:bg-emerald-950/20"
+            className={`mt-3 rounded-lg border-2 border-dashed border-emerald-300 bg-emerald-50/40 p-3 dark:border-emerald-700 dark:bg-emerald-950/20 ${mergeMode ? "opacity-60" : ""}`}
             style={{ borderLeft: `4px solid ${color.replace(/0\.30\)$/, "0.85)")}` }}
+            data-hub-group-card={group ? group.键 : ""}
+            data-hub-merge-disabled={mergeMode ? "已确认组·先拆开" : ""}
         >
             <div className="flex flex-wrap items-center gap-2">
-                <Tag color="success" className="m-0">同一件东西·共{bucket.length}行</Tag>
-                <span className="text-sm font-semibold">{representative.短名 || `#${representative.n}`}</span>
+                <Tag color="success" className="m-0" data-hub-group-badge>
+                    {badge}
+                </Tag>
+                <span className="text-sm font-semibold" data-hub-group-name>
+                    {groupName || representative.短名 || `#${representative.n}`}
+                </span>
                 {representative.建议 === "必须换" ? <Tag color="red" className="m-0">必须换</Tag> : null}
-                <span className="font-mono text-xs text-stone-400 dark:text-stone-500">#{bucket.map((card) => card.n).join("、#")}</span>
-                {shots.length ? <span className="text-xs text-stone-400 dark:text-stone-500">影响镜次：第{shots.join("、")}镜</span> : null}
-                <Button size="small" className="ml-auto" loading={busy === "ungroup"} disabled={busy !== null} onClick={onUngroup}>
-                    解组
+                <span className="font-mono text-xs text-stone-400 dark:text-stone-500">#{members.map((n) => (n === representative.n ? `${n}（主行）` : n)).join("、#")}</span>
+                {unionShots.length ? (
+                    <span className="text-xs text-stone-400 dark:text-stone-500" data-hub-group-shots>
+                        影响镜次：第{unionShots.join("、")}镜
+                    </span>
+                ) : null}
+                {mergeMode ? <Tag className="m-0">已确认组·先拆开（不可并入其他合并）</Tag> : null}
+                <Button size="small" className="ml-auto" loading={busy === "ungroup"} disabled={busy !== null || mergeMode} onClick={confirmUngroup} data-hub-group-ungroup>
+                    拆开合并
                 </Button>
             </div>
-            <div className="mt-1 text-xs text-emerald-700 dark:text-emerald-400">组内一行换图 = 全组生效（清单、流水、提交次序三处同步，由后端单点完成）。</div>
+            <div className="mt-1 text-xs text-emerald-700 dark:text-emerald-400">
+                {group ? `合并后一体：传一张图 · 一个图号替换 #${members.join("、#")} 全部（解除联动各自保留当前图）。` : "组内一行换图 = 全组生效（清单、流水、提交次序三处同步，由后端单点完成）。"}
+            </div>
             <div className="mt-2 flex flex-wrap items-stretch gap-2">
-                <FrameWithPosition card={representative} className="shrink-0" />
+                {group ? <GroupFrame group={group} className="shrink-0" /> : <FrameWithPosition card={representative} className="shrink-0" />}
 
                 {uploadedAll.length ? <ArrowRight className="mx-0.5 size-5 shrink-0 self-center text-stone-300 dark:text-stone-600" /> : null}
                 <AssetUploadZone
@@ -619,7 +773,7 @@ function GroupCard({
                     busy={busy}
                     setBusy={setBusy}
                     onWritten={onWritten}
-                    hint={`传一张，#${bucket.map((card) => card.n).join("、#")} 全组生效`}
+                    hint={`传一张，#${members.join("、#")} 全组生效`}
                 />
             </div>
             {/* 组内逐行回显（真源=清单，刷新后与组内其他行一致） */}
@@ -634,7 +788,109 @@ function GroupCard({
     );
 }
 
-/** 单卡置换单元：帧+overlay、传图/清空并排、疑似组提示按钮、品牌文字（品牌视觉卡）。 */
+/**
+ * AT-11 M2 合并卡代表帧（§3.1.2 单帧单框）：帧与唯一框同源自主行投影（组.代表帧/组.单框），
+ * 帧上**恰一枚框**（data-hub-box-row=主行）；主行无自身框 → 不画任何框+「主行未定位」诚实文案
+ * （绝不搬组内其他行的框充数、不跨镜拼框）。几何口径与 AT-10 相同：contain 内容盒 + 百分比框。
+ */
+function GroupFrame({ group, className = "" }: { group: HubCardGroup; className?: string }) {
+    const url = (group.代表帧.url || "").trim();
+    const [ratio, setRatio] = useState<number | null>(null);
+    const stageRef = useRef<HTMLDivElement | null>(null);
+
+    // 比例探针同 FrameWithPosition（antd Image 不透传 onLoad + 缓存早挂载，挂载期主动查一次）。
+    useEffect(() => {
+        setRatio(null);
+        if (!url) return;
+        let alive = true;
+        const apply = (img: HTMLImageElement | null) => {
+            const next = ratioFromImage(img);
+            if (alive && next !== null) setRatio(next);
+        };
+        apply(stageRef.current?.querySelector("img") ?? null);
+        const probe = new Image();
+        probe.onload = () => apply(probe);
+        probe.onerror = () => apply(null);
+        probe.src = url;
+        apply(probe);
+        return () => {
+            alive = false;
+            probe.onload = null;
+            probe.onerror = null;
+        };
+    }, [url]);
+
+    const stage = stageSize(ratio);
+    const content = containRect(ratio, stage);
+    const boxRow = groupBoxRow(group); // 恰一枚框（行号=主行）；null=主行未定位（诚实降级）
+    const rect = boxRow && group.单框 ? boxRect(group.单框, content) : null;
+    const located = Boolean(url) && (group.代表帧.定位 || "").trim() === "精确";
+    const shot = group.代表帧.镜次;
+    const caption = located
+        ? [typeof shot === "number" && shot > 0 ? `第${shot}镜` : "", formatSeconds(group.代表帧.秒), "AI粗标"].filter(Boolean).join(" · ")
+        : "未能定位到该资产出现的镜头 · 暂用整片画面";
+
+    return (
+        <div className={className} data-hub-group-frame data-hub-frame-state={boxRow ? "precise" : "unlocated"}>
+            <div className="relative">
+                <div
+                    ref={stageRef}
+                    className="relative shrink-0 overflow-hidden rounded-md bg-stone-100 dark:bg-stone-900"
+                    style={{ width: stage.w, height: stage.h }}
+                    data-hub-frame-stage
+                    data-hub-frame-state={boxRow ? "precise" : "unlocated"}
+                >
+                    {url ? (
+                        <AntdImage src={url} width={stage.w} height={stage.h} style={{ objectFit: "contain", display: "block" }} alt={`#${group.主行} 主行代表帧`} />
+                    ) : (
+                        <div className="flex size-full flex-col items-center justify-center gap-1 px-2 text-center text-xs text-stone-400 dark:text-stone-500">
+                            <ImageOff className="size-4" />
+                            <span>未定位（无可用帧）</span>
+                        </div>
+                    )}
+
+                    {/* 内容盒：与 contain 后图片实际内容区重合；组卡只放主行那一枚框 */}
+                    {url ? (
+                        <div className="pointer-events-none absolute" style={{ left: content.x, top: content.y, width: content.w, height: content.h }} data-hub-frame-content-box>
+                            {boxRow && rect ? (
+                                <div
+                                    data-hub-box-row={boxRow.row}
+                                    data-hub-box-own="1"
+                                    className="absolute rounded-[2px]"
+                                    style={{
+                                        left: rect.x,
+                                        top: rect.y,
+                                        width: rect.w,
+                                        height: rect.h,
+                                        border: "2px solid rgb(225,29,72)",
+                                        backgroundColor: "rgba(244,63,94,0.14)",
+                                    }}
+                                >
+                                    {badgeFits(rect) ? (
+                                        <span className="absolute left-0.5 top-0.5 rounded px-1 text-[10px] leading-4" data-hub-box-badge style={{ backgroundColor: "rgb(225,29,72)", color: "#fff" }}>
+                                            #{boxRow.row}
+                                        </span>
+                                    ) : null}
+                                </div>
+                            ) : null}
+                        </div>
+                    ) : null}
+                </div>
+            </div>
+            <div className="mt-1 max-w-full px-0.5 text-left text-[11px] text-stone-500 dark:text-stone-400">
+                <div>{caption}{located ? "（点图放大）" : ""}</div>
+                {url && !boxRow ? (
+                    <Tag color="warning" className="m-0 mt-0.5 !text-[10px]" data-hub-group-degraded>
+                        主行未定位
+                    </Tag>
+                ) : null}
+            </div>
+        </div>
+    );
+}
+
+/** 单卡置换单元：帧+overlay、传图/清空并排、疑似组提示按钮、品牌文字（品牌视觉卡）。
+ *  AT-11 M2：多选态下整卡可点选（行号入 Set）；置灰行（确认组/品牌行）不可选并注明原因。 */
 function AssetCardUnit({
     card,
     color,
@@ -644,6 +900,10 @@ function AssetCardUnit({
     taskId,
     onWritten,
     onGroup,
+    mergeMode = false,
+    selected = false,
+    disabledReason = "",
+    onToggleRow,
 }: {
     card: HubAssetCard;
     color: string;
@@ -653,10 +913,15 @@ function AssetCardUnit({
     taskId: string;
     onWritten: () => void;
     onGroup: () => void;
+    mergeMode?: boolean;
+    selected?: boolean;
+    disabledReason?: string;
+    onToggleRow?: () => void;
 }) {
     const { message } = App.useApp();
     const [brandText, setBrandText] = useState("");
     const brand = card.类别.includes("品牌视觉");
+    const clickBlocked = mergeMode && Boolean(disabledReason);
 
     const saveText = async () => {
         const text = brandText.trim();
@@ -675,10 +940,35 @@ function AssetCardUnit({
 
     return (
         <div
-            className="rounded-lg border border-stone-200 p-3 dark:border-stone-800"
+            role={mergeMode && !disabledReason ? "button" : undefined}
+            aria-disabled={mergeMode ? Boolean(disabledReason) : undefined}
+            onClick={mergeMode && !disabledReason ? onToggleRow : undefined}
+            className={`rounded-lg border p-3 dark:border-stone-800 ${
+                mergeMode
+                    ? disabledReason
+                        ? "cursor-not-allowed border-stone-200 opacity-60 dark:border-stone-800"
+                        : "cursor-pointer border-stone-200 transition hover:border-stone-400 dark:border-stone-800 dark:hover:border-stone-500"
+                    : ""
+            } ${selected ? "!border-indigo-500 ring-2 ring-indigo-200 dark:ring-indigo-900" : ""}`}
             style={{ borderLeft: `4px solid ${color.replace(/0\.30\)$/, "0.85)")}` }}
+            data-hub-merge-row={mergeMode ? card.n : undefined}
+            data-hub-merge-selected={mergeMode && selected ? "1" : "0"}
+            data-hub-merge-disabled={mergeMode ? disabledReason : ""}
         >
             <header className="flex flex-wrap items-center gap-2">
+                {mergeMode ? (
+                    selected ? (
+                        <Tag color="geekblue" className="m-0" data-hub-merge-selected-tag>
+                            已选
+                        </Tag>
+                    ) : disabledReason ? (
+                        <Tag className="m-0" data-hub-merge-disabled-tag>
+                            {disabledReason}
+                        </Tag>
+                    ) : (
+                        <Tag className="m-0">点选参与合并</Tag>
+                    )
+                ) : null}
                 {card.建议 === "必须换" ? <Tag color="red" className="m-0">必须换</Tag> : card.建议 === "建议准备" ? <Tag color="blue" className="m-0">建议准备</Tag> : null}
                 <span className="text-sm font-semibold">{card.短名 || `#${card.n}`}</span>
                 <span className="font-mono text-xs text-stone-400 dark:text-stone-500">#{card.n}</span>
@@ -690,24 +980,24 @@ function AssetCardUnit({
                 {shots.length ? <span className="text-xs text-stone-400 dark:text-stone-500">影响镜次：第{shots.join("、")}镜</span> : null}
             </header>
 
-            <div className="mt-2 flex flex-wrap items-stretch gap-2">
+            <div className="mt-2 flex flex-wrap items-stretch gap-2" onClick={mergeMode ? (event) => event.stopPropagation() : undefined}>
                 <FrameWithPosition card={card} className="shrink-0" />
                 {card.已传图.length ? <ArrowRight className="mx-0.5 size-5 shrink-0 self-center text-stone-300 dark:text-stone-600" /> : null}
                 <AssetUploadZone taskId={taskId} n={card.n} uploaded={card.已传图} busy={busy} setBusy={setBusy} onWritten={onWritten} />
             </div>
 
-            {/* 疑似组：只提示 + 一键成组，绝不自动联动（#3↔#5 误连实证反例） */}
+            {/* 疑似组：只提示 + 一键成组，绝不自动联动（#3↔#5 误连实证反例）；多选态下禁用（走浮条合并） */}
             {card.同实体疑似.length ? (
-                <div className="mt-2 flex flex-wrap items-center gap-2 rounded-md bg-amber-50/70 px-2 py-1.5 text-xs text-amber-700 dark:bg-amber-950/20 dark:text-amber-300">
+                <div className="mt-2 flex flex-wrap items-center gap-2 rounded-md bg-amber-50/70 px-2 py-1.5 text-xs text-amber-700 dark:bg-amber-950/20 dark:text-amber-300" onClick={mergeMode ? (event) => event.stopPropagation() : undefined}>
                     <span>可能是同一件？与 #{card.同实体疑似.join("、#")} 疑似同实体（现不联动，各自独立换图）</span>
-                    <Button size="small" loading={busy === "group"} disabled={busy !== null} onClick={onGroup}>
+                    <Button size="small" loading={busy === "group"} disabled={busy !== null || clickBlocked} onClick={onGroup}>
                         成组
                     </Button>
                 </div>
             ) : null}
 
             {brand ? (
-                <div className="mt-2 flex flex-wrap items-center gap-2">
+                <div className="mt-2 flex flex-wrap items-center gap-2" onClick={mergeMode ? (event) => event.stopPropagation() : undefined}>
                     <Type className="size-4 shrink-0 text-stone-400" />
                     <Input size="small" value={brandText} placeholder="品牌文字（品牌名 / 品类名 / slogan）" className="max-w-xs" disabled={busy !== null} onChange={(event) => setBrandText(event.target.value)} onPressEnter={() => void saveText()} />
                     <Button size="small" type="primary" ghost loading={busy === "upload"} onClick={() => void saveText()}>
@@ -726,6 +1016,140 @@ function AssetCardUnit({
                 </details>
             ) : null}
         </div>
+    );
+}
+
+/**
+ * AT-11 M2 确认小窗（§3.1）：合并后名称（默认主行短名可改）、主行（默认行号最小可改——落盘『组元数据』）、
+ * 影响预览（镜次并集 + 传 1 张图 1 个图号替换全部）、已传图三分支（B3）：
+ * 零图=直接组；一张唯一图=提示「沿用 #N 已传图统一到全组」；多张不同图=列出点名保留一张（其余行图
+ * 清空走既有清空路径，流水如实记录）或取消合并不悄悄任选。
+ * 提交失败不关窗（可重选）；父层负责提交编排与成员复核。
+ */
+function MergeConfirmModal({
+    open,
+    rows,
+    shotMap,
+    submitting,
+    onCancel,
+    onSubmit,
+}: {
+    open: boolean;
+    rows: HubAssetCard[];
+    shotMap: Map<number, number[]>;
+    submitting: boolean;
+    onCancel: () => void;
+    onSubmit: (opts: { rows: number[]; primary: number; name: string; keepN: number | null }) => Promise<boolean>;
+}) {
+    // rows=打开确认窗时的快照（父层拍定），此处排序仅展示用。
+    const sortedRows = useMemo(() => [...rows].sort((a, b) => a.n - b.n), [rows]);
+    const branch = useMemo(() => mergeImageBranch(sortedRows), [sortedRows]);
+    const [primary, setPrimary] = useState<number>(sortedRows[0]?.n ?? 0);
+    const [name, setName] = useState(sortedRows[0]?.短名 || "");
+    const [keepN, setKeepN] = useState<number | null>(branch.branch === "multi" ? branch.candidates[0].n : null);
+    const [error, setError] = useState("");
+
+    const shotUnion = mergeShotUnion(sortedRows.map((card) => shotMap.get(card.n) || []));
+
+    const submit = async () => {
+        if (!sortedRows.length) return;
+        if (!primary || !sortedRows.some((card) => card.n === primary)) {
+            setError("请选主行（主行必须是本次合并的行之一）");
+            return;
+        }
+        if (branch.branch === "multi" && keepN === null) {
+            setError("多张不同图：请点名保留哪一张，或取消合并");
+            return;
+        }
+        setError("");
+        await onSubmit({ rows: sortedRows.map((card) => card.n), primary, name: name.trim(), keepN: branch.branch === "multi" ? keepN : null });
+    };
+
+    return (
+        <Modal
+            title={`合并为一项（已选 ${sortedRows.length} 行）`}
+            open={open}
+            onCancel={onCancel}
+            footer={null}
+            width={560}
+            destroyOnHidden
+        >
+            <div data-hub-merge-modal>
+            {sortedRows.length ? (
+                <div className="space-y-4 py-1">
+                    {/* 影响预览（§3.1）：镜次并集 + 一图一号替换全部 */}
+                    <div className="rounded-md bg-stone-50 px-3 py-2 text-sm dark:bg-stone-900" data-hub-merge-preview>
+                        <div className="font-medium">影响预览</div>
+                        <div className="mt-1 text-xs text-stone-500 dark:text-stone-400">
+                            合并 #{sortedRows.map((card) => card.n).join("、#")}
+                            {shotUnion.length ? ` · 镜次并集：第 ${shotUnion.join("、")} 镜` : ""}
+                            {branch.branch === "single" ? " · 沿用既有图" : " · 传 1 张图 · 1 个图号替换全部"}
+                        </div>
+                    </div>
+
+                    {/* 已传图三分支（B3） */}
+                    {branch.branch === "empty" ? (
+                        <div className="rounded-md border border-stone-200 px-3 py-2 text-xs text-stone-500 dark:border-stone-800 dark:text-stone-400" data-hub-merge-branch="empty">
+                            组内暂无已传图：直接合并，之后传一张全组生效。
+                        </div>
+                    ) : branch.branch === "single" ? (
+                        <div className="rounded-md border border-emerald-200 bg-emerald-50/60 px-3 py-2 text-xs text-emerald-700 dark:border-emerald-800 dark:bg-emerald-950/20 dark:text-emerald-300" data-hub-merge-branch="single">
+                            沿用 #{branch.keepN} 已传图统一到全组（合并后全组同图同图号）。
+                        </div>
+                    ) : (
+                        <div className="rounded-md border border-amber-200 bg-amber-50/60 px-3 py-2 text-xs text-amber-700 dark:border-amber-800 dark:bg-amber-950/20 dark:text-amber-300" data-hub-merge-branch="multi">
+                            <div className="font-medium">所选行有多张不同图，保留哪一张？</div>
+                            <Radio.Group className="mt-1.5 flex flex-col gap-1" value={keepN} onChange={(event) => setKeepN(event.target.value)}>
+                                {branch.candidates.map((pair) => (
+                                    <Radio key={`${pair.n}-${pair.url}`} value={pair.n}>
+                                        保留 #{pair.n} 的图
+                                    </Radio>
+                                ))}
+                            </Radio.Group>
+                            <div className="mt-1 text-[11px] text-amber-600/80 dark:text-amber-300/80">其余行已传图将清空（流水如实记录）；也可取消合并不动任何图。</div>
+                        </div>
+                    )}
+
+                    {/* 主行（默认行号最小可改——落盘『组元数据』，代表帧/单框/图号锚定它） */}
+                    <div className="flex flex-wrap items-center gap-2 text-sm">
+                        <span className="shrink-0">主行</span>
+                        <span data-hub-merge-primary className="inline-flex">
+                            <Select
+                                size="small"
+                                className="min-w-40"
+                                value={primary}
+                                onChange={(value) => {
+                                    setPrimary(value);
+                                    setName(sortedRows.find((card) => card.n === value)?.短名 || name);
+                                }}
+                                options={sortedRows.map((card) => ({ value: card.n, label: `#${card.n} ${card.短名 || card.描述.slice(0, 16)}` }))}
+                            />
+                        </span>
+                        <span className="text-xs text-stone-400 dark:text-stone-500">代表帧与合并卡取主行</span>
+                    </div>
+
+                    {/* 合并后名称（默认主行短名可改） */}
+                    <div className="flex flex-wrap items-center gap-2 text-sm">
+                        <span className="shrink-0">合并后名称</span>
+                        <Input size="small" className="min-w-60 flex-1" value={name} onChange={(event) => setName(event.target.value)} placeholder="合并后叫什么（默认主行短名）" data-hub-merge-name />
+                    </div>
+
+                    {error ? <div className="text-xs text-red-600 dark:text-red-400">{error}</div> : null}
+
+                    <div className="flex justify-end gap-2">
+                        <Button size="small" onClick={onCancel}>
+                            取消
+                        </Button>
+                        <Button size="small" type="primary" loading={submitting} onClick={() => void submit()} data-hub-merge-confirm>
+                            确认合并
+                        </Button>
+                    </div>
+                </div>
+            ) : (
+                <div className="py-6 text-center text-sm text-stone-500 dark:text-stone-400">没有可合并的行（请先在多选态选中 ≥2 行）。</div>
+            )}
+            </div>
+        </Modal>
     );
 }
 

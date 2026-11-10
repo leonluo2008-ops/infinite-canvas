@@ -444,8 +444,9 @@ export async function confirmHubReplace(localId: string, emptyConfirm = false, a
  *  - {n, image_url} 换图（重传覆盖）；image_url 必须是公网 HTTPS（先走 uploadHubImage）
  *  - {n, clear:true} 「沿用」= 清空该行绑定
  *  - {n, text}       品牌视觉卡的文字，写清单「命名」列
+ *  - {n, decision}   AT-11 行决策：keep_origin（按原片）/ restore（恢复），与上三者互斥（M3 单行降级用）
  */
-export async function postHubAsset(localId: string, payload: { n: number; image_url?: string; clear?: boolean; text?: string }): Promise<HubAssetWriteResult> {
+export async function postHubAsset(localId: string, payload: { n: number; image_url?: string; clear?: boolean; text?: string; decision?: string }): Promise<HubAssetWriteResult> {
     return request<HubAssetWriteResult>("/api/hub/asset", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -514,12 +515,15 @@ export async function rollbackHubTask(localId: string): Promise<{ state?: string
     });
 }
 
-/** 成组（同实体确认组，≥2 行；组内一传全组联动）。rows=清单行号。 */
-export async function groupHubRows(localId: string, rows: number[]): Promise<{ ok?: boolean; 组?: number[][] }> {
-    return request<{ ok?: boolean; 组?: number[][] }>(`/api/hub/task/${encodeURIComponent(localId)}/group`, {
+/**
+ * 成组（同实体确认组，≥2 行；组内一传全组联动）。rows=清单行号。
+ * AT-11 M2 确认小窗：可选主行/组名 → 后端落盘『组元数据』（缺省主行=最小行）。
+ */
+export async function groupHubRows(localId: string, rows: number[], opts?: { primary?: number; name?: string }): Promise<{ ok?: boolean; 组?: number[][]; 组元数据?: Record<string, { 主行?: number; 组名?: string }> }> {
+    return request<{ ok?: boolean; 组?: number[][]; 组元数据?: Record<string, { 主行?: number; 组名?: string }> }>(`/api/hub/task/${encodeURIComponent(localId)}/group`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ rows }),
+        body: JSON.stringify({ rows, 主行: opts?.primary ?? null, 组名: opts?.name ?? "" }),
     });
 }
 

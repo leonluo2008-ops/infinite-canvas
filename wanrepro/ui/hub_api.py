@@ -626,12 +626,15 @@ def set_asset(local_id: str, n: int, *, image_url: str | None = None,
 
 # ---------------------------------------------------------------- 确认组端点（AT-9 B2）
 
-def group_rows(local_id: str, rows: list[int]) -> dict:
+def group_rows(local_id: str, rows: list[int], primary: int | None = None,
+               name: str | None = None) -> dict:
     """成组：校验行号在清单、≥2 行、都不在别的组 → 写 sidecar『同实体确认』。
 
     AT-11 §3.1.1/§3.2 追加两拒绝：品牌视觉行不可入组（品牌位不读图不占号，
     render.py 品牌分支）；行有 keep_origin 不可入组（先降级再合并会留半组替换，
     先恢复再合并）。
+    AT-11 §3.1.2（M2 确认小窗）：primary=主行（必须 ∈ rows，缺省=最小行）、
+    name=组名——给了任一就落盘『组元数据』{组键: {主行, 组名}}，刷新不回跳最小行。
     """
     task_dir = _task_dir(local_id)
     bridge = _bridge_of(task_dir)
@@ -661,7 +664,28 @@ def group_rows(local_id: str, rows: list[int]) -> dict:
             if overlap:
                 raise HubError(f"行 {overlap} 已在组 {g} 里（先解组再成组）")
         saved = replace.save_groups(bridge, groups + [rows])
-        return {"ok": True, "task_id": local_id, "本次": rows, "组": saved}
+        meta: dict[str, dict] | None = None
+        if primary is not None or (name is not None and str(name).strip()):
+            if primary is not None:
+                try:
+                    primary_no = int(primary)
+                except (TypeError, ValueError):
+                    raise HubError(f"主行必须是整数行号，收到 {primary!r}") from None
+                if primary_no not in rows:
+                    raise HubError(f"主行 {primary_no} 不在本次成组行 {rows} 里")
+            else:
+                primary_no = rows[0]
+            clean_name = re.sub(r"\s+", " ", str(name)).strip() if name is not None else ""
+            key = replace.group_key(rows)
+            cur = replace.load_group_meta(bridge)
+            entry = cur.get(key) if isinstance(cur.get(key), dict) else {}
+            cur[key] = {"主行": primary_no, "组名": clean_name,
+                        **{k: v for k, v in entry.items() if k not in ("主行", "组名")}}
+            meta = replace.save_group_meta(bridge, cur)
+        out: dict = {"ok": True, "task_id": local_id, "本次": rows, "组": saved}
+        if meta is not None:
+            out["组元数据"] = meta
+        return out
 
 
 def ungroup_rows(local_id: str, rows: list[int]) -> dict:
