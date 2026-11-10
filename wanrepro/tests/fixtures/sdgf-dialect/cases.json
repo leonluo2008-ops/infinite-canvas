@@ -1,0 +1,399 @@
+{
+  "version": 1,
+  "contract": "docs/nodes/AT-13.md v3 §2.9 方言合同锁（I-06）",
+  "purpose": "SDGF 方言的**唯一共享夹具**：TS（web/scripts/probe-sdgf-payload.mjs）与 PY（wanrepro/automation/probe_sdgf_dialect.py）加载同一份输入+期望，单改任一端实现 → 至少一条 case 必红。",
+  "schema": {
+    "input": {
+      "model": "画布传给渠道的裸模型名（原样，不 trim 由实现做）",
+      "ratio": "最终 aspect_ratio 值（= bridge payload.ratio = 渠道请求体 aspect_ratio；16:9|9:16|1:1|4:3|3:4|adaptive|21:9）",
+      "size": "可选：画布侧 size 输入（只有 auto 这类需归一的值才填；缺省时 TS 侧按 ratio 本身过映射）",
+      "sound": "布尔：面板「生成音频」",
+      "duration": "整数秒（请求值，未截断）",
+      "mode": "frames | reference（画布 videoMode）",
+      "imageCount": "参考图张数"
+    },
+    "expect": {
+      "fullModel": "满血 GF 精确名判定（纯函数）",
+      "ratioFields": "纯函数比例字段（键序不比，值全等）",
+      "soundFields": "纯函数声音字段（sendParam 恒 true——总开关不进夹具，映射范围在此显式锁定）",
+      "clampDuration": "纯函数时长（代际截断后）",
+      "modeName": "站方中文 mode；null = 该输入被拒、无 mode 名",
+      "assembly": {
+        "ok": "组装/预检是否通过",
+        "reject": "ok=false 时的拒绝因：model | duration | ratio | reference-no-image"
+      },
+      "metadata": "组装体 metadata 合并结果（ratio 与 sound 的 metadata 同一对象；null = 不带 metadata 键）；仅 ok=true 时断言",
+      "topEnableSound": "组装体顶层 enableSound（null = 无该键）；仅 ok=true 时断言"
+    }
+  },
+  "cases": [
+    {
+      "id": "full-480p-9x16-on-20s-2img",
+      "input": { "model": "SD2.5-满血-GF-480P", "ratio": "9:16", "sound": true, "duration": 20, "mode": "frames", "imageCount": 2 },
+      "expect": {
+        "fullModel": true,
+        "ratioFields": { "aspect_ratio": "9:16" },
+        "soundFields": { "enableSound": "on" },
+        "clampDuration": 20,
+        "modeName": "首尾帧",
+        "assembly": { "ok": true },
+        "metadata": null,
+        "topEnableSound": "on"
+      }
+    },
+    {
+      "id": "full-720p-16x9-on-8s-1img",
+      "input": { "model": "SD2.5-满血-GF-720P", "ratio": "16:9", "sound": true, "duration": 8, "mode": "frames", "imageCount": 1 },
+      "expect": {
+        "fullModel": true,
+        "ratioFields": { "aspect_ratio": "16:9" },
+        "soundFields": { "enableSound": "on" },
+        "clampDuration": 8,
+        "modeName": "首帧生视频",
+        "assembly": { "ok": true },
+        "metadata": null,
+        "topEnableSound": "on"
+      }
+    },
+    {
+      "id": "full-1080p-1x1-off-30s-0img",
+      "input": { "model": "SD2.5-满血-GF-1080P", "ratio": "1:1", "sound": false, "duration": 30, "mode": "frames", "imageCount": 0 },
+      "expect": {
+        "fullModel": true,
+        "ratioFields": { "aspect_ratio": "1:1" },
+        "soundFields": {},
+        "clampDuration": 30,
+        "modeName": "文生视频",
+        "assembly": { "ok": true },
+        "metadata": null,
+        "topEnableSound": null
+      }
+    },
+    {
+      "id": "full-720p-trim-casefold-12s-1img",
+      "input": { "model": " sd2.5-满血-gf-720p ", "ratio": "9:16", "sound": true, "duration": 12, "mode": "frames", "imageCount": 1 },
+      "expect": {
+        "fullModel": true,
+        "ratioFields": { "aspect_ratio": "9:16" },
+        "soundFields": { "enableSound": "on" },
+        "clampDuration": 12,
+        "modeName": "首帧生视频",
+        "assembly": { "ok": true },
+        "metadata": null,
+        "topEnableSound": "on"
+      }
+    },
+    {
+      "id": "full-name-boundary-480px-falls-to-alias",
+      "input": { "model": "SD2.5-满血-GF-480PX", "ratio": "9:16", "sound": true, "duration": 20, "mode": "frames", "imageCount": 2 },
+      "expect": {
+        "fullModel": false,
+        "ratioFields": { "aspect_ratio": "9:16", "metadata": { "ratio": "9:16" } },
+        "soundFields": { "metadata": { "enableSound": "on" } },
+        "clampDuration": 20,
+        "modeName": "首尾帧",
+        "assembly": { "ok": true },
+        "metadata": { "ratio": "9:16", "enableSound": "on" },
+        "topEnableSound": null
+      }
+    },
+    {
+      "id": "alias-ap-9x16-on-20s-2img-metadata-merge",
+      "input": { "model": "sd2.5-720p-ap", "ratio": "9:16", "sound": true, "duration": 20, "mode": "frames", "imageCount": 2 },
+      "expect": {
+        "fullModel": false,
+        "ratioFields": { "aspect_ratio": "9:16", "metadata": { "ratio": "9:16" } },
+        "soundFields": { "metadata": { "enableSound": "on" } },
+        "clampDuration": 20,
+        "modeName": "首尾帧",
+        "assembly": { "ok": true },
+        "metadata": { "ratio": "9:16", "enableSound": "on" },
+        "topEnableSound": null
+      }
+    },
+    {
+      "id": "alias-zh-2.0-clamp15-16x9-off-1img",
+      "input": { "model": "sd2.0-720p-zh", "ratio": "16:9", "sound": false, "duration": 20, "mode": "frames", "imageCount": 1 },
+      "expect": {
+        "fullModel": false,
+        "ratioFields": { "aspect_ratio": "16:9", "metadata": { "ratio": "16:9" } },
+        "soundFields": {},
+        "clampDuration": 15,
+        "modeName": "首帧生视频",
+        "assembly": { "ok": true },
+        "metadata": { "ratio": "16:9" },
+        "topEnableSound": null
+      }
+    },
+    {
+      "id": "alias-ds-2.0-1x1-on-12s-2img",
+      "input": { "model": "sd2-720p-ds-v933", "ratio": "1:1", "sound": true, "duration": 12, "mode": "frames", "imageCount": 2 },
+      "expect": {
+        "fullModel": false,
+        "ratioFields": { "aspect_ratio": "1:1", "metadata": { "ratio": "1:1" } },
+        "soundFields": { "metadata": { "enableSound": "on" } },
+        "clampDuration": 12,
+        "modeName": "首尾帧",
+        "assembly": { "ok": true },
+        "metadata": { "ratio": "1:1", "enableSound": "on" },
+        "topEnableSound": null
+      }
+    },
+    {
+      "id": "alias-ap-4x3-no-ratio-metadata-sound-only",
+      "input": { "model": "sd2.5-1080p-ap", "ratio": "4:3", "sound": true, "duration": 10, "mode": "frames", "imageCount": 1 },
+      "expect": {
+        "fullModel": false,
+        "ratioFields": { "aspect_ratio": "4:3" },
+        "soundFields": { "metadata": { "enableSound": "on" } },
+        "clampDuration": 10,
+        "modeName": "首帧生视频",
+        "assembly": { "ok": true },
+        "metadata": { "enableSound": "on" },
+        "topEnableSound": null
+      }
+    },
+    {
+      "id": "alias-zh2-3x4-off-5s-0img",
+      "input": { "model": "sd2.0-720p-zh2", "ratio": "3:4", "sound": false, "duration": 5, "mode": "frames", "imageCount": 0 },
+      "expect": {
+        "fullModel": false,
+        "ratioFields": { "aspect_ratio": "3:4" },
+        "soundFields": {},
+        "clampDuration": 5,
+        "modeName": "文生视频",
+        "assembly": { "ok": true },
+        "metadata": null,
+        "topEnableSound": null
+      }
+    },
+    {
+      "id": "unknown-model-generic-dual-write",
+      "input": { "model": "veo-3", "ratio": "9:16", "sound": true, "duration": 20, "mode": "frames", "imageCount": 1 },
+      "expect": {
+        "fullModel": false,
+        "ratioFields": { "aspect_ratio": "9:16", "metadata": { "ratio": "9:16" } },
+        "soundFields": { "metadata": { "enableSound": "on" } },
+        "clampDuration": 20,
+        "modeName": "首帧生视频",
+        "assembly": { "ok": true },
+        "metadata": { "ratio": "9:16", "enableSound": "on" },
+        "topEnableSound": null
+      }
+    },
+    {
+      "id": "alias-ap-adaptive-auto-on-1img",
+      "input": { "model": "sd2.5-720p-ap", "ratio": "adaptive", "size": "auto", "sound": true, "duration": 10, "mode": "frames", "imageCount": 1 },
+      "expect": {
+        "fullModel": false,
+        "ratioFields": { "aspect_ratio": "adaptive" },
+        "soundFields": { "metadata": { "enableSound": "on" } },
+        "clampDuration": 10,
+        "modeName": "首帧生视频",
+        "assembly": { "ok": true },
+        "metadata": { "enableSound": "on" },
+        "topEnableSound": null
+      }
+    },
+    {
+      "id": "full-720p-adaptive-auto-on-1img",
+      "input": { "model": "SD2.5-满血-GF-720P", "ratio": "adaptive", "size": "auto", "sound": true, "duration": 10, "mode": "frames", "imageCount": 1 },
+      "expect": {
+        "fullModel": true,
+        "ratioFields": { "aspect_ratio": "adaptive" },
+        "soundFields": { "enableSound": "on" },
+        "clampDuration": 10,
+        "modeName": "首帧生视频",
+        "assembly": { "ok": true },
+        "metadata": null,
+        "topEnableSound": "on"
+      }
+    },
+    {
+      "id": "alias-zh-2.0-clamp-30s-to-15",
+      "input": { "model": "sd2.0-720p-zh", "ratio": "9:16", "sound": true, "duration": 30, "mode": "frames", "imageCount": 0 },
+      "expect": {
+        "fullModel": false,
+        "ratioFields": { "aspect_ratio": "9:16", "metadata": { "ratio": "9:16" } },
+        "soundFields": { "metadata": { "enableSound": "on" } },
+        "clampDuration": 15,
+        "modeName": "文生视频",
+        "assembly": { "ok": true },
+        "metadata": { "ratio": "9:16", "enableSound": "on" },
+        "topEnableSound": null
+      }
+    },
+    {
+      "id": "alias-ds-2.0-15s-stays",
+      "input": { "model": "sd2-720p-ds-v933", "ratio": "9:16", "sound": true, "duration": 15, "mode": "frames", "imageCount": 1 },
+      "expect": {
+        "fullModel": false,
+        "ratioFields": { "aspect_ratio": "9:16", "metadata": { "ratio": "9:16" } },
+        "soundFields": { "metadata": { "enableSound": "on" } },
+        "clampDuration": 15,
+        "modeName": "首帧生视频",
+        "assembly": { "ok": true },
+        "metadata": { "ratio": "9:16", "enableSound": "on" },
+        "topEnableSound": null
+      }
+    },
+    {
+      "id": "mode-frames-0img-text",
+      "input": { "model": "sd2.5-720p-ap", "ratio": "16:9", "sound": true, "duration": 8, "mode": "frames", "imageCount": 0 },
+      "expect": {
+        "fullModel": false,
+        "ratioFields": { "aspect_ratio": "16:9", "metadata": { "ratio": "16:9" } },
+        "soundFields": { "metadata": { "enableSound": "on" } },
+        "clampDuration": 8,
+        "modeName": "文生视频",
+        "assembly": { "ok": true },
+        "metadata": { "ratio": "16:9", "enableSound": "on" },
+        "topEnableSound": null
+      }
+    },
+    {
+      "id": "mode-frames-1img-first-frame",
+      "input": { "model": "sd2.5-720p-ap", "ratio": "16:9", "sound": true, "duration": 8, "mode": "frames", "imageCount": 1 },
+      "expect": {
+        "fullModel": false,
+        "ratioFields": { "aspect_ratio": "16:9", "metadata": { "ratio": "16:9" } },
+        "soundFields": { "metadata": { "enableSound": "on" } },
+        "clampDuration": 8,
+        "modeName": "首帧生视频",
+        "assembly": { "ok": true },
+        "metadata": { "ratio": "16:9", "enableSound": "on" },
+        "topEnableSound": null
+      }
+    },
+    {
+      "id": "mode-frames-2img-first-last",
+      "input": { "model": "sd2.5-720p-ap", "ratio": "16:9", "sound": true, "duration": 8, "mode": "frames", "imageCount": 2 },
+      "expect": {
+        "fullModel": false,
+        "ratioFields": { "aspect_ratio": "16:9", "metadata": { "ratio": "16:9" } },
+        "soundFields": { "metadata": { "enableSound": "on" } },
+        "clampDuration": 8,
+        "modeName": "首尾帧",
+        "assembly": { "ok": true },
+        "metadata": { "ratio": "16:9", "enableSound": "on" },
+        "topEnableSound": null
+      }
+    },
+    {
+      "id": "mode-frames-3img-auto-reference",
+      "input": { "model": "sd2.5-720p-ap", "ratio": "16:9", "sound": true, "duration": 8, "mode": "frames", "imageCount": 3 },
+      "expect": {
+        "fullModel": false,
+        "ratioFields": { "aspect_ratio": "16:9", "metadata": { "ratio": "16:9" } },
+        "soundFields": { "metadata": { "enableSound": "on" } },
+        "clampDuration": 8,
+        "modeName": "参考生视频",
+        "assembly": { "ok": true },
+        "metadata": { "ratio": "16:9", "enableSound": "on" },
+        "topEnableSound": null
+      }
+    },
+    {
+      "id": "mode-frames-5img-auto-reference",
+      "input": { "model": "sd2.5-720p-ap", "ratio": "16:9", "sound": true, "duration": 8, "mode": "frames", "imageCount": 5 },
+      "expect": {
+        "fullModel": false,
+        "ratioFields": { "aspect_ratio": "16:9", "metadata": { "ratio": "16:9" } },
+        "soundFields": { "metadata": { "enableSound": "on" } },
+        "clampDuration": 8,
+        "modeName": "参考生视频",
+        "assembly": { "ok": true },
+        "metadata": { "ratio": "16:9", "enableSound": "on" },
+        "topEnableSound": null
+      }
+    },
+    {
+      "id": "mode-reference-1img",
+      "input": { "model": "sd2.5-720p-ap", "ratio": "16:9", "sound": true, "duration": 8, "mode": "reference", "imageCount": 1 },
+      "expect": {
+        "fullModel": false,
+        "ratioFields": { "aspect_ratio": "16:9", "metadata": { "ratio": "16:9" } },
+        "soundFields": { "metadata": { "enableSound": "on" } },
+        "clampDuration": 8,
+        "modeName": "参考生视频",
+        "assembly": { "ok": true },
+        "metadata": { "ratio": "16:9", "enableSound": "on" },
+        "topEnableSound": null
+      }
+    },
+    {
+      "id": "mode-reference-0img-rejected",
+      "input": { "model": "sd2.5-720p-ap", "ratio": "16:9", "sound": true, "duration": 8, "mode": "reference", "imageCount": 0 },
+      "expect": {
+        "fullModel": false,
+        "ratioFields": { "aspect_ratio": "16:9", "metadata": { "ratio": "16:9" } },
+        "soundFields": { "metadata": { "enableSound": "on" } },
+        "clampDuration": 8,
+        "modeName": null,
+        "assembly": { "ok": false, "reject": "reference-no-image" }
+      }
+    },
+    {
+      "id": "invalid-duration-40-rejected",
+      "input": { "model": "sd2.5-720p-ap", "ratio": "16:9", "sound": true, "duration": 40, "mode": "frames", "imageCount": 0 },
+      "expect": {
+        "fullModel": false,
+        "ratioFields": { "aspect_ratio": "16:9", "metadata": { "ratio": "16:9" } },
+        "soundFields": { "metadata": { "enableSound": "on" } },
+        "clampDuration": 40,
+        "modeName": "文生视频",
+        "assembly": { "ok": false, "reject": "duration" }
+      }
+    },
+    {
+      "id": "invalid-duration-3-rejected",
+      "input": { "model": "sd2.5-720p-ap", "ratio": "16:9", "sound": true, "duration": 3, "mode": "frames", "imageCount": 1 },
+      "expect": {
+        "fullModel": false,
+        "ratioFields": { "aspect_ratio": "16:9", "metadata": { "ratio": "16:9" } },
+        "soundFields": { "metadata": { "enableSound": "on" } },
+        "clampDuration": 3,
+        "modeName": "首帧生视频",
+        "assembly": { "ok": false, "reject": "duration" }
+      }
+    },
+    {
+      "id": "invalid-ratio-21x9-rejected",
+      "input": { "model": "sd2.5-720p-ap", "ratio": "21:9", "sound": true, "duration": 10, "mode": "frames", "imageCount": 1 },
+      "expect": {
+        "fullModel": false,
+        "ratioFields": { "aspect_ratio": "21:9" },
+        "soundFields": { "metadata": { "enableSound": "on" } },
+        "clampDuration": 10,
+        "modeName": "首帧生视频",
+        "assembly": { "ok": false, "reject": "ratio" }
+      }
+    },
+    {
+      "id": "invalid-empty-model-rejected",
+      "input": { "model": "", "ratio": "9:16", "sound": true, "duration": 10, "mode": "frames", "imageCount": 1 },
+      "expect": {
+        "fullModel": false,
+        "ratioFields": { "aspect_ratio": "9:16", "metadata": { "ratio": "9:16" } },
+        "soundFields": { "metadata": { "enableSound": "on" } },
+        "clampDuration": 10,
+        "modeName": "首帧生视频",
+        "assembly": { "ok": false, "reject": "model" }
+      }
+    },
+    {
+      "id": "alias-ap-9x16-off-2img-sound-absent",
+      "input": { "model": "sd2.5-720p-ap", "ratio": "9:16", "sound": false, "duration": 20, "mode": "frames", "imageCount": 2 },
+      "expect": {
+        "fullModel": false,
+        "ratioFields": { "aspect_ratio": "9:16", "metadata": { "ratio": "9:16" } },
+        "soundFields": {},
+        "clampDuration": 20,
+        "modeName": "首尾帧",
+        "assembly": { "ok": true },
+        "metadata": { "ratio": "9:16" },
+        "topEnableSound": null
+      }
+    }
+  ]
+}

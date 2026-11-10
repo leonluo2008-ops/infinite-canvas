@@ -28,6 +28,13 @@
 
 真数据只读：pop-4 清单/sidecar、auto-0012 任务文件探针前后 SHA256 必须相同；
 夹具目录 analysis/reverse/probe-at11-m1/ 与临时任务目录用完即删（零残留）。
+
+夹具自包含（AT-13 B4）：清单 md / 组 sidecar / 拆解 / 意图建议一律读**探针自带夹具**
+`tests/fixtures/at11-m1/`（B1 验收时坐实的真数据漂移债：真实 pop-4 后来被 UI 写入了 #5 资产图与
+`同实体确认/组元数据/行决策覆盖`，[4] 的「keep_origin 行不占号」与「自检四项」两条断言因此假红——
+产品没坏，是探针吃了活的用户盘面）。夹具 = pop-4 基线快照（#1 有图 / #5 无图 / sidecar 组与决策清空），
+断言语义零改动；真数据只读校验段（SHA 前后不变）保留不动。[6] 组卡投影仍读真实 pop-4（代表帧/看帧
+缓存是二进制产物，不做夹具化，只读）。
 """
 from __future__ import annotations
 
@@ -53,6 +60,7 @@ POP4 = ROOT / "analysis" / "reverse" / "pop-4"
 REAL_TASK_DIR = ROOT / "automation" / "projects" / "auto-0012"
 FIXTURE_BRIDGE = "probe-at11-m1"
 FIXTURE_DIR = ROOT / "analysis" / "reverse" / FIXTURE_BRIDGE
+FIXTURE_SRC = ROOT / "tests" / "fixtures" / "at11-m1"   # 探针自带夹具（自包含，不读用户盘面）
 
 RESULTS: list[tuple[str, bool, str]] = []
 
@@ -77,8 +85,8 @@ def load_hub():
 hub = load_hub()
 render = selfcheck._load_render()
 REAL_TASK = state.load(REAL_TASK_DIR)
-REAL_MD = (POP4 / "待确认清单.md").read_text(encoding="utf-8-sig")
-REAL_SIDE = (POP4 / "待确认清单.json").read_text(encoding="utf-8-sig")
+BASE_MD = (FIXTURE_SRC / "待确认清单.md").read_text(encoding="utf-8-sig")
+BASE_SIDE = (FIXTURE_SRC / "待确认清单.json").read_text(encoding="utf-8-sig")
 
 TMP_TASK = Path(tempfile.mkdtemp(prefix="probe-at11-m1-task-"))
 READONLY_WATCH = [POP4 / "待确认清单.md", POP4 / "待确认清单.json",
@@ -88,10 +96,14 @@ READONLY_WATCH = [POP4 / "待确认清单.md", POP4 / "待确认清单.json",
 # ---------------------------------------------------------------- 夹具与内存任务替身
 
 def build_fixture() -> None:
-    """夹具桥目录：pop-4 的清单/sidecar/拆解/意图建议副本（probe 自有目录，用完即删）。"""
+    """夹具桥目录：探针自带夹具（清单/sidecar/拆解/意图建议）副本（probe 自有目录，用完即删）。
+
+    自包含：源=tests/fixtures/at11-m1/，不读真实 pop-4 盘面——真数据被 UI 改动（传图/成组/按原片）
+    时探针不再假红（AT-13 B4 修的真数据漂移债）。
+    """
     FIXTURE_DIR.mkdir(parents=True, exist_ok=True)
     for name in ("待确认清单.md", "待确认清单.json", "拆解.md", "意图建议.md"):
-        src = POP4 / name
+        src = FIXTURE_SRC / name
         if src.is_file():
             shutil.copy2(src, FIXTURE_DIR / name)
 
@@ -122,8 +134,8 @@ def install_task(pending: list[dict], st: str = "awaiting_assets") -> None:
 
 def scenario(md: str | None = None, side_extra: dict | None = None):
     """重置夹具盘面 + 安装 state/hub 内存替身，返回 patches 列表（start/stop 自己管）。"""
-    (FIXTURE_DIR / "待确认清单.md").write_text(md if md is not None else REAL_MD, encoding="utf-8")
-    payload = json.loads(REAL_SIDE)
+    (FIXTURE_DIR / "待确认清单.md").write_text(md if md is not None else BASE_MD, encoding="utf-8")
+    payload = json.loads(BASE_SIDE)
     # 夹具自净：真实 pop-4 sidecar 的组/行决策是历史运行态（现已含 [[1,5]] 组），探针必须从干净合同
     # 起跑，各判据只吃自己 side_extra 注入的状态（否则重跑即撞组，判据不再可复现）。
     payload.update({"同实体确认": [], "行决策覆盖": {}, "组元数据": {}})
@@ -167,9 +179,9 @@ def build_prompt(groups: list[list[int]], decisions: dict[int, str]) -> str:
 def build_variant_md() -> str:
     """M5 夹具自建（AT-10 C4 教训：不依赖可能被 UI 删掉的真实任务产物 pop-4-variant）：
     pop-4 清单就地改造——#1 命名=参考片旧描述「有粉色标签款」、#5 复用 #1 的图（组内一图成立）。"""
-    url1 = next(r["cur_assets"].strip() for r in replace.parse_rows(REAL_MD) if r["no"] == 1)
+    url1 = next(r["cur_assets"].strip() for r in replace.parse_rows(BASE_MD) if r["no"] == 1)
     lines: list[str] = []
-    for line in REAL_MD.splitlines():
+    for line in BASE_MD.splitlines():
         cells = replace.row_cells(line)
         if cells and re.fullmatch(r"\d+", cells[0] or ""):
             while len(cells) < 8:
@@ -201,7 +213,7 @@ def main() -> int:
     try:
         # ================================================= [1] 正例：pop-4 baseline 一张唯一图分支
         print("[1] 正例：成组 #1+#5 → 一张唯一图 → 一个图号 → 正文统一 @图片1 → 自检四项 PASS")
-        url1 = next(r["cur_assets"].strip() for r in replace.parse_rows(REAL_MD) if r["no"] == 1)
+        url1 = next(r["cur_assets"].strip() for r in replace.parse_rows(BASE_MD) if r["no"] == 1)
         with _Patches(scenario()):
             install_task([])
             out = hub.group_rows("probe-at11-m1", [1, 5])
@@ -243,7 +255,7 @@ def main() -> int:
 
         # ================================================= [2] 自检反例
         print("[2] 反例：同组两 URL / 同号不同 URL → ④ FAIL；组外同 URL 独立图号不误红；同组两提交 → ① FAIL")
-        md_lines = REAL_MD.splitlines()
+        md_lines = BASE_MD.splitlines()
         fixed = []
         url_b = url1.replace(".png", "-b.png")
         for line in md_lines:
@@ -467,7 +479,7 @@ def main() -> int:
         VARIANT_MD = build_variant_md()
         with _Patches(scenario(md=VARIANT_MD, side_extra={"同实体确认": [[1, 5]]})):
             for fname in ("拆解.md", "意图建议.md"):       # 夹具同源：pop-4 的拆解/意图建议副本
-                shutil.copy2(POP4 / fname, FIXTURE_DIR / fname)
+                shutil.copy2(FIXTURE_SRC / fname, FIXTURE_DIR / fname)
             install_task([])
             ents = render.parse_checklist(FIXTURE_DIR / "待确认清单.md")
             render.assign_numbers(ents, [[1, 5]], {})
