@@ -125,7 +125,7 @@ const a3 = row.rowDecisionAction(mustKeep);
 check("旧 keep_origin 行 → 恢复替换（旧数据可恢复）", a3 !== null && a3.action === "restore");
 check("反例：组内行不给移除入口（组=原子单位，先拆开）",
     row.rowDecisionAction({ 建议: "必须换", 决策: "", 同实体确认: [1, 5] }) === null);
-check("可沿用行无移除入口（不需要替换）", row.rowDecisionAction({ 建议: "可沿用", 决策: "", 同实体确认: [] }) === null);
+check("可沿用行也有移除入口（AT-12 N2 修订：一律可移除）", row.rowDecisionAction({ 建议: "可沿用", 决策: "", 同实体确认: [] })?.action === "dismissed");
 check("dismissed 反馈点名行号+恢复指引",
     row.decisionFeedback(5, "dismissed").includes("#5") && row.decisionFeedback(5, "dismissed").includes("恢复"));
 check("restore 反馈点名行号", row.decisionFeedback(5, "restore").includes("#5") && row.decisionFeedback(5, "restore").includes("恢复替换"));

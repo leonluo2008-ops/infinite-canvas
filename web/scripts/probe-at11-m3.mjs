@@ -57,8 +57,8 @@ const a1 = mod.rowDecisionAction(mustRow);
 check("必换行 → dismissed「移除（不需要替换，按原片处理）」", a1 !== null && a1.action === "dismissed" && a1.label === "移除（不需要替换，按原片处理）", JSON.stringify(a1));
 const a2 = mod.rowDecisionAction(prepareRow);
 check("建议准备行 → dismissed 入口", a2 !== null && a2.action === "dismissed");
-check("可沿用行 → 无入口（null）", mod.rowDecisionAction(keepRow) === null);
-check("待核对行（建议空）→ 无入口", mod.rowDecisionAction(unverifiedRow) === null);
+check("可沿用行 → 也有移除入口（AT-12 N2 修订）", mod.rowDecisionAction(keepRow)?.action === "dismissed");
+check("待核对行（建议空）→ 也有移除入口（AT-12 N2 修订）", mod.rowDecisionAction(unverifiedRow)?.action === "dismissed");
 const groupedMust = { 建议: "必须换", 决策: "", 同实体确认: [1, 5] };
 check("组内行 → 入口隐藏（null，组=原子单位）", mod.rowDecisionAction(groupedMust) === null);
 

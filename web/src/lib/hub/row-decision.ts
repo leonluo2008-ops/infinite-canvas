@@ -36,10 +36,9 @@ export function rowDecisionAction(
 ): RowDecisionAction {
     if (card.同实体确认.length >= 2) return null;
     if (isOriginDecision(card.决策)) return { action: "restore", label: "恢复替换" };
-    if (card.建议 === "必须换" || card.建议 === "建议准备") {
-        return { action: "dismissed", label: "移除（不需要替换，按原片处理）" };
-    }
-    return null;
+    // AT-12 N2 修订（所有者实测反馈）：移除=「不需要替换的资产从置换区清走」——
+    // 可沿用/待核对行恰是最典型的移除对象，一律给入口；唯一互斥=组内行。
+    return { action: "dismissed", label: "移除（不需要替换，按原片处理）" };
 }
 
 /** 决策行徽标文字（dismissed=「已移除·按原片」，旧 keep_origin=「按原片」）；无覆盖 → ""。 */
