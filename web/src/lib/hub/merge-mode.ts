@@ -49,9 +49,9 @@ export function pruneSelection(
     return keep;
 }
 
-/** 底部浮条计数文案（AT-12：「合并勾选项(N)」）。 */
+/** 底部浮条计数文案（AT-12 N3：浮条同时承载合并/移除 → 改中性「已勾选 N 项」）。 */
 export function mergeBarText(count: number): string {
-    return `合并勾选项(${count})`;
+    return `已勾选 ${count} 项`;
 }
 
 /** 已传图三分支（B3）判定结果。 */

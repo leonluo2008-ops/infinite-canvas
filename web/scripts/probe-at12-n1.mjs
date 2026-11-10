@@ -75,7 +75,7 @@ const sameRef = merge.pruneSelection(new Set([1, 2]), cards);
 check("轮询无变化 → 返回原 Set 引用（不触发重渲染）", sameRef instanceof Set);
 const stable = new Set([1, 2]);
 check("轮询无变化 → 引用相等", merge.pruneSelection(stable, cards) === stable);
-check("浮条计数文案=「合并勾选项(N)」", merge.mergeBarText(3) === "合并勾选项(3)");
+check("浮条计数文案=「已勾选 N 项」（N3：浮条承载合并+移除，中性标题）", merge.mergeBarText(3) === "已勾选 3 项");
 check("品牌行置灰=品牌行单独处理",
     merge.mergeSelectable({ 类别: "品牌视觉", 同实体确认: [] }).selectable === false &&
     merge.mergeSelectable({ 类别: "品牌视觉", 同实体确认: [] }).reason.includes("品牌行单独处理"));
@@ -146,9 +146,11 @@ check("taskId 切换清空勾选（I2）",
     /useEffect\(\(\) => \{[\s\S]*?setSelectedRows\(new Set\(\)\);[\s\S]*?\}, \[taskId\]\)/.test(drawer));
 check("轮询收口接 pruneSelection（无变化返回原引用）",
     drawer.includes("pruneSelection(prev, detail.asset_cards)") && drawer.includes("}, [detail.asset_cards]);"));
-check("浮条勾≥2 才出现 + 文案走 mergeBarText + [合并][清空]",
+check("浮条勾≥2 才出现 + 文案走 mergeBarText + [合并][移除][清空] 三钮（N3）",
     drawer.includes("mergeableSelected.length >= 2") && drawer.includes("{mergeBarText(mergeableSelected.length)}") &&
-    drawer.includes("data-hub-merge-bar") && drawer.includes("data-hub-merge-submit") && drawer.includes("data-hub-merge-clear"));
+    drawer.includes("data-hub-merge-bar") && drawer.includes("data-hub-merge-submit") && drawer.includes("data-hub-merge-dismiss") && drawer.includes("data-hub-merge-clear"));
+check("N3 批量移除：dismissSelection 逐行 decision:dismissed + busy 锁 + 失败行保留勾选",
+    drawer.includes("dismissSelection") && drawer.includes('decision: "dismissed"') && drawer.includes("dismiss-batch") && drawer.includes("保留勾选"));
 check("合并成功清空勾选、失败保留（catch 不动 selectedRows）",
     /message\.success\(`已合并[\s\S]*?setSelectedRows\(new Set\(\)\);/.test(drawer) &&
     /catch \(error\) \{[\s\S]*?其中一行已在他组[\s\S]*?return false;/.test(drawer));

@@ -43,7 +43,7 @@ const OVERLAY_COLORS = [
 
 const POST_DECOMPOSE_STATES = ["awaiting_assets", "rendering", "awaiting_approval", "approved", "generating", "done", "failed"];
 
-type BusyKind = "upload" | "confirm" | "empty" | "approve" | "submit" | "retry" | "rollback" | "group" | "ungroup" | "discuss" | "decision" | null;
+type BusyKind = "upload" | "confirm" | "empty" | "approve" | "submit" | "retry" | "rollback" | "group" | "ungroup" | "discuss" | "decision" | "dismiss-batch" | null;
 
 /**
  * 任务详情全屏 Drawer（AT-9 §五）：头部 → Agent 建议 → 资产置换 → 提示词 → 审批/生成/成片。
@@ -430,7 +430,7 @@ function AssetSection({
     const unfilledMust = mustCards.filter((card) => lockNs.includes(card.n));
 
     // ---- AT-12 N1 勾选式合并（替换 AT-11 模式切换）：每张非组卡左上常驻 checkbox；勾选态=行号 Set
-    // （禁存卡对象引用）。勾≥2 → 底部浮条「合并勾选项(N)·[合并][清空]」。
+    // （禁存卡对象引用）。勾≥2 → 底部浮条「已勾选 N 项·[合并][移除][清空]」（N3 增批量移除）。
     const [selectedRows, setSelectedRows] = useState<Set<number>>(new Set());
     const [confirmOpen, setConfirmOpen] = useState(false);
     const [confirmRows, setConfirmRows] = useState<HubAssetCard[]>([]);
@@ -462,6 +462,34 @@ function AssetSection({
         setSelectedRows((prev) => toggleMergeRow(prev, card.n));
     };
     const clearSelection = () => setSelectedRows(new Set());
+    // AT-12 N3 批量移除（所有者反馈）：浮条「移除」=勾选行逐行写 dismissed（与「…」菜单同一后端通道），
+    // 顺序单飞（busy 锁）；部分失败如实报行号并保留失败行勾选，全成清空勾选。
+    const dismissSelection = async () => {
+        if (busy) return;
+        const rows = mergeableSelected;
+        if (!rows.length) return;
+        setBusy("dismiss-batch");
+        const failed: number[] = [];
+        try {
+            for (const row of rows) {
+                try {
+                    await postHubAsset(taskId, { n: row.n, decision: "dismissed" });
+                } catch {
+                    failed.push(row.n);
+                }
+            }
+            if (failed.length) {
+                setSelectedRows(new Set(failed));
+                message.warning(`已移除 ${rows.length - failed.length} 项；失败行保留勾选：${failed.map((n) => `#${n}`).join("、")}`);
+            } else {
+                setSelectedRows(new Set());
+                message.success(`已移除 ${rows.length} 项（按原片处理，可在顶部折叠条恢复）`);
+            }
+            onWritten();
+        } finally {
+            setBusy(null);
+        }
+    };
     const openConfirm = () => {
         // 打开确认小窗时拍快照（提交时复核组成员未变，§3.6）。
         setConfirmRows(mergeableSelected);
@@ -690,7 +718,7 @@ function AssetSection({
                 ))}
             </div>
 
-            {/* 勾选式合并底部浮条（AT-12：勾≥2 →「合并勾选项(N)·[合并][清空]」） */}
+            {/* 勾选底部浮条（AT-12 N3：勾≥2 →「已勾选 N 项·[合并][移除][清空]」） */}
             {mergeableSelected.length >= 2 ? (
                 <div
                     className="fixed bottom-6 left-1/2 z-30 flex -translate-x-1/2 items-center gap-3 rounded-full border border-stone-200 bg-card px-5 py-2.5 shadow-lg dark:border-stone-700"
@@ -699,6 +727,9 @@ function AssetSection({
                     <span className="text-sm font-medium">{mergeBarText(mergeableSelected.length)}</span>
                     <Button size="small" type="primary" disabled={busy !== null} loading={busy === "group"} onClick={openConfirm} data-hub-merge-submit>
                         合并
+                    </Button>
+                    <Button size="small" danger disabled={busy !== null} loading={busy === "dismiss-batch"} onClick={dismissSelection} data-hub-merge-dismiss>
+                        移除
                     </Button>
                     <Button size="small" onClick={clearSelection} data-hub-merge-clear>
                         清空
