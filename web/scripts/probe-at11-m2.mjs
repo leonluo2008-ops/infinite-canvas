@@ -137,7 +137,7 @@ check("确认窗「沿用 #N 已传图统一到全组」文案", drawer.includes
 check("单帧单框：组卡走 GroupFrame（恰一枚 data-hub-box-row=主行）", drawer.includes("<GroupFrame group={group}") && /data-hub-box-row=\{boxRow\.row\}/.test(drawer) && drawer.includes("groupBoxRow(group)"));
 check("主行未定位诚实文案（不搬他人框）", drawer.includes("主行未定位"));
 check("合并卡徽标走 mergeBadge（#N 已合并）", drawer.includes("mergeBadge(members)"));
-check("拆开合并文案=解除联动保留当前图（不是历史撤销）", drawer.includes("拆开合并") && drawer.includes("解除联动，各行保留当前图与流水"));
+check("拆开合并文案=已解除联动保留当前传图（M3 I1 收尾，不是历史撤销）", drawer.includes("拆开合并") && drawer.includes("解除联动，各行保留当前传图"));
 check("组卡置灰标记（mergeMode 下 data-hub-merge-disabled=先拆开）", drawer.includes('data-hub-merge-disabled={mergeMode ? "已确认组·先拆开" : ""}'));
 check("置灰行点卡只弹原因不入选（warning reason）", /if \(verdict && !verdict\.selectable\) \{\s*\n\s*message\.warning\(verdict\.reason\);/.test(drawer));
 
