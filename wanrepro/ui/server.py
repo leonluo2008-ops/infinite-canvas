@@ -1836,7 +1836,8 @@ class Handler(BaseHTTPRequestHandler):
         except ApiError as err:
             self.send_json({"error": err.msg}, err.status)
         except hub_api.HubError as e:      # 工作台业务错（状态不对/文件缺失）→ 4xx，原文给员工看
-            self.send_json({"error": str(e)}, 409)
+            # AT-13 §2.2：配置不合法（HubInputError）→ 400，不是状态冲突 409
+            self.send_json({"error": str(e)}, getattr(e, "status", 409))
         except subprocess.TimeoutExpired:
             self.send_json({"error": "子进程超时"}, 500)
         except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
@@ -2062,7 +2063,14 @@ class Handler(BaseHTTPRequestHandler):
             return
         m = re.fullmatch(r"/api/hub/approve/([^/]+)", path)
         if m:
-            self.send_json(hub_api.do_approve(urllib.parse.unquote(m.group(1))))
+            # AT-13 §2.2/§三：body 可带 config（画布生成配置：渠道身份/model/mode/params，**无 key**）
+            # → 服务端白名单取键（hub_api._normalize_config 校验+构造）→ 固化+算 v2 快照 → approved。
+            # 不带 config = 旧语义（v1 快照，老任务/CLI），行为零变化。
+            payload = self.read_json()
+            config = payload.get("config")
+            if config is not None and not isinstance(config, dict):
+                raise ApiError(400, "config 必须是 JSON 对象（{渠道身份,model,mode,params}）")
+            self.send_json(hub_api.do_approve(urllib.parse.unquote(m.group(1)), config=config))
             return
         m = re.fullmatch(r"/api/hub/submit/([^/]+)", path)
         if m:

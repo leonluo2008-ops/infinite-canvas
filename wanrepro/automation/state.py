@@ -60,11 +60,74 @@ def save(task_dir: Path, task: dict) -> None:
     tmp.replace(mf)  # 原子替换：中途 kill 不留半截任务文件
 
 
+SNAPSHOT_VERSION = 2                     # AT-13 §2.5：当前审批快照版本（新任务）
+CHANNEL_IDENTITY_KEYS = ("baseUrl", "apiFormat", "渠道名")   # 渠道身份三键（进 v2 快照，key 不进）
+# 退回置换时一并作废的键（AT-13 §2.5 清理键表扩展；dispatch 标记归 B2 再加）
+ROLLBACK_CLEARED_KEYS = ("approval", "approval_snapshot", "gen_params",
+                         "gen_channel", "submit_unknown", "snapshot_version")
+
+
+def _blob_hash(blob: dict) -> str:
+    return hashlib.sha256(json.dumps(blob, ensure_ascii=False,
+                                     sort_keys=True).encode("utf-8")).hexdigest()
+
+
 def snapshot_hash(prompt: str, params: dict) -> str:
-    """审批快照：prompt + 生成参数 的内容 hash（绑定批准与提交内容）。"""
-    blob = json.dumps({"prompt": prompt, "params": params},
-                      ensure_ascii=False, sort_keys=True)
-    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+    """审批快照 v1：prompt + 生成参数 的内容 hash（绑定批准与提交内容）。
+
+    AT-13 §2.5：这是**旧算法，逐字节保持不动**——老任务（任务.json 无 snapshot_version）
+    一律按此比对；给 v1 输入 append 空 model 会让全部老任务 instantly stale（R2 实证）。
+    """
+    return _blob_hash({"prompt": prompt, "params": params})
+
+
+def channel_identity(gen_channel: dict) -> dict:
+    """渠道身份三键（缺键补空串，保证哈希输入结构稳定）。"""
+    ch = gen_channel if isinstance(gen_channel, dict) else {}
+    return {k: ("" if ch.get(k) is None else str(ch.get(k))) for k in CHANNEL_IDENTITY_KEYS}
+
+
+def snapshot_hash_v2(prompt: str, params: dict, gen_channel: dict,
+                     model: str | None = None, mode: str | None = None) -> str:
+    """审批快照 v2（AT-13 §2.5）：prompt + params + 渠道身份 + model + mode。
+
+    - 渠道身份=baseUrl+apiFormat+渠道名：同名模型换渠道 → 快照失效（§2.2）；
+    - **key 不进快照**：只轮换 key 不作废批准；
+    - model/mode 缺省从 gen_channel 取，显式传参可覆盖（探针/CLI 用）；None/空 → 空串，
+      不省略字段（结构恒定，便于跨版本排障）。
+    """
+    ch = gen_channel if isinstance(gen_channel, dict) else {}
+    model_value = ch.get("model") if model is None else model
+    mode_value = ch.get("mode") if mode is None else mode
+    return _blob_hash({
+        "snapshot_version": SNAPSHOT_VERSION,
+        "prompt": prompt,
+        "params": params,
+        "channel": channel_identity(ch),
+        "model": "" if model_value is None else str(model_value),
+        "mode": "" if mode_value is None else str(mode_value),
+    })
+
+
+def snapshot_version(task: dict) -> int:
+    """任务自身的快照版本（无字段/坏值 = v1，老任务语义）。"""
+    try:
+        return int((task or {}).get("snapshot_version") or 1)
+    except (TypeError, ValueError):
+        return 1
+
+
+def snapshot_for(task: dict, prompt: str) -> str:
+    """按任务自身版本算「当前输入」的快照（AT-13 §2.5 版本分流唯一入口）。
+
+    v1（无 snapshot_version）= prompt+params 旧算法；v2 = 再并入渠道身份/model/mode。
+    approval_stale 仍是字符串比对——两侧必须同版本算出，故调用方一律走这里，不许自己拼。
+    """
+    task = task or {}
+    params = task.get("gen_params") or {}
+    if snapshot_version(task) >= SNAPSHOT_VERSION:
+        return snapshot_hash_v2(prompt, params, task.get("gen_channel") or {})
+    return snapshot_hash(prompt, params)
 
 
 # 停点内建守卫：引擎层强制，不靠调用方自觉（审计路1 B2「不可绕过」）
@@ -151,8 +214,8 @@ def rollback_to_assets(task_dir: Path, *, note: str = "退回置换") -> dict:
     selfcheck_file = task_dir / "自检.json"
     if selfcheck_file.is_file():
         selfcheck_file.unlink()             # 自检结论属于被丢弃的那次渲染，一并作废（B5）
-    for key in ("approval", "approval_snapshot", "gen_params"):
-        task.pop(key, None)                  # 预演参数/审批随提示词一起作废
+    for key in ROLLBACK_CLEARED_KEYS:
+        task.pop(key, None)                  # 预演参数/审批/渠道身份/未知标记随提示词一起作废
     task["state"] = "awaiting_assets"
     task.setdefault("history", []).append({"at": _now(), "from": "awaiting_approval",
                                            "to": "awaiting_assets", "note": note})

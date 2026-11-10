@@ -11,12 +11,15 @@ automation 以子包 import（server.py 启动 cwd 不确定时由 _ensure_path 
 from __future__ import annotations
 
 import json
+import math
 import re
 import shutil
 import sys
 import threading
 import traceback
+import urllib.parse
 import uuid
+from contextlib import contextmanager, nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -37,17 +40,67 @@ _SUBMIT_LOCK = threading.Lock()
 
 # 任务级串行锁（AT-9 §六层3）：同一任务的写路径（贴图/成组/解组/确认/回退/删除）串行，
 # 不同任务互不阻塞。锁只在 server 进程内有效（server 是这些写路径的唯一 HTTP 面）。
+# AT-13 §2.7：**普通 Lock（非重入）**，由 `task_lock()` 这一公共入口统一持有；
+# runner/CLI 是独立进程，线程锁不跨进程——跨进程守卫靠任务.json 上的磁盘标记（B2 落）。
 _TASK_LOCKS: dict[str, threading.Lock] = {}
 _TASK_LOCKS_GUARD = threading.Lock()
+_TASK_LOCK_HELD = threading.local()      # 线程内已持有的任务号集合（同一线程重入直通，防自锁）
 
 
 def _task_lock(local_id: str) -> threading.Lock:
+    """取任务锁对象（**内部用**；持锁一律走 task_lock()，别直接 with 它）。"""
     with _TASK_LOCKS_GUARD:
         return _TASK_LOCKS.setdefault(local_id, threading.Lock())
 
 
+@contextmanager
+def task_lock(local_id: str):
+    """任务级锁唯一公共入口（AT-13 §2.7 锁持有规则）。
+
+    - 请求线程**短持**：校验状态 → 冻结配置 → 注册提交占用后立刻释放，不持锁等全局
+      提交槽、也不持锁等后台线程跑完；
+    - 后台线程写任务文件时短持同一把锁（进度回写也走这条，防 read-modify-save 覆盖）；
+    - 同一线程重复进入=直通（底层是普通非重入 Lock，不加这层会自锁）；跨线程仍严格互斥。
+    """
+    held = getattr(_TASK_LOCK_HELD, "held", None)
+    if held is None:
+        held = _TASK_LOCK_HELD.held = set()
+    if local_id in held:
+        yield
+        return
+    lock = _task_lock(local_id)
+    lock.acquire()
+    held.add(local_id)
+    try:
+        yield
+    finally:
+        held.discard(local_id)
+        lock.release()
+
+
+def _write_task(task_dir: Path, mutate):
+    """任务文件「读-改-写」短持改写（AT-13 §2.7：后台进度/阶段回写不覆盖别人刚写的状态）。
+
+    mutate(task) 返回 False = 不改（不落盘）；其余返回值忽略。返回改写后的任务 dict。
+    """
+    with task_lock(task_dir.name):
+        task = state.load(task_dir)
+        if mutate(task) is False:
+            return task
+        state.save(task_dir, task)
+        return task
+
+
 class HubError(RuntimeError):
-    """工作台业务错误——server 层转 4xx JSON，message 面向员工。"""
+    """工作台业务错误——server 层转 4xx JSON，message 面向员工。status=HTTP 状态码。"""
+
+    status = 409
+
+
+class HubInputError(HubError):
+    """请求内容不合法（配置缺字段/值域外/带敏感键）——400，不是状态冲突。"""
+
+    status = 400
 
 
 def _now() -> str:
@@ -265,8 +318,7 @@ def _stage_recorder(task_dir: Path):
         except OSError:
             pass
         try:
-            t = state.load(task_dir)
-            state.save(task_dir, {**t, "lapian_stage": msg})
+            _write_task(task_dir, lambda t: t.__setitem__("lapian_stage", msg))
         except Exception:  # noqa: BLE001 —— 状态回写失败不拖垮拆解
             pass
 
@@ -333,7 +385,7 @@ def do_confirm(local_id: str, empty_confirm: bool = False,
     是自检③锁点对账的确认时点记录（不自证）。
     """
     task_dir = _task_dir(local_id)
-    with _task_lock(local_id):
+    with task_lock(local_id):
         try:
             st = replace.run_replace(task_dir, assets=None, map_spec=None, name_spec=None,
                                      confirm=True, verbose=False,
@@ -366,7 +418,7 @@ def _render_and_advance(task_dir: Path) -> dict:
 def do_rollback(local_id: str) -> dict:
     """退回置换（AT-9 受控回退边）：awaiting_approval → awaiting_assets，丢弃当前提示词。"""
     task_dir = _task_dir(local_id)
-    with _task_lock(local_id):
+    with task_lock(local_id):
         try:
             task = state.rollback_to_assets(task_dir, note="退回置换（丢弃当前提示词）")
         except state.StateError as e:
@@ -455,7 +507,7 @@ def delete_task(local_id: str, *, confirm_name: str | None = None) -> dict:
                        f"\"{local_id}\"（或完整任务名「{task_name}」）")
     bridge_id = str(task.get("bridge_id") or "")
     video_name = str((task.get("ingestion") or {}).get("video_name") or "")
-    with _task_lock(local_id):
+    with task_lock(local_id):
         shutil.rmtree(task_dir)
         removed_analysis = False
         if bridge_id and not _bridge_still_referenced(bridge_id, exclude=local_id):
@@ -586,7 +638,7 @@ def set_asset(local_id: str, n: int, *, image_url: str | None = None,
         url = str(image_url).strip()
         if not url.startswith("https://"):
             raise HubError(f"image_url 必须是公网 HTTPS（SDGF 只收公网图）：{image_url!r}")
-    with _task_lock(local_id):
+    with task_lock(local_id):
         if decision is not None:
             # ---- AT-11 §3.2/§3.5：单行降级/恢复（行决策覆盖） ----
             task = state.load(task_dir)
@@ -648,7 +700,7 @@ def group_rows(local_id: str, rows: list[int], primary: int | None = None,
     rows = sorted({int(x) for x in rows})
     if len(rows) < 2:
         raise HubError(f"成组至少要 2 行（收到 {rows}）")
-    with _task_lock(local_id):
+    with task_lock(local_id):
         try:
             checklist = replace.checklist_path(bridge).read_text(encoding="utf-8-sig")
         except replace.ReplaceError as e:
@@ -706,7 +758,7 @@ def ungroup_rows(local_id: str, rows: list[int]) -> dict:
     rows = sorted({int(x) for x in rows})
     if not rows:
         raise HubError("解组要给行号（rows）")
-    with _task_lock(local_id):
+    with task_lock(local_id):
         groups = replace.load_groups(bridge)
         loose = [n for n in rows if not any(n in g for g in groups)]
         if loose:
@@ -740,32 +792,230 @@ def do_render(local_id: str) -> dict:
             "prompt_md": _read(_prompt_path(task_dir, task))}
 
 
-def do_approve(local_id: str) -> dict:
-    task_dir = _task_dir(local_id)
+# ------------------------------------------------ 生成配置接纳（AT-13 §2.1/§2.2/§三）
+
+# 画布口径画幅（web/src/lib/media-size.ts videoRatioOptions）——hub 面板与后端同源
+CANVAS_RATIOS = ("1:1", "3:4", "4:3", "16:9", "9:16", "21:9", "auto")
+# 协议真实接收域：与 ui/server.py 的 SDGF_RATIOS / WAN_RATIOS 同源。server 反向 import 本模块，
+# 不能倒过来 import，故此处是副本——B4 合同锁（§2.9 共享 fixture）一并锁死，改一处必红。
+SDGF_RATIOS = ("16:9", "9:16", "1:1", "4:3", "3:4", "adaptive")
+SDGF_RESOLUTIONS = ("480", "720", "1080")
+WAN_RATIOS = ("16:9", "9:16", "1:1")
+WAN_FIXED_MODELS = ("wan3.0", "wan-omni2video")     # §2.1：wan 固定模型语义，不消费 model 选择
+CONFIG_PARAM_KEYS = ("duration", "size", "vquality", "audio")
+# 敏感键：出现就 400（不是静默丢弃——调用方会以为 key 已生效）
+_SENSITIVE_KEYS = ("apikey", "api_key", "key", "secret", "token", "authorization",
+                   "password", "access_token", "accesskey")
+_CREDENTIAL_QUERY = ("key", "api_key", "apikey", "token", "access_token", "secret",
+                     "signature", "sig", "password", "accesskey")
+_URL_USERINFO_RE = re.compile(r"^[a-zA-Z][\w+.-]*://[^/?#]*@")
+
+
+def _config_base_url(raw) -> str:
+    """渠道 baseUrl 校验：http(s) 且不带 userinfo / 凭据 query（§2.8 先脱敏后落账的前置）。"""
+    url = str(raw or "").strip()
+    if not url:
+        raise HubInputError("渠道身份缺 baseUrl")
+    if not re.match(r"^https?://", url, re.IGNORECASE):
+        raise HubInputError(f"渠道 baseUrl 必须是 http(s) 地址：{url!r}")
+    if _URL_USERINFO_RE.match(url):
+        raise HubInputError("渠道 baseUrl 不能带 userinfo（user:pass@）——key 不拼 URL（§2.8）")
+    query = urllib.parse.urlparse(url).query
+    if query:
+        bad = sorted(k for k in urllib.parse.parse_qs(query) if k.lower() in _CREDENTIAL_QUERY)
+        if bad:
+            raise HubInputError(f"渠道 baseUrl 的 query 里带凭据参数 {bad}——key 不进 URL（§2.8）")
+    return url
+
+
+def _config_api_format(raw) -> str:
+    fmt = str(raw or "").strip().lower()
+    if fmt not in ("sdgf", "wan"):
+        raise HubInputError(f"apiFormat={raw!r} 属画布专用协议，hub 不承接"
+                            f"（本节点只承接 sdgf 系与 wan，§2.1）")
+    return fmt
+
+
+def _config_model(api_format: str, raw) -> str:
+    model = str(raw or "").strip()
+    if api_format == "wan":
+        if model and model not in WAN_FIXED_MODELS:
+            raise HubInputError(f"万相模型固定 wan3.0、不消费 model 选择（§2.1），收到 {model!r}")
+        return ""                                    # 固定语义：落空串，不进快照自由度
+    if not model:
+        raise HubInputError("SDGF 渠道必须给 model（裸模型名，渠道::模型 里的后半段）")
+    return model
+
+
+def _config_mode(api_format: str, raw) -> str:
+    mode = str(raw or "").strip().lower()
+    if api_format == "wan":
+        if mode:
+            raise HubInputError("万相没有 mode（自动多图参考语义，§2.1）——选 wan 时 model/mode 留空")
+        return ""
+    if mode not in ("", "frames", "reference"):
+        raise HubInputError(f"mode 只能是 frames / reference（或留空），收到 {raw!r}")
+    return mode
+
+
+def _ratio_from_size(raw) -> str:
+    """画幅：画布字面值照收；WxH 按最大公约数归一到比例（画布 media-size.ts 同口径的精确版）。"""
+    size = str(raw or "").strip()
+    if not size:
+        raise HubInputError("params.size（画幅）不能为空")
+    if size in CANVAS_RATIOS:
+        return size
+    m = re.fullmatch(r"(\d+)\s*[x×*]\s*(\d+)", size)
+    if m:
+        w, h = int(m.group(1)), int(m.group(2))
+        if w <= 0 or h <= 0:
+            raise HubInputError(f"params.size 的像素宽高必须为正：{size!r}")
+        g = math.gcd(w, h)
+        return f"{w // g}:{h // g}"
+    raise HubInputError(f"params.size 不认识：{size!r}"
+                        f"（画布口径 {'/'.join(CANVAS_RATIOS)} 或 WxH）")
+
+
+def _protocol_ratio(api_format: str, ratio: str) -> str:
+    """渠道不接受的画幅显式拒绝（§2.1「不做固定白名单混同」——说明白哪个值不行）。"""
+    if api_format == "wan":
+        if ratio not in WAN_RATIOS:
+            raise HubInputError(f"万相只接 {'/'.join(WAN_RATIOS)} 三个画幅，{ratio} 不在其内")
+        return ratio
+    if ratio == "auto":
+        return "adaptive"                            # SDGF 的自适应字面值
+    if ratio not in SDGF_RATIOS:
+        raise HubInputError(f"SDGF 不接画幅 {ratio}（支持 {'/'.join(SDGF_RATIOS)}；"
+                            f"21:9 属画布专用，渠道不生效）")
+    return ratio
+
+
+def _config_resolution(raw) -> str:
+    value = str(raw if raw is not None else "").strip()
+    if value not in SDGF_RESOLUTIONS:
+        raise HubInputError(f"params.vquality 只能是 {'/'.join(SDGF_RESOLUTIONS)}，收到 {raw!r}")
+    return value
+
+
+def _config_duration(raw) -> int:
     try:
-        st = generate.do_approve(task_dir, verbose=False)
-    except generate.GenError as e:
-        raise HubError(str(e)) from None
-    return {"state": st}
+        value = int(raw)
+    except (TypeError, ValueError):
+        raise HubInputError(f"params.duration 必须是整数秒，收到 {raw!r}") from None
+    if not 4 <= value <= 30:                          # 画布 VIDEO_SECONDS_MIN/MAX
+        raise HubInputError(f"params.duration 必须在 4–30 秒，收到 {value}")
+    return value
+
+
+def _config_audio(raw) -> bool:
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, (int, float)):
+        return bool(raw)
+    text = str(raw or "").strip().lower()
+    if text in ("true", "1", "yes"):
+        return True
+    if text in ("false", "0", "no", ""):
+        return False
+    raise HubInputError(f"params.audio 只能是布尔值，收到 {raw!r}")
+
+
+def _normalize_config(config: dict, task: dict) -> tuple[dict, dict]:
+    """approve 携带的画布配置 → (gen_params, gen_channel)：白名单构造，key 一律不落。
+
+    config = {渠道身份:{baseUrl,apiFormat,渠道名}, model, mode,
+              params:{duration,size,vquality,audio}}（§2.1，无 key）
+    白名单外键丢弃（§三「read_json 后白名单取键」）；敏感键直接 400。
+    gen_params 落桥提交体词表 {duration,ratio,resolution,audio}（画布 size/vquality 派生），
+    gen_channel 落 {baseUrl,apiFormat,渠道名,model,mode}——两者合起来就是 v2 快照的输入。
+    """
+    if not isinstance(config, dict):
+        raise HubInputError("config 必须是 JSON 对象")
+    lowered = {str(k).strip().lower(): k for k in config}
+    hit = [lowered[k] for k in _SENSITIVE_KEYS if k in lowered]
+    if hit:
+        raise HubInputError(f"approve 的 config 不允许带敏感键 {hit}——批准只固化非敏感身份，"
+                            f"key 在提交时一次性透传（§2.1）")
+    identity = config.get("渠道身份")
+    if not isinstance(identity, dict):
+        raise HubInputError("config 缺渠道身份（渠道身份:{baseUrl,apiFormat,渠道名}）")
+    base_url = _config_base_url(identity.get("baseUrl"))
+    api_format = _config_api_format(identity.get("apiFormat"))
+    name = str(identity.get("渠道名") or "").strip()
+    if not name:
+        raise HubInputError("渠道身份缺渠道名——同名模型不同渠道必须是不同快照（§2.2）")
+    model = _config_model(api_format, config.get("model"))
+    mode = _config_mode(api_format, config.get("mode"))
+    raw_params = config.get("params")
+    if not isinstance(raw_params, dict):
+        raise HubInputError("config 缺 params（{duration,size,vquality,audio}）")
+    base = task.get("gen_params") if isinstance(task.get("gen_params"), dict) else {}
+    given = {k: raw_params[k] for k in CONFIG_PARAM_KEYS if k in raw_params}
+    gen_params = {
+        "duration": _config_duration(given.get("duration", base.get("duration", 5))),
+        "ratio": _protocol_ratio(api_format,
+                                 _ratio_from_size(given.get("size") or base.get("size")
+                                                  or base.get("ratio"))),
+        "resolution": _config_resolution(given.get("vquality") or base.get("vquality")
+                                        or base.get("resolution")),
+        "audio": _config_audio(given.get("audio", base.get("audio", True))),
+    }
+    gen_channel = {"baseUrl": base_url, "apiFormat": api_format, "渠道名": name,
+                   "model": model, "mode": mode}
+    return gen_params, gen_channel
+
+
+def do_approve(local_id: str, config: dict | None = None) -> dict:
+    """批准 = 审批停点（AT-13 §2.2）：先固化配置，再按 v2 算快照，再进 approved。
+
+    带 config：校验 → 写 gen_params+gen_channel（无 key）→ v2 快照（prompt+params+渠道身份
+    +model+mode）→ approved；submit 阶段零配置改动。
+    不带 config：旧语义（v1 快照，老任务 / 无浏览器 CLI）。
+    任务锁短持：校验+固化+迁移做完即释放（§2.7），不持锁等后台。
+    """
+    task_dir = _task_dir(local_id)
+    with task_lock(local_id):
+        task = state.load(task_dir)
+        norm = _normalize_config(config, task) if config is not None else None
+        try:
+            st = generate.do_approve(task_dir, config=norm, verbose=False)
+        except generate.GenError as e:
+            raise HubError(str(e)) from None
+        task = state.load(task_dir)
+    return {"state": st,
+            "snapshot_version": state.snapshot_version(task),
+            "gen_params": task.get("gen_params") or {},
+            "gen_channel": task.get("gen_channel") or {}}
 
 
 def start_submit(local_id: str) -> dict:
-    """真提交（付费，前端只在「批准」后调用）——异步，进度写任务.json gen_progress。"""
+    """真提交（付费，前端只在「批准」后调用）——异步，进度写任务.json gen_progress。
+
+    AT-13 §2.7 锁规则：本函数**短持**任务锁——校验状态 + 冻结已批准配置 + 注册提交占用
+    （HUB_JOBS 建立）后立即释放；后台线程不持锁等全局提交槽，只在写任务文件时短持同一把锁
+    （进度回写走同一条短持路径，防 read-modify-save 覆盖状态）。
+    """
     task_dir = _task_dir(local_id)
-    task = state.load(task_dir)
-    if task["state"] != "approved":
-        raise HubError(f"提交需 approved（先批准），当前 {task['state']}")
 
-    def _run(td: Path):
+    def _run(td: Path, frozen_cfg: dict):
+        def _progress(pct, waited):  # noqa: ANN001 —— generate 回调签名
+            if pct is None:
+                return
+            _write_task(td, lambda t: t.__setitem__("gen_progress", int(pct)))
         with _SUBMIT_LOCK:
-            def _progress(pct, waited):  # noqa: ANN001 —— generate 回调签名
-                if pct is None:
-                    return
-                t = state.load(td)
-                state.save(td, {**t, "gen_progress": int(pct)})
-            return generate.do_submit(td, verbose=False, on_progress=_progress)
+            return generate.do_submit(td, verbose=False, on_progress=_progress,
+                                      frozen=frozen_cfg,
+                                      write_guard=lambda: task_lock(td.name))
 
-    return _spawn("hub-submit", _run, task_dir)
+    with task_lock(local_id):
+        task = state.load(task_dir)
+        if task["state"] != "approved":
+            raise HubError(f"提交需 approved（先批准），当前 {task['state']}")
+        # 冻结副本=已批准快照的输入；批准后若被改，do_submit 的快照比对会作废本次提交
+        frozen = {"gen_params": dict(task.get("gen_params") or {}),
+                  "gen_channel": dict(task.get("gen_channel") or {})}
+        job = _spawn("hub-submit", _run, task_dir, frozen)
+    return job
 
 
 def output_file(local_id: str) -> Path:
