@@ -104,6 +104,12 @@ def run() -> int:
             ok &= check("缺渠道应拒", False)
         except GenError as e:
             ok &= check("缺渠道 submit 拒", "渠道配置" in str(e), str(e)[:60])
+        # AT-13 B2 升级断言：这条当年「拒了但任务留在 generating」是绿灯过的 bug——
+        # 前置拒绝必须受控回退（approved/generating → awaiting_approval），绝不许停在 generating。
+        st = load(t1)["state"]
+        ok &= check("缺渠道拒后任务不得停 generating（原 bug 曾绿灯）", st != "generating", st)
+        ok &= check("缺渠道=前置拒绝 → 受控回退 awaiting_approval", st == "awaiting_approval", st)
+        ok &= check("回退清掉批准（必须重批）", not load(t1).get("approval"), "")
 
         print("[5] 假渠道：提交被服务端拒 → 环境错不判任务死")
         # SDGF 端点若已部署：假 key 提交会失败——不真调（探针不触达付费）；

@@ -313,10 +313,13 @@ def plan(task_id: str, template: str, duration: int, ratio: str, resolution: str
 
 
 def failed_record(info: dict, pf: dict, prompt: str, images: list[Path], reason: str) -> dict:
-    """核对没过的记录。**只写 failed，绝不写 running**（写 running 会让页面显示「生成中」，那是假的）。"""
+    """核对没过的记录。**只写 failed，绝不写 running**（写 running 会让页面显示「生成中」，那是假的）。
+
+    AT-13 §2.3 R2 N-03：落结构化阶段 `phase`，供适配层做失败四层判定——**不靠错误文案猜分类**。
+    """
     stamp = time.time()
     return {
-        "status": "failed", "taskId": "", "template": info.get("template", ""),
+        "status": "failed", "phase": "pre_rejected", "taskId": "", "template": info.get("template", ""),
         "duration": info.get("duration"), "ratio": info.get("ratio"),
         "resolution": info.get("resolution"),
         "images": [p.name for p in images], "promptChars": len(prompt),
@@ -357,7 +360,7 @@ def generate(args: argparse.Namespace) -> int:
         before = credits()
 
     rec = {
-        "status": "running", "taskId": "", "template": tpl,
+        "status": "running", "phase": "planning", "taskId": "", "template": tpl,
         "duration": args.duration, "ratio": args.ratio, "resolution": args.resolution,
         "images": [p.name for p in images], "promptChars": len(prompt),
         "promptFirstLine": prompt.splitlines()[0] if prompt else "",
@@ -373,25 +376,32 @@ def generate(args: argparse.Namespace) -> int:
                      ratio=args.ratio, resolution=args.resolution, audio=audio)
     problems = WS.validate(req)
     if problems:
-        rec.update(status="failed", error="；".join(problems), preflight=info.get("preflight"))
+        rec.update(status="failed", phase="pre_rejected", error="；".join(problems),
+                   preflight=info.get("preflight"))
         save_record(task_id, rec)
         print("；".join(problems), file=sys.stderr)
         return 2
+    # 阶段标记：**提交前**落盘（外呼之后崩溃也留得下「已尝试提交」的证据）
+    rec.update(phase="submitting")
+    save_record(task_id, rec)
     try:
         task_token = WS.submit(req, run=run_cli, timeout=300)
     except WS.SubmitError as exc:
-        rec.update(status="failed", elapsed=round(time.time() - rec["started"], 1),
+        rec.update(status="failed", phase="submit_unknown", elapsed=round(time.time() - rec["started"], 1),
                    error=str(exc)[:300])
         save_record(task_id, rec)
         print(rec["error"], file=sys.stderr)
         return 3
-    rec.update(taskId=task_token)
+    rec.update(taskId=task_token, phase="submitted")
     save_record(task_id, rec)
 
     try:
         src = WS.wait(task_token, out_dir, run=run_cli, timeout=1800)
     except WS.SubmitError as exc:
-        rec.update(status="failed", elapsed=round(time.time() - rec["started"], 1),
+        # 有云端 id = 云端可能仍在跑（等待超时），与「提交未知」分开表达
+        rec.update(status="failed",
+                   phase="wait_timeout" if rec.get("taskId") else "submit_unknown",
+                   elapsed=round(time.time() - rec["started"], 1),
                    error=str(exc)[:300])
         save_record(task_id, rec)
         print(rec["error"], file=sys.stderr)
@@ -402,7 +412,7 @@ def generate(args: argparse.Namespace) -> int:
         final.unlink()                       # 同名旧片直接换成新的：不堆副本
     src.replace(final)
     after = credits()
-    rec.update(status="done", elapsed=round(time.time() - rec["started"], 1),
+    rec.update(status="done", phase="done", elapsed=round(time.time() - rec["started"], 1),
                finishedAt=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                video=final.name, videoBytes=final.stat().st_size,
                creditsAfter=after,

@@ -225,6 +225,12 @@ def _prompt_path(task_dir: Path, task: dict) -> Path:
     return task_dir / "提示词.md"
 
 
+def _active_submit(local_id: str) -> bool:
+    """该任务是否有活跃提交占用（HUB_JOBS 运行中）——孤儿三步判定第①步的数据源。"""
+    return any(rec.get("local_id") == local_id and rec.get("status") == "running"
+               for rec in list(HUB_JOBS.values()))
+
+
 def get_task(local_id: str) -> dict:
     task_dir = _task_dir(local_id)
     task = state.load(task_dir)
@@ -255,6 +261,14 @@ def get_task(local_id: str) -> dict:
         "gen": task.get("gen") or {},
         "lapian_stage": task.get("lapian_stage") or "",
         "log_tail": _log_tail(task_dir),
+        # ---- AT-13 B2 提交链透出（§2.4 孤儿三步）——只读，不在读路径上迁移状态 ----
+        "gen_error": task.get("gen_error") or "",
+        "submit_unknown": task.get("submit_unknown") or None,
+        "dispatch": task.get("dispatch") or None,
+        "cloud_task_id": task.get("cloud_task_id") or "",
+        "active_submit": _active_submit(local_id),
+        "submit_lost": generate.diagnose(task_dir, task,
+                                         active_submit=_active_submit(local_id)),
     })
     return d
 
@@ -280,7 +294,11 @@ def do_ingest(video_path: Path, intent: str) -> dict:
 
 
 def _spawn(job_kind: str, target, *args) -> dict:
-    """统一异步：后台线程跑 target，HUB_JOBS 记状态，错误原文进 job。"""
+    """统一异步：后台线程跑 target，HUB_JOBS 记状态，错误原文进 job。
+
+    AT-13 §2.8：job 记录是**可 GET 的落账面**（/api/hub/job/<id>）——错误文本与 traceback
+    必须脱敏后再存，traceback 不许裸存（R1 实证裸 traceback 会把 key 原样带出去）。
+    """
     job_id = uuid.uuid4().hex[:12]
     HUB_JOBS[job_id] = {"status": "running", "kind": job_kind, "started": _now(),
                         "local_id": _job_local_id(args[0]) if args else None}
@@ -290,8 +308,9 @@ def _spawn(job_kind: str, target, *args) -> dict:
             result = target(*args)
             HUB_JOBS[job_id].update({"status": "done", "result": result, "ended": _now()})
         except Exception as e:  # noqa: BLE001 —— 失败原文如实进 job，不吞
-            HUB_JOBS[job_id].update({"status": "failed", "error": f"{e}",
-                                     "stderr": traceback.format_exc()[-2000:],
+            HUB_JOBS[job_id].update({"status": "failed",
+                                     "error": generate.safe_error(f"{e}", "", 2000),
+                                     "stderr": generate.safe_error(traceback.format_exc(), "", 2000),
                                      "ended": _now()})
     threading.Thread(target=wrap, daemon=True, name=f"hub-{job_kind}-{job_id}").start()
     return {"job_id": job_id}
@@ -988,16 +1007,20 @@ def do_approve(local_id: str, config: dict | None = None) -> dict:
             "gen_channel": task.get("gen_channel") or {}}
 
 
-def start_submit(local_id: str) -> dict:
+def start_submit(local_id: str, key: str | None = None) -> dict:
     """真提交（付费，前端只在「批准」后调用）——异步，进度写任务.json gen_progress。
 
     AT-13 §2.7 锁规则：本函数**短持**任务锁——校验状态 + 冻结已批准配置 + 注册提交占用
-    （HUB_JOBS 建立）后立即释放；后台线程不持锁等全局提交槽，只在写任务文件时短持同一把锁
-    （进度回写走同一条短持路径，防 read-modify-save 覆盖状态）。
+    （HUB_JOBS 建立）后立即释放；后台线程不持锁等全局提交槽，只在写任务文件时短持同一把锁。
+
+    AT-13 §2.3 守卫生效点（hub 侧）：已有活跃提交 / dispatch 未完结 / submit_unknown 阻断
+    → 409 拒绝，**一次创建都不发**（跨进程守卫在 generate.do_submit 里再兜一层）。
+    state=generating + 有确定回执 → 走「续查」不创建（runner/CLI 同一条链）。
+    key：提交时一次性透传的渠道 key（不落盘、不进 argv/URL、不进 job 记录）。
     """
     task_dir = _task_dir(local_id)
 
-    def _run(td: Path, frozen_cfg: dict):
+    def _run(td: Path, frozen_cfg: dict, api_key: str | None):
         def _progress(pct, waited):  # noqa: ANN001 —— generate 回调签名
             if pct is None:
                 return
@@ -1005,17 +1028,80 @@ def start_submit(local_id: str) -> dict:
         with _SUBMIT_LOCK:
             return generate.do_submit(td, verbose=False, on_progress=_progress,
                                       frozen=frozen_cfg,
-                                      write_guard=lambda: task_lock(td.name))
+                                      write_guard=lambda: task_lock(td.name),
+                                      api_key=api_key)
 
     with task_lock(local_id):
         task = state.load(task_dir)
-        if task["state"] != "approved":
-            raise HubError(f"提交需 approved（先批准），当前 {task['state']}")
+        st = task["state"]
+        if _active_submit(local_id):
+            raise HubError("这个任务已有提交在跑（排队/执行中）——别重复点，等它出结果")
+        if state.dispatch_blocks_create(task):
+            raise HubError(f"上次提交没拿到确定回执（dispatch={state.dispatch_phase(task)}）："
+                           f"云端可能已收单。先到渠道控制台核对没有这一单 →「解除阻断」→ 再提交；"
+                           f"直接重提会重复扣费")
+        if task.get("submit_unknown"):
+            raise HubError("任务被「未知收单」挡住（submit_unknown）：先核对渠道无单 →「解除阻断」，"
+                           "已有云端 taskId 的按该 id 续查，不许重提")
+        if st not in ("approved", "generating"):
+            raise HubError(f"提交需 approved（先批准），当前 {st}")
         # 冻结副本=已批准快照的输入；批准后若被改，do_submit 的快照比对会作废本次提交
         frozen = {"gen_params": dict(task.get("gen_params") or {}),
                   "gen_channel": dict(task.get("gen_channel") or {})}
-        job = _spawn("hub-submit", _run, task_dir, frozen)
+        job = _spawn("hub-submit", _run, task_dir, frozen, key or "")
     return job
+
+
+def revoke_approval(local_id: str, *, note: str = "撤销批准（改配置后重批）") -> dict:
+    """受控回退边（AT-13 §2.4）：approved → awaiting_approval，清批准、保留资产/提示词/草稿配置。
+
+    给「批准后改配置」用：§2.2 明确**不自动重批**——先撤销，再由所有者带新配置批准。
+    """
+    task_dir = _task_dir(local_id)
+    with task_lock(local_id):
+        try:
+            task = state.reject_back_to_approval(task_dir, note=note)
+        except state.StateError as e:
+            raise HubError(str(e)) from None
+    return {"ok": True, "state": task["state"], "note": note}
+
+
+def release_submit_unknown(local_id: str, *, confirm: bool = False, note: str = "") -> dict:
+    """解除「未知收单」阻断（AT-13 §2.3 人工动作）：只有核对过渠道无单才允许，全程记 history。"""
+    task_dir = _task_dir(local_id)
+    with task_lock(local_id):
+        task = state.load(task_dir)
+        blocked = bool(task.get("submit_unknown")) or state.dispatch_blocks_create(task)
+        if not blocked:
+            raise HubError("任务当前没有提交阻断（submit_unknown/dispatch），无需解除")
+        if not confirm:
+            raise HubInputError("解除阻断是人工动作：确认已在渠道控制台核对「没有这一单」后，"
+                                "请求体带 confirm:true 再调")
+        out = generate.release_unknown(task_dir,
+                                       note=note or "人工核对渠道无单后解除阻断",
+                                       guard=lambda: task_lock(local_id))
+    return {"ok": True, "state": out["state"], "dispatch": out.get("dispatch")}
+
+
+def recover_orphan(local_id: str, *, confirm: bool = False) -> dict:
+    """generating 孤儿受控恢复（AT-13 §2.4）：四守卫（无活跃提交/无云端在途/无成片/已解除）
+    全过才迁 awaiting_approval；任一不过如实 409，并回诊断。"""
+    task_dir = _task_dir(local_id)
+    with task_lock(local_id):
+        task = state.load(task_dir)
+        if not confirm:
+            raise HubInputError("受控恢复是人工动作：确认渠道无单、无在途后再调，请求体带 confirm:true")
+        ev = generate.cloud_evidence(task_dir, task)
+        try:
+            out = state.recover_orphan_generating(
+                task_dir, active_submit=_active_submit(local_id),
+                cloud_in_flight=bool(ev.get("in_flight")),
+                cloud_task_id=ev.get("cloud_task_id") or "",
+                note="人工核对渠道无单后受控恢复（generating 孤儿）")
+        except state.StateError as e:
+            raise HubError(str(e)) from None
+    return {"ok": True, "state": out["state"],
+            "diagnosis": generate.diagnose(task_dir, out)}
 
 
 def output_file(local_id: str) -> Path:

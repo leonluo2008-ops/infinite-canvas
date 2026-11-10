@@ -62,9 +62,13 @@ def save(task_dir: Path, task: dict) -> None:
 
 SNAPSHOT_VERSION = 2                     # AT-13 §2.5：当前审批快照版本（新任务）
 CHANNEL_IDENTITY_KEYS = ("baseUrl", "apiFormat", "渠道名")   # 渠道身份三键（进 v2 快照，key 不进）
-# 退回置换时一并作废的键（AT-13 §2.5 清理键表扩展；dispatch 标记归 B2 再加）
+# 提交链运行时键（AT-13 B2）：一次提交尝试的"在途/未知/回执"痕迹。
+# 作废/回退/受控恢复一律连根清掉——留着会让「有 dispatch、无 confirmed」的守卫挡住下一次正经提交。
+SUBMIT_RUNTIME_KEYS = ("gen_job", "gen_task_id", "cloud_task_id", "submit_unknown",
+                       "dispatch", "gen_error", "gen_progress")
+# 退回置换时一并作废的键（AT-13 §2.5 清理键表扩展 + B2 提交链键）
 ROLLBACK_CLEARED_KEYS = ("approval", "approval_snapshot", "gen_params",
-                         "gen_channel", "submit_unknown", "snapshot_version")
+                         "gen_channel", "snapshot_version") + SUBMIT_RUNTIME_KEYS
 
 
 def _blob_hash(blob: dict) -> str:
@@ -219,6 +223,88 @@ def rollback_to_assets(task_dir: Path, *, note: str = "退回置换") -> dict:
     task["state"] = "awaiting_assets"
     task.setdefault("history", []).append({"at": _now(), "from": "awaiting_approval",
                                            "to": "awaiting_assets", "note": note})
+    save(task_dir, task)
+    return task
+
+
+# ---------------------------------------------------------------- AT-13 B2：提交链受控迁移
+
+def dispatch_phase(task: dict) -> str:
+    """提交意图阶段（§2.3）：prepared → dispatched → confirmed｜cleared（无标记 = 空串）。
+
+    结构：{"phase": str, "at": iso, "note": str, "job": bridge job, "carrier": wan 本地承载目录}。
+    兼容早期扁平字符串写法（只读，不再写扁平值）。
+    """
+    raw = (task or {}).get("dispatch")
+    if isinstance(raw, dict):
+        return str(raw.get("phase") or "")
+    return str(raw or "")
+
+
+def dispatch_blocks_create(task: dict) -> bool:
+    """「有 dispatch、无 confirmed 回执 → 禁建」的唯一判定（§2.3 R2 N-01）。
+
+    prepared（已落意图、未发出）/dispatched（已发出、无回执）= 结果未知：所有发起方
+    （hub HTTP / runner / CLI）都必须先人工核对渠道无单再解除，不许再创建。
+    """
+    return dispatch_phase(task) in ("prepared", "dispatched")
+
+
+def reject_back_to_approval(task_dir: Path, *, note: str = "前置拒绝：受控回退重批",
+                            error: str | None = None) -> dict:
+    """受控回退边（AT-13 §2.4）：approved → awaiting_approval，**仅前置拒绝路径**。
+
+    清 approval/approval_snapshot（批准作废，必须重批）+ 提交链运行时键；
+    保留 assets_confirmed / empty_confirm / 提示词 / gen_params / gen_channel（草稿）。
+    不走 rollback_to_assets（那条会丢提示词，属"退回置换"语义）。
+    """
+    task = load(task_dir)
+    if task["state"] != "approved":
+        raise StateError(f"前置拒绝回退需 approved，当前 {task['state']}")
+    for key in ("approval", "approval_snapshot") + SUBMIT_RUNTIME_KEYS:
+        task.pop(key, None)
+    if error:
+        task["gen_error"] = error
+    task["state"] = "awaiting_approval"
+    task.setdefault("history", []).append({"at": _now(), "from": "approved",
+                                           "to": "awaiting_approval", "note": note})
+    save(task_dir, task)
+    return task
+
+
+def recover_orphan_generating(task_dir: Path, *, active_submit: bool = False,
+                              cloud_in_flight: bool = False, cloud_task_id: str = "",
+                              note: str = "generating 孤儿受控恢复") -> dict:
+    """generating 孤儿受控恢复（AT-13 §2.4 R2 B-04 尾巴）：generating → awaiting_approval。
+
+    四个守卫全过才动（任一不过如实抛，不硬迁）：
+      ① 无活跃提交占用（active_submit=False）——提交线程还在跑=不是孤儿；
+      ② 无云端在途证据（cloud_in_flight=False）——有 taskId 就续查，不恢复；
+      ③ 无成片（成片.mp4 存在 → 走 done/续查，不许把已成片的任务退回）；
+      ④ 提交意图已核对解除（dispatch 不是 prepared/dispatched、且无 submit_unknown 阻断）。
+    动作：清 approval/approval_snapshot + 提交链运行时键，保留资产/提示词/gen_params/gen_channel，
+    全程 history。不走 approved 借道。
+    """
+    task = load(task_dir)
+    if task["state"] != "generating":
+        raise StateError(f"孤儿恢复起态必须是 generating，当前 {task['state']}")
+    if active_submit:
+        raise StateError("任务还有活跃提交占用（提交进行中）——不是孤儿，禁恢复")
+    if cloud_in_flight:
+        raise StateError(f"有云端在途证据（taskId={cloud_task_id or '?'}）——先续查该任务，禁恢复")
+    video = task_dir / "成片.mp4"
+    if video.is_file() and video.stat().st_size > 0:
+        raise StateError(f"成片已在（{video.stat().st_size} 字节）——走续查/完成路径，禁恢复")
+    phase = dispatch_phase(task)
+    if phase in ("prepared", "dispatched"):
+        raise StateError(f"提交意图未核对解除（dispatch={phase}）——先到渠道控制台核对无单并解除阻断")
+    if task.get("submit_unknown"):
+        raise StateError("仍有「未知收单」阻断（submit_unknown）——先人工核对渠道无单并解除阻断")
+    for key in ("approval", "approval_snapshot") + SUBMIT_RUNTIME_KEYS:
+        task.pop(key, None)
+    task["state"] = "awaiting_approval"
+    task.setdefault("history", []).append({"at": _now(), "from": "generating",
+                                           "to": "awaiting_approval", "note": note})
     save(task_dir, task)
     return task
 

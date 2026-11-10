@@ -17,10 +17,14 @@
 生成参数默认：duration=5 ratio=9:16 resolution=720 audio=true（--set 覆盖）。
 """
 import argparse
+import base64
 import json
 import os
+import re
 import sys
 import time
+import urllib.error
+import urllib.request
 from contextlib import nullcontext
 from pathlib import Path
 
@@ -35,10 +39,40 @@ PROMPT_FILE = "提示词.md"
 VIDEO_FILE = "成片.mp4"
 GEN_POLL_INTERVAL = 5
 GEN_POLL_MAX = 3600  # 思念云普遍 5min+，上限 1 小时
+ROOT = Path(__file__).resolve().parents[1]
+WAN_ENGINE_DIR = "生成"
+WAN_RECORD = "记录.json"
 
 
 class GenError(RuntimeError):
     pass
+
+
+# ---------------------------------------------------------------- 脱敏（AT-13 §2.8）
+
+# 「先脱敏后截断」的唯一实现：截断在前会把 key 切半，前半段照样泄出去（R1 实证）。
+_MASK_RULES = (
+    re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]{6,}"),
+    re.compile(r"\bsk-[A-Za-z0-9._~-]{4,}"),
+    re.compile(r"(?i)\b(api[_-]?key|apikey|access[_-]?token|refresh[_-]?token|token|secret|"
+               r"password|authorization)\b(\"?\s*[:=]\s*\"?)([^\s\"',;&}]{3,})"),
+)
+
+
+def mask_text(text, secret: str = "") -> str:
+    """把凭证从任何要落账/回显的文本里抹掉（已知 key 直接替换，其余按形态兜底）。"""
+    out = str(text or "")
+    if secret:
+        out = out.replace(secret, "***")
+    for rule in _MASK_RULES:
+        out = rule.sub(lambda m: (f"{m.group(1)}{m.group(2)}***"
+                                  if m.lastindex and m.lastindex >= 3 else "***"), out)
+    return out
+
+
+def safe_error(text, secret: str = "", limit: int = 600) -> str:
+    """落账用错误文本：**先脱敏，后截断**（顺序不可换）。"""
+    return mask_text(text, secret)[:limit]
 
 
 def _channel_source() -> dict:
@@ -57,32 +91,46 @@ def _channel_source() -> dict:
     return ch if isinstance(ch, dict) else {}
 
 
-def channel(gen_channel: dict | None = None) -> dict:
-    """本次提交要用的渠道三元组 {baseUrl, apiKey, model}。
+def api_format_of(task: dict) -> str:
+    """协议的单一解析入口：已批准 gen_channel.apiFormat > env/file 兜底 > 历史默认 sdgf。"""
+    approved = (task or {}).get("gen_channel")
+    approved = approved if isinstance(approved, dict) else {}
+    try:
+        fallback = _channel_source()
+    except GenError:
+        fallback = {}
+    fmt = str(approved.get("apiFormat") or fallback.get("apiFormat") or "sdgf").strip().lower()
+    return fmt
 
-    AT-13 §2.1/§2.2：**baseUrl/model 以「已批准 gen_channel」为真源**（画布配置经 approve
-    固化进任务文件），不再静默换成 env/channel.json 里另一个渠道——渠道身份进快照，
-    换了渠道必须重批。key 不进快照也不落盘：本批仍从 env/file 兜底读（提交时前端一次性
-    透传归 B3），缺失就报明确错误，绝不盲提交。
-    无已批准渠道身份（老任务 / CLI submit）时退回既有 env>file 语义。
+
+def channel(gen_channel: dict | None = None, api_key: str | None = None) -> dict:
+    """本次提交要用的渠道四元组 {baseUrl, apiKey, model, apiFormat}。
+
+    AT-13 §2.1/§2.2：**baseUrl/model/apiFormat 以「已批准 gen_channel」为真源**（画布配置经
+    approve 固化进任务文件），不再静默换成 env/channel.json 里另一个渠道——渠道身份进快照，
+    换了渠道必须重批。key 不进快照也不落盘：hub 提交时由请求一次性透传（api_key 参数），
+    无浏览器 CLI 才退回 env>file 兜底；缺失就报明确错误，绝不盲提交。
+    wan 渠道按 CLI 现合同：**key 可空**（走本机 wan CLI 会员），model 不消费（固定 wan3.0）。
     """
     approved = gen_channel if isinstance(gen_channel, dict) else {}
     fallback = _channel_source()
-    api_format = str(approved.get("apiFormat") or fallback.get("apiFormat") or "").strip()
-    if api_format and api_format != "sdgf":
-        raise GenError(f"提交链目前只接了 sdgf 协议；apiFormat={api_format} 的派发适配"
-                       f"归 B2 批次（AT-13 §2.1）")
+    api_format = str(approved.get("apiFormat") or fallback.get("apiFormat") or "sdgf").strip().lower()
+    if api_format not in ("sdgf", "wan"):
+        raise GenError(f"apiFormat={api_format!r} 属画布专用协议，hub 提交链不承接（§2.1 只接 sdgf 系与 wan）")
     base_url = str(approved.get("baseUrl") or fallback.get("baseUrl") or "").strip()
-    api_key = str(fallback.get("apiKey") or "").strip()
+    api_key = str(api_key or fallback.get("apiKey") or "").strip()
     model = str(approved.get("model") or fallback.get("model") or "").strip()
-    missing = [name for name, value in (("baseUrl", base_url), ("apiKey", api_key),
-                                        ("model", model)) if not value]
+    needed = [("baseUrl", base_url)]
+    if api_format == "sdgf":
+        needed += [("apiKey", api_key), ("model", model)]
+    missing = [name for name, value in needed if not value]
     if missing:
         raise GenError(
             f"缺渠道配置（{'/'.join(missing)}）：hub 上先选画布渠道与模型再批准"
-            f"（已批准 gen_channel 优先），或设 WANREPRO_SDGF_CHANNEL / "
-            f"{config.PROJECTS_DIR / 'channel.json'}（{{baseUrl,apiKey,model}}）")
-    return {"baseUrl": base_url, "apiKey": api_key, "model": model}
+            f"（已批准 gen_channel 优先，key 由批准后的提交一次性透传），或设 "
+            f"WANREPRO_SDGF_CHANNEL / {config.PROJECTS_DIR / 'channel.json'}"
+            f"（{{baseUrl,apiKey,model}}）")
+    return {"baseUrl": base_url, "apiKey": api_key, "model": model, "apiFormat": api_format}
 
 
 def submit_params(params: dict) -> dict:
@@ -165,8 +213,8 @@ def do_approve(task_dir: Path, config: tuple | None = None, verbose: bool = True
     if st != "awaiting_approval":
         if st == "approved" and config is not None:
             version = state.snapshot_version(task)
-            raise GenError(f"任务已批准（快照 v{version}）：换新配置须先走受控回退重批——"
-                           f"approved→awaiting_approval 回退边归 B2 批次（AT-13 §2.4）")
+            raise GenError(f"任务已批准（快照 v{version}）：改配置请先「撤销批准」走受控回退边"
+                           f"（approved→awaiting_approval，不自动重批），再带新配置批准")
         raise GenError(f"approve 需 awaiting_approval，当前 {st}")
     if config is not None:
         gen_params, gen_channel = config
@@ -197,24 +245,446 @@ def do_approve(task_dir: Path, config: tuple | None = None, verbose: bool = True
     return "approved"
 
 
+# ------------------------------------------------------- 提交意图标记与受控迁移（§2.3/§2.4）
+
+def dispatch_of(task: dict) -> dict:
+    """任务上的 dispatch 结构化值（无标记 → {}；兼容早期扁平串只读）。"""
+    raw = (task or {}).get("dispatch")
+    if isinstance(raw, dict):
+        return dict(raw)
+    return {"phase": str(raw)} if raw else {}
+
+
+def _dispatch_write(task_dir: Path, guard, phase: str, *, note: str = "",
+                    job: str | None = None, carrier: str | None = None) -> dict:
+    """落一次 dispatch 阶段（**单独一次原子写**，与外呼严格分先后：先落盘再发请求）。"""
+    with guard():
+        task = state.load(task_dir)
+        cur = dispatch_of(task)
+        entry = {"phase": phase, "at": state._now(), "note": note,
+                 "job": job if job is not None else str(cur.get("job") or ""),
+                 "carrier": carrier if carrier is not None else str(cur.get("carrier") or "")}
+        task["dispatch"] = entry
+        state.save(task_dir, task)
+        return task
+
+
+def _mark_submit_unknown(task_dir: Path, guard, *, reason: str, secret: str = "") -> dict:
+    """标「未知收单」持久阻断（§2.3）：只落标记，不猜结果、不重提。"""
+    msg = safe_error(reason, secret)
+    with guard():
+        task = state.load(task_dir)
+        task["submit_unknown"] = {"at": state._now(), "reason": msg,
+                                  "dispatch": state.dispatch_phase(task)}
+        task["gen_error"] = msg
+        state.save(task_dir, task)
+        return task
+
+
+def release_unknown(task_dir: Path, *, note: str = "人工核对渠道无单后解除阻断",
+                    guard=None) -> dict:
+    """人工解除「未知收单」阻断（§2.3）：清 submit_unknown/gen_error，dispatch 记 cleared。
+
+    这是**人工动作**（到渠道控制台核对确实没有这一单之后），解除记 history；解除本身不迁移状态。
+    """
+    with (guard or nullcontext)():
+        task = state.load(task_dir)
+        prev = task.get("submit_unknown")
+        cur = task["state"]
+        task.pop("submit_unknown", None)
+        task.pop("gen_error", None)
+        old = dispatch_of(task)
+        task["dispatch"] = {"phase": "cleared", "at": state._now(), "note": note,
+                            "job": str(old.get("job") or ""),
+                            "carrier": str(old.get("carrier") or "")}
+        detail = ""
+        if isinstance(prev, dict) and prev.get("reason"):
+            detail = f"（原阻断：{safe_error(prev['reason'], '', 120)}）"
+        task.setdefault("history", []).append(
+            {"at": state._now(), "from": cur, "to": cur,
+             "note": safe_error(f"{note}{detail}", "", 300)})
+        state.save(task_dir, task)
+        return task
+
+
+def wan_record(carrier: str) -> dict:
+    """万相承载任务的引擎记录（`analysis/reverse/<carrier>/生成/记录.json`，唯一状态源）。"""
+    name = str(carrier or "")
+    if not name or "/" in name or "\\" in name:
+        return {}
+    path = ROOT / "analysis" / "reverse" / name / WAN_ENGINE_DIR / WAN_RECORD
+    try:
+        data = json.loads(path.read_text(encoding="utf-8") or "{}")
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def cloud_evidence(task_dir: Path, task: dict) -> dict:
+    """云端在途证据（§2.4 第二步）：SDGF=gen_task_id；wan=记录.json.taskId（**不是**本地 wan-* id）。"""
+    fmt = api_format_of(task)
+    if fmt == "wan":
+        carrier = str(dispatch_of(task).get("carrier") or "")
+        rec = wan_record(carrier)
+        cid = str(rec.get("taskId") or "")
+        status = str(rec.get("status") or "")
+        return {"apiFormat": "wan", "carrier": carrier, "cloud_task_id": cid,
+                "in_flight": bool(cid) and status == "running",
+                "record_status": status, "record_phase": str(rec.get("phase") or "")}
+    cid = str(task.get("gen_task_id") or task.get("cloud_task_id") or "")
+    return {"apiFormat": "sdgf", "cloud_task_id": cid,
+            "in_flight": bool(cid) and task.get("state") == "generating"}
+
+
+def diagnose(task_dir: Path, task: dict, *, active_submit: bool = False) -> dict:
+    """疑似孤儿三步判定（§2.4）——只判定不动状态；透给 hub get_task 与 CLI。"""
+    ev = cloud_evidence(task_dir, task)
+    video = task_dir / VIDEO_FILE
+    has_video = video.is_file() and video.stat().st_size > 0
+    phase = state.dispatch_phase(task)
+    unknown = bool(task.get("submit_unknown"))
+    out = {"state": task.get("state"), "apiFormat": ev["apiFormat"],
+           "active_submit": bool(active_submit), "cloud_task_id": ev["cloud_task_id"],
+           "cloud_in_flight": ev["in_flight"], "has_video": has_video,
+           "dispatch": phase, "submit_unknown": unknown,
+           "step": 3, "submit_lost": False, "reason": ""}
+    if task.get("state") == "generating":
+        if active_submit:
+            out.update(step=1, reason="提交进行中（活跃提交占用）——禁重试")
+        elif ev["in_flight"]:
+            out.update(step=2, reason=f"有云端 taskId（{ev['cloud_task_id']}）——续查该任务，不重提")
+        elif has_video:
+            out.update(step=2, reason="成片已落盘——走完成/续查路径")
+        elif unknown or phase in ("prepared", "dispatched"):
+            out.update(step=3, submit_lost=True,
+                       reason="无在途证据且无成片＝疑似孤儿：先到渠道控制台核对无单，再受控恢复")
+        else:
+            out.update(step=3, submit_lost=True,
+                       reason="无在途证据且无成片＝疑似孤儿（无提交痕迹）：核对无单后受控恢复")
+    return out
+
+
+# ---------------------------------------------------------------- 提交体装配
+
+def _submit_images(task: dict) -> list[str]:
+    """提交图清单：按图号序、组内去重（与发号映射同一 row_unit 口径；组外同 URL 不合并）。"""
+    groups = replace.load_groups(str(task.get("bridge_id") or ""))
+    entries = sorted((f for f in (task.get("assets_confirmed") or []) if isinstance(f, dict)),
+                     key=lambda f: int(f.get("no") or 0))
+    seen_units: set[tuple] = set()
+    images: list[str] = []
+    for f in entries:
+        unit = replace.row_unit(int(f.get("no") or 0), groups)
+        if unit in seen_units:
+            continue
+        seen_units.add(unit)
+        url = str(f.get("url") or "")
+        if url:
+            images.append(url)
+    return images
+
+
+def url_to_data_url(url: str, no: int) -> str:
+    """公网图 URL → dataUrl（万相 CLI 只解 dataUrl）。下载失败即抛=前置拒绝，不花钱。"""
+    u = str(url or "").strip()
+    if u.lower().startswith("data:image/"):
+        return u
+    if not u.lower().startswith("http"):
+        raise GenError(f"参考图 {no} 不是可下载的 URL：{u[:80]!r}")
+    req = urllib.request.Request(u, headers={"User-Agent": "Mozilla/5.0 (wanrepro-hub)"})
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            blob = resp.read()
+            ctype = (resp.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+    except (urllib.error.URLError, TimeoutError, OSError) as e:
+        raise GenError(f"参考图 {no} 下载失败（{u[:80]}）：{e}") from None
+    if not blob:
+        raise GenError(f"参考图 {no} 是 0 字节（{u[:80]}）")
+    if len(blob) > 20 * 1024 * 1024:
+        raise GenError(f"参考图 {no} 超过 20 MB（{len(blob) / 1048576:.1f} MB）")
+    mime = ctype if ctype.startswith("image/") else "image/png"
+    return f"data:{mime};base64," + base64.b64encode(blob).decode("ascii")
+
+
+def _sdgf_payload(prompt: str, params: dict, images: list[str], ch: dict) -> tuple[str, dict]:
+    body = {"prompt": prompt, "duration": params["duration"], "ratio": params["ratio"],
+            "resolution": params["resolution"], "audio": params["audio"], "confirm": True,
+            "channel": {"baseUrl": ch["baseUrl"], "apiKey": ch["apiKey"], "model": ch["model"]}}
+    if images:
+        body["images"] = [{"name": f"img{i}", "url": u} for i, u in enumerate(images, 1)]
+    return "/api/sdgf/video/run", body
+
+
+def _wan_payload(prompt: str, params: dict, images: list[str], ch: dict) -> tuple[str, dict]:
+    """万相派发（§2.1 R2 IMPL）：URL → dataUrl 按原图号顺序转换，走 wan 承载端点（不派 SDGF 体）。"""
+    body = {"prompt": prompt, "duration": params["duration"], "ratio": params["ratio"],
+            "resolution": params["resolution"], "audio": params["audio"], "confirm": True}
+    if images:
+        body["images"] = [{"name": f"图片{i}", "dataUrl": url_to_data_url(u, i)}
+                          for i, u in enumerate(images, 1)]
+    return "/api/wan/video/run", body
+
+
+def _pre_reject(task_dir: Path, guard, message: str, *, note: str = "",
+                secret: str = "") -> None:
+    """前置拒绝：受控回退 approved→awaiting_approval（清批准，保留资产/提示词/草稿配置）。"""
+    msg = safe_error(message, secret)
+    with guard():
+        task = state.load(task_dir)
+        if task["state"] != "approved":
+            return                       # 续查路径的状态由调用方给明确错误，这里不动
+        state.reject_back_to_approval(task_dir, note=note or "前置拒绝：受控回退重批", error=msg)
+
+
+def _enter_generating(task_dir: Path, guard, *, job: str, cloud: str, carrier: str = "",
+                      gen_task_id: str = "", note: str = "云端已收单") -> dict:
+    """进入 generating：gen_job / 云端 id / dispatch=confirmed **同一次 save 原子写**（§2.4）。"""
+    with guard():
+        task = state.load(task_dir)
+        if task["state"] == "generating":
+            return task
+        state.transition(task_dir, "generating",
+                         extra={"gen_job": job, "gen_task_id": gen_task_id,
+                                "cloud_task_id": cloud, "gen_error": "",
+                                "dispatch": {"phase": "confirmed", "at": state._now(),
+                                             "note": note, "job": job, "carrier": carrier}},
+                         note=note)
+        return state.load(task_dir)
+
+
+def _finish(task_dir: Path, data: bytes, *, guard, verbose: bool, note: str) -> str:
+    """成片落盘 → done（写盘失败/0 字节一律如实抛，不当成功）。"""
+    vf = task_dir / VIDEO_FILE
+    vf.write_bytes(data)
+    if vf.stat().st_size <= 0:
+        raise GenError("成片 0 字节——如实记失败")
+    with guard():
+        task = state.load(task_dir)
+        if task["state"] != "generating":
+            raise GenError(f"成片已落盘但任务状态是 {task['state']}（应为 generating）——人工核对")
+        state.transition(task_dir, "done", note=safe_error(note, "", 500))
+    if verbose:
+        print(f"[OK] {task_dir.name}: 成片落盘 {vf}（{vf.stat().st_size} 字节）→ done")
+    return "done"
+
+
+def _try_file(task_id: str) -> bytes | None:
+    if not task_id:
+        return None
+    try:
+        return bridge.get_bytes(f"/api/sdgf/video/file/{task_id}")
+    except bridge.BridgeError:
+        return None
+
+
+def _poll_sdgf(task_dir: Path, *, job: str, cloud: str, guard, verbose: bool,
+               on_progress=None, secret: str = "") -> str:
+    """SDGF 轮询：done/error 双终态、failed 方言、超时未知与重启续查（§2.6/§5）。"""
+    waited = 0
+    while waited < GEN_POLL_MAX:
+        try:
+            rec = bridge.get(f"/api/sdgf/video/job/{job}")
+        except bridge.BridgeError as e:
+            data = _try_file(cloud)                 # JOBS 是内存态：重启后按云端 id 找成片
+            if data:
+                return _finish(task_dir, data, guard=guard, verbose=verbose,
+                               note=f"重启恢复：按云端 taskId={cloud} 取回成片")
+            raise GenError(safe_error(
+                f"轮询端点丢了（{e}）——按云端 taskId={cloud or '?'} 续查；本任务未判失败、别重提",
+                secret)) from None
+        st = str(rec.get("status") or "")
+        if st == "done":
+            tid = str(rec.get("taskId") or cloud or "")
+            data = _try_file(tid)
+            if data is None:
+                data = bridge.get_bytes(f"/api/sdgf/video/file/{tid}")   # 抛错即如实
+            return _finish(task_dir, data, guard=guard, verbose=verbose,
+                           note=f"成片 taskId={tid}")
+        if st in ("failed", "error"):            # 双方言终态（§2.6）
+            msg = safe_error(f"云端判失败（{st}）：{rec.get('error') or '原因见渠道'}", secret)
+            with guard():
+                task = state.load(task_dir)
+                if task["state"] != "failed":
+                    state.transition(task_dir, "failed", extra={"gen_error": msg}, note=msg)
+            raise GenError(msg)
+        pct = rec.get("progress")
+        if on_progress is not None:
+            try:
+                on_progress(pct if isinstance(pct, (int, float)) else None, waited)
+            except Exception:  # noqa: BLE001 —— 进度回写失败不拖垮生成主链
+                pass
+        if verbose and pct is not None and waited % 30 == 0:
+            print(f"  生成中 {pct}%（{waited}s）")
+        time.sleep(GEN_POLL_INTERVAL)
+        waited += GEN_POLL_INTERVAL
+    msg = safe_error(f"超 {GEN_POLL_MAX}s 未完成：云端可能仍在跑（taskId={cloud or '?'}）"
+                     f"——本任务不判失败、不重提，按 taskId 续查", secret)
+    with guard():
+        task = state.load(task_dir)
+        task["gen_error"] = msg
+        state.save(task_dir, task)
+    raise GenError(msg)
+
+
+def _wan_failure_kind(phase: str, cloud_id: str) -> str:
+    """万相失败四层（§2.3 R2 N-03）——只认结构化阶段，不猜错误文案。
+
+    phase=planning/pre_rejected：引擎连 `WS.submit` 都没走到 → 前置拒绝（可回退重试）；
+    phase=submitting/submit_unknown 且无云端 id：已外呼但拿不到 id → 提交结果未知（阻断）；
+    有云端 id 但没终态（wait_timeout）→ 可能还在跑；有 id + cloud_failed → 确认失败。
+    """
+    if phase in ("pre_rejected", "preflight_failed", "planning"):
+        return "pre_rejected"
+    if not cloud_id:
+        return "submit_unknown"
+    if phase in ("cloud_failed", "wait_failed", "failed"):
+        return "cloud_failed"
+    return "cloud_timeout"          # 有云端 id 但没拿到终态：可能还在跑
+
+
+def _poll_wan(task_dir: Path, *, job: str, carrier: str, guard, verbose: bool,
+              on_progress=None, secret: str = "") -> str:
+    """万相轮询：结构化四阶段（前置拒绝/提交未知/已知 id 等待超时/确认失败）+ 云端 id 回执。"""
+    waited = 0
+    while waited < GEN_POLL_MAX:
+        try:
+            rec = bridge.get(f"/api/wan/video/job/{job}")
+        except bridge.BridgeError:
+            try:                                     # JOBS 丢了（重启）→ 按承载目录读记录
+                rec = bridge.get(f"/api/wan/video/state/{carrier}")
+            except bridge.BridgeError as e:
+                raise GenError(safe_error(
+                    f"万相状态查不到（承载 {carrier}，job={job or '?'}）：{e}"
+                    f"——任务未判失败，先到 analysis/reverse/{carrier}/生成/记录.json 核对",
+                    secret)) from None
+        status = str(rec.get("status") or "")
+        phase = str(rec.get("phase") or "")
+        cloud = str(rec.get("cloudTaskId") or rec.get("cloud_task_id") or "")
+        if cloud:
+            task = state.load(task_dir)
+            if str(task.get("cloud_task_id") or "") != cloud:
+                with guard():                        # 云端 id 回执（本地 wan-* 不算云端 id）
+                    task = state.load(task_dir)
+                    task["cloud_task_id"] = cloud
+                    state.save(task_dir, task)
+            if state.load(task_dir)["state"] == "approved":
+                _enter_generating(task_dir, guard, job=job, cloud=cloud, carrier=carrier,
+                                  note="万相云端已收单（id 回执与 generating 同盘）")
+        if status == "done":
+            if not cloud:
+                raise GenError(safe_error(
+                    f"万相报完成但拿不到云端 id（承载 {carrier}）——人工核对任务目录", secret))
+            data = bridge.get_bytes(f"/api/wan/video/file/{carrier}")
+            return _finish(task_dir, data, guard=guard, verbose=verbose,
+                           note=f"成片（万相 taskId={cloud}，承载 {carrier}）")
+        if status == "failed":
+            kind = _wan_failure_kind(phase, cloud)
+            msg = safe_error(f"万相失败（阶段 {phase or '未知'}）：{rec.get('error') or '原因见记录'}", secret)
+            if kind == "pre_rejected":
+                if state.load(task_dir)["state"] == "generating":
+                    state.recover_orphan_generating(
+                        task_dir, note="万相前置拒绝（本次提交已收尾）：受控回退重批")
+                else:
+                    state.reject_back_to_approval(task_dir, note="万相前置拒绝：受控回退重批",
+                                                  error=msg)
+                raise GenError(msg)
+            if kind == "cloud_failed":
+                with guard():
+                    task = state.load(task_dir)
+                    if task["state"] != "failed":
+                        state.transition(task_dir, "failed", extra={"gen_error": msg}, note=msg)
+                raise GenError(msg)
+            if kind == "cloud_timeout":
+                _enter_generating(task_dir, guard, job=job, cloud=cloud, carrier=carrier,
+                                  note="万相等待超时（云端可能仍在跑）")
+                with guard():
+                    task = state.load(task_dir)
+                    task["gen_error"] = msg
+                    state.save(task_dir, task)
+                raise GenError(msg)
+            _mark_submit_unknown(task_dir, guard,
+                                 reason=f"万相提交结果未知（无云端 taskId）：{rec.get('error') or phase}",
+                                 secret=secret)
+            raise GenError(safe_error(f"万相提交结果未知（无云端 taskId）：{msg}"
+                                      f"——已阻断，先核对渠道无单", secret)) from None
+        if on_progress is not None:
+            try:
+                on_progress(None, waited)            # 万相没有百分比：只报等待时长
+            except Exception:  # noqa: BLE001
+                pass
+        if verbose and waited % 30 == 0:
+            print(f"  万相生成中（阶段 {str(rec.get('stage') or '')}，{waited}s）")
+        time.sleep(GEN_POLL_INTERVAL)
+        waited += GEN_POLL_INTERVAL
+    msg = safe_error(f"超 {GEN_POLL_MAX}s 未完成：万相云端可能仍在跑（承载 {carrier}"
+                     f"{'，taskId=' + cloud if cloud else ''}）——本任务不判失败、不重提", secret)
+    with guard():
+        task = state.load(task_dir)
+        task["gen_error"] = msg
+        state.save(task_dir, task)
+    raise GenError(msg)
+
+
+def _resume(task_dir: Path, task: dict, *, guard, verbose: bool, on_progress=None,
+            api_key: str | None = None) -> str:
+    """generating 续查（**不创建**）：有确定回执就按既有 job/云端 id 继续等/取片。"""
+    secret = api_key or ""
+    phase = state.dispatch_phase(task)
+    job = str(task.get("gen_job") or "")
+    ev = cloud_evidence(task_dir, task)
+    if phase == "confirmed" or job or ev["cloud_task_id"]:
+        if ev["apiFormat"] == "wan":
+            return _poll_wan(task_dir, job=job, carrier=str(dispatch_of(task).get("carrier") or ""),
+                             guard=guard, verbose=verbose, on_progress=on_progress,
+                             secret=secret)
+        return _poll_sdgf(task_dir, job=job, cloud=str(ev["cloud_task_id"]), guard=guard,
+                          verbose=verbose, on_progress=on_progress, secret=secret)
+    if not task.get("submit_unknown"):           # 无在途证据 = 疑似孤儿：按未知收单处理，禁重提
+        _mark_submit_unknown(task_dir, guard,
+                             reason="generating 但无 gen_job/云端 id/成片——疑似孤儿，"
+                                    "先核对渠道无单再受控恢复",
+                             secret=secret)
+    raise GenError("generating 疑似孤儿（无活跃提交、无云端 taskId、无成片）——已标 submit_unknown；"
+                   "核对渠道无单后「解除阻断」并走受控恢复，别重提")
+
+
 def do_submit(task_dir: Path, verbose: bool = True,
               on_progress=None, frozen: dict | None = None,
-              write_guard=None) -> str:
+              write_guard=None, api_key: str | None = None) -> str:
     """approved → generating →（轮询）→ done；成片落任务目录。
 
+    提交结果二分类（AT-13 §2.3）：
+      · 前置拒绝（校验失败/缺配置/并发满 409/状态不符）→ 受控回退 awaiting_approval，可修正重试；
+      · 未知收单（超时/断连/非 JSON/无 id/回执写盘失败）→ submit_unknown 持久阻断，禁重提；
+      · 外呼**之前**先落 dispatch=prepared/dispatched（磁盘标记，天然跨进程），成功回执与
+        generating/gen_job/云端 id 同一次 save 原子写（§2.4，消除两次写盘窗口）。
     on_progress: 可选回调 (pct:int|None, waited:int)——Notion 中控台用它回写进度。
-    frozen: 接纳时冻结的配置副本 {gen_params, gen_channel}（AT-13 §2.7：后台线程用冻结副本，
-            不重读任务文件取配置——批准后被改动由快照比对拦住，不被悄悄覆盖）。
+    frozen: 接纳时冻结的配置副本 {gen_params, gen_channel}（AT-13 §2.7：后台线程用冻结副本）。
     write_guard: 写任务文件用的短持上下文（hub 传任务锁；缺省 nullcontext = CLI 单进程语义）。
+    api_key: hub 提交时一次性透传的 key（不落盘、不进 argv/URL）。
     """
     guard = write_guard or nullcontext
     task = state.load(task_dir)
-    if task["state"] == "generating":
-        print(f"[续跑] {task['local_id']}: 上次提交中断，重查（产物优先）")
-    elif task["state"] == "approved":
-        pass
-    else:
-        raise GenError(f"submit 需 approved（先审批），当前 {task['state']}")
+    st = task["state"]
+    if st not in ("approved", "generating"):
+        raise GenError(f"submit 需 approved（先审批），当前 {st}")
+
+    # 守卫（§2.3）：submit_unknown 是持久阻断，**不依赖 dispatch 是否还在**（重启/人工改盘后
+    # dispatch 可能已清而阻断仍在）——单看它也要挡住，否则会绕过阻断重复建单、重复扣费。
+    if task.get("submit_unknown"):
+        prev = task.get("submit_unknown") or {}
+        raise GenError("提交结果未知（submit_unknown 阻断未解除）——先到渠道控制台核对没有这一单，"
+                       "再人工「解除阻断」；不许重复创建。原因："
+                       + safe_error(str(prev.get("reason") or "未记录"), api_key or "", 160))
+
+    # 守卫（§2.3 R2 N-01）：有 dispatch、无 confirmed 回执 → 禁建。hub/runner/CLI 共用这一条。
+    if state.dispatch_blocks_create(task):
+        phase = state.dispatch_phase(task)
+        _mark_submit_unknown(task_dir, guard,
+                             reason=f"上次提交没拿到确定回执（dispatch={phase}）——云端可能已收单",
+                             secret=api_key or "")
+        raise GenError("提交结果未知（有 dispatch、无 confirmed 回执）——已标 submit_unknown："
+                       "先到渠道控制台核对没有这一单，再人工「解除阻断」；不许重复创建")
 
     frozen = frozen or {}
     prompt = (task_dir / PROMPT_FILE).read_text(encoding="utf-8")
@@ -231,85 +701,69 @@ def do_submit(task_dir: Path, verbose: bool = True,
     # 产物优先：成片已在（kill 重启后）→ 直接 done
     vf = task_dir / VIDEO_FILE
     if vf.is_file() and vf.stat().st_size > 0:
-        if task["state"] == "generating":
+        if st == "generating":
             with guard():
                 state.transition(task_dir, "done", note="成片已落盘（恢复路径）")
             print(f"[SKIP] {task['local_id']}: 成片已在（{vf.stat().st_size} 字节）→ done")
             return "done"
 
-    if task["state"] == "approved":
-        with guard():
-            state.transition(task_dir, "generating", note="提交生成")
-        # AT-11 B1：提交图片按组去重——组内 N 行一图只提交一条（与发号映射同一 row_unit 口径）；
-        # 组外同 URL 保持独立条目（禁全局 URL 去重）。确认快照已在确认时按组归一，
-        # 这里兜底旧任务/外部写入的逐行快照，保证提交清单=发号单位。
-        groups = replace.load_groups(str(task.get("bridge_id") or ""))
-        entries = sorted((f for f in (task.get("assets_confirmed") or []) if isinstance(f, dict)),
-                         key=lambda f: int(f.get("no") or 0))
-        seen_units: set[tuple] = set()
-        images: list[str] = []
-        for f in entries:
-            unit = replace.row_unit(int(f.get("no") or 0), groups)
-            if unit in seen_units:
-                continue
-            seen_units.add(unit)
-            url = str(f.get("url") or "")
-            if url:
-                images.append(url)
-        body = {"prompt": prompt, "duration": params["duration"],
-                "ratio": params["ratio"], "resolution": params["resolution"],
-                "audio": params["audio"], "confirm": True,
-                "channel": channel(gen_channel)}
-        if images:
-            body["images"] = [{"name": f"img{i}", "url": u} for i, u in enumerate(images, 1)]
-        out = bridge.post_json("/api/sdgf/video/run", body)
-        job = out.get("job") or ""
-        with guard():
-            task = state.load(task_dir)
-            task["gen_job"] = job
-            task["gen_task_id"] = out.get("taskId") or ""
-            state.save(task_dir, task)
+    secret = api_key or ""
+    if st == "generating":                       # 续查路径：只查不建
+        return _resume(task_dir, task, guard=guard, verbose=verbose,
+                       on_progress=on_progress, api_key=api_key)
+
+    # ---- 预检全部在写 dispatch 之前：这里出错=前置拒绝，未产生任何副作用 ----
+    try:
+        ch = channel(gen_channel, api_key=api_key)
+        images = _submit_images(task)
+        endpoint, body = (_wan_payload(prompt, params, images, ch)
+                          if ch["apiFormat"] == "wan"
+                          else _sdgf_payload(prompt, params, images, ch))
+    except GenError as e:
+        _pre_reject(task_dir, guard, str(e), note=f"前置拒绝：{safe_error(e, secret, 200)}",
+                    secret=secret)
+        raise GenError(str(e)) from None
+
+    # ---- 外呼前持久标记（跨进程守卫）：先落盘，再发请求 ----
+    _dispatch_write(task_dir, guard, "prepared", note="提交意图已落盘（外呼之前）")
+    _dispatch_write(task_dir, guard, "dispatched", note="已向云端创建端点发出请求")
+    try:
+        out = bridge.post_json(endpoint, body)
+    except bridge.BridgeError as e:
+        status = getattr(e, "status", None)
+        if status in (400, 409):                 # 前置拒绝：服务端在校验/并发闸就挡下了
+            msg = safe_error(f"渠道前置拒绝（HTTP {status}）：{e}", secret)
+            _pre_reject(task_dir, guard, msg, note=f"前置拒绝（HTTP {status}）：受控回退重批",
+                        secret=secret)
+            raise GenError(msg) from None
+        _mark_submit_unknown(task_dir, guard, reason=f"提交结果未知：{e}", secret=secret)
+        raise GenError(safe_error(
+            f"提交结果未知（云端可能已收单，勿重复提交）：{e}", secret)) from None
+
+    job = str(out.get("job") or "")
+    carrier = str(out.get("taskId") or "")
+    if ch["apiFormat"] == "wan":
+        if not carrier:
+            _mark_submit_unknown(task_dir, guard, reason="万相承载端点没回任务号", secret=secret)
+            raise GenError("万相承载端点没回任务号——提交结果未知，已阻断")
+        # 云端 id 未回执前**不进 generating**（生成态必须与确定回执同盘）；这里只记承载
+        _dispatch_write(task_dir, guard, "dispatched",
+                        note="万相承载任务已建（等云端 id 回执）", job=job, carrier=carrier)
         if verbose:
-            print(f"[提交] job={job} taskId={task['gen_task_id']}（思念云普遍 5 分钟+）")
+            print(f"[提交] 万相承载 {carrier}（job={job}；云端 id 待回执）")
+        return _poll_wan(task_dir, job=job, carrier=carrier, guard=guard, verbose=verbose,
+                         on_progress=on_progress, secret=secret)
 
-    task = state.load(task_dir)
-    job = task.get("gen_job") or ""
-    if not job:
-        raise GenError("任务缺 gen_job（提交未落账）——重跑 submit")
-
-    waited = 0
-    while waited < GEN_POLL_MAX:
-        rec = bridge.get(f"/api/sdgf/video/job/{job}")
-        st = rec.get("status")
-        if st == "done":
-            tid = rec.get("taskId") or task.get("gen_task_id")
-            data = bridge.get_bytes(f"/api/sdgf/video/file/{tid}")
-            if not data:
-                raise GenError(f"成片端点空响应（taskId={tid}）")
-            vf.write_bytes(data)
-            if vf.stat().st_size <= 0:
-                raise GenError("成片 0 字节——如实记失败")
-            with guard():
-                state.transition(task_dir, "done",
-                                 note=f"成片 {vf.stat().st_size} 字节（taskId={tid}）")
-            if verbose:
-                print(f"[OK] {task['local_id']}: 成片落盘 {vf}（{vf.stat().st_size} 字节）→ done")
-            return "done"
-        if st == "error":
-            with guard():
-                state.transition(task_dir, "failed", note=str(rec.get("error"))[:500])
-            raise GenError(f"生成失败（原文）: {rec.get('error')}")
-        pct = rec.get("progress")
-        if on_progress is not None:
-            try:
-                on_progress(pct if isinstance(pct, (int, float)) else None, waited)
-            except Exception:  # noqa: BLE001 —— 进度回写失败不拖垮生成主链
-                pass
-        if verbose and pct is not None and waited % 30 == 0:
-            print(f"  生成中 {pct}%（{waited}s）")
-        time.sleep(GEN_POLL_INTERVAL)
-        waited += GEN_POLL_INTERVAL
-    raise GenError(f"超 {GEN_POLL_MAX}s 未完成——不判失败，重跑 submit 续查（job={job}）")
+    cloud = str(out.get("taskId") or "")
+    if not cloud:
+        _mark_submit_unknown(task_dir, guard, reason="创建响应里没有任务 id", secret=secret)
+        raise GenError("提交结果未知（创建响应没有任务 id）——已阻断，先核对渠道无单")
+    _enter_generating(task_dir, guard, job=job, cloud=cloud, gen_task_id=cloud,
+                      note="提交生成（gen_job 与云端 id 同盘）")
+    if verbose:
+        print(f"[提交] job={job} taskId={cloud}（思念云普遍 5 分钟+）")
+    return _poll_sdgf(task_dir, job=job, cloud=cloud, guard=guard, verbose=verbose,
+                      on_progress=on_progress, secret=secret)
 
 
 def main(argv: list[str] | None = None) -> int:

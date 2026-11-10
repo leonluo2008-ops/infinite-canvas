@@ -221,10 +221,11 @@ def probe_legacy() -> None:
     check("approve 响应 snapshot_version=1（老任务如实标 v1）", out.get("snapshot_version") == 1,
           str(out.get("snapshot_version")))
 
-    # approved(v1) 带 config → 拒（回退边归 B2），文件字节不变
+    # approved(v1) 带 config → 拒：B2 已给出受控回退边，但**不自动重批**（先撤销再带新配置批准），文件字节不变
     raw_before = task_bytes(tdir)
     expect_hub_error(lambda: hub_api.do_approve("auto-9304", config=sdgf_config()),
-                     status=409, contains="B2", label="approved(v1) 带 config → 拒（B2 回退边）")
+                     status=409, contains="撤销批准",
+                     label="approved(v1) 带 config → 拒（走「撤销批准」回退边，不自动重批）")
     check("拒绝后任务文件字节不变（没半途改写）", task_bytes(tdir) == raw_before, "")
 
     for state_name, extra, label in (
@@ -462,15 +463,14 @@ def probe_submit_dispatch() -> None:
           and ch["model"] == "SD2.5-满血-GF-720P" and ch["apiKey"] == FAKE_KEY,
           json.dumps({k: ("***" if k == "apiKey" else v) for k, v in ch.items()},
                      ensure_ascii=False))
+    # B2 已承接 wan 派发：channel() 必须接受 wan 配置并标 apiFormat=wan（而不是误当 sdgf 派发）
     try:
-        generate.channel({"baseUrl": "https://approved.example", "apiFormat": "wan",
-                          "model": ""})
+        ch_wan = generate.channel({"baseUrl": "http://127.0.0.1:8776", "apiFormat": "wan",
+                                   "model": ""})
+        check("wan 配置走到 submit → channel() 认 wan（B2 已承接派发，不再报「归 B2」）",
+              ch_wan.get("apiFormat") == "wan", json.dumps(ch_wan, ensure_ascii=False)[:100])
     except generate.GenError as e:
-        check("wan 配置走到 submit → 如实报「派发归 B2」而不是误发 SDGF 端点",
-              "B2" in str(e), str(e)[:80])
-    else:
-        check("wan 配置走到 submit → 如实报「派发归 B2」而不是误发 SDGF 端点", False,
-              "没抛错——wan 可能被误派到 sdgf 链")
+        check("wan 配置走到 submit → channel() 认 wan（B2 已承接派发）", False, str(e)[:90])
     check("submit_params 兼容画布词表（size/vquality → ratio/resolution）",
           generate.submit_params({"duration": 6, "size": "16:9", "vquality": "1080",
                                   "audio": False})

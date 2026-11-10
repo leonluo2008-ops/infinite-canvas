@@ -745,6 +745,32 @@ def wan_argv(task_id: str, duration: int, ratio: str, resolution: str,
     return argv
 
 
+def wan_state_by_task(task_id: str) -> dict:
+    """/api/wan/video/state/<taskId>：按承载目录读 `生成/记录.json`（**重启后 JOBS 丢了也能查**）。
+
+    AT-13 §2.3/§5：万相续查/找回只认这条读路径；cloudTaskId=记录.json.taskId（云端 id），
+    taskId=本地承载目录号（wan-<ts>，不是云端 id）。
+    """
+    if not task_id or ".." in task_id or not re.fullmatch(r"[0-9A-Za-z._-]{1,64}", task_id):
+        raise ApiError(400, f"任务号不合法：{task_id!r}")
+    d = ANALYSIS / task_id
+    if not d.is_dir():
+        raise ApiError(404, f"没有这个万相承载任务：{task_id}")
+    rec = gen_record(task_id)
+    if not rec:
+        return {"status": "idle", "phase": "", "cloudTaskId": "", "stage": "",
+                "taskId": task_id, "hasVideo": False}
+    status = str(rec.get("status") or "")
+    out: dict = {"status": status or "running", "phase": str(rec.get("phase") or ""),
+                 "cloudTaskId": str(rec.get("taskId") or ""), "taskId": task_id,
+                 "stage": str(rec.get("stage") or "")}
+    if status == "failed":
+        out["error"] = str(rec.get("error") or "生成失败（原因见任务记录）")
+    final = d / GEN_DIR / f"成片-{WAN_TEMPLATE}.mp4"
+    out["hasVideo"] = bool(final.is_file() and final.stat().st_size > 0)
+    return out
+
+
 def wan_video_job_state(job_id: str) -> dict:
     """/api/wan/video/job/<jobId>：JOBS 记录 + 生成/记录.json → 轮询状态。
 
@@ -765,7 +791,11 @@ def wan_video_job_state(job_id: str) -> dict:
 
     out: dict = {"status": "running", "stage": "计划",
                  "elapsed": round(time.time() - float(rec.get("started") or time.time()), 1),
-                 "taskId": task_id}
+                 "taskId": task_id,
+                 # AT-13 §2.3 R2 N-03：结构化阶段（pre_rejected/submitting/submit_unknown/
+                 # submitted/wait_timeout/cloud_failed/done）+ 云端 id（记录.json.taskId）
+                 "phase": str(gen_rec.get("phase") or ""),
+                 "cloudTaskId": str(gen_rec.get("taskId") or "")}
     final_name = f"成片-{WAN_TEMPLATE}.mp4"
     jstatus = str(gen_rec.get("status") or "")
     if jstatus == "done":
@@ -1056,8 +1086,10 @@ def sdgf_http(url: str, key: str, *, method: str = "GET", body: dict | None = No
         with SDGF_DIRECT.open(req, timeout=timeout) as resp:
             return resp.read()
     except urllib.error.HTTPError as err:
-        text = err.read()[:600].decode("utf-8", errors="replace").strip()
-        raise ApiError(502, mask_secret(f"渠道响应 HTTP {err.code}：{text or err.reason}", key)) from None
+        # AT-13 §2.8：**先脱敏后截断**——先截 600 字节会把 key 切半，剩下的前缀照样泄出去（R1 实证）
+        raw = err.read(65536).decode("utf-8", errors="replace").strip()
+        text = mask_secret(raw, key)[:600]
+        raise ApiError(502, f"渠道响应 HTTP {err.code}：{text or err.reason}") from None
     except urllib.error.URLError as err:
         raise ApiError(502, mask_secret(
             f"渠道连不上（{err.reason}）——提交状态不明时勿重复提交，先到渠道控制台核对", key)) from None
@@ -1115,8 +1147,9 @@ def sdgf_download(api_base: str, key: str, task_id: str, direct_url: str, dest: 
         with SDGF_DIRECT.open(req, timeout=SDGF_DOWNLOAD_TIMEOUT) as resp:
             ctype = (resp.headers.get("Content-Type") or "").lower()
             if "json" in ctype or "text/" in ctype:
-                text = resp.read(600).decode("utf-8", errors="replace").strip()
-                raise ApiError(502, mask_secret(f"成片下载拿到的是错误响应：{text[:400]}", key))
+                # 先脱敏后截断（AT-13 §2.8）：顺序反了会漏出被切断的 key 前缀
+                text = mask_secret(resp.read(65536).decode("utf-8", errors="replace").strip(), key)[:400]
+                raise ApiError(502, f"成片下载拿到的是错误响应：{text}")
             total = 0
             with open(temp, "wb") as fh:
                 while True:
@@ -1130,8 +1163,9 @@ def sdgf_download(api_base: str, key: str, task_id: str, direct_url: str, dest: 
         temp.replace(dest)
         return total
     except urllib.error.HTTPError as err:
-        text = err.read()[:400].decode("utf-8", errors="replace").strip()
-        raise ApiError(502, mask_secret(f"成片下载 HTTP {err.code}：{text or err.reason}", key)) from None
+        raw = err.read(65536).decode("utf-8", errors="replace").strip()
+        text = mask_secret(raw, key)[:400]
+        raise ApiError(502, f"成片下载 HTTP {err.code}：{text or err.reason}") from None
     except urllib.error.URLError as err:
         raise ApiError(502, f"成片下载连不上（{err.reason}）") from None
     finally:
@@ -1956,6 +1990,11 @@ class Handler(BaseHTTPRequestHandler):
         if m:
             self.send_json(wan_video_job_state(urllib.parse.unquote(m.group(1))))
             return
+        m = re.fullmatch(r"/api/wan/video/state/([^/]+)", path)
+        if m:
+            # AT-13 §2.3/§5：按承载目录读记录（重启后 JOBS 丢失的续查路径）
+            self.send_json(wan_state_by_task(urllib.parse.unquote(m.group(1))))
+            return
         m = re.fullmatch(r"/api/wan/video/file/([^/]+)", path)
         if m:
             self.serve_wan_video(urllib.parse.unquote(m.group(1)))
@@ -2074,7 +2113,37 @@ class Handler(BaseHTTPRequestHandler):
             return
         m = re.fullmatch(r"/api/hub/submit/([^/]+)", path)
         if m:
-            self.send_json(hub_api.start_submit(urllib.parse.unquote(m.group(1))))
+            # AT-13 §三：body 可带 key（一次性，不落盘、不进 argv/URL/日志）→ start_submit 透传
+            payload = self.read_json()
+            key = payload.get("key")
+            if key is not None and not isinstance(key, str):
+                raise ApiError(400, "key 必须是字符串（渠道密钥，提交时一次性透传）")
+            self.send_json(hub_api.start_submit(urllib.parse.unquote(m.group(1)),
+                                                key=(key or "").strip() or None))
+            return
+        m = re.fullmatch(r"/api/hub/task/([^/]+)/release", path)
+        if m:
+            # AT-13 §2.3：人工解除「未知收单」阻断（核对渠道无单之后，身体带 confirm:true）
+            payload = self.read_json()
+            self.send_json(hub_api.release_submit_unknown(
+                urllib.parse.unquote(m.group(1)),
+                confirm=payload.get("confirm") is True,
+                note=str(payload.get("note") or "")))
+            return
+        m = re.fullmatch(r"/api/hub/task/([^/]+)/recover", path)
+        if m:
+            # AT-13 §2.4：generating 孤儿受控恢复（四守卫，confirm:true 才动）
+            payload = self.read_json()
+            self.send_json(hub_api.recover_orphan(urllib.parse.unquote(m.group(1)),
+                                                  confirm=payload.get("confirm") is True))
+            return
+        m = re.fullmatch(r"/api/hub/task/([^/]+)/revoke", path)
+        if m:
+            # AT-13 §2.2/§2.4：撤销批准（受控回退 approved→awaiting_approval，不自动重批）
+            payload = self.read_json()
+            self.send_json(hub_api.revoke_approval(
+                urllib.parse.unquote(m.group(1)),
+                note=str(payload.get("note") or "撤销批准（改配置后重批）")))
             return
         # ---- AT-9 B2：任务级 REST（确认组 / 回退 / 删除，路径参数非模板变量） ----
         m = re.fullmatch(r"/api/hub/task/([^/]+)/delete", path)

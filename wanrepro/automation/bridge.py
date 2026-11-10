@@ -22,7 +22,13 @@ from . import config
 
 
 class BridgeError(RuntimeError):
-    """bridge 调用失败——message 带 HTTP 状态与响应体片段，如实抛出。"""
+    """bridge 调用失败——message 带 HTTP 状态与响应体片段，如实抛出。
+
+    `status`：HTTP 状态码（连接失败/超时为 None）。AT-13 §2.3 的提交结果二分类**只认它**，
+    不靠错误文案猜「是前置拒绝还是未知收单」。
+    """
+
+    status: int | None = None
 
 
 def _request(method: str, path: str, *, body: bytes | None = None,
@@ -37,9 +43,13 @@ def _request(method: str, path: str, *, body: bytes | None = None,
             raw = resp.read().decode("utf-8", errors="replace")
     except urllib.error.HTTPError as e:
         detail = e.read().decode("utf-8", errors="replace")[:300]
-        raise BridgeError(f"bridge {method} {path} → HTTP {e.code}: {detail}") from None
+        err = BridgeError(f"bridge {method} {path} → HTTP {e.code}: {detail}")
+        err.status = int(e.code)
+        raise err from None
     except urllib.error.URLError as e:
         raise BridgeError(f"bridge {method} {path} 连不上（{config.BRIDGE_BASE}）: {e.reason}") from None
+    except TimeoutError:
+        raise BridgeError(f"bridge {method} {path} 超时（{timeout}s）——结果不明，按未知处理") from None
     if not raw:
         raise BridgeError(f"bridge {method} {path} → 空响应（按失败处理，不得当结果）")
     try:
@@ -61,7 +71,9 @@ def get_bytes(path: str, timeout: int = 600) -> bytes:
             data = resp.read()
     except urllib.error.HTTPError as e:
         detail = e.read().decode("utf-8", errors="replace")[:300]
-        raise BridgeError(f"bridge GET {path} → HTTP {e.code}: {detail}") from None
+        err = BridgeError(f"bridge GET {path} → HTTP {e.code}: {detail}")
+        err.status = int(e.code)
+        raise err from None
     except urllib.error.URLError as e:
         raise BridgeError(f"bridge GET {path} 连不上: {e.reason}") from None
     if not data:
