@@ -241,6 +241,9 @@ def _check_residue(body: str, ents, render) -> dict:
     scanned: list[str] = []
     hits: list[str] = []
     for e in ents:
+        if e.kind.startswith("品牌视觉"):
+            # AT-16 B1b：品牌位有图号后「命名」是客户字样而非原物核心词，按它取词会误红。
+            continue
         if not (e.no and e.has_asset_image):
             continue
         core = render.entity_noun_core(e)

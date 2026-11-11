@@ -379,6 +379,59 @@ def parse_map(spec: str) -> list[tuple[int, str]]:
     return out
 
 
+_RENDER_MODULE = None
+
+
+def render_module():
+    """按路径加载 pipeline/reverse/render.py（发号/有效映射同一口径）。
+
+    与 selfcheck._load_render 同法：render.py 不是包，pipeline 也不该被 automation
+    反向 import 成依赖——只在确认时懒加载一次。
+    """
+    global _RENDER_MODULE
+    if _RENDER_MODULE is None:
+        import importlib.util
+        path = Path(__file__).resolve().parent.parent / "pipeline" / "reverse" / "render.py"
+        sys.path.insert(0, str(path.parent))       # render 内部 `from aspect import …` 同目录依赖
+        spec = importlib.util.spec_from_file_location("wanrepro_replace_render", path)
+        if spec is None or spec.loader is None:
+            raise ReplaceError(f"导不进 {path.name}（确认需要发号同源）")
+        _RENDER_MODULE = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(_RENDER_MODULE)
+    return _RENDER_MODULE
+
+
+def effective_entries(bridge_id: str) -> list[dict]:
+    """确认时点提交清单（AT-16 B1b 同源装配）：清单当前有效绑定 → 行→图号→提交条目。
+
+    真源=待确认清单.md「资产图」列，**不是** pending_replace 上传流水：流水只是本次会话的
+    上传痕迹，用户「清空/覆盖」后流水与盘面会脱节；品牌行更曾整行只活在流水里——两套合同
+    打架就是「提交快照 3 ≠ 发图单位 2」的根因。组内多行只出一条（组=一个发号单位）、
+    组外同 URL 各自独立、按原片行先胜出、清空即出局，全部由 render.effective_units 判。
+
+    条目形状沿用历史快照 {"no","img","url","name","desc"}：no 是**行号**（自检按行号查发号
+    映射），列表序=提交序=图号序。
+    """
+    render = render_module()
+    path = checklist_path(bridge_id)
+    ents = render.parse_checklist(path)
+    units = render.effective_units(ents, load_groups(bridge_id),
+                                   load_row_decisions(bridge_id))
+    descs = {r["no"]: str(r.get("desc") or "")
+             for r in parse_rows(path.read_text(encoding="utf-8-sig"))}
+    out: list[dict] = []
+    for unit in units:
+        url = str(unit.get("url") or "")
+        if not url:
+            continue
+        row_no = int(unit["row_no"])
+        img = url.rsplit("/", 1)[-1] if local_assets.is_ref(url) else ""
+        out.append({"no": row_no, "img": img, "url": url,
+                    "name": unit["entity"].name or "",
+                    "desc": descs.get(row_no, "")[:40]})
+    return out
+
+
 def run_replace(task_dir: Path, *, assets: list[str] | None, map_spec: str | None,
                 name_spec: str | None, confirm: bool, verbose: bool = True,
                 empty_confirm: bool = False, ack_rows: list[int] | None = None) -> str:
@@ -393,17 +446,9 @@ def run_replace(task_dir: Path, *, assets: list[str] | None, map_spec: str | Non
         # AT-11 §3.4（B2）：同一确认动作内先算有效决策——「按原片行」（keep_origin / AT-12 dismissed）
         # 在发号/组装有效上传清单之前胜出；原值（清单图列/命名/流水）不动，restore 后原样回来。
         ko_rows = {n for n, d in load_row_decisions(bridge_id).items() if is_origin_decision(d)}
-        groups = load_groups(bridge_id)
-        effective = [x for x in pending if int(x.get("no") or 0) not in ko_rows]
-        # 组内 N 行一图 = 一个图号一条提交：确认快照按组去重（组外同 URL 保持独立，不全局去重）。
-        seen_units: set[tuple] = set()
-        confirmed: list[dict] = []
-        for entry in sorted(effective, key=lambda x: int(x.get("no") or 0)):
-            unit = row_unit(int(entry.get("no") or 0), groups)
-            if unit in seen_units:
-                continue
-            seen_units.add(unit)
-            confirmed.append(entry)
+        # AT-16 B1b：提交清单、正文引用、资产清单、确认快照同一份有效映射（清单当前绑定）。
+        # 组去重与按原片屏蔽都在 render.effective_units 里完成；上传流水 pending 只作回显。
+        confirmed = effective_entries(bridge_id)
         acks = sorted({int(x) for x in (ack_rows or [])})
         ko_snap = sorted(ko_rows)
         if confirmed:
@@ -437,7 +482,7 @@ def run_replace(task_dir: Path, *, assets: list[str] | None, map_spec: str | Non
                              note=note,
                              extra=extra)
         if verbose:
-            how = f"回填 {len(pending)} 行" if pending else "全沿用（空置换）"
+            how = f"提交 {len(confirmed)} 张图" if confirmed else "全沿用（空置换）"
             print(f"[OK] {task['local_id']}: 置换已确认 → rendering（{how}）")
         return "rendering"
 

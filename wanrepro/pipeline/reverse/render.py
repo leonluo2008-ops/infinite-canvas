@@ -1272,6 +1272,10 @@ def strip_core_residue(line: str, ents: list["Entity"]) -> str:
     uploaded: dict[int, frozenset] = {}
     claimed: dict[int, int] = {}
     for e in ents:
+        if e.kind.startswith("品牌视觉"):
+            # AT-16 B1b：品牌位有图号后其「命名」是客户字样（品牌文字/客户品牌字样），
+            # 不是原物核心词——按它取词组会把正文里的中性词当旧物残留扫掉。
+            continue
         if e.no and e.has_asset_image:
             uploaded[e.no] = (uploaded.get(e.no, frozenset())
                               | _noun_grams(entity_noun_core(e)))
@@ -1517,6 +1521,11 @@ class Entity:
         return out
 
 
+def image_urls(image: str) -> list[str]:
+    """「资产图」列 → URL 列表（多图英文/中文逗号分隔，顺序即绑定顺序）。"""
+    return [u.strip() for u in re.split(r"[,，]", image or "") if u.strip()]
+
+
 def parse_checklist(path: Path) -> list[Entity]:
     if not path.is_file():
         return []
@@ -1531,12 +1540,13 @@ def parse_checklist(path: Path) -> list[Entity]:
         if cells[1].startswith("品牌视觉"):
             # 「品牌视觉（置换位）」（B4/T6-G）：收进实体列表、**免「建议」条件**直接进资产表
             # ——真机对照（pop2-source-2）里该行「建议」列被意图回填清空过，按建议值过滤
-            # 会把置换位整行丢掉；t6r-pop1（建议=必须换）收得进、pop2（建议=空）收不进，
-            # 正是这个坑。仍然不占 @图片N（assign_numbers 跳过）、不进实体竞争。
-            # 「命名/用我的描述」照读：客户把定稿字样填进本行要能带到资产表；
-            # 「建议」不读（suggest=""）：置换位没有图片N，不进「本片替换说明」的图片N列表。
-            rows.append(Entity(cells[1], cells[2], cells[3], "", cells[5],
+            # 会把置换位整行丢掉（t6r-pop1 建议=必须换收得进、pop2 建议=空收不进）。
+            # AT-16 B1b：资产图列**不再置空**——品牌图走「有效参考」进正文引用/发号/提交清单/
+            # 资产清单（五点同源，见 effective_units）；未绑图时 no=0，照旧不占号不猜图。
+            # 「命名/用我的描述」照读；「建议」也照读（有图号后与普通行同口径）。
+            rows.append(Entity(cells[1], cells[2], cells[3], cells[4], cells[5],
                                no=0,
+                               suggest=cells[6] if len(cells) > 6 else "",
                                my_desc=decode_user_desc(cells[7]) if len(cells) > 7 else "",
                                row_no=int(cells[0])))
             continue
@@ -1560,6 +1570,8 @@ def assign_numbers(ents: list[Entity], groups: list[list[int]] | None = None,
     · decisions（『行决策覆盖』）里「按原片行」（keep_origin / AT-12 dismissed）在发号**之前**胜出
       （§3.4）：已有图/命名/自填描述的**有效视图**被屏蔽（该行按原片描述渲染、无 @图片N），原值留在
       清单/覆盖表里供 restore——这里只改内存副本，不动盘面。
+    · **AT-16 B1b**：品牌视觉行不再豁免——绑了图就与普通行同口径占号（唯一口径见 effective_units）；
+      未绑图 → no=0 不占号。
     · 不传 groups/decisions 时行为与旧版逐行发号完全一致（旧调用方零破坏）。
     """
     units = [sorted({int(x) for x in g}) for g in (groups or [])]
@@ -1567,16 +1579,12 @@ def assign_numbers(ents: list[Entity], groups: list[list[int]] | None = None,
     seq = 0
     seen: dict[tuple, int] = {}
     for ent in ents:
-        if ent.kind.startswith("品牌视觉"):
-            ent.no = 0          # 置换位不是备图资产（B4）：即便误绑了图也不占号、不进提示词
-            continue
-        has_img = bool(ent.image)
+        ent.no = 0
         if ent.row_no in ko_rows:
-            has_img = False
             ent.name = ""       # 「按原片」屏蔽命名的有效视图（照抄原描述文字）
             ent.my_desc = ""    # 自填描述同屏蔽（§3.4-2）；盘面原值不动
-        if not has_img:
-            ent.no = 0
+            continue
+        if not ent.image:
             continue
         unit = next((("g", gi) for gi, g in enumerate(units) if ent.row_no in g),
                     ("s", ent.row_no))
@@ -1585,6 +1593,39 @@ def assign_numbers(ents: list[Entity], groups: list[list[int]] | None = None,
             seen[unit] = seq
         ent.no = seen[unit]
     return ents
+
+
+def effective_units(ents: list[Entity], groups: list[list[int]] | None = None,
+                    decisions: dict[int, str] | None = None) -> list[dict]:
+    """**五点同源装配**（AT-16 B1b）：行→图号→提交清单→确认快照→资产清单的唯一口径。
+
+    同一份有效映射（清单当前「资产图」绑定 + 组 + 行决策）装配成按图号升序的发号单位：
+        {"no": 图号, "row_no": 主行号, "rows": [行号…], "urls": [...], "url": 末张绑定,
+         "entity": Entity}
+    渲染侧读 ents.no（render_assets / entity_roll_call），提交侧读本函数
+    （automation.replace.effective_entries）——两端不再各有一套合同。
+    「不静默丢图」=保护**当前有效绑定**：清空/覆盖/dismiss 后旧 URL 已不在清单 → 自动出局；
+    restore 后重新入列（不是无差别保留历史图）。
+    """
+    ents = assign_numbers(ents, groups, decisions)
+    out: list[dict] = []
+    index: dict[int, dict] = {}
+    for ent in ents:
+        if not ent.no:
+            continue
+        item = index.get(ent.no)
+        if item is None:
+            item = {"no": ent.no, "row_no": ent.row_no, "rows": [ent.row_no],
+                    "urls": image_urls(ent.image), "entity": ent}
+            index[ent.no] = item
+            out.append(item)
+        else:
+            item["rows"].append(ent.row_no)
+            item["urls"] += image_urls(ent.image)
+    out.sort(key=lambda x: x["no"])
+    for item in out:
+        item["url"] = item["urls"][-1] if item["urls"] else ""   # 末张=最新绑定（覆盖/重传后为准）
+    return out
 
 
 def load_merge_overlay(sidecar_path) -> tuple[list[list[int]], dict[int, str]]:
@@ -2105,9 +2146,20 @@ def render_assets(ents: list[Entity], layers: dict[str, str], pid: str) -> str:
     ]
     next_no = 0
     pending: list[str] = []
+    unbound_brand: list[Entity] = []
     for ent in ents:
         if ent.kind.startswith("品牌视觉"):
-            continue            # 置换位在下面单独成行，不走备图/占号
+            # AT-16 B1b 第五点：品牌行绑了图 → 与备图行同表同号（不再另列无编号占位）；
+            # 未绑图 → 走文末置换位占位行（不占号、不猜图）。
+            if not ent.no:
+                unbound_brand.append(ent)
+                continue
+            next_no = max(next_no, ent.no)
+            nimg = len(image_urls(ent.image))
+            what = ent.label().replace("|", "／") + f"（已备图 {nimg} 张）"
+            out.append(f"| 图片{ent.no} | {BRAND_VISUAL_CATEGORY} | 清单第 {ent.row_no} 行 · {what}"
+                       f" | {ent.lock or '客户品牌字样（待填）'} |")
+            continue
         kind = KIND_TO_ASSET_TYPE.get(ent.kind)
         if not kind:
             raise Fail(EXIT_INPUT, f"待确认清单里有未知类别「{ent.kind}」（只认 主体/人物/场景/道具）")
@@ -2128,17 +2180,18 @@ def render_assets(ents: list[Entity], layers: dict[str, str], pid: str) -> str:
 
     # 第十层品牌字/包装字 → 「品牌视觉（置换位）」（2026-11-04 路 A 审计 B4；T6-G 双保险）：
     # 首选收待确认清单里的品牌视觉行（免「建议」条件——意图回填会把该列清空，真机对照
-    # pop2-source-2 因此丢过整行；人工填的命名/描述也随行带上）。清单行被人工删掉时
-    # 退回「十」层探测，置换位仍在。字幕/标语/角标/水印是文案位，生成端占位即可，
+    # pop2-source-2 因此丢过整行；人工填的命名/描述也随行带上）。AT-16 B1b：绑了图的品牌行
+    # 已在上面与备图行同表同号，这里只列**未绑图**的品牌行；清单里根本没有品牌行时才退回
+    # 「十」层探测，置换位仍在。字幕/标语/角标/水印是文案位，生成端占位即可，
     # 没有可备的图，不进资产表。
-    brand_ents = [e for e in ents if e.kind.startswith("品牌视觉")]
-    if brand_ents:
-        for e in brand_ents:
+    if unbound_brand:
+        for e in unbound_brand:
             head = f"{e.name}：" if e.name else ""
             desc = (head + (e.my_desc.strip() or e.seen)).replace("|", "／")
             out.append(f"| — | {BRAND_VISUAL_CATEGORY} | 清单第 {e.row_no} 行 · {desc}"
                        f" | {e.lock or '客户品牌字样（待填）'} |")
-    elif re.search(r"品牌字|包装字", layers.get("十", "")):
+    elif not any(e.kind.startswith("品牌视觉") for e in ents) \
+            and re.search(r"品牌字|包装字", layers.get("十", "")):
         out.append("| — | 品牌视觉（置换位） | 不要求备图：参考片品牌字/包装字原字已置换，"
                    "生成端按「客户品牌字样」占位渲染；客户定稿后把实际字样填进本行"
                    " | 客户品牌字样（待填） |")
