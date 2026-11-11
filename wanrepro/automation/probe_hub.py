@@ -124,8 +124,8 @@ def main() -> int:
         s, d = req("/api/hub/confirm/auto-0002", "POST", b"{}")
         check("无可确认置换 confirm → 409", s == 409, f"{s} {str(d)[:100]}")
     else:
-        check(f"无可确认置换 confirm → 409（auto-0001 当前 {st0001}"
-              f"{'有 pending' if pending0001 else ''}，前置不满足，不发确认防误推进）",
+        check(f"无可确认置换 confirm → 409（auto-0002 当前 {st0002}"
+              f"{'有 pending' if pending0002 else ''}，前置不满足，不发确认防误推进）",
               True, "真实任务状态依赖断言，按当前状态如实跳过")
 
     # ── 3. 摄取幂等（真建一条→复投 HIT→清理） ─────────────────
