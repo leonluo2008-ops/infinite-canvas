@@ -28,7 +28,7 @@ import urllib.request
 from contextlib import nullcontext
 from pathlib import Path
 
-from . import bridge, config, replace, state
+from . import bridge, config, local_assets, replace, state
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 sys.stderr.reconfigure(encoding="utf-8", errors="replace")
@@ -256,8 +256,13 @@ def dispatch_of(task: dict) -> dict:
 
 
 def _dispatch_write(task_dir: Path, guard, phase: str, *, note: str = "",
-                    job: str | None = None, carrier: str | None = None) -> dict:
-    """落一次 dispatch 阶段（**单独一次原子写**，与外呼严格分先后：先落盘再发请求）。"""
+                    job: str | None = None, carrier: str | None = None,
+                    asset_host: list | None = None) -> dict:
+    """落一次 dispatch 阶段（**单独一次原子写**，与外呼严格分先后：先落盘再发请求）。
+
+    asset_host：可选，装配链自述的图床来源列表（AT-14 B3 A）——给了就在**同一次 save** 里
+    落 task["asset_host"]，不另开写盘窗口。
+    """
     with guard():
         task = state.load(task_dir)
         cur = dispatch_of(task)
@@ -265,6 +270,8 @@ def _dispatch_write(task_dir: Path, guard, phase: str, *, note: str = "",
                  "job": job if job is not None else str(cur.get("job") or ""),
                  "carrier": carrier if carrier is not None else str(cur.get("carrier") or "")}
         task["dispatch"] = entry
+        if asset_host is not None:
+            task["asset_host"] = list(asset_host)
         state.save(task_dir, task)
         return task
 
@@ -385,7 +392,12 @@ def _submit_images(task: dict) -> list[str]:
 
 
 def url_to_data_url(url: str, no: int) -> str:
-    """公网图 URL → dataUrl（万相 CLI 只解 dataUrl）。下载失败即抛=前置拒绝，不花钱。"""
+    """公网图 URL → dataUrl（万相 CLI 只解 dataUrl）。下载失败即抛=前置拒绝，不花钱。
+
+    错误分两类（AT-14 B3：过期的重传，网络抖的重试——文案让员工一眼知道怎么办）：
+      · 403/404/410 = 图床直链已失效 → 「已过期，请重传」；
+      · 其余（连不上/超时/IO）→ 「不可用，请重试」。
+    """
     u = str(url or "").strip()
     if u.lower().startswith("data:image/"):
         return u
@@ -396,8 +408,12 @@ def url_to_data_url(url: str, no: int) -> str:
         with urllib.request.urlopen(req, timeout=60) as resp:
             blob = resp.read()
             ctype = (resp.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+    except urllib.error.HTTPError as e:
+        if e.code in (403, 404, 410):
+            raise GenError(f"参考图 {no} 已过期（HTTP {e.code}）——图已过期，请重传") from None
+        raise GenError(f"参考图 {no} 不可用（HTTP {e.code}）——图片不可用，请重试") from None
     except (urllib.error.URLError, TimeoutError, OSError) as e:
-        raise GenError(f"参考图 {no} 下载失败（{u[:80]}）：{e}") from None
+        raise GenError(f"参考图 {no} 不可用（{e}）——图片不可用，请重试") from None
     if not blob:
         raise GenError(f"参考图 {no} 是 0 字节（{u[:80]}）")
     if len(blob) > 20 * 1024 * 1024:
@@ -406,23 +422,97 @@ def url_to_data_url(url: str, no: int) -> str:
     return f"data:{mime};base64," + base64.b64encode(blob).decode("ascii")
 
 
-def _sdgf_payload(prompt: str, params: dict, images: list[str], ch: dict) -> tuple[str, dict]:
+# 装配体元素的 dataUrl mime（按落盘扩展名；jpg/jpeg 同 mime）
+_DATAURL_MIME = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg", "webp": "image/webp"}
+
+
+def _assemble_images(refs: list[str], api_format: str) -> list[dict]:
+    """引用列表 → 装配体 images 元素（AT-14 B3 A：提交时才装配，复用既有链）。
+
+    三类输入：
+      · local 引用 → 本地读字节转 dataUrl（**零网络请求**）；读失败=前置拒绝（图丢了让员工重传）；
+      · data:image → 原样透传（已是装配体形态）；
+      · 老 https URL → wan 转 dataUrl（url_to_data_url）；sdgf 原样带 url
+        （服务端 sdgf_plan 对 {name,url} / {name,dataUrl} 两种都原生收）。
+    元素 name 按图号固定（图片N / imgN），组内去重语义在 _submit_images，已保证序号=原图号序。
+    """
+    items: list[dict] = []
+    for i, u in enumerate(refs, 1):
+        u = str(u or "").strip()
+        if local_assets.is_ref(u):
+            try:
+                blob = local_assets.read(u)
+            except local_assets.LocalAssetError:
+                raise GenError(f"参考图 {i} 本地资产缺失（{u}）——请重传") from None
+            _lid, name = local_assets.parse_ref(u)
+            ext = name.rsplit(".", 1)[-1]
+            mime = _DATAURL_MIME.get(ext, "image/png")
+            items.append({"name": f"图片{i}.{ext}",
+                          "dataUrl": f"data:{mime};base64," + base64.b64encode(blob).decode("ascii")})
+        elif u.lower().startswith("data:image/"):
+            items.append({"name": f"图片{i}", "dataUrl": u})
+        elif u.lower().startswith("http"):
+            if api_format == "wan":
+                items.append({"name": f"图片{i}", "dataUrl": url_to_data_url(u, i)})
+            else:
+                items.append({"name": f"img{i}", "url": u})
+        else:
+            raise GenError(f"参考图 {i} 不是可用的引用（local 引用/dataUrl/公网 URL）：{u[:80]!r}")
+    return items
+
+
+def _sdgf_payload(prompt: str, params: dict, items: list[dict], ch: dict) -> tuple[str, dict]:
     body = {"prompt": prompt, "duration": params["duration"], "ratio": params["ratio"],
             "resolution": params["resolution"], "audio": params["audio"], "confirm": True,
             "channel": {"baseUrl": ch["baseUrl"], "apiKey": ch["apiKey"], "model": ch["model"]}}
-    if images:
-        body["images"] = [{"name": f"img{i}", "url": u} for i, u in enumerate(images, 1)]
+    if items:
+        body["images"] = items                 # 元素可带 url 或 dataUrl——服务端 sdgf_plan 两种都收
     return "/api/sdgf/video/run", body
 
 
-def _wan_payload(prompt: str, params: dict, images: list[str], ch: dict) -> tuple[str, dict]:
-    """万相派发（§2.1 R2 IMPL）：URL → dataUrl 按原图号顺序转换，走 wan 承载端点（不派 SDGF 体）。"""
+def _wan_payload(prompt: str, params: dict, items: list[dict], ch: dict) -> tuple[str, dict]:
+    """万相派发（§2.1 R2 IMPL）：装配体直接消费（元素都是 dataUrl），走 wan 承载端点（不派 SDGF 体）。"""
     body = {"prompt": prompt, "duration": params["duration"], "ratio": params["ratio"],
             "resolution": params["resolution"], "audio": params["audio"], "confirm": True}
-    if images:
-        body["images"] = [{"name": f"图片{i}", "dataUrl": url_to_data_url(u, i)}
-                          for i, u in enumerate(images, 1)]
+    if items:
+        body["images"] = items
     return "/api/wan/video/run", body
+
+
+def ref_state(ref: str, timeout: float = 8.0) -> str:
+    """引用健康态（AT-14 B3 probe 面板数据源）：local|ok|expired|unknown。
+
+    local 引用看盘上文件在不在（不猜、不发网络请求）；data:image 恒 ok；
+    https 先 HEAD 失败再 GET：200/206=ok，403/404/410=expired，其余=unknown。
+    **禁止**按文件名猜「本地有没有同名副本」——真源只有引用串自己。
+    """
+    u = str(ref or "").strip()
+    if local_assets.is_ref(u):
+        try:
+            local_assets.read(u)
+            return "local"
+        except local_assets.LocalAssetError:
+            return "expired"
+    if u.lower().startswith("data:image/"):
+        return "ok"
+    if not u.lower().startswith("http"):
+        return "unknown"
+
+    def _probe(method: str) -> str:
+        req = urllib.request.Request(u, method=method,
+                                     headers={"User-Agent": "Mozilla/5.0 (wanrepro-hub)"})
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return "ok" if resp.status in (200, 206) else "unknown"
+        except urllib.error.HTTPError as e:
+            if e.code in (403, 404, 410):
+                return "expired"
+            return "unknown"
+        except (urllib.error.URLError, TimeoutError, OSError):
+            return "unknown"
+
+    st = _probe("HEAD")
+    return st if st != "unknown" else _probe("GET")
 
 
 def _pre_reject(task_dir: Path, guard, message: str, *, note: str = "",
@@ -437,8 +527,12 @@ def _pre_reject(task_dir: Path, guard, message: str, *, note: str = "",
 
 
 def _enter_generating(task_dir: Path, guard, *, job: str, cloud: str, carrier: str = "",
-                      gen_task_id: str = "", note: str = "云端已收单") -> dict:
-    """进入 generating：gen_job / 云端 id / dispatch=confirmed **同一次 save 原子写**（§2.4）。"""
+                      gen_task_id: str = "", note: str = "云端已收单",
+                      extra: dict | None = None) -> dict:
+    """进入 generating：gen_job / 云端 id / dispatch=confirmed **同一次 save 原子写**（§2.4）。
+
+    extra：附加键（如 AT-14 B3 的 asset_host）并入同一次 transition 的 extra——不另写盘。
+    """
     with guard():
         task = state.load(task_dir)
         if task["state"] == "generating":
@@ -447,7 +541,8 @@ def _enter_generating(task_dir: Path, guard, *, job: str, cloud: str, carrier: s
                          extra={"gen_job": job, "gen_task_id": gen_task_id,
                                 "cloud_task_id": cloud, "gen_error": "",
                                 "dispatch": {"phase": "confirmed", "at": state._now(),
-                                             "note": note, "job": job, "carrier": carrier}},
+                                             "note": note, "job": job, "carrier": carrier},
+                                **(extra or {})},
                          note=note)
         return state.load(task_dir)
 
@@ -716,9 +811,12 @@ def do_submit(task_dir: Path, verbose: bool = True,
     try:
         ch = channel(gen_channel, api_key=api_key)
         images = _submit_images(task)
-        endpoint, body = (_wan_payload(prompt, params, images, ch)
+        # AT-14 B3 A：提交时才装配（local 引用读本地/dataUrl 透传/老 https 经既有下载链），
+        # 时序合同=必须在 _dispatch_write(prepared) 之前；GenError 仍走 _pre_reject（不扣费）。
+        items = _assemble_images(images, ch["apiFormat"])
+        endpoint, body = (_wan_payload(prompt, params, items, ch)
                           if ch["apiFormat"] == "wan"
-                          else _sdgf_payload(prompt, params, images, ch))
+                          else _sdgf_payload(prompt, params, items, ch))
     except GenError as e:
         _pre_reject(task_dir, guard, str(e), note=f"前置拒绝：{safe_error(e, secret, 200)}",
                     secret=secret)
@@ -746,9 +844,11 @@ def do_submit(task_dir: Path, verbose: bool = True,
         if not carrier:
             _mark_submit_unknown(task_dir, guard, reason="万相承载端点没回任务号", secret=secret)
             raise GenError("万相承载端点没回任务号——提交结果未知，已阻断")
-        # 云端 id 未回执前**不进 generating**（生成态必须与确定回执同盘）；这里只记承载
+        # 云端 id 未回执前**不进 generating**（生成态必须与确定回执同盘）；这里只记承载。
+        # asset_host 如实落账：wan 是本地读字节转 dataUrl（零图床），不伪称 uguu（AT-14 B3 A7）
         _dispatch_write(task_dir, guard, "dispatched",
-                        note="万相承载任务已建（等云端 id 回执）", job=job, carrier=carrier)
+                        note="万相承载任务已建（等云端 id 回执）", job=job, carrier=carrier,
+                        asset_host=["local-dataurl"] * len(items))
         if verbose:
             print(f"[提交] 万相承载 {carrier}（job={job}；云端 id 待回执）")
         return _poll_wan(task_dir, job=job, carrier=carrier, guard=guard, verbose=verbose,
@@ -758,8 +858,11 @@ def do_submit(task_dir: Path, verbose: bool = True,
     if not cloud:
         _mark_submit_unknown(task_dir, guard, reason="创建响应里没有任务 id", secret=secret)
         raise GenError("提交结果未知（创建响应没有任务 id）——已阻断，先核对渠道无单")
+    # AT-14 B3 A7：服务端装配链自述的图床来源（imageSources）如实落账（同一次 guard 写盘）
+    sources = out.get("imageSources")
+    extra = {"asset_host": list(sources)} if isinstance(sources, list) else None
     _enter_generating(task_dir, guard, job=job, cloud=cloud, gen_task_id=cloud,
-                      note="提交生成（gen_job 与云端 id 同盘）")
+                      note="提交生成（gen_job 与云端 id 同盘）", extra=extra)
     if verbose:
         print(f"[提交] job={job} taskId={cloud}（思念云普遍 5 分钟+）")
     return _poll_sdgf(task_dir, job=job, cloud=cloud, guard=guard, verbose=verbose,

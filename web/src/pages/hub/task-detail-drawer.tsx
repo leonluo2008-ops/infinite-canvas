@@ -1,6 +1,6 @@
 import { ArrowRight, CheckCircle2, CircleAlert, Download, FileText, ImageOff, LoaderCircle, MoreHorizontal, RefreshCw, Sparkles, Type, Upload } from "lucide-react";
 import { App, Button, Checkbox, Drawer, Dropdown, Empty, Image as AntdImage, Input, Modal, Radio, Select, Slider, Tag, Tooltip } from "antd";
-import { useCallback, useEffect, useMemo, useRef, useState, type DragEvent } from "react";
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type DragEvent } from "react";
 import { Streamdown } from "streamdown";
 
 import { ModelPicker } from "@/components/model-picker";
@@ -48,6 +48,7 @@ import {
     groupHubRows,
     hubOutputUrl,
     postHubAsset,
+    probeHubAssets,
     retryHubTask,
     revokeHubTask,
     rollbackHubTask,
@@ -104,6 +105,9 @@ export function TaskDetailDrawer({
     const [loadError, setLoadError] = useState("");
     const [lastUpdated, setLastUpdated] = useState<number | null>(null);
     const [busy, setBusy] = useState<BusyKind>(null);
+    // AT-14 B3：资产引用健康态（显示 URL → local|ok|expired|unknown）；旧任务里失效图床直链据此
+    // 出「图已过期，请重传 / 图片不可用，请重试」，正常引用不打扰（缺键=不显示）。
+    const [assetStates, setAssetStates] = useState<Record<string, string>>({});
     const seqRef = useRef(0);
     const reportedStateRef = useRef("");
 
@@ -122,6 +126,18 @@ export function TaskDetailDrawer({
                 reportedStateRef.current = next.state;
                 onStateChange(localId, next.state);
             }
+            // 引用健康态独立拉（服务端 60s 缓存）：不阻塞详情渲染，失败一律静默（面板退化=不提示）。
+            void probeHubAssets(localId)
+                .then((rows) => {
+                    if (seq !== seqRef.current) return;
+                    const states: Record<string, string> = {};
+                    for (const row of rows) {
+                        if (row.display) states[row.display] = row.state;
+                        if (row.ref) states[row.ref] = row.state;
+                    }
+                    setAssetStates(states);
+                })
+                .catch(() => undefined);
         } catch (error) {
             if (seq !== seqRef.current) return;
             setLoadError(errorText(error));
@@ -179,6 +195,7 @@ export function TaskDetailDrawer({
     const titleName = summary?.task_name || summary?.local_id || "任务详情";
 
     return (
+        <AssetStateContext.Provider value={assetStates}>
         <Drawer
             open={open}
             onClose={onClose}
@@ -285,6 +302,7 @@ export function TaskDetailDrawer({
                 </div>
             )}
         </Drawer>
+        </AssetStateContext.Provider>
     );
 }
 
@@ -1589,11 +1607,41 @@ function FrameWithPosition({ card, className = "" }: { card: HubAssetCard; class
     );
 }
 
-/** 传图/清空并排的上传区（图床公网直链 → 定向写清单；组卡传代表行=全组联动）。 */
+/** 资产引用健康态（AT-14 B3）：显示 URL → local|ok|expired|unknown。由 Drawer 顶层注入，
+ *  卡片深处（AssetUploadZone）直接取——避免把一份只读映射逐层穿过七个子组件。 */
+const AssetStateContext = createContext<Record<string, string>>({});
+
+/**
+ * 已传图缩略块（AT-14 B3 旧 URL 三态）：正常引用照常出图；确证失效（403/404/410 → expired）
+ * 出「图已过期，请重传」；未证实（超时/网络 → unknown）出「图片不可用，请重试」。
+ * 两态都**不**自行猜本地副本、也不把破图当成功——重传走既有退回置换通道（同一上传区）。
+ */
+function UploadedThumb({ url, state, n }: { url: string; state: string; n: number }) {
+    if (state === "expired" || state === "unknown") {
+        const expired = state === "expired";
+        return (
+            <div
+                data-hub-asset-state={state}
+                className="flex aspect-video w-40 flex-col items-center justify-center gap-1 rounded-md border border-dashed border-red-300 bg-red-50/60 px-2 text-center text-[11px] leading-tight text-red-600 dark:border-red-700 dark:bg-red-950/30 dark:text-red-400"
+            >
+                <span className="font-medium">{expired ? "图已过期，请重传" : "图片不可用，请重试"}</span>
+                <span className="text-[10px] text-stone-400 dark:text-stone-500">{expired ? "图床直链已失效（403/404）" : "连不上/超时（未证实失效）"}</span>
+            </div>
+        );
+    }
+    return (
+        <a href={url} target="_blank" rel="noreferrer" className="block">
+            <img src={url} alt={`#${n} 换图`} className="aspect-video w-40 rounded-md border border-emerald-300 bg-stone-100 object-contain dark:border-emerald-700 dark:bg-stone-900" />
+        </a>
+    );
+}
+
+/** 传图/清空并排的上传区（本地资产引用 → 定向写清单；组卡传代表行=全组联动）。 */
 function AssetUploadZone({
     taskId,
     n,
     uploaded,
+    assetStates,
     busy,
     setBusy,
     onWritten,
@@ -1602,6 +1650,8 @@ function AssetUploadZone({
     taskId: string;
     n: number;
     uploaded: string[];
+    /** 显示 URL → 引用健康态（AT-14 B3 旧 URL 三态）；缺键/正常值一律照常出图。 */
+    assetStates?: Record<string, string>;
     busy: BusyKind;
     setBusy: (kind: BusyKind) => void;
     onWritten: () => void;
@@ -1611,13 +1661,15 @@ function AssetUploadZone({
     const fileInputRef = useRef<HTMLInputElement>(null);
     const dragDepthRef = useRef(0);
     const [dragActive, setDragActive] = useState(false);
+    const ctxAssetStates = useContext(AssetStateContext);
+    const states = assetStates ?? ctxAssetStates;
 
     const uploadOne = async (file: File) => {
         if (busy) return;
         setBusy("upload");
         try {
-            const url = await uploadHubImage(file);
-            const result = await postHubAsset(taskId, { n, image_url: url });
+            const uploadedRef = await uploadHubImage(file, taskId);
+            const result = await postHubAsset(taskId, { n, image_url: uploadedRef.ref });
             message.success(result.组?.length ? `已换图，#${result.组.join("、#")} 全组生效` : `#${n} 已换图`);
             onWritten();
         } catch (error) {
@@ -1659,11 +1711,7 @@ function AssetUploadZone({
         <div className="flex min-w-0 flex-1 flex-col justify-center gap-1.5">
             {uploaded.length ? (
                 <div className="flex flex-wrap items-stretch gap-2">
-                    {uploaded.map((url) => (
-                        <a key={url} href={url} target="_blank" rel="noreferrer" className="block">
-                            <img src={url} alt={`#${n} 换图`} className="aspect-video w-40 rounded-md border border-emerald-300 bg-stone-100 object-contain dark:border-emerald-700 dark:bg-stone-900" />
-                        </a>
-                    ))}
+                    {uploaded.map((url) => <UploadedThumb key={url} url={url} state={states[url] || ""} n={n} />)}
                 </div>
             ) : null}
             <div className="flex flex-wrap items-center gap-2">

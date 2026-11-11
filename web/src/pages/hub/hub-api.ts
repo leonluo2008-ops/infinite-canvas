@@ -556,20 +556,64 @@ export async function postHubAsset(localId: string, payload: { n: number; image_
     });
 }
 
+/** 本地引用串形态（与 automation/local_assets.py 的 REF_RE 逐字对齐）：local:任务号/asset-uploads/16位hex.扩展名 */
+const LOCAL_REF_RE = /^local:[0-9A-Za-z_-]{1,64}\/asset-uploads\/[0-9a-f]{16}\.(?:png|jpg|jpeg|webp)$/;
+
+export function isLocalAssetRef(value: string): boolean {
+    return LOCAL_REF_RE.test(String(value || "").trim());
+}
+
+/** 本地引用 → 前端可直接 <img>/<a> 的服务端取图 URL；非本地引用原样返回（显示层唯一换算点）。 */
+export function hubAssetDisplayUrl(value: string): string {
+    const u = String(value || "").trim();
+    const m = LOCAL_REF_RE.exec(u);
+    if (!m) return u;
+    const parts = u.slice("local:".length).split("/");
+    return `/api/hub/asset-file/${encodeURIComponent(parts[0])}/${encodeURIComponent(parts[2])}`;
+}
+
 /**
- * 单图 → 图床公网 HTTPS 直链（POST /api/asset/upload）。
- * 通道收原始字节 + X-Filename 头（非 multipart），与 services/api/video.ts 的 SDGF 参考图同一条桥端路由。
+ * 单图上传（POST /api/asset/upload）。
+ *
+ * AT-14 B3：带 taskId（X-Task-Id 头）→ 服务端只落本地引用、不碰图床；提交时才由后端装配成
+ * 渠道要的形态。返回 ref 写进任务数据（pending_replace[].url），display 供 <img> 直接用。
+ * 不带 taskId 或旧服务端回了公网直链 → ref=display=https 直链（向旧行为兼容，非静默降级：
+ * source 如实带回，调用方按需展示）。
  */
-export async function uploadHubImage(file: File): Promise<string> {
+export async function uploadHubImage(file: File, taskId?: string): Promise<{ ref: string; display: string; source: string }> {
     const name = encodeURIComponent(file.name || `ref-${Date.now()}.png`);
-    const data = await request<{ url?: string }>("/api/asset/upload", {
+    const headers: Record<string, string> = { "X-Filename": name, "Content-Type": "application/octet-stream" };
+    if (taskId) headers["X-Task-Id"] = encodeURIComponent(taskId);
+    const data = await request<{ url?: string; local?: string; source?: string }>("/api/asset/upload", {
         method: "POST",
-        headers: { "X-Filename": name, "Content-Type": "application/octet-stream" },
+        headers,
         body: file,
     });
+    const local = typeof data.local === "string" ? data.local.trim() : "";
+    if (isLocalAssetRef(local)) return { ref: local, display: hubAssetDisplayUrl(local), source: "local" };
     const url = typeof data.url === "string" ? data.url : "";
-    if (!/^https:\/\//.test(url)) throw new Error(`图床未返回公网 HTTPS 直链：${JSON.stringify(data).slice(0, 120)}`);
-    return url;
+    if (!/^https:\/\//.test(url)) throw new Error(`上传未返回本地引用或公网 HTTPS 直链：${JSON.stringify(data).slice(0, 120)}`);
+    return { ref: url, display: url, source: typeof data.source === "string" ? data.source : "" };
+}
+
+/** 资产引用健康态（POST /api/hub/asset-probe/{id}）：ref=数据层原串，state=local|ok|expired|unknown，display=显示 URL。 */
+export type HubAssetProbe = { ref: string; state: string; display: string };
+
+export async function probeHubAssets(localId: string): Promise<HubAssetProbe[]> {
+    const data = await request<{ refs?: unknown[] }>(`/api/hub/asset-probe/${encodeURIComponent(localId)}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{}",
+    });
+    const rows = Array.isArray(data.refs) ? data.refs : [];
+    return rows
+        .map((raw) => (raw && typeof raw === "object" ? (raw as JsonRecord) : {}))
+        .map((item) => ({
+            ref: hubText(item.ref),
+            state: hubText(item.state) || "unknown",
+            display: hubText(item.display),
+        }))
+        .filter((item) => item.ref || item.display);
 }
 
 export async function renderHubTask(localId: string): Promise<{ state?: string; preview?: HubRenderPreview | null; prompt_md?: string }> {

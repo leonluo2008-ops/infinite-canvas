@@ -574,8 +574,8 @@ function AssetReplaceCard({ card, taskId, onWritten }: { card: HubAssetCard; tas
         if (busy) return;
         setBusy("upload");
         try {
-            const url = await uploadHubImage(file);
-            await postHubAsset(taskId, { n: card.n, image_url: url });
+            const uploadedRef = await uploadHubImage(file, taskId);
+            await postHubAsset(taskId, { n: card.n, image_url: uploadedRef.ref });
             message.success(`#${card.n} 已换图`);
             onWritten();
         } catch (error) {

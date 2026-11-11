@@ -16,6 +16,7 @@ import re
 import shutil
 import sys
 import threading
+import time
 import traceback
 import urllib.parse
 import uuid
@@ -27,7 +28,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from automation import cards, config as auto_config, discuss, frames, generate, ingest, replace, selfcheck, state  # noqa: E402
+from automation import cards, config as auto_config, discuss, frames, generate, ingest, local_assets, replace, selfcheck, state  # noqa: E402
 
 # 任务目录根的**唯一来源** = automation.config.PROJECTS_DIR（认 WANREPRO_AUTO_DIR）。
 # 禁止在这里另写一个 ROOT/"automation"/"projects"：硬编码会让「设 env 起隔离实例」变成
@@ -266,7 +267,11 @@ def get_task(local_id: str) -> dict:
         "prompt_md": _read(_prompt_path(task_dir, task)),
         # AT-9 B5 自检合同：渲染完成时落盘的 自检.json 三条 {项,结论,证据}；无文件 → None（前端「未检查」）
         "自检": selfcheck.load_selfcheck(task_dir),
-        "pair_lines": task.get("pending_replace") or [],
+        # AT-14 B3 B1b：pair_lines 回显过显示层（local 引用 → /api/hub/asset-file/...），
+        # 构造新 list，不原地改任务数据
+        "pair_lines": [{**line, "url": _display_refs([str(line.get("url") or "")])[0]}
+                       if isinstance(line, dict) else line
+                       for line in (task.get("pending_replace") or [])],
         # AT-8 B2：置换台视觉包（合同 v3）。只读面——写路径见 set_asset。
         "asset_cards": cards.build(str(task.get("bridge_id") or ""), local_id),
         # AT-12 N1 行决策两集合（服务端真源）：按原片行 = keep_origin ∪ dismissed（置换区折叠归此），
@@ -413,7 +418,11 @@ def do_assets(local_id: str, image_paths: list[Path]) -> dict:
     except replace.ReplaceError as e:
         raise HubError(str(e)) from None
     task = state.load(task_dir)
-    return {"state": run, "filled": task.get("pending_replace") or []}
+    return {"state": run,
+            # B1b：filled 回显过显示层（local 引用 → 服务端取图 URL），数据层 pending_replace 不变
+            "filled": [{**item, "url": _display_refs([str(item.get("url") or "")])[0]}
+                       if isinstance(item, dict) else item
+                       for item in (task.get("pending_replace") or [])]}
 
 
 def do_confirm(local_id: str, empty_confirm: bool = False,
@@ -643,6 +652,15 @@ def lock_remaining(bridge: str) -> list[int]:
     return sorted(must - free)
 
 
+def _display_refs(urls: list) -> list[str]:
+    """回显列表：local 引用 → 服务端取图 URL（前端 <img> 能直接用），其余原样（AT-14 B3 A3）。"""
+    out = []
+    for u in urls or []:
+        u = str(u or "").strip()
+        out.append(local_assets.display_url(u) if local_assets.is_ref(u) else u)
+    return out
+
+
 def set_asset(local_id: str, n: int, *, image_url: str | None = None,
               clear: bool = False, text: str | None = None,
               decision: str | None = None) -> dict:
@@ -676,8 +694,11 @@ def set_asset(local_id: str, n: int, *, image_url: str | None = None,
     url = None
     if image_url:
         url = str(image_url).strip()
-        if not url.startswith("https://"):
-            raise HubError(f"image_url 必须是公网 HTTPS（SDGF 只收公网图）：{image_url!r}")
+        # AT-14 B3 A：本地引用（local:任务号/asset-uploads/文件名）与公网 https 同级收——
+        # 提交时才由 generate._assemble_images 装配成渠道要的形态，这里不再强转图床。
+        if not (local_assets.is_ref(url) or url.startswith("https://")):
+            raise HubError("image_url 必须是公网 HTTPS 或本地引用 "
+                           f"local:任务号/asset-uploads/文件名：{image_url!r}")
     with task_lock(local_id):
         if decision is not None:
             # ---- AT-11 §3.2/§3.5：单行降级/恢复（行决策覆盖） ----
@@ -706,7 +727,7 @@ def set_asset(local_id: str, n: int, *, image_url: str | None = None,
                                               clear=clear, text=text)
                 return {"ok": True, "task_id": local_id, "n": n, "组": out["members"],
                         "rows": [{"n": r["no"],
-                                  "已传图": cards.split_urls(r.get("cur_assets") or ""),
+                                  "已传图": _display_refs(cards.split_urls(r.get("cur_assets") or "")),
                                   "命名": r.get("name") or ""} for r in out["rows"]]}
             if url:
                 row = replace.set_row(bridge, n, image_urls=[url], overwrite=True)
@@ -719,8 +740,44 @@ def set_asset(local_id: str, n: int, *, image_url: str | None = None,
         except replace.ReplaceError as e:
             raise HubError(str(e)) from None
     return {"ok": True, "task_id": local_id, "n": n,
-            "已传图": cards.split_urls(row.get("cur_assets") or ""),
+            "已传图": _display_refs(cards.split_urls(row.get("cur_assets") or "")),
             "命名": row.get("name") or ""}
+
+
+# 引用健康态缓存（AT-14 B3 A3）：键=引用串，值=(时间戳, state)。ref_state 对 https 要发
+# HEAD/GET（秒级），前端探针面板逐卡轮询会把图床打痛——60 秒内同引用直接复用上次结论。
+_ASSET_PROBE_TTL = 60.0
+_ASSET_PROBE_CACHE: dict[str, tuple[float, str]] = {}
+
+
+def probe_assets(local_id: str) -> dict:
+    """POST /api/hub/asset-probe/<local_id> —— 该任务全部资产引用的健康态。
+
+    扫 pending_replace（会话流水）与 assets_confirmed（确认落账）里的引用，去重保序；
+    每个引用过 generate.ref_state：local（盘上在=local/丢=expired）/ok（data:image）/
+    expired|unknown（公网直链）。display = 前端可直接 <img> 的 URL。
+    """
+    task = state.load(_task_dir(local_id))
+    refs: list[str] = []
+    for source in (task.get("pending_replace") or [], task.get("assets_confirmed") or []):
+        for item in source:
+            if not isinstance(item, dict):
+                continue
+            u = str(item.get("url") or "").strip()
+            if u and u not in refs:                       # 去重保序：首次出现的位置为准
+                refs.append(u)
+    now = time.time()
+    out = []
+    for ref in refs:
+        cached = _ASSET_PROBE_CACHE.get(ref)
+        if cached is not None and now - cached[0] < _ASSET_PROBE_TTL:
+            st = cached[1]
+        else:
+            st = generate.ref_state(ref)
+            _ASSET_PROBE_CACHE[ref] = (now, st)
+        display = local_assets.display_url(ref) if local_assets.is_ref(ref) else ref
+        out.append({"ref": ref, "state": st, "display": display})
+    return {"refs": out}
 
 
 # ---------------------------------------------------------------- 确认组端点（AT-9 B2）

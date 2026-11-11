@@ -23,7 +23,7 @@ import re
 import sys
 from pathlib import Path
 
-from . import bridge, config, state
+from . import bridge, config, local_assets, state
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 sys.stderr.reconfigure(encoding="utf-8", errors="replace")
@@ -471,10 +471,16 @@ def run_replace(task_dir: Path, *, assets: list[str] | None, map_spec: str | Non
 
     filled = []
     for no, img in pairs:
-        up = bridge.upload_asset(img)
-        url = up.get("url") or ""
-        if not url.startswith("https://"):
-            raise ReplaceError(f"图 {img.name} 上传未回公网 HTTPS（SDGF 只收公网图）: {up}")
+        # AT-14 B3 A：带 task_id 上传 → 服务端落本地引用，清单/流水存引用串（提交时才装配）；
+        # 旧服务端不认 X-Task-Id 时不回 local，回退 url（公网 HTTPS），两者都不合法才抛。
+        up = bridge.upload_asset(img, task_id=str(task.get("local_id") or ""))
+        ref = str(up.get("local") or "")
+        if local_assets.is_ref(ref):
+            url = ref
+        else:
+            url = str(up.get("url") or "")
+            if not url.startswith("https://"):
+                raise ReplaceError(f"图 {img.name} 上传未回公网 HTTPS（SDGF 只收公网图）: {up}")
         md = fill_row(md, no, [url], names.get(no))
         filled.append({"no": no, "img": img.name, "url": url,
                        "name": names.get(no, ""), "desc": by_no[no]["desc"][:40]})

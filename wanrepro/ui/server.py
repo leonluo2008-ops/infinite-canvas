@@ -54,6 +54,7 @@ if _NOWINDOW_DIR not in sys.path:
 import hub_api  # noqa: E402 —— 自动化工作台业务层（内部自行把 wanrepro/ 加进 sys.path）
 os.environ["PYTHONPATH"] = _NOWINDOW_DIR + (os.pathsep + os.environ["PYTHONPATH"] if os.environ.get("PYTHONPATH") else "")
 import sitecustomize  # noqa: E402  （_nowindow 目录；import 即安装 subprocess 无窗口补丁）
+from automation import config as auto_config, local_assets  # noqa: E402  AT-14 B3 本地资产（config.PROJECTS_DIR 与 hub TASKS_DIR 同源）
 
 ANALYSIS = ROOT / "analysis" / "reverse"
 RAW = ROOT / "原始资料"
@@ -667,6 +668,18 @@ def decode_data_url(raw: str, name: str) -> tuple[bytes, str]:
 
 PUBLIC_IMAGE_TUNNEL = "https://vc-t.aistar.work/vc/"   # 图床降级直链前缀
 
+# 上传渠道计数（AT-14 B3 A2，/api/hub/where 透出）：local=本地引用（零图床），
+# uguu=转传成功，tunnel=降级隧道。只增不减，进程内诊断面用。
+ASSET_COUNTERS = {"local": 0, "uguu": 0, "tunnel": 0}
+_ASSET_COUNTERS_LOCK = threading.Lock()
+
+
+def _bump_asset_counter(source: str) -> None:
+    key = "tunnel" if source == "local-tunnel" else source
+    if key in ASSET_COUNTERS:
+        with _ASSET_COUNTERS_LOCK:
+            ASSET_COUNTERS[key] += 1
+
 
 def upload_uguu_bytes(data: bytes, name: str) -> str:
     """转传 uguu（Pomf API）返回直链；任何异常返回空串由调用方降级。
@@ -704,7 +717,9 @@ def store_public_image(data: bytes, raw_name: str) -> tuple[str, str]:
     dest.parent.mkdir(parents=True, exist_ok=True)
     dest.write_bytes(data)
     url = upload_uguu_bytes(data, safe_name)
-    return (url, "uguu") if url else (f"{PUBLIC_IMAGE_TUNNEL}{key}", "local-tunnel")
+    source = "uguu" if url else "local-tunnel"
+    _bump_asset_counter(source)                   # 计数只旁路观察，不改返回形状
+    return (url, source) if url else (f"{PUBLIC_IMAGE_TUNNEL}{key}", source)
 
 
 def wan_prepare_task(prompt: str, images: list) -> str:
@@ -1194,17 +1209,23 @@ def sdgf_write_record(task_id: str, data: dict) -> None:
         pass                                          # 记录写不进去不影响生成本身
 
 
-def sdgf_host_images(plan: dict) -> dict:
+def sdgf_host_images(plan: dict) -> tuple[dict, list[str]]:
     """把预演体里的图片占位换成真 URL：URL 直接用；dataUrl 字节先换公网直链。
 
     换不到就报错——宁可失败也不发一条没有参考图的请求（那会出一版跟提示词无关的片子还照样扣费）。
+    AT-14 B3 A5：同时返回每张图的**实际来源**（(body, sources)，序=images 序）——
+    调用点把它作为 imageSources 透传给 automation 落账，装配链自述不伪称。
     """
     body = dict(plan["body"])
     urls: list[str] = []
+    sources: list[str] = []
     for img in plan["images"]:
         url = img["url"]
         if not url:
-            url, _source = store_public_image(img["data"], img["name"])
+            url, source = store_public_image(img["data"], img["name"])
+            sources.append(source)
+        else:
+            sources.append("url")             # 调用方自带的直链：如实标注，不算图床上传
         if not url.lower().startswith("https://"):
             raise ApiError(502, f"参考图 {img['name']} 换公网 URL 失败（图床不可用）")
         urls.append(url)
@@ -1212,7 +1233,7 @@ def sdgf_host_images(plan: dict) -> dict:
         body["images"] = urls
     else:
         body.pop("images", None)
-    return body
+    return body, sources
 
 
 def sdgf_job_update(job_id: str, **fields) -> None:
@@ -1892,8 +1913,27 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/hub/where":
             # 数据根自述（诊断面）：探针跑前据此断言「服务端写入目录 == 探针读取目录」，
-            # 读/写分家的伪隔离直接拒跑（AT-14 B2 P0：真实任务 auto-0001 被误删）
-            self.send_json(hub_api.where())
+            # 读/写分家的伪隔离直接拒跑（AT-14 B2 P0：真实任务 auto-0001 被误删）。
+            # AT-14 B3 A2：附上传渠道计数（local/uguu/tunnel），装配链自述可对账。
+            self.send_json({**hub_api.where(), "asset_counters": dict(ASSET_COUNTERS)})
+            return
+        m = re.fullmatch(r"/api/hub/asset-file/([^/]+)/([^/]+)", path)
+        if m:
+            # AT-14 B3 A：本地引用取图（local:任务号/asset-uploads/文件名 的读面）。
+            # 为什么不能复用现有 /assets/ 路由：那条按 bridge_id 取 bridge 资产目录
+            # （analysis/reverse/<bridge_id>/assets）、且只认 图片N 扩展名；本地引用按
+            # automation local_id 分任务目录、内容寻址命名（16位hex），且在上传时就
+            # 要能取（拆解/桥任务存在之前）——两套命名两套根，塞不进同一个 handler。
+            local_id = urllib.parse.unquote(m.group(1))
+            name = urllib.parse.unquote(m.group(2))
+            try:
+                blob = local_assets.read(f"local:{local_id}/asset-uploads/{name}")
+            except local_assets.LocalAssetError as e:
+                raise ApiError(404, str(e)) from None
+            mime = {".png": "image/png", ".jpg": "image/jpeg",
+                    ".jpeg": "image/jpeg", ".webp": "image/webp"}.get(
+                        Path(name).suffix.lower(), "application/octet-stream")
+            self.send_body(blob, 200, mime)
             return
         m = re.fullmatch(r"/api/hub/task/([^/]+)", path)
         if m:
@@ -2078,6 +2118,12 @@ class Handler(BaseHTTPRequestHandler):
         # ---- 自动化工作台（hub）：建任务/拆解/置换/确认/渲染/批准/提交 ----
         if path == "/api/hub/ingest":
             self.do_hub_ingest()
+            return
+        m = re.fullmatch(r"/api/hub/asset-probe/([^/]+)", path)
+        if m:
+            # AT-14 B3 A3：该任务全部资产引用健康态（local/ok/expired/unknown + 显示URL）
+            self.read_json()                    # 无字段，读掉请求体保持 keep-alive 干净
+            self.send_json(hub_api.probe_assets(urllib.parse.unquote(m.group(1))))
             return
         m = re.fullmatch(r"/api/hub/discuss/([^/]+)", path)
         if m:
@@ -2390,12 +2436,15 @@ class Handler(BaseHTTPRequestHandler):
         self.send_body(f.read_bytes(), 200, "video/mp4")
 
     def do_asset_upload(self) -> None:
-        """POST /api/asset/upload —— 参考图字节 → 本地备份 + 转传 uguu → 公网 HTTPS 直链。
+        """POST /api/asset/upload —— 参考图上传。
 
-        SD GF 的 images 只收公网 HTTPS 域名 URL。2026-11-03 实测：器灵生成端拉
-        Cloudflare Tunnel（vc-t.aistar.work）图不稳定（网关过、生成挂），同图换
-        uguu 源即通 → 全面切 uguu（docs/技术文档-SDGF带图生成排查与图床切换uguu-20261103.md）。
-        本地落盘保留作备份；uguu 失败时降级返回本地 tunnel 直链（source 标注）。
+        AT-14 B3 A 两条路（按可选头 X-Task-Id 分流，percent-encoded）：
+          · 带任务号：只落本地引用（任务目录 asset-uploads/，内容寻址），**不碰任何图床、
+            不写 uploads/vc**——提交时才由 generate._assemble_images 装配成渠道要的形态；
+          · 不带：旧行为一字不改（本地备份 uploads/vc + 转传 uguu，失败降级隧道直链）。
+        2026-11-03 实测：器灵生成端拉 Cloudflare Tunnel（vc-t.aistar.work）图不稳定
+        （网关过、生成挂），同图换 uguu 源即通 → 旧路全面切 uguu
+        （docs/技术文档-SDGF带图生成排查与图床切换uguu-20261103.md）。
         """
         import urllib.parse as _up
         length = int(self.headers.get("Content-Length") or 0)
@@ -2404,10 +2453,26 @@ class Handler(BaseHTTPRequestHandler):
         if length > 20 * 1024 * 1024:
             raise ApiError(413, f"图片太大（{length / 1048576:.1f} MB），上限 20 MB")
         raw_name = _up.unquote(self.headers.get("X-Filename") or "ref.png")
+        data = self.rfile.read(length)
+        task_id = _up.unquote(self.headers.get("X-Task-Id") or "").strip()
+        if task_id:
+            # 新路：本地引用。任务不存在=409（不是 400：请求形态对、目标不在）。
+            if not local_assets.local_id_ok(task_id) \
+                    or not (auto_config.PROJECTS_DIR / task_id).is_dir():
+                raise ApiError(409, f"任务不存在: {task_id}")
+            try:
+                ref = local_assets.store(task_id, data, raw_name)
+            except local_assets.LocalAssetError as e:
+                raise ApiError(400, str(e)) from None
+            with _ASSET_COUNTERS_LOCK:
+                ASSET_COUNTERS["local"] += 1
+            self.send_json({"url": local_assets.display_url(ref), "local": ref,
+                            "bytes": length, "source": "local"})
+            return
+        # 旧路（无 X-Task-Id）：uguu + 隧道降级 + uploads/vc 备份，一字不改
         suffix = Path(raw_name).suffix.lower()
         if suffix not in {".png", ".jpg", ".jpeg", ".webp"}:
             raise ApiError(400, f"参考图只收 png/jpg/webp（收到 {suffix or '无扩展名'}）")
-        data = self.rfile.read(length)
         url, source = store_public_image(data, raw_name)
         self.send_json({"url": url, "bytes": length, "source": source})
 
@@ -2763,7 +2828,7 @@ class Handler(BaseHTTPRequestHandler):
         if not SDGF_JOBS.acquire(blocking=False):
             raise ApiError(409, "同时最多 2 条 SDGF 生成在跑（并发上限），稍后再试")
         try:
-            body = sdgf_host_images(plan)                 # dataUrl → 公网 URL（dry 不走到这里）
+            body, sources = sdgf_host_images(plan)    # dataUrl → 公网 URL（dry 不走到这里）
             task_id = sdgf_create(plan["channel"]["baseUrl"], plan["key"], body)
         except BaseException:
             SDGF_JOBS.release()
@@ -2779,7 +2844,8 @@ class Handler(BaseHTTPRequestHandler):
         threading.Thread(target=sdgf_run_job,
                          args=(job_id, task_id, plan["channel"]["baseUrl"], plan["key"], plan["request"]),
                          daemon=True, name=f"sdgf-video-{sdgf_safe_id(task_id)}").start()
-        self.send_json({"job": job_id, "taskId": task_id, "dry": False})
+        self.send_json({"job": job_id, "taskId": task_id, "dry": False,
+                        "imageSources": sources})   # AT-14 B3 A5：装配来源如实透传（dry 分支不带）
 
     def serve_sdgf_video(self, task_id: str) -> None:
         """GET /api/sdgf/video/file/<taskId> —— 本地成片（bridge 代下，凭证不出服务端）。

@@ -101,16 +101,19 @@ def upload_video(video: Path) -> dict:
     return out
 
 
-def upload_asset(image: Path) -> dict:
-    """POST /api/asset/upload（原始字节 + X-Filename）→ {url, bytes, source}。
+def upload_asset(image: Path, task_id: str | None = None) -> dict:
+    """POST /api/asset/upload（原始字节 + X-Filename）→ {url, local, bytes, source}。
 
-    url 是公网 HTTPS 直链（uguu 优先，失败降级 local-tunnel——server.py:1607）；
-    SDGF images 只收公网 HTTPS，调用方须校验 url 前缀。
+    AT-14 B3 A：给 task_id 时加 X-Task-Id 头 → 服务端只落本地引用，**优先用 local
+    本地引用**（提交时才装配）；不给 task_id = 旧行为，url 是公网 HTTPS 直链
+    （uguu 优先，失败降级 local-tunnel——server.py do_asset_upload），调用方须校验前缀。
     """
     encoded = urllib.parse.quote(image.name, safe="")
+    headers = {"Content-Type": "application/octet-stream", "X-Filename": encoded}
+    if task_id:
+        headers["X-Task-Id"] = urllib.parse.quote(str(task_id), safe="")
     return _request("POST", "/api/asset/upload", body=image.read_bytes(), timeout=120,
-                    headers={"Content-Type": "application/octet-stream",
-                             "X-Filename": encoded})
+                    headers=headers)
 
 
 def tasks() -> list[dict]:

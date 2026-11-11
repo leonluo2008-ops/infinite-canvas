@@ -223,9 +223,11 @@ def run() -> int:
         real_store = server.store_public_image
         server.store_public_image = lambda data, name: ("https://mock.host/ref.png", "uguu")
         try:
-            hosted = server.sdgf_host_images(data_plan)
+            hosted, sources = server.sdgf_host_images(data_plan)
             ok &= check(hosted["images"] == ["https://mock.host/ref.png"],
                         "真提交前 dataUrl 换公网 URL（占位被替换）", str(hosted.get("images")))
+            ok &= check(sources == ["uguu"],
+                        "装配链自述来源 sources == ['uguu']", str(sources))
         finally:
             server.store_public_image = real_store
 
