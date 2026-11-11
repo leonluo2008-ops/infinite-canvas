@@ -66,7 +66,7 @@ import {
     type HubTaskSummary,
 } from "./hub-api";
 import { lapianClockTexts, lapianStageName, useLapianClock } from "./lapian-clock";
-import { deleteGuard, HubStateTag } from "./hub-status";
+import { deleteGuard, HubStateTag, SubmitResultLine } from "./hub-status";
 
 /** 九宫格粗标配色（同帧多目标分色，AT-9 层1）。 */
 const OVERLAY_COLORS = [
@@ -169,6 +169,9 @@ export function TaskDetailDrawer({
     const summary: HubTaskSummary | null = detail
         ? { ...detail, task_name: detail.task_name || task?.task_name || detail.local_id }
         : task;
+    // AT-16 B5a-1：抽屉顶部与详情头共用同一份提交诊断（详情有就用详情的，回落到列表摘要）。
+    // 三处（列表 / 详情头 / 抽屉顶部）同一来源 = hub_api._summary → automation/submit_view.build。
+    const submitView = detail?.submit ?? summary?.submit ?? undefined;
 
     const reload = useCallback(() => void load(), [load]);
 
@@ -208,7 +211,7 @@ export function TaskDetailDrawer({
             title={
                 <div className="flex min-w-0 flex-wrap items-center gap-2 pr-8">
                     <span className="truncate text-base font-semibold">{titleName}</span>
-                    <HubStateTag state={state} />
+                    <HubStateTag state={state} submit={submitView} />
                 </div>
             }
         >
@@ -232,9 +235,14 @@ export function TaskDetailDrawer({
                             <div className="min-w-0 flex-1">
                                 <div className="flex flex-wrap items-center gap-2">
                                     <span className="font-mono text-sm font-semibold">{summary.local_id}</span>
-                                    <HubStateTag state={state} />
+                                    <HubStateTag state={state} submit={submitView} />
                                     <span className="text-xs text-stone-400 dark:text-stone-500">{summary.video_name || "参考视频"}</span>
                                     {summary.created_at ? <span className="text-xs text-stone-400 dark:text-stone-500">建于 {formatTime(summary.created_at)}</span> : null}
+                                </div>
+                                {/* AT-16 B5a-1：提交结果就地可见（结论 + 短错误码 + 可展开的可能原因/脱敏原文），
+                                    与主表行内同一个组件、同一份摘要字段（三处同源）。 */}
+                                <div className="mt-2">
+                                    <SubmitResultLine submit={submitView} />
                                 </div>
                                 <div className="mt-2 whitespace-pre-wrap break-words text-sm leading-6 text-stone-700 dark:text-stone-200">
                                     <span className="mr-1 font-medium text-stone-500 dark:text-stone-400">改造意图：</span>

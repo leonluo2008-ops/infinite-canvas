@@ -28,7 +28,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from automation import cards, config as auto_config, discuss, frames, generate, ingest, local_assets, replace, selfcheck, state  # noqa: E402
+from automation import cards, config as auto_config, discuss, frames, generate, ingest, local_assets, replace, selfcheck, state, submit_view  # noqa: E402
 
 # 任务目录根的**唯一来源** = automation.config.PROJECTS_DIR（认 WANREPRO_AUTO_DIR）。
 # 禁止在这里另写一个 ROOT/"automation"/"projects"：硬编码会让「设 env 起隔离实例」变成
@@ -199,6 +199,11 @@ def _summary(task: dict, task_dir: Path) -> dict:
         "gen_progress": task.get("gen_progress"),
         "has_pending_replace": bool(task.get("pending_replace")),
         "has_output": out,
+        # AT-16 B5a-1（审计 A2 闭合）：最小提交诊断 + 人话说明走**同一个生产函数**
+        # （automation/submit_view.build），列表摘要与详情同源——5 秒轮询刷新后错误不会消失。
+        # 判定源全是既有持久事实（active_submit/dispatch.phase/submit_unknown/gen_error/
+        # state/cloud id），本层不新造状态、不另起端点。
+        "submit": submit_view.build(task, active_submit=_active_submit(task["local_id"])),
     }
 
 

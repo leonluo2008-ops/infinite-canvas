@@ -4,7 +4,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 
 import { errorText, listHubTasks, type HubTaskSummary } from "./hub-api";
-import { deleteGuard, HubStateTag } from "./hub-status";
+import { deleteGuard, HubStateTag, SubmitResultLine } from "./hub-status";
 import { lapianClockTexts, lapianStageName, useLapianClock } from "./lapian-clock";
 import { LegacyHubView } from "./legacy-view";
 import { NewTaskModal } from "./new-task-modal";
@@ -88,10 +88,13 @@ function HubTableView() {
             title: "状态",
             dataIndex: "state",
             key: "state",
-            width: 200,
+            width: 240,
             render: (_, task) => (
                 <div className="space-y-1">
-                    <HubStateTag state={task.state} />
+                    {/* AT-16 B5a-1：有提交结果就用四类形态说话（不再只按 state 显示「已批准·待提交」）；
+                        结论/原文来自摘要的 submit 字段，5 秒轮询刷新后照旧在——不靠临时 toast。 */}
+                    <HubStateTag state={task.state} submit={task.submit} />
+                    <SubmitResultLine submit={task.submit} />
                     {task.state === "discussing" ? <LapianStageCell task={task} /> : null}
                 </div>
             ),

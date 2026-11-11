@@ -8,6 +8,9 @@
  */
 
 import type { IngestOutcome } from "@/lib/hub/ingest-hit";
+import type { HubSubmitForm, HubSubmitView } from "@/lib/hub/gen-settings";
+
+export type { HubSubmitForm, HubSubmitView };
 
 export type HubTaskState = "ingested" | "discussing" | "awaiting_assets" | "rendering" | "awaiting_approval" | "approved" | "generating" | "done" | "failed";
 
@@ -35,6 +38,12 @@ export type HubTaskSummary = {
     /** 已换资产数 "已换/必换"（实时计算，如 "1/2"）。 */
     replaced?: string;
     has_pending_replace?: boolean;
+    /**
+     * AT-16 B5a-1 最小提交诊断 + 人话说明（后端 automation/submit_view.build 一处生产）。
+     * 列表只靠摘要就能说清「提交到哪一步 / 下一步做什么」，不拉详情；
+     * 旧 bridge 缺字段 → 归一成 {form:"none"}（不假装有结果）。
+     */
+    submit?: HubSubmitView;
 };
 
 /**
@@ -317,6 +326,8 @@ export async function listHubTasks(): Promise<HubTaskSummary[]> {
         replaced: hubText(row.replaced),
         bridge_id: hubText(row.bridge_id) || undefined,
         lapian: normalizeLapianAnchors(row.lapian),
+        // 列表只靠摘要就能说清提交结果（5 秒轮询整表替换也不会把错误信息抹掉）
+        submit: normalizeSubmitView(row.submit),
     }));
 }
 
@@ -339,6 +350,8 @@ export async function getHubTask(localId: string): Promise<HubTaskDetail> {
         active_submit: Boolean(task.active_submit),
         submit_lost: normalizeSubmitLost(task.submit_lost),
         lapian: normalizeLapianAnchors(task.lapian),
+        // 与摘要同一条生产函数（_summary → submit_view.build）：详情头/抽屉顶部/列表三处同源
+        submit: normalizeSubmitView(task.submit),
         // 阶段文案与锚同一条透传口径（异构历史值 → 空串，不出 repr）
         stage: contractText(task.stage),
         lapian_stage: contractText(task.lapian_stage),
@@ -405,6 +418,53 @@ function normalizeSubmitLost(value: unknown): HubSubmitLost | null {
         step: Number.isFinite(step) ? Math.round(step) : undefined,
         submit_lost: Boolean(raw.submit_lost),
         reason,
+    };
+}
+
+/**
+ * 提交结果诊断归一（AT-16 B5a-1）：只认后端 `submit_view.build` 的合法形态，
+ * 形态不在四种之内（旧 bridge / 畸形值）→ 一律 `{form:"none"}`（不假装有提交结果）。
+ * 文案数组逐项取非空字符串——空串/非字符串直接丢，不把 undefined 印到界面上。
+ */
+export function normalizeSubmitView(value: unknown): HubSubmitView {
+    const empty: HubSubmitView = {
+        form: "none",
+        label: "",
+        conclusion: "",
+        causes: [],
+        guidance: [],
+        error_code: "",
+        raw: "",
+        dispatch_phase: "",
+        submit_unknown: false,
+        active_submit: false,
+        has_gen_error: false,
+        cloud_task_id: "",
+        blocks_retry: false,
+        can_resume: false,
+    };
+    if (!value || typeof value !== "object") return empty;
+    const raw = value as JsonRecord;
+    const form = hubText(raw.form).trim() as HubSubmitForm;
+    const forms: HubSubmitForm[] = ["none", "unknown", "rejected", "inflight", "failed"];
+    if (!forms.includes(form)) return empty;
+    const texts = (input: unknown): string[] =>
+        Array.isArray(input) ? input.map((item) => hubText(item).trim()).filter(Boolean) : [];
+    return {
+        form,
+        label: hubText(raw.label).trim(),
+        conclusion: hubText(raw.conclusion).trim(),
+        causes: texts(raw.causes),
+        guidance: texts(raw.guidance),
+        error_code: hubText(raw.error_code).trim(),
+        raw: hubText(raw.raw),
+        dispatch_phase: hubText(raw.dispatch_phase).trim(),
+        submit_unknown: Boolean(raw.submit_unknown),
+        active_submit: Boolean(raw.active_submit),
+        has_gen_error: Boolean(raw.has_gen_error),
+        cloud_task_id: hubText(raw.cloud_task_id).trim(),
+        blocks_retry: Boolean(raw.blocks_retry),
+        can_resume: Boolean(raw.can_resume),
     };
 }
 

@@ -558,6 +558,8 @@ export type GenIssueDetail = {
     dispatch?: { phase?: string; at?: string; note?: string } | string | null;
     cloud_task_id?: string;
     active_submit?: boolean;
+    /** AT-16 B5a-1：后端 submit_view.build 的透出（四类形态 + 人话 + 动作许可）。旧 bridge 缺 → 走既有事实判定。 */
+    submit?: HubSubmitView | null;
     submit_lost?: {
         step?: number;
         reason?: string;
@@ -569,7 +571,40 @@ export type GenIssueDetail = {
     } | null;
 };
 
-export type GenIssueKind = "none" | "active" | "blocked" | "orphan";
+/**
+ * 提交结果四类形态（AT-16 B5a-1）：**判定在后端** `automation/submit_view.py` 一处，
+ * 前端只按 form 分发文案与动作许可，不再自己按 state+gen_error 重判（禁造第二份判定）。
+ *   unknown  结果未知（可能已收单）→ 禁重提，给核对/解除/续查
+ *   rejected 前置拒绝（渠道 400/409 / 本地预检）→ 可改后重提
+ *   inflight 在途 / 等待超时 → 按 taskId 续查，禁重提
+ *   failed   明确渠道失败且无未知阻断 → 可重试
+ */
+export type HubSubmitForm = "none" | "unknown" | "rejected" | "inflight" | "failed";
+
+/** 后端 submit_view.build 的返回形状（最小提交诊断 + 人话说明，摘要与详情同源）。 */
+export type HubSubmitView = {
+    form: HubSubmitForm;
+    /** 状态标签短文案（列表 / 详情头 / 抽屉顶部同一份） */
+    label: string;
+    /** 人话结论（一句话，含下一步） */
+    conclusion: string;
+    /** 可能原因**并列**（不翻译成唯一原因） */
+    causes: string[];
+    /** 怎么处理（指向真实存在的入口） */
+    guidance: string[];
+    error_code: string;
+    raw: string;
+    dispatch_phase: string;
+    submit_unknown: boolean;
+    active_submit: boolean;
+    has_gen_error: boolean;
+    cloud_task_id: string;
+    blocks_retry: boolean;
+    can_resume: boolean;
+};
+
+export type GenIssueKind = "none" | "active" | "blocked" | "orphan" | "rejected" | "failed";
+
 
 export type GenIssue = {
     kind: GenIssueKind;
@@ -581,7 +616,10 @@ export type GenIssue = {
     canResume: boolean;
     /** 禁止直接重提（阻断/在途一律 true）。 */
     blocksRetry: boolean;
+    /** AT-16 B5a-1：后端四类形态（有 submit 透出时原样带上，供探针/UI 按形态断言）。 */
+    form?: HubSubmitForm;
 };
+
 
 export function genDispatchPhase(detail: GenIssueDetail | null | undefined): string {
     const raw = detail?.dispatch;
@@ -598,8 +636,32 @@ export function genIssue(detail: GenIssueDetail | null | undefined): GenIssue {
     const phase = genDispatchPhase(detail);
     const active = Boolean(detail.active_submit);
 
+    // AT-16 B5a-1：四类形态的**判定在后端**（automation/submit_view.py 一处）。前端只按 form
+    // 分发文案与动作许可，不自己按 state+gen_error 重判（禁造第二份判定）。
+    // 旧 bridge 没有 submit 字段 → form 为空 → 退回下面既有的事实判定（向后兼容，语义不变）。
+    const sv = detail.submit && detail.submit.form ? detail.submit : null;
+    const form = sv && sv.form !== "none" ? sv.form : "";
+    const svCauses = sv && Array.isArray(sv.causes) ? sv.causes : [];
+    const svGuidance = sv && Array.isArray(sv.guidance) ? sv.guidance : [];
+    /** 有后端人话就用它（结论/可能原因/指引/动作许可）；没有就保留既有文案。 */
+    const say = (base: GenIssue): GenIssue =>
+        sv
+            ? {
+                  ...base,
+                  form: sv.form,
+                  title: sv.conclusion || base.title,
+                  detail: svCauses.length ? svCauses.join(" ") : base.detail,
+                  steps: svGuidance.length ? svGuidance : base.steps,
+                  cloudTaskId: base.cloudTaskId || sv.cloud_task_id || "",
+                  canResume: Boolean(sv.can_resume),
+                  blocksRetry: Boolean(sv.blocks_retry),
+              }
+            : base;
+    /** 只带形态标记（孤儿三步的细文案比四类形态更具体，不能被摘要口径覆盖）。 */
+    const tagForm = (base: GenIssue): GenIssue => (sv ? { ...base, form: sv.form } : base);
+
     if (active) {
-        return {
+        return say({
             kind: "active",
             title: "提交进行中",
             detail: "这个任务已有提交在跑（排队 / 已发出等云端回执）——别重复点，重复提交会重复扣费。",
@@ -607,12 +669,12 @@ export function genIssue(detail: GenIssueDetail | null | undefined): GenIssue {
             cloudTaskId,
             canResume: false,
             blocksRetry: true,
-        };
+        });
     }
 
     const unknown = detail.submit_unknown;
     if (unknown) {
-        return {
+        return say({
             kind: "blocked",
             title: "提交结果未知 · 已阻断重提",
             detail: String(unknown.reason || "已尝试发出但没拿到确定回执：云端可能已收单。"),
@@ -624,11 +686,11 @@ export function genIssue(detail: GenIssueDetail | null | undefined): GenIssue {
             cloudTaskId,
             canResume: Boolean(cloudTaskId),
             blocksRetry: true,
-        };
+        });
     }
 
     if (phase === "prepared" || phase === "dispatched") {
-        return {
+        return say({
             kind: "blocked",
             title: `提交未拿到确定回执（dispatch=${phase}）`,
             detail: phase === "prepared" ? "提交意图已落盘，但服务端没记录到「已发出」——云端大概率没收单，仍需人工核对。" : "请求已发出，但没拿到回执——云端可能已收单。",
@@ -640,14 +702,14 @@ export function genIssue(detail: GenIssueDetail | null | undefined): GenIssue {
             cloudTaskId,
             canResume: Boolean(cloudTaskId),
             blocksRetry: true,
-        };
+        });
     }
 
     const lost = detail.submit_lost;
     const lostStep = Number(lost?.step) || 0;
     if (state === "generating" && lost && (lost.submit_lost || lostStep === 1 || lostStep === 2)) {
         if (lostStep === 1) {
-            return {
+            return tagForm({
                 kind: "active",
                 title: "提交进行中",
                 detail: String(lost.reason || "有活跃提交占用。"),
@@ -655,10 +717,10 @@ export function genIssue(detail: GenIssueDetail | null | undefined): GenIssue {
                 cloudTaskId,
                 canResume: false,
                 blocksRetry: true,
-            };
+            });
         }
         if (lostStep === 2) {
-            return {
+            return tagForm({
                 kind: "orphan",
                 title: "有云端在途任务 · 按 taskId 续查",
                 detail: String(lost.reason || (cloudTaskId ? `云端 taskId ${cloudTaskId} 仍在跑/已出片。` : "云端仍有在途证据。")),
@@ -666,9 +728,9 @@ export function genIssue(detail: GenIssueDetail | null | undefined): GenIssue {
                 cloudTaskId,
                 canResume: true,
                 blocksRetry: true,
-            };
+            });
         }
-        return {
+        return tagForm({
             kind: "orphan",
             title: "疑似孤儿（无在途证据、无成片）",
             detail: String(lost.reason || "generating 但无活跃提交、无云端 taskId、无成片。"),
@@ -680,7 +742,59 @@ export function genIssue(detail: GenIssueDetail | null | undefined): GenIssue {
             cloudTaskId,
             canResume: false,
             blocksRetry: true,
-        };
+        });
+    }
+
+    // ② 结果未知（含兜底：有 gen_error 但 facts 证明不了「没被收单」）→ 先核对，禁重提
+    if (form === "unknown") {
+        return say({
+            kind: "blocked",
+            title: "结果未知：可能已收单，先核对",
+            detail: "",
+            steps: [],
+            cloudTaskId,
+            canResume: Boolean(cloudTaskId),
+            blocksRetry: true,
+        });
+    }
+
+    // ③ 前置拒绝（渠道 400/409 / 本地预检 → 受控回退 awaiting_approval）→ 改完可重提
+    if (form === "rejected") {
+        return say({
+            kind: "rejected",
+            title: "已拒绝：可改后重提",
+            detail: "",
+            steps: [],
+            cloudTaskId,
+            canResume: false,
+            blocksRetry: false,
+        });
+    }
+
+    // ④ 明确渠道失败（无未知阻断）→ 可重试
+    if (form === "failed") {
+        return say({
+            kind: "failed",
+            title: "失败：可重试",
+            detail: "",
+            steps: [],
+            cloudTaskId,
+            canResume: false,
+            blocksRetry: false,
+        });
+    }
+
+    // ⑤ 在途 / 等待超时（列表摘要没有 submit_lost 时，这里也必须有话说）
+    if (form === "inflight") {
+        return say({
+            kind: "active",
+            title: "云端处理中 · 按 taskId 续查",
+            detail: "",
+            steps: [],
+            cloudTaskId,
+            canResume: Boolean(cloudTaskId),
+            blocksRetry: true,
+        });
     }
 
     return none;
