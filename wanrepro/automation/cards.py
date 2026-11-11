@@ -258,6 +258,55 @@ def _layers(bridge_id: str) -> dict:
     return _split(_summary_markdown(bridge_id))
 
 
+# ---------------------------------------------------------------- 分镜表时段（AT-15 S1）
+
+def _relaxed_bounds(shots_layer: str, total: float) -> dict[int, tuple[float, float]]:
+    """分镜表宽松复算：严格闸门（confirm 消歧 v2）整表被拒时的第二路（AT-15 S1 止血）。
+
+    严格闸门要求「末段右端 ≈ 片长（±0.5s）」——片尾带品牌定格/尾卡的片（pop-1：分镜表止
+    00:05、片长 6.04s）会因此整表被打回，代表帧全落中段兜底（现场 auto-0036 八卡同帧）。
+    宽松路只做四件事：读得出 ∧ 段内有序 ∧ 按镜号单调 ∧ 单镜不越界；读法固定 mm:ss
+    （frames.clock_seconds 的文档口径，与拆解.md 分镜表同一套）；单镜越界即丢该镜、不丢整表，
+    整表不足两镜则不认（单镜表无法自证）。
+    """
+    rows = _confirm()._clock_span_rows(shots_layer)   # 复用 confirm 的表行解析，不另造一套
+    raw: dict[int, tuple[float, float]] = {}
+    for shot, start_token, end_token in rows:
+        start, end = frames.clock_seconds(start_token), frames.clock_seconds(end_token)
+        if start is None or end is None or end <= start or start < 0:
+            continue
+        if total > 0 and end > total + 0.5:            # 越界镜：这个读法不可信，丢镜不丢表
+            continue
+        raw[int(shot)] = (start, end)
+    if len(raw) < 2:
+        return {}
+    ordered = sorted(raw.items())
+    for (_no1, (_start1, end1)), (_no2, (start2, _end2)) in zip(ordered, ordered[1:]):
+        if start2 < end1 - 0.01:                      # 段间不单调 → 整表不认
+            return {}
+    return raw
+
+
+def shot_bounds(shots_layer: str, total: float | None) -> dict[int, tuple[float, float]]:
+    """七 分镜表 → {镜号: (起秒, 止秒)}：严格闸门优先，整表被拒才走宽松复算（AT-15 S1）。
+
+    严格路 = confirm.parse_shot_times（歧义 token 全表联判）；它的结果非空就原样用，
+    宽松路只在「一条都读不出」时兜底，老片（pop-4 等）行为零变化。
+    """
+    strict = _confirm().parse_shot_times(shots_layer, total or None) or {}
+    out: dict[int, tuple[float, float]] = {}
+    for shot, pair in strict.items():
+        try:
+            start, end = frames.clock_seconds(pair[0]), frames.clock_seconds(pair[1])
+            number = int(shot)
+        except (TypeError, ValueError, IndexError):
+            continue
+        if start is None or end is None or end <= start:
+            continue
+        out[number] = (start, end)
+    return out or _relaxed_bounds(shots_layer, total or 0.0)
+
+
 # ---------------------------------------------------------------- 意图建议（AT-10 C1）
 
 INTENT_NAME = "意图建议.md"
@@ -385,34 +434,41 @@ def build(bridge_id: str, local_id: str) -> list[dict]:
     bounds: dict[int, tuple[float, float]] = {}
     shots_layer = layers.get("七 分镜表", "")
     if shots_layer:
-        shot_times = _confirm().parse_shot_times(shots_layer, total or None)
-        for shot, (start_text, end_text) in shot_times.items():
-            start, end = frames.clock_seconds(start_text), frames.clock_seconds(end_text)
-            if start is None or end is None or end <= start:
-                continue
-            try:
-                bounds[int(shot)] = (start, end)
-            except (TypeError, ValueError):
-                continue
+        bounds = shot_bounds(shots_layer, total)
     suggested = load_suggested_shots(bridge_id)
-    shared: dict[tuple, dict] = {}      # 组装级去重：("shot", 镜号) / ("fallback", 中段秒) → 同一帧对象
+    shared: dict[tuple, dict] = {}      # 组装级去重：("shot", 镜号) / ("frame", url) / ("fallback", 中段秒)
     box_cache: dict[int, list] = {}     # AT-10 C2：帧内框集合按镜缓存（同一镜只组装一次，同帧多卡复用）
 
-    def representative(no: int, payload: dict) -> dict:
-        """该行代表帧：① 画面位置键所指镜 ② 意图建议里第一个可用镜 ③ 整片中段兜底。"""
+    def representative(no: int, payload: dict, row_frames: list[dict]) -> dict:
+        """该行代表帧（AT-15 S1 四级回退链）：
+
+        ① 画面位置键所指镜（镜次直取——pop-1 式拆解只有「画面位置：九宫格5·镜2」，没有「出现于」）
+        ② 意图建议.md 里第一个可用镜
+        ③ 本行「帧」列表里首个 定位=精确 的时段帧（镜次未知 → 不标镜次、不画框）
+        ④ 整片中段兜底（诚实兜底，最后一路）
+        镜次越界/查不到（分镜表没这镜）→ 顺延下一路，不炸、不拿他镜帧冒充。
+        """
         pos = payload.get("画面位置")
         shot = pos.get("镜次") if isinstance(pos, dict) else None
-        if not (isinstance(shot, int) and shot in bounds):
+        if isinstance(shot, bool) or not isinstance(shot, int) or shot not in bounds:
             shot = next((cand for cand in suggested.get(no) or [] if cand in bounds), None)
-        if shot is None:
-            key: tuple = ("fallback", round((total or 0.0) / 2, 2))
+        if shot is not None:
+            key: tuple = ("shot", shot)
             if key not in shared:
-                shared[key] = frames.build_fallback_frame(bridge_id, local_id, video)
+                start, end = bounds[shot]
+                shared[key] = frames.build_shot_frame(bridge_id, local_id, shot, start, end, cache, video)
             return shared[key]
-        key = ("shot", shot)
+        exact = next((frame for frame in row_frames
+                      if frame.get("定位") == "精确" and frame.get("url")), None)
+        if exact is not None:
+            key = ("frame", str(exact.get("url")))
+            if key not in shared:
+                shared[key] = {"url": exact.get("url") or "", "秒": exact.get("秒"),
+                               "镜次": None, "定位": "精确", "来源": "时段帧"}
+            return shared[key]
+        key = ("fallback", round((total or 0.0) / 2, 2))
         if key not in shared:
-            start, end = bounds[shot]
-            shared[key] = frames.build_shot_frame(bridge_id, local_id, shot, start, end, cache, video)
+            shared[key] = frames.build_fallback_frame(bridge_id, local_id, video)
         return shared[key]
 
     cards: list[dict] = []
@@ -428,7 +484,7 @@ def build(bridge_id: str, local_id: str) -> list[dict]:
             located = "未定位"
         elif any(frame.get("定位") == "未精确定位" for frame in shots):
             located = "未精确定位"
-        rep_frame = representative(no, payload)
+        rep_frame = representative(no, payload, shots)
         # AT-10 C2 帧内框：代表帧精确定位且镜次是 int → 该镜框集合（按镜缓存），逐卡 copy 打「本卡」；
         # 未定位 / 镜次非 int → []（不画框不标镜次）；本行无九宫格键 → 不产生自己的框但保留同镜他人的框
         rep_boxed = rep_frame.get("定位") == "精确" and isinstance(rep_frame.get("镜次"), int) \

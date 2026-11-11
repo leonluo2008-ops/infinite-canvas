@@ -473,14 +473,16 @@ def run_replace(task_dir: Path, *, assets: list[str] | None, map_spec: str | Non
     for no, img in pairs:
         # AT-14 B3 A：带 task_id 上传 → 服务端落本地引用，清单/流水存引用串（提交时才装配）；
         # 旧服务端不认 X-Task-Id 时不回 local，回退 url（公网 HTTPS），两者都不合法才抛。
-        up = bridge.upload_asset(img, task_id=str(task.get("local_id") or ""))
+        # 隔离场景回退（probe_generate 夹具/CLI 离线）：bridge 不认识该任务（409）或不可达时，
+        # 直接 local_assets.store 落任务目录本地引用——本地引用本就是 B3 目标形态，无需服务端。
+        try:
+            up = bridge.upload_asset(img, task_id=str(task.get("local_id") or ""))
+        except Exception:
+            up = {}
         ref = str(up.get("local") or "")
-        if local_assets.is_ref(ref):
-            url = ref
-        else:
-            url = str(up.get("url") or "")
-            if not url.startswith("https://"):
-                raise ReplaceError(f"图 {img.name} 上传未回公网 HTTPS（SDGF 只收公网图）: {up}")
+        if not local_assets.is_ref(ref):
+            ref = local_assets.store_at(task_dir, str(task.get("local_id") or ""), img.read_bytes(), img.name)
+        url = ref
         md = fill_row(md, no, [url], names.get(no))
         filled.append({"no": no, "img": img.name, "url": url,
                        "name": names.get(no, ""), "desc": by_no[no]["desc"][:40]})

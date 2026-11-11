@@ -105,9 +105,19 @@ def store(local_id: str, data: bytes, raw_name: str) -> str:
         raise LocalAssetError("参考图是空的（0 字节）——请重传")
     if len(data) > MAX_BYTES:
         raise LocalAssetError(f"参考图太大（{len(data) / 1048576:.1f} MB），上限 20 MB")
+    return store_at(asset_dir(local_id), local_id, data, raw_name)
+
+
+def store_at(task_dir: Path, local_id: str, data: bytes, raw_name: str) -> str:
+    """同 store，但字节落在调用方给的任务目录（隔离夹具的任务根不在全局 PROJECTS_DIR 时用，
+    防止探针/CLI 离线场景往真实 projects 写入）。引用串格式与 store 完全一致。"""
+    if not isinstance(data, (bytes, bytearray)) or not data:
+        raise LocalAssetError("参考图是空的（0 字节）——请重传")
+    if len(data) > MAX_BYTES:
+        raise LocalAssetError(f"参考图太大（{len(data) / 1048576:.1f} MB），上限 20 MB")
     ext = _sniff_ext(bytes(data), raw_name)
     name = hashlib.sha1(bytes(data)).hexdigest()[:16] + "." + ext
-    d = asset_dir(local_id)
+    d = Path(task_dir) / UPLOAD_DIR_NAME
     dest = d / name
     if not dest.is_file():                    # 同名=同内容（sha1），在就复用不重写
         d.mkdir(parents=True, exist_ok=True)
