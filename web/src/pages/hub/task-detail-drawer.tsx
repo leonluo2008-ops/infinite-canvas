@@ -1780,9 +1780,15 @@ function AssetUploadZone({
 
 // ---------------------------------------------------------------- 提示词段 + 审批/生成/成片段
 
+/** 拆解门禁条目名（与 automation/selfcheck.GATE_ITEM_NAME 同值；数据由服务端读路径汇总进 自检 束）。 */
+const GATE_ITEM_NAME = "拆解门禁";
+
 /** 提示词段：全文默认折叠可展开 + 自检结论（AT-9 B5：渲染完成自动跑；无文件=「未检查」）。 */
 function PromptSection({ detail }: { detail: HubTaskDetail }) {
     const prompt = detail.prompt_md || "";
+    // AT-15 R2：拆解门禁条目从自检束里拆出来单独渲染（绿Tag=绿项数摘要；FAIL/WARN 红条=缺项+重拆轮次）。
+    const gateItem = detail.自检?.find((item) => item.项 === GATE_ITEM_NAME) ?? null;
+    const checkItems = detail.自检?.filter((item) => item.项 !== GATE_ITEM_NAME) ?? null;
     return (
         <section className="rounded-lg border border-stone-200 bg-card p-4 dark:border-stone-800">
             <div className="flex flex-wrap items-center justify-between gap-2">
@@ -1790,8 +1796,9 @@ function PromptSection({ detail }: { detail: HubTaskDetail }) {
                     <FileText className="size-4" />
                     提示词
                 </h2>
-                <SelfCheckBadge items={detail.自检 ?? null} />
+                <SelfCheckBadge items={checkItems} />
             </div>
+            {gateItem ? <GateBadge item={gateItem} /> : null}
             {prompt ? (
                 <details className="mt-2 rounded-md border border-stone-200 dark:border-stone-800">
                     <summary className="flex cursor-pointer list-none items-center justify-between gap-2 px-3 py-2 text-sm [&::-webkit-details-marker]:hidden">
@@ -1848,6 +1855,45 @@ function SelfCheckBadge({ items }: { items: HubSelfCheckItem[] | null }) {
                         ) : null}
                     </div>
                 ))}
+            </div>
+        </details>
+    );
+}
+
+/** 拆解门禁（AT-15 R2 数据合同）：PASS → 绿 Tag 带摘要（状态/绿项数/重拆轮次）；
+ *  FAIL/WARN → 红条（可展开）写明缺项/告警逐条 + 重拆轮次。数据是 selfcheck.load_gate_item
+ *  在读路径汇总的「拆解门禁」条目，这里只做渲染不解释（红线 25）。 */
+function GateBadge({ item }: { item: HubSelfCheckItem }) {
+    const lines = (item.证据 || "").split("\n").map((line) => line.trim()).filter(Boolean);
+    const summary = lines[0] ?? "";
+    const details = lines.slice(1);
+    if (item.结论 === "PASS") {
+        return (
+            <div className="mb-2">
+                <Tag color="green" className="m-0">拆解门禁 ✓ {summary}</Tag>
+            </div>
+        );
+    }
+    const failed = item.结论 !== "WARN";
+    return (
+        <details className="mb-2 min-w-0">
+            <summary className="flex cursor-pointer list-none items-center [&::-webkit-details-marker]:hidden">
+                <Tag color={failed ? "red" : "gold"} className="m-0">
+                    {failed
+                        ? `拆解门禁 ✗ ${summary}（点开看缺项）`
+                        : `拆解门禁 ⚠ ${summary}（点开看告警）`}
+                </Tag>
+            </summary>
+            <div className="mt-2 w-[min(560px,80vw)] space-y-1 rounded-md border border-red-300 bg-red-50 p-2 text-left dark:border-red-900 dark:bg-red-950">
+                {details.length ? (
+                    details.map((line, index) => (
+                        <div key={index} className="break-words whitespace-pre-wrap text-xs leading-5 text-stone-600 dark:text-stone-300">
+                            {line}
+                        </div>
+                    ))
+                ) : (
+                    <div className="text-xs leading-5 text-stone-600 dark:text-stone-300">{summary}</div>
+                )}
             </div>
         </details>
     );

@@ -64,17 +64,78 @@ def run_selfcheck(task_dir: Path) -> list[dict]:
 
 
 def load_selfcheck(task_dir: Path) -> list[dict] | None:
-    """读 自检.json（get_task 透出用）；无文件/坏文件/非列表 → None（前端显「未检查」）。"""
+    """读 自检.json（get_task 透出用）；无文件/坏文件/非列表 → None（前端显「未检查」）。
+
+    AT-15 R2：追加一条「拆解门禁」合成条目（只读 analysis/reverse/<bridge>/门禁.json，
+    不落盘、不改 B5 自检合同的原有四项）——门禁数据是渲染后门禁步落的另一份文件，
+    前端自检面板只认 自检.json 这一束，所以在读路径汇总（白名单判据汇总位）。
+    """
+    items: list[dict] | None = None
     path = task_dir / SELFCHECK_NAME
-    if not path.is_file():
+    if path.is_file():
+        try:
+            data = json.loads(path.read_text(encoding="utf-8-sig"))
+        except (OSError, json.JSONDecodeError):
+            data = None
+        if isinstance(data, list):
+            rows = [row for row in data if isinstance(row, dict)]
+            items = rows or None
+    gate = load_gate_item(task_dir)
+    if gate is not None:
+        items = (items or []) + [gate]
+    return items
+
+
+# ---------------------------------------------------------------- 拆解门禁汇总（AT-15 R2）
+
+GATE_ITEM_NAME = "拆解门禁"          # 前端按 项==GATE_ITEM_NAME 识别并单独渲染红/绿条
+
+
+def _gate_bridge_id(task_dir: Path) -> str:
+    """任务号 → 桥 id（只读 任务.json 单键；state.load 的校验在读路径上太重）。"""
+    try:
+        data = json.loads((Path(task_dir) / "任务.json").read_text(encoding="utf-8-sig"))
+    except (OSError, json.JSONDecodeError):
+        return ""
+    return str(data.get("bridge_id") or "").strip()
+
+
+def load_gate_item(task_dir: Path) -> dict | None:
+    """analysis/reverse/<bridge>/门禁.json → 自检面板一条 {项,结论,证据}；无文件 → None。
+
+    结论三态沿用门禁自己的 verdict（PASS/WARN/FAIL）；证据第一行是摘要（状态/绿项数/
+    重拆轮次），缺项与告警逐条排在后面——前端只渲染，不解释（红线 25：渲染承接既有自检位）。
+    """
+    bridge_id = _gate_bridge_id(task_dir)
+    if not bridge_id:
+        return None
+    gate_path = ROOT / "analysis" / "reverse" / bridge_id / "门禁.json"
+    if not gate_path.is_file():
         return None
     try:
-        data = json.loads(path.read_text(encoding="utf-8-sig"))
+        gate = json.loads(gate_path.read_text(encoding="utf-8-sig"))
     except (OSError, json.JSONDecodeError):
-        return None
-    if not isinstance(data, list):
-        return None
-    return [row for row in data if isinstance(row, dict)] or None
+        gate = None
+    if not isinstance(gate, dict):
+        return {"项": GATE_ITEM_NAME, "结论": FAIL,
+                "证据": "门禁.json 读不出（拆解产物门禁留痕损坏）——如实标红，重跑拆解可重建"}
+    result = gate.get("结果") if isinstance(gate.get("结果"), dict) else {}
+    verdict = str(result.get("verdict") or "").strip().upper()
+    checks = result.get("checks") if isinstance(result.get("checks"), list) else []
+    total = len(checks)
+    passed = sum(1 for item in checks if isinstance(item, dict) and item.get("verdict") == PASS)
+    missing = [str(x) for x in (result.get("缺项") or []) if str(x).strip()]
+    warns = [str(x) for x in (result.get("告警") or []) if str(x).strip()]
+    status = str(gate.get("状态") or "").strip()
+    rounds = gate.get("轮次") if isinstance(gate.get("轮次"), int) else 0
+    limit = gate.get("上限") if isinstance(gate.get("上限"), int) else "?"
+    if not verdict:
+        verdict = FAIL if "标红" in status else (WARN if "告警" in status else PASS)
+    lines = [f"状态 {status or '未知'}｜绿项 {passed}/{total}"
+             f"｜缺项 {len(missing)}｜告警 {len(warns)}｜重拆 {rounds}/{limit}"]
+    lines += [f"❌ {item}" for item in missing]
+    lines += [f"⚠ {item}" for item in warns]
+    return {"项": GATE_ITEM_NAME, "结论": verdict, "证据": "\n".join(lines)}
 
 
 # ---------------------------------------------------------------- 三项

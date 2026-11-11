@@ -30,6 +30,42 @@ class DiscussError(RuntimeError):
     pass
 
 
+# AT-15 R2：门禁轮次进拆解日志。R1 的透出链是 mark_stage → 进度.json → job 轮询逐阶段记日志，
+# 但轮询粒度（3s）追不上门禁尾段的快速阶段变化（实测「投影」「门禁第1轮」整段被跳过），
+# 门禁轮次在拆解日志里丢线。这里在 job done 终态补账一次：读 analysis/reverse/<bridge>/门禁.json
+# （与自检面板/selfcheck.load_gate_item 同一真源，红线 25 同源不另判）追一行门禁终态，确定性落日志。
+_ANALYSIS_ROOT = Path(__file__).resolve().parents[1] / "analysis" / "reverse"
+
+
+def _gate_summary_line(bridge_id: str) -> str:
+    try:
+        gate = json.loads((_ANALYSIS_ROOT / bridge_id / "门禁.json").read_text(encoding="utf-8-sig"))
+    except (OSError, json.JSONDecodeError):
+        return ""
+    if not isinstance(gate, dict):
+        return ""
+    result = gate.get("结果") if isinstance(gate.get("结果"), dict) else {}
+    checks = result.get("checks") if isinstance(result.get("checks"), list) else []
+    passed = sum(1 for item in checks if isinstance(item, dict) and item.get("verdict") == "PASS")
+    missing = len(result.get("缺项") or [])
+    warns = len(result.get("告警") or [])
+    verdict = str(result.get("verdict") or "?")
+    rounds = gate.get("轮次") if isinstance(gate.get("轮次"), int) else 0
+    limit = gate.get("上限") if isinstance(gate.get("上限"), int) else "?"
+    return (f"门禁终态：{gate.get('状态') or '?'}｜{verdict}｜绿项 {passed}/{len(checks)}"
+            f"｜缺项 {missing}｜告警 {warns}｜重拆 {rounds}/{limit}")
+
+
+def _emit_gate_summary(task: dict, on_stage=None) -> None:
+    """job done 后补一行门禁终态（无 门禁.json = 旧任务/门禁没跑成，如实不写）。"""
+    bridge_id = str(task.get("bridge_id") or "").strip()
+    if not bridge_id:
+        return
+    line = _gate_summary_line(bridge_id)
+    if line and on_stage:
+        on_stage(line)
+
+
 def _products_ready(bridge_id: str) -> bool:
     p = state.probe_bridge_products(bridge_id)
     return bool(p and p["has_disc"] and p["has_check"] and p["has_prompt"])
@@ -83,6 +119,7 @@ def start_and_wait(task: dict, on_stage=None) -> str:
         st = rec.get("status")
         if st == "done":
             _emit(f"拆解完成（耗时 {rec.get('elapsed', '?')}s）")
+            _emit_gate_summary(task, on_stage=_emit)
             return job
         if st == "error":
             _emit(f"失败：{rec.get('error')}")
