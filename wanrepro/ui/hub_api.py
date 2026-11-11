@@ -284,6 +284,22 @@ def _active_submit(local_id: str) -> bool:
                for rec in list(HUB_JOBS.values()))
 
 
+def _submit_block_kind(task: dict, local_id: str) -> str:
+    """提交链阻断的唯一判定源（AT-13 §2.3）："" / "active" / "dispatch" / "unknown"。
+
+    start_submit 与 revoke_approval 共用本函数——API 层必须自守（前端起态门只是 UI 层）。
+    撤销批准会连根清掉 approval + SUBMIT_RUNTIME_KEYS（含 submit_unknown/dispatch），
+    若只看任务锁就能撤销，等于从 API 侧绕过「未知收单先核对」防线（可能重复付费提交）。
+    """
+    if _active_submit(local_id):
+        return "active"
+    if state.dispatch_blocks_create(task):
+        return "dispatch"
+    if task.get("submit_unknown"):
+        return "unknown"
+    return ""
+
+
 def get_task(local_id: str) -> dict:
     task_dir = _task_dir(local_id)
     task = state.load(task_dir)
@@ -1237,13 +1253,16 @@ def start_submit(local_id: str, key: str | None = None) -> dict:
     with task_lock(local_id):
         task = state.load(task_dir)
         st = task["state"]
-        if _active_submit(local_id):
+        # AT-13 §2.3：阻断判定收口到 _submit_block_kind（revoke_approval 同源共用），
+        # 判定顺序固定 active → dispatch → unknown，报错文案与旧三段 raise 逐字一致。
+        kind = _submit_block_kind(task, local_id)
+        if kind == "active":
             raise HubError("这个任务已有提交在跑（排队/执行中）——别重复点，等它出结果")
-        if state.dispatch_blocks_create(task):
+        if kind == "dispatch":
             raise HubError(f"上次提交没拿到确定回执（dispatch={state.dispatch_phase(task)}）："
                            f"云端可能已收单。先到渠道控制台核对没有这一单 →「解除阻断」→ 再提交；"
                            f"直接重提会重复扣费")
-        if task.get("submit_unknown"):
+        if kind == "unknown":
             raise HubError("任务被「未知收单」挡住（submit_unknown）：先核对渠道无单 →「解除阻断」，"
                            "已有云端 taskId 的按该 id 续查，不许重提")
         if st not in ("approved", "generating"):
@@ -1259,9 +1278,29 @@ def revoke_approval(local_id: str, *, note: str = "撤销批准（改配置后�
     """受控回退边（AT-13 §2.4）：approved → awaiting_approval，清批准、保留资产/提示词/草稿配置。
 
     给「批准后改配置」用：§2.2 明确**不自动重批**——先撤销，再由所有者带新配置批准。
+
+    AT-16 技术债守卫（API 自守）：reject_back_to_approval 会连根清掉 approval +
+    SUBMIT_RUNTIME_KEYS（含 submit_unknown / dispatch）。任务带提交链阻断（活跃提交 /
+    dispatch 未完结 / submit_unknown）时若放行撤销，等于从 API 侧绕过「未知收单先核对」
+    防线——阻断标记被清后可直接重提，可能重复付费提交。前端起态门只是 UI 层，
+    API 必须自守：与 start_submit 共用 _submit_block_kind 判定（active → dispatch → unknown），
+    任一阻断即 409 拒撤，先「解除阻断」再撤销。
     """
     task_dir = _task_dir(local_id)
     with task_lock(local_id):
+        task = state.load(task_dir)
+        if task["state"] != "approved":
+            raise HubError(f"撤销批准需 approved（当前 {task['state']}）——只有已批准的任务能撤销")
+        kind = _submit_block_kind(task, local_id)
+        if kind == "active":
+            raise HubError("不能撤销批准：这个任务有提交在跑（排队/执行中）——等它出结果再撤销")
+        if kind == "dispatch":
+            raise HubError(f"不能撤销批准：上次提交没拿到确定回执（dispatch={state.dispatch_phase(task)}）"
+                           f"——云端可能已收单。先到渠道控制台核对没有这一单 →「解除阻断」→ 再撤销；"
+                           f"直接撤销会清掉未知标记，可能重复付费")
+        if kind == "unknown":
+            raise HubError("不能撤销批准：任务被「未知收单」挡住（submit_unknown）——撤销会把未知标记"
+                           "一起清掉。先核对渠道无单 →「解除阻断」→ 再撤销")
         try:
             task = state.reject_back_to_approval(task_dir, note=note)
         except state.StateError as e:
