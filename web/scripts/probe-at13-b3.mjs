@@ -105,13 +105,22 @@ check("清晰度枚举＝通道接收域（480/720/1080），与 media-size 解�
     gen.GEN_VIDEO_RESOLUTIONS.every((value) => media.parseVideoResolution(value) === value));
 check("时长上下限＝media-size.VIDEO_SECONDS_MIN/MAX",
     gen.GEN_DURATION_MIN === media.VIDEO_SECONDS_MIN && gen.GEN_DURATION_MAX === media.VIDEO_SECONDS_MAX);
-check("自定义 W×H 一律接受（桥按 gcd 归一成比例）",
+check("自定义 W×H 一律接受（规约到枚举后渠道能接）",
     gen.genSizeAccepted("1920x1080", sdgfChannel) && gen.genSizeAccepted("1080x1920", wanChannel));
-check("WxH 提交值原样透传（由桥归一）",
-    gen.genSizeForSubmit("1920x1080", "720") === "1920x1080");
-check("比例值提交时按清晰度算像素（与画布 computeVideoSize 同口径）",
-    gen.genSizeForSubmit("16:9", "720") === media.computeVideoSize("720", "16:9"));
-check("auto 提交为 auto（桥归一到 adaptive）", gen.genSizeForSubmit("auto", "720") === "auto");
+check("WxH 提交值＝画布 inferVideoRatio 规约结果（不再转像素串）",
+    gen.genSizeForSubmit("1920x1080") === "16:9" && gen.genSizeForSubmit("240x427") === "9:16",
+    gen.genSizeForSubmit("1920x1080"));
+check("枚举比例提交原值照传（不再经 computeVideoSize 算像素）",
+    gen.genSizeForSubmit("16:9") === "16:9" && gen.genSizeForSubmit("9:16") === "9:16");
+check("提交体永不出现像素串（「9:16+480p→480x854」那条自造转换已删）",
+    ["16:9", "9:16", "1:1", "auto", "1920x1080", "240x427"].every((value) => !/^\d+x\d+$/.test(gen.genSizeForSubmit(value))),
+    ["16:9", "1920x1080", "240x427"].map((value) => `${value}→${gen.genSizeForSubmit(value)}`).join(" "));
+check("auto 提交为 auto（桥归一到 adaptive）", gen.genSizeForSubmit("auto") === "auto");
+check("零维输入显式拒绝（不静默换值，原样上送让渠道拒）",
+    gen.genResolveSize("0x0", sdgfChannel).valid === false && gen.genSizeForSubmit("0x0") === "0x0");
+check("W×H 规约提示「将按 9:16 生成」",
+    gen.genResolveSize("240x427", sdgfChannel).note === "将按 9:16 生成",
+    gen.genResolveSize("240x427", sdgfChannel).note);
 
 // ---------------------------------------------------------------- ② 协议矩阵 / ③ wan 如实
 check("协议族判定：sdgf/wan 承接，gemini/openai/未知=画布专用",
@@ -143,7 +152,7 @@ check("SDGF 族：model 与 mode 控件都在",
 // ---------------------------------------------------------------- ④ approve 带 config 无 key / submit 带 key
 const sdgfDraft = {
     channelId: "ch-sdgf", model: "sdgf-2.5-pro", mode: "reference",
-    size: "9:16", vquality: "720", duration: 8, audio: true,
+    size: "9:16", rawSize: "", vquality: "720", duration: 8, audio: true,
 };
 const approveConfig = gen.buildApproveConfig(sdgfDraft, sdgfChannel);
 check("approve config 四键齐（渠道身份/model/mode/params）",
@@ -151,8 +160,14 @@ check("approve config 四键齐（渠道身份/model/mode/params）",
     Object.keys(approveConfig).join(","));
 check("渠道身份只带非敏感身份（baseUrl/apiFormat/渠道名）",
     JSON.stringify(Object.keys(approveConfig.渠道身份).sort()) === JSON.stringify(["apiFormat", "baseUrl", "渠道名"]));
-check("params 四键＝backend CONFIG_PARAM_KEYS（duration/size/vquality/audio）",
-    JSON.stringify(Object.keys(approveConfig.params).sort()) === JSON.stringify(["audio", "duration", "size", "vquality"]));
+check("params 五键＝backend CONFIG_PARAM_KEYS（duration/size/rawSize/vquality/audio）",
+    JSON.stringify(Object.keys(approveConfig.params).sort()) === JSON.stringify(["audio", "duration", "rawSize", "size", "vquality"]));
+check("params.size 是枚举（不是像素串）", approveConfig.params.size === "9:16");
+check("自定义 W×H：params.size=规约结果 + params.rawSize=原始输入",
+    (() => {
+        const cfg = gen.buildApproveConfig({ ...sdgfDraft, size: "9:16", rawSize: "240x427" }, sdgfChannel);
+        return cfg.params.size === "9:16" && cfg.params.rawSize === "240x427";
+    })());
 check("params.duration 是整数秒（不是字符串）", typeof approveConfig.params.duration === "number" && approveConfig.params.duration === 8);
 check("params.audio 是布尔", approveConfig.params.audio === true);
 check("approve config 全程无 key（任何层级都不出现 key 值/键名）", (() => {
@@ -166,7 +181,7 @@ const wanConfig = gen.buildApproveConfig(wanDraft, wanChannel);
 check("wan config：model/mode 落空串（固定语义，不进快照自由度）",
     wanConfig.model === "" && wanConfig.mode === "" && wanConfig.渠道身份.apiFormat === "wan");
 check("wan config 仍带渠道名与画幅（同名模型不同渠道＝不同快照）",
-    wanConfig.渠道身份.渠道名 === "本地万相" && wanConfig.params.size === gen.genSizeForSubmit("9:16", "720"));
+    wanConfig.渠道身份.渠道名 === "本地万相" && wanConfig.params.size === gen.genSizeForSubmit("9:16"));
 check("submit 请求体＝{key}（一次性透传）",
     JSON.stringify(gen.buildSubmitBody("sk-fake-sdgf")) === JSON.stringify({ key: "sk-fake-sdgf" }));
 check("wan 允许空 key（CLI 本地承载）", gen.buildSubmitBody("").key === "" && gen.buildSubmitBody(null).key === "");
@@ -272,6 +287,61 @@ check("面板摘要含渠道/模型/画幅/时长（审批与生成中回显）"
 check("wan 摘要走固定文案（不显示假模型名）",
     gen.genDraftSummary(wanDraft, wanChannel).includes("固定 wan3.0 · 自动多图参考"));
 
+// ---------------------------------------------------------------- ⑨ 画幅规约（AT-14 §3.1/§五.1，与 PY 共享同一份夹具）
+const fixturePath = path.resolve("../wanrepro/tests/fixtures/sdgf-dialect/cases.json");
+const sizeBlock = JSON.parse(readFileSync(fixturePath, "utf8")).sizeCases || {};
+const sizeCases = sizeBlock.cases || [];
+const channelOfFormat = (apiFormat) => (apiFormat === "wan" ? wanChannel : sdgfChannel);
+check("画幅夹具 sizeCases 已接入（与 PY 探针同一份 cases.json）", sizeCases.length >= 10, `${sizeCases.length} 例`);
+check("夹具含 §五.1 十个规定输入",
+    ["240x427", "480x854", "240X427", "240×427", "9:16", "21:9", "auto", "0x0", "abc", "2000x100"]
+        .every((value) => sizeCases.some((item) => item.input.size === value)));
+
+for (const item of sizeCases) {
+    const rawSize = item.input.size;
+    const channel = channelOfFormat(item.input.apiFormat);
+    const want = item.expect;
+    const resolved = gen.genResolveSize(rawSize, channel);
+    const submit = gen.genSizeForSubmit(rawSize);
+    const expectedSize = want.ratio ?? "";
+    const expectedSubmit = want.ratio ?? rawSize;          // 无效输入原样上送（渠道显式拒）
+
+    check(`${item.id} · genResolveSize 规约结果`, resolved.size === expectedSize, `${resolved.size} ≠ ${expectedSize}`);
+    check(`${item.id} · genSizeForSubmit 提交值（无像素串）`, submit === expectedSubmit, `${submit} ≠ ${expectedSubmit}`);
+    check(`${item.id} · 渠道接收标记（false=按钮置灰）`, resolved.accepted === want.accepted, `accepted=${resolved.accepted} ≠ ${want.accepted}`);
+    if (want.note) check(`${item.id} · 面板提示文案`, resolved.note.includes(want.note), resolved.note);
+
+    // approve 请求体走真函数：size=规约值、rawSize=原始输入
+    const draft = {
+        channelId: channel.id,
+        model: channel.id === "ch-wan" ? "" : "sdgf-2.5-pro",
+        mode: channel.id === "ch-wan" ? "" : "frames",
+        size: resolved.valid ? resolved.size : rawSize,
+        rawSize,
+        vquality: "720",
+        duration: 8,
+        audio: true,
+    };
+    const cfg = gen.buildApproveConfig(draft, channel);
+    const issues = gen.genApproveIssues(draft, channel);
+    check(`${item.id} · approve params.size＝规约结果`, cfg.params.size === expectedSubmit, `${cfg.params.size} ≠ ${expectedSubmit}`);
+    check(`${item.id} · approve params.rawSize 在场（原始输入留痕）`, cfg.params.rawSize === rawSize, cfg.params.rawSize);
+    check(`${item.id} · 提交前置校验与接收标记一致（不静默放行）`,
+        want.accepted ? issues.length === 0 : issues.length > 0,
+        issues.join("；"));
+    // 枚举输入不再触发「非枚举画幅」拒绝（D1 缺陷在该输入集内不可复现）
+    if (want.accepted) {
+        check(`${item.id} · 枚举输入不触发非枚举画幅报错`,
+            !issues.some((issue) => issue.includes("不在渠道接收域")), issues.join("；"));
+    }
+}
+
+// 21:9 = 画布专用 → 渠道不接：置灰（不静默换值、不静默删项）
+const ratio21 = gen.genResolveSize("21:9", sdgfChannel);
+check("21:9 在 SDGF 面 accepted=false（按钮置灰）+ 文案含「画布专用」",
+    ratio21.accepted === false && ratio21.note.includes("画布专用"), ratio21.note);
+check("21:9 提交值仍是 21:9（不静默换成别的比例）", gen.genSizeForSubmit("21:9") === "21:9");
+
 // ---------------------------------------------------------------- ⑧ JSX / API 接线护栏
 const drawer = readFileSync(path.resolve("src/pages/hub/task-detail-drawer.tsx"), "utf8");
 const api = readFileSync(path.resolve("src/pages/hub/hub-api.ts"), "utf8");
@@ -316,6 +386,22 @@ check("不随任务改写全局 videoModel（无 updateConfig(\"videoModel\") / 
 check("生成中不再由 OutcomeSection 出进度条（统一走生成设置段，避免双份 UI）",
     drawer.includes('state === "awaiting_approval" || state === "approved" || state === "generating"') &&
     drawer.includes("<GenSettingsSection detail={detail} busy={busy} act={act} />"));
+// AT-14 B1 画幅根治接线：自定义 W×H 就地规约 + 渠道不接置灰（数据层断言见上，这里锁 JSX 真把结果画出来）
+check("drawer 画幅段调 genResolveSize（画布 inferVideoRatio 同口径，禁自造换算）",
+    drawer.includes("genResolveSize(draft.size, channel)") && drawer.includes("const applyPixels ="));
+check("自定义 W×H 输入即规约并落 rawSize（草稿存规约结果 + 原始输入）",
+    drawer.includes("const resolved = genResolveSize(raw, channel);") &&
+    drawer.includes("update({ size: resolved.valid ? resolved.size : raw, rawSize: raw })") &&
+    drawer.includes("parsePixelSizeOf(draft.rawSize || draft.size)"));
+check("画幅提示显示规约结果（data-hub-gen-size-resolved + 「将按 X 生成」）",
+    drawer.includes("data-hub-gen-size-resolved") && drawer.includes("将按 {sizeInfo.size} 生成"));
+check("渠道不接的枚举标「渠道不生效」（照列不静默删）", drawer.includes("渠道不生效"));
+check("批准/提交按钮按画幅置灰（data-hub-gen-approve-size-blocked / submit 同款）",
+    drawer.includes("sizeBlocked") && drawer.includes("data-hub-gen-approve-size-blocked") &&
+    drawer.includes("data-hub-gen-submit-size-blocked") &&
+    drawer.includes("blocked.blocksRetry || sizeBlocked"));
+check("drawer 不再用 computeVideoSize 转像素串（自造转换已删）",
+    !drawer.includes("computeVideoSize") && !drawer.includes("genSizeForSubmit(draft.size, draft.vquality)"));
 
 // ---------------------------------------------------------------- 结果
 console.log(`probe-at13-b3: ${pass} PASS, ${fails.length} FAIL`);

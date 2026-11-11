@@ -22,7 +22,7 @@ import {
     genNeedsReapproval,
     genRatioRows,
     genResolutionRows,
-    genSizeNote,
+    genResolveSize,
     genSubmitIssues,
     genUiFlags,
     readGenDraft,
@@ -2056,7 +2056,17 @@ function GenSettingsSection({ detail, busy, act }: { detail: HubTaskDetail; busy
     const apiKey = String(channel?.apiKey || "").trim();
     const ratioRows = genRatioRows(channel);
     const resolutionRows = genResolutionRows();
-    const pixels = draft ? parsePixelSizeOf(draft.size) : null;
+    // 画幅规约（AT-14 §3.1）：自定义 W×H 走画布 inferVideoRatio 就地规约，禁像素串外传
+    const sizeInfo = draft ? genResolveSize(draft.size, channel) : genResolveSize("auto", channel);
+    const sizeBlocked = !sizeInfo.valid || !sizeInfo.accepted;
+    const pixels = draft ? parsePixelSizeOf(draft.rawSize || draft.size) : null;
+
+    /** 自定义 W×H 输入 → 立即规约并落草稿（size=规约结果，rawSize=用户原始输入）。 */
+    const applyPixels = (width: number, height: number) => {
+        const raw = `${width}x${height}`;
+        const resolved = genResolveSize(raw, channel);
+        update({ size: resolved.valid ? resolved.size : raw, rawSize: raw });
+    };
 
     // 批准 = 固化配置（无 key）+ 算 v2 快照 → 立刻提交（key 一次性透传）
     const approveAndSubmit = () => {
@@ -2226,9 +2236,10 @@ function GenSettingsSection({ detail, busy, act }: { detail: HubTaskDetail; busy
                                 className={`h-8 rounded-full border px-3 text-sm transition disabled:cursor-not-allowed disabled:opacity-50 ${
                                     draft.size === row.value ? "border-stone-900 text-stone-900 dark:border-stone-100 dark:text-stone-100" : "border-stone-300 text-stone-600 dark:border-stone-700 dark:text-stone-300"
                                 }`}
-                                onClick={() => update({ size: row.value })}
+                                onClick={() => update({ size: row.value, rawSize: "" })}
                             >
                                 {row.label}
+                                {row.accepted ? null : <span className="ml-1 text-[10px] text-amber-600 dark:text-amber-400">渠道不生效</span>}
                             </button>
                         ))}
                         <label className="flex h-8 items-center gap-1.5 rounded-full border border-stone-300 px-2 text-xs text-stone-600 dark:border-stone-700 dark:text-stone-300">
@@ -2243,7 +2254,7 @@ function GenSettingsSection({ detail, busy, act }: { detail: HubTaskDetail; busy
                                 onChange={(event) => {
                                     const width = Math.floor(Number(event.target.value) || 0);
                                     const height = pixels?.height || 0;
-                                    if (width > 0 && height > 0) update({ size: `${width}x${height}` });
+                                    if (width > 0 && height > 0) applyPixels(width, height);
                                 }}
                             />
                             ×
@@ -2258,14 +2269,20 @@ function GenSettingsSection({ detail, busy, act }: { detail: HubTaskDetail; busy
                                 onChange={(event) => {
                                     const height = Math.floor(Number(event.target.value) || 0);
                                     const width = pixels?.width || 0;
-                                    if (width > 0 && height > 0) update({ size: `${width}x${height}` });
+                                    if (width > 0 && height > 0) applyPixels(width, height);
                                 }}
                             />
                         </label>
                     </div>
-                    {genSizeNote(draft.size, channel) ? (
-                        <div className="text-xs text-amber-600 dark:text-amber-400" data-hub-gen-size-note>
-                            {genSizeNote(draft.size, channel)}
+                    {sizeInfo.note ? (
+                        <div className="text-xs text-amber-600 dark:text-amber-400" data-hub-gen-size-note
+                            data-hub-gen-size-resolved={sizeInfo.size} data-hub-gen-size-accepted={sizeInfo.accepted ? "1" : "0"}>
+                            {sizeInfo.note}
+                        </div>
+                    ) : sizeInfo.custom ? (
+                        <div className="text-xs text-stone-500 dark:text-stone-400" data-hub-gen-size-note
+                            data-hub-gen-size-resolved={sizeInfo.size} data-hub-gen-size-accepted={sizeInfo.accepted ? "1" : "0"}>
+                            将按 {sizeInfo.size} 生成
                         </div>
                     ) : null}
                 </div>
@@ -2349,15 +2366,16 @@ function GenSettingsSection({ detail, busy, act }: { detail: HubTaskDetail; busy
                             <Button danger ghost loading={busy === "rollback"} disabled={busy !== null} onClick={rollback}>
                                 退回置换
                             </Button>
-                            <Tooltip title={promptReady ? "" : "提示词还没出（等渲染完成）"}>
+                            <Tooltip title={!promptReady ? "提示词还没出（等渲染完成）" : sizeBlocked ? sizeInfo.note || "当前画幅渠道不生效" : ""}>
                                 <span>
                                     <Button
                                         type="primary"
                                         icon={<Sparkles className="size-4" />}
                                         loading={busy === "approve"}
-                                        disabled={!promptReady || busy !== null || blocked.blocksRetry}
+                                        disabled={!promptReady || busy !== null || blocked.blocksRetry || sizeBlocked}
                                         onClick={approveAndSubmit}
                                         data-hub-gen-approve
+                                        data-hub-gen-approve-size-blocked={sizeBlocked ? "1" : "0"}
                                     >
                                         批准出片（固化配置并提交）
                                     </Button>
@@ -2374,9 +2392,10 @@ function GenSettingsSection({ detail, busy, act }: { detail: HubTaskDetail; busy
                             <Button
                                 type="primary"
                                 loading={busy === "submit"}
-                                disabled={busy !== null || needsReapproval || blocked.blocksRetry}
+                                disabled={busy !== null || needsReapproval || blocked.blocksRetry || sizeBlocked}
                                 onClick={submitOnly}
                                 data-hub-gen-submit
+                                data-hub-gen-submit-size-blocked={sizeBlocked ? "1" : "0"}
                             >
                                 提交生成
                             </Button>

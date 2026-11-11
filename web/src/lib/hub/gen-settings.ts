@@ -15,7 +15,6 @@
  */
 import {
     clampVideoSeconds,
-    computeVideoSize,
     inferVideoRatio,
     parseAspectRatio,
     parsePixelSize,
@@ -149,33 +148,86 @@ export function genResolutionRows(): { value: string; label: string; accepted: b
     return GEN_VIDEO_RESOLUTIONS.map((value) => ({ value, label: `${value}p`, accepted: true }));
 }
 
-/** 画幅是否被当前渠道接受（WxH 一律接受：bridge 按最大公约数归一成比例）。 */
-export function genSizeAccepted(size: string, channel: GenChannelDesc | null): boolean {
-    const value = String(size || "").trim();
-    if (!value) return false;
-    const pixels = parsePixelSize(value);
-    if (pixels) return pixels.width > 0 && pixels.height > 0;
-    const row = genRatioRows(channel).find((item) => item.value === value);
-    return Boolean(row?.accepted);
+/** 自定义 W×H 输入的语法：x / X / × / *（画布 parsePixelSize 只认 x/X，这里是入口层清洗，不复制比例逻辑）。 */
+const GEN_PIXEL_INPUT = /^(\d+)\s*[x×*]\s*(\d+)$/i;
+/** 比例字面（形如 0:0 会被画布 parseAspectRatio 判空后兜底 16:9——零维在此显式拒绝）。 */
+const GEN_RATIO_INPUT = /^(\d+(?:\.\d+)?):(\d+(?:\.\d+)?)$/;
+
+export function genSizeSyntax(raw: string): string {
+    const value = String(raw || "").trim();
+    const match = GEN_PIXEL_INPUT.exec(value);
+    return match ? `${match[1]}x${match[2]}` : value;
 }
 
-export function genSizeNote(size: string, channel: GenChannelDesc | null): string {
-    const value = String(size || "").trim();
-    if (parsePixelSize(value)) {
-        const parsed = parseAspectRatio(value);
-        return parsed ? "" : `渠道按宽高最大公约数归一到比例（${value} 提交后按比例派发）`;
+export type GenSizeResolution = {
+    /** 用户原始输入（进 approve config 的 rawSize；提交值永远不取它）。 */
+    raw: string;
+    /** 规约后的提交用画幅：画布枚举 / auto；无效输入为空串（不给假值）。 */
+    size: string;
+    /** 输入本身可用（零维 → false，显式拒绝不静默改值）。 */
+    valid: boolean;
+    /** 是否在渠道接收域内（21:9 在 SDGF 不接 → false，提交按钮置灰）。 */
+    accepted: boolean;
+    /** 面板提示：自定义 W×H 显示「将按 9:16 生成」；渠道不接显示原因。 */
+    note: string;
+    /** 是否来自自定义 W×H / 非枚举输入。 */
+    custom: boolean;
+};
+
+/**
+ * 画幅输入 → 提交用枚举（AT-14 §3.1 / §五.1）。
+ *
+ * 枚举 / auto 原值照传；自定义 W×H 走画布 media-size.ts#inferVideoRatio（**同一函数，禁复制实现**）
+ * 就近规约到枚举——**不再经 computeVideoSize 转像素串**（画布引擎从不这样传，那正是
+ * 「9:16+480p → 480x854 → 240:427 被渠道拒」的根因）。
+ */
+export function genResolveSize(size: string, channel: GenChannelDesc | null): GenSizeResolution {
+    const raw = String(size || "").trim();
+    if (!raw) return { raw: "", size: "auto", valid: true, accepted: true, note: "", custom: false };
+    if (GEN_CANVAS_RATIOS.includes(raw)) {
+        const row = genRatioRows(channel).find((item) => item.value === raw);
+        const accepted = Boolean(row?.accepted);
+        return { raw, size: raw, valid: true, accepted, note: accepted ? "" : String(row?.note || ""), custom: false };
     }
-    return genRatioRows(channel).find((item) => item.value === value)?.note || "";
+    const syntax = genSizeSyntax(raw);
+    const pixels = parsePixelSize(syntax) || parseAspectRatio(syntax);
+    const ratioForm = GEN_RATIO_INPUT.exec(syntax);
+    const zeroDim =
+        (pixels ? pixels.width <= 0 || pixels.height <= 0 : false) ||
+        (ratioForm ? Number(ratioForm[1]) <= 0 || Number(ratioForm[2]) <= 0 : false);
+    if (zeroDim) {
+        return {
+            raw,
+            size: "",
+            valid: false,
+            accepted: false,
+            note: `${raw} 的宽高必须为正数（自定义画幅写成 宽x高，如 1080x1920）`,
+            custom: true,
+        };
+    }
+    const normalized = inferVideoRatio(syntax);        // 画布同一函数：就近规约到枚举
+    const row = genRatioRows(channel).find((item) => item.value === normalized);
+    const accepted = Boolean(row?.accepted);
+    const note = accepted ? `将按 ${normalized} 生成` : `将按 ${normalized} 生成 · ${String(row?.note || "")}`;
+    return { raw, size: normalized, valid: true, accepted, note, custom: true };
 }
 
-/** 画布字面画幅 → 提交用 size：比例值照传（auto 由桥归一 adaptive），WxH 照传。 */
-export function genSizeForSubmit(size: string, vquality: string): string {
-    const value = String(size || "").trim();
-    if (!value) return "auto";
-    if (parsePixelSize(value)) return value;
-    const ratio = inferVideoRatio(value);
-    if (ratio === "auto") return "auto";
-    return computeVideoSize(parseVideoResolution(vquality), ratio);
+/** 画幅是否被当前渠道接受（= 输入可用 + 在渠道接收域内）。 */
+export function genSizeAccepted(size: string, channel: GenChannelDesc | null): boolean {
+    const resolution = genResolveSize(size, channel);
+    return resolution.valid && resolution.accepted;
+}
+
+/** 画幅提示：自定义 W×H「将按 9:16 生成」/ 渠道不接的原因；可接受枚举 → 空串。 */
+export function genSizeNote(size: string, channel: GenChannelDesc | null): string {
+    return genResolveSize(size, channel).note;
+}
+
+/** 提交用 size：枚举 / auto 原值；自定义 W×H → 画布 inferVideoRatio 规约值（禁像素串）。 */
+export function genSizeForSubmit(size: string): string {
+    const resolution = genResolveSize(size, null);
+    // 无效输入原样上送，由渠道校验显式拒绝（不静默换值、不伪造一个能过的值）
+    return resolution.valid ? resolution.size : resolution.raw;
 }
 
 // ---------------------------------------------------------------- 草稿（按任务存，不写全局 videoModel）
@@ -187,8 +239,10 @@ export type GenDraft = {
     model: string;
     /** frames | reference（仅 SDGF；wan 恒空）。 */
     mode: "" | "frames" | "reference";
-    /** 画幅字面值：videoRatioOptions 之一，或 "WxH" 自定义。 */
+    /** 画幅枚举（视频枚举之一，或自定义 W×H 规约后的枚举；auto=自适应）。 */
     size: string;
+    /** 用户原始画幅输入（自定义 W×H 存原串；进 approve config 的 rawSize，不进 v2 快照哈希）。 */
+    rawSize: string;
     /** 清晰度（480 / 720 / 1080，画布可更高）。 */
     vquality: string;
     duration: number;
@@ -202,13 +256,15 @@ export function defaultGenDraft(channel: GenChannelDesc | null, seed: GenDraftSe
     const family = channel ? genFamily(channel.apiFormat) : "sdgf";
     const rows = genModelRows(channel);
     const seedSize = String(seed.size || "").trim();
-    const ratio = seedSize && !parsePixelSize(seedSize) && GEN_CANVAS_RATIOS.includes(seedSize) ? seedSize : inferVideoRatio(seedSize || "auto");
+    // 画布全局默认画幅同样走规约（WxH → 枚举，禁像素串外传）
+    const ratio = genResolveSize(seedSize || "auto", channel).size || "auto";
     const duration = Math.max(GEN_DURATION_MIN, Math.min(GEN_DURATION_MAX, Math.floor(Number(clampVideoSeconds(seed.videoSeconds || "6")) || 6)));
     return {
         channelId: channel?.id || "",
         model: family === "sdgf" ? rows.find((row) => row.selectable)?.name || "" : "",
         mode: family === "sdgf" ? (seed.videoMode === "reference" ? "reference" : "frames") : "",
         size: ratio,
+        rawSize: "",                                  // 画布全局默认不是用户原始输入（任务内自定义 W×H 才记）
         vquality: parseVideoResolution(seed.vquality),
         duration,
         audio: String(seed.videoGenerateAudio ?? "true") !== "false",
@@ -223,6 +279,7 @@ export function normalizeGenDraft(raw: unknown): GenDraft | null {
     const model = String(value.model || "").trim();
     const modeRaw = String(value.mode || "").trim();
     const size = String(value.size || "").trim() || "auto";
+    const rawSize = String(value.rawSize || "").trim();
     const vquality = String(value.vquality || "").trim() || "720";
     const duration = Math.floor(Number(value.duration));
     return {
@@ -230,6 +287,7 @@ export function normalizeGenDraft(raw: unknown): GenDraft | null {
         model,
         mode: modeRaw === "reference" ? "reference" : modeRaw === "frames" ? "frames" : "",
         size,
+        rawSize,
         vquality,
         duration: Number.isFinite(duration) ? Math.max(GEN_DURATION_MIN, Math.min(GEN_DURATION_MAX, duration)) : 6,
         audio: value.audio === undefined ? true : Boolean(value.audio),
@@ -250,7 +308,8 @@ export type GenApproveConfig = {
     渠道身份: { baseUrl: string; apiFormat: string; 渠道名: string };
     model: string;
     mode: string;
-    params: { duration: number; size: string; vquality: string; audio: boolean };
+    /** size=规约后的提交值（枚举/auto）；rawSize=用户原始输入（留痕，不进快照哈希）。 */
+    params: { duration: number; size: string; rawSize: string; vquality: string; audio: boolean };
 };
 
 /** approve 请求体（**无 key**：批准只固化非敏感身份；改任一有效字段＝快照失效需重批）。 */
@@ -266,7 +325,8 @@ export function buildApproveConfig(draft: GenDraft, channel: GenChannelDesc | nu
         mode: family === "wan" ? "" : String(draft.mode || ""),
         params: {
             duration: Math.floor(Number(draft.duration) || 0),
-            size: genSizeForSubmit(draft.size, draft.vquality),
+            size: genSizeForSubmit(draft.size),
+            rawSize: String(draft.rawSize || "").trim(),
             vquality: String(draft.vquality || "").trim(),
             audio: Boolean(draft.audio),
         },
@@ -307,9 +367,12 @@ export function genApproveIssues(draft: GenDraft | null, channel: GenChannelDesc
     if (family === "canvas-only") issues.push("这个渠道是画布专用协议（gemini/openai/模型脚本），hub 不承接——换 SDGF 或万相渠道。");
     if (!String(channel.baseUrl || "").trim()) issues.push("渠道缺 baseUrl（画布「设置 → 渠道」里补）。");
     if (family === "sdgf" && !String(draft.model || "").trim()) issues.push("SDGF 渠道必须选模型。");
-    if (!genSizeAccepted(draft.size, channel)) {
-        const note = genSizeNote(draft.size, channel);
-        issues.push(note || `画幅 ${draft.size} 不在渠道接收域内。`);
+    // 画幅：输入可用性 + 渠道接收域两道显式拒绝（不静默换值）
+    const sizeInfo = genResolveSize(draft.size, channel);
+    if (!sizeInfo.valid) {
+        issues.push(sizeInfo.note || `画幅 ${draft.size} 无效。`);
+    } else if (!sizeInfo.accepted) {
+        issues.push(sizeInfo.note || `画幅 ${draft.size} 不在渠道接收域内。`);
     }
     if (!GEN_VIDEO_RESOLUTIONS.includes(String(draft.vquality))) issues.push(`清晰度只能是 ${GEN_VIDEO_RESOLUTIONS.join(" / ")}（当前 ${draft.vquality}）。`);
     if (!(draft.duration >= GEN_DURATION_MIN && draft.duration <= GEN_DURATION_MAX)) {
@@ -575,8 +638,10 @@ export function genDraftSummary(draft: GenDraft | null, channel: GenChannelDesc 
     if (!draft || !channel) return "未选渠道";
     const family = genFamily(channel.apiFormat);
     const parts = [channel.name];
-    if (family === "wan") parts.push(GEN_WAN_FIXED_NOTE, genSizeForSubmit(draft.size, draft.vquality));
-    else parts.push(draft.model || "未选模型", draft.mode === "reference" ? "参考图模式" : "首尾帧模式", genSizeForSubmit(draft.size, draft.vquality));
+    const raw = String(draft.rawSize || "").trim();
+    const sizeText = `${genSizeForSubmit(draft.size)}${raw && raw !== draft.size ? `（原 ${raw}）` : ""}`;
+    if (family === "wan") parts.push(GEN_WAN_FIXED_NOTE, sizeText);
+    else parts.push(draft.model || "未选模型", draft.mode === "reference" ? "参考图模式" : "首尾帧模式", sizeText);
     parts.push(`${draft.vquality}p`, `${draft.duration}s`, draft.audio ? "带声音" : "静音");
     return parts.filter(Boolean).join(" · ");
 }

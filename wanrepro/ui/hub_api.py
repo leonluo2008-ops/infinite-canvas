@@ -11,7 +11,6 @@ automation 以子包 import（server.py 启动 cwd 不确定时由 _ensure_path 
 from __future__ import annotations
 
 import json
-import math
 import re
 import shutil
 import sys
@@ -815,13 +814,18 @@ def do_render(local_id: str) -> dict:
 
 # 画布口径画幅（web/src/lib/media-size.ts videoRatioOptions）——hub 面板与后端同源
 CANVAS_RATIOS = ("1:1", "3:4", "4:3", "16:9", "9:16", "21:9", "auto")
+# 画布 videoRatioOptions 的宽高比（media-size.ts 同源）；**数组顺序即 tie 顺序**——
+# TS 侧 inferVideoRatio 用 reduce 严格小于比较，同距离保留更靠前的项，这里逐条对齐。
+CANVAS_VIDEO_RATIO_PX = (("1:1", 1.0), ("3:4", 3 / 4), ("4:3", 4 / 3),
+                         ("16:9", 16 / 9), ("9:16", 9 / 16), ("21:9", 21 / 9))
+CANVAS_VIDEO_RATIO_FALLBACK = "16:9"          # media-size.ts#inferVideoRatio 的兜底值（非法串）
 # 协议真实接收域：与 ui/server.py 的 SDGF_RATIOS / WAN_RATIOS 同源。server 反向 import 本模块，
 # 不能倒过来 import，故此处是副本——B4 合同锁（§2.9 共享 fixture）一并锁死，改一处必红。
 SDGF_RATIOS = ("16:9", "9:16", "1:1", "4:3", "3:4", "adaptive")
 SDGF_RESOLUTIONS = ("480", "720", "1080")
 WAN_RATIOS = ("16:9", "9:16", "1:1")
 WAN_FIXED_MODELS = ("wan3.0", "wan-omni2video")     # §2.1：wan 固定模型语义，不消费 model 选择
-CONFIG_PARAM_KEYS = ("duration", "size", "vquality", "audio")
+CONFIG_PARAM_KEYS = ("duration", "size", "vquality", "audio", "rawSize")
 # 敏感键：出现就 400（不是静默丢弃——调用方会以为 key 已生效）
 _SENSITIVE_KEYS = ("apikey", "api_key", "key", "secret", "token", "authorization",
                    "password", "access_token", "accesskey")
@@ -877,22 +881,58 @@ def _config_mode(api_format: str, raw) -> str:
     return mode
 
 
-def _ratio_from_size(raw) -> str:
-    """画幅：画布字面值照收；WxH 按最大公约数归一到比例（画布 media-size.ts 同口径的精确版）。"""
-    size = str(raw or "").strip()
-    if not size:
-        raise HubInputError("params.size（画幅）不能为空")
-    if size in CANVAS_RATIOS:
-        return size
-    m = re.fullmatch(r"(\d+)\s*[x×*]\s*(\d+)", size)
+_PIXEL_SIZE_RE = re.compile(r"^(\d+)\s*[x×*]\s*(\d+)$", re.IGNORECASE)
+_RATIO_SIZE_RE = re.compile(r"^(\d+(?:\.\d+)?):(\d+(?:\.\d+)?)$")
+
+
+def _canvas_infer_video_ratio(size: str) -> str:
+    """画布 `media-size.ts#inferVideoRatio` 的 PY 同合同实现（AT-14 §3.1「同一合同双实现」）。
+
+    口径逐条对齐 TS 侧（改任一端，共享 fixture 的 size 用例必红）：
+      · 空串 / auto → auto；
+      · 画布枚举（CANVAS_RATIOS）→ 原值；
+      · W×H（分隔符 x / X / × / *，允许空白）→ 就近规约到枚举；
+      · W:H（可带小数）→ 就近规约到枚举；
+      · 其余非法串 → 画布兜底 16:9（不另立规则）。
+    tie 顺序：画布数组顺序（1:1 / 3:4 / 4:3 / 16:9 / 9:16 / 21:9），同距离保留靠前者。
+    **与画布的唯一有意差异**：零维在画布会兜底 16:9，这里显式拒绝——不静默改用户参数。
+    """
+    raw = str(size if size is not None else "").strip()
+    if not raw or raw == "auto":                  # 画布口径：只有字面 auto（AUTO 走兜底分支，与 TS 一致）
+        return "auto"
+    if raw in CANVAS_RATIOS:
+        return raw
+    target: float | None = None
+    m = _PIXEL_SIZE_RE.match(raw)
     if m:
         w, h = int(m.group(1)), int(m.group(2))
         if w <= 0 or h <= 0:
-            raise HubInputError(f"params.size 的像素宽高必须为正：{size!r}")
-        g = math.gcd(w, h)
-        return f"{w // g}:{h // g}"
-    raise HubInputError(f"params.size 不认识：{size!r}"
-                        f"（画布口径 {'/'.join(CANVAS_RATIOS)} 或 WxH）")
+            raise HubInputError(f"params.size 的像素宽高必须为正：{raw!r}")
+        target = w / h
+    else:
+        m = _RATIO_SIZE_RE.match(raw)
+        if m:
+            w, h = float(m.group(1)), float(m.group(2))
+            if w <= 0 or h <= 0:
+                raise HubInputError(f"params.size 的宽高必须为正：{raw!r}")
+            target = w / h
+    if target is None:
+        return CANVAS_VIDEO_RATIO_FALLBACK
+    best, best_diff = CANVAS_VIDEO_RATIO_FALLBACK, abs(16 / 9 - target)
+    for value, px in CANVAS_VIDEO_RATIO_PX:
+        diff = abs(px - target)
+        if diff < best_diff:                      # 严格小于：与 TS reduce 的 tie 行为一致
+            best, best_diff = value, diff
+    return best
+
+
+def _ratio_from_size(raw) -> str:
+    """画幅第一步（AT-14 §3.1）：画布 inferVideoRatio 同口径规约到枚举。
+
+    旧实现做最大公约数归一，互素时字面直出 240:427 被渠道拒（D1 根因②）——
+    画布引擎从不这样传，它就近规约到枚举。渠道接收域校验交给 `_protocol_ratio`。
+    """
+    return _canvas_infer_video_ratio(str(raw or ""))
 
 
 def _protocol_ratio(api_format: str, ratio: str) -> str:
@@ -939,14 +979,21 @@ def _config_audio(raw) -> bool:
     raise HubInputError(f"params.audio 只能是布尔值，收到 {raw!r}")
 
 
-def _normalize_config(config: dict, task: dict) -> tuple[dict, dict]:
-    """approve 携带的画布配置 → (gen_params, gen_channel)：白名单构造，key 一律不落。
+def _config_raw_size(raw) -> str:
+    """用户原始画幅输入（**只留痕，不进快照、不参与提交值**）：截断防脏数据。"""
+    return str(raw if raw is not None else "").strip()[:64]
+
+
+def _normalize_config(config: dict, task: dict) -> tuple[dict, dict, dict]:
+    """approve 携带的画布配置 → (gen_params, gen_channel, size_input)：白名单构造，key 一律不落。
 
     config = {渠道身份:{baseUrl,apiFormat,渠道名}, model, mode,
-              params:{duration,size,vquality,audio}}（§2.1，无 key）
+              params:{duration,size,rawSize,vquality,audio}}（§2.1，无 key）
     白名单外键丢弃（§三「read_json 后白名单取键」）；敏感键直接 400。
     gen_params 落桥提交体词表 {duration,ratio,resolution,audio}（画布 size/vquality 派生），
     gen_channel 落 {baseUrl,apiFormat,渠道名,model,mode}——两者合起来就是 v2 快照的输入。
+    size_input = {raw, ratio}（AT-14 §3.1 留痕：原始输入 + 规约结果）——**不并进 gen_params**，
+    否则会改变 v2 快照哈希输入（合同要求哈希输入不变）。
     """
     if not isinstance(config, dict):
         raise HubInputError("config 必须是 JSON 对象")
@@ -981,7 +1028,11 @@ def _normalize_config(config: dict, task: dict) -> tuple[dict, dict]:
     }
     gen_channel = {"baseUrl": base_url, "apiFormat": api_format, "渠道名": name,
                    "model": model, "mode": mode}
-    return gen_params, gen_channel
+    # 原始输入留痕（前端给 rawSize；CLI/旧调用方没带 → 就记实际用的那个 size 字面）
+    raw_size = _config_raw_size(given.get("rawSize")) or _config_raw_size(
+        given.get("size") or base.get("size") or base.get("ratio"))
+    size_input = {"raw": raw_size, "ratio": gen_params["ratio"]} if raw_size else {}
+    return gen_params, gen_channel, size_input
 
 
 def do_approve(local_id: str, config: dict | None = None) -> dict:
@@ -997,14 +1048,19 @@ def do_approve(local_id: str, config: dict | None = None) -> dict:
         task = state.load(task_dir)
         norm = _normalize_config(config, task) if config is not None else None
         try:
-            st = generate.do_approve(task_dir, config=norm, verbose=False)
+            st = generate.do_approve(task_dir, config=norm[:2] if norm is not None else None,
+                                     verbose=False)
         except generate.GenError as e:
             raise HubError(str(e)) from None
+        if norm is not None and norm[2]:
+            # AT-14 §3.1：原始画幅输入落任务文件（gen_params 旁的 size_input，不进快照哈希）
+            task = _write_task(task_dir, lambda t: t.__setitem__("size_input", norm[2]))
         task = state.load(task_dir)
     return {"state": st,
             "snapshot_version": state.snapshot_version(task),
             "gen_params": task.get("gen_params") or {},
-            "gen_channel": task.get("gen_channel") or {}}
+            "gen_channel": task.get("gen_channel") or {},
+            "size_input": task.get("size_input") or {}}
 
 
 def start_submit(local_id: str, key: str | None = None) -> dict:

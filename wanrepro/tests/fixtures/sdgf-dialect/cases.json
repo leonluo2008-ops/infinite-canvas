@@ -395,5 +395,48 @@
         "topEnableSound": null
       }
     }
-  ]
+  ],
+  "sizeCases": {
+    "contract": "docs/nodes/AT-14.md v2 §3.1 + §五.1（画幅根治：画布 inferVideoRatio 同口径规约 → 渠道校验两步）",
+    "purpose": "画幅输入的**唯一共享夹具**：PY（wanrepro/automation/probe_sdgf_dialect.py，走 hub_api._ratio_from_size + _normalize_config 真入口）与 TS（web/scripts/probe-at13-b3.mjs，走 gen-settings 前端提交组装真函数）加载同一份期望，单改任一端实现 → 至少一条 case 必红。fixture 是测试合同，不是生产枚举源（生产枚举仍以 media-size.ts / CANVAS_RATIOS 为源）。",
+    "schema": {
+      "input": {
+        "size": "用户/前端给 approve config 的 params.size 原值（也可以是 rawSize 原串）",
+        "apiFormat": "sdgf | wan（缺省 sdgf）——渠道接收域按它判"
+      },
+      "expect": {
+        "ratio": "画布 inferVideoRatio 规约结果（枚举 / auto）；null = 输入本身被拒（零维）",
+        "wire": "渠道提交体画幅（SDGF 的 auto → adaptive）；null = 未走到这一步",
+        "reject": "null=通过；size=输入本身无效（零维显式拒绝）；channel=渠道接收域不收（保留报错文案）",
+        "accepted": "前端是否可提交（false → 批准/提交按钮置灰）",
+        "note": "面板提示应包含的片段（空串=无可接受画幅时不必提示）"
+      }
+    },
+    "cases": [
+      { "id": "size-240x427-lower-x", "input": { "size": "240x427" },
+        "expect": { "ratio": "9:16", "wire": "9:16", "reject": null, "accepted": true, "note": "将按 9:16 生成" } },
+      { "id": "size-480x854-even-pixels", "input": { "size": "480x854" },
+        "expect": { "ratio": "9:16", "wire": "9:16", "reject": null, "accepted": true, "note": "将按 9:16 生成" } },
+      { "id": "size-240X427-upper-x", "input": { "size": "240X427" },
+        "expect": { "ratio": "9:16", "wire": "9:16", "reject": null, "accepted": true, "note": "将按 9:16 生成" } },
+      { "id": "size-240-times-427-multiply-sign", "input": { "size": "240×427" },
+        "expect": { "ratio": "9:16", "wire": "9:16", "reject": null, "accepted": true, "note": "将按 9:16 生成" } },
+      { "id": "size-9x16-enum-passthrough", "input": { "size": "9:16" },
+        "expect": { "ratio": "9:16", "wire": "9:16", "reject": null, "accepted": true, "note": "" } },
+      { "id": "size-21x9-sdgf-not-accepted", "input": { "size": "21:9" },
+        "expect": { "ratio": "21:9", "wire": null, "reject": "channel", "accepted": false, "note": "21:9" } },
+      { "id": "size-auto-adaptive", "input": { "size": "auto" },
+        "expect": { "ratio": "auto", "wire": "adaptive", "reject": null, "accepted": true, "note": "" } },
+      { "id": "size-zero-dim-rejected", "input": { "size": "0x0" },
+        "expect": { "ratio": null, "wire": null, "reject": "size", "accepted": false, "note": "必须为正" } },
+      { "id": "size-garbage-canvas-fallback", "input": { "size": "abc" },
+        "expect": { "ratio": "16:9", "wire": "16:9", "reject": null, "accepted": true, "note": "将按 16:9 生成" } },
+      { "id": "size-2000x100-wide-then-rejected", "input": { "size": "2000x100" },
+        "expect": { "ratio": "21:9", "wire": null, "reject": "channel", "accepted": false, "note": "21:9" } },
+      { "id": "size-16x9-wan-accepted", "input": { "size": "1920x1080", "apiFormat": "wan" },
+        "expect": { "ratio": "16:9", "wire": "16:9", "reject": null, "accepted": true, "note": "将按 16:9 生成" } },
+      { "id": "size-4x3-wan-not-accepted", "input": { "size": "4:3", "apiFormat": "wan" },
+        "expect": { "ratio": "4:3", "wire": null, "reject": "channel", "accepted": false, "note": "万相只接" } }
+    ]
+  }
 }
