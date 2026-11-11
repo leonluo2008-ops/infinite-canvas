@@ -572,6 +572,20 @@ export function hubAssetDisplayUrl(value: string): string {
     return `/api/hub/asset-file/${encodeURIComponent(parts[0])}/${encodeURIComponent(parts[2])}`;
 }
 
+/** 受控出口视图（AT-16 B1a）：数据层 ref 原串 → 一份渲染属性。
+ *
+ *  img src 与大图 a href 同源取 `display`，`ref` 原串原样带回——健康态（AssetStateContext）
+ *  按 ref 查键，**不**按换算后 URL 查（服务端 asset-probe 也同时回 ref/display 两键，两边一致）。
+ *  全 drawer 只允许受控出口组件（task-detail-drawer.tsx 的 hub-asset-exit 标记区内）消费本视图。
+ */
+export type HubAssetView = { ref: string; display: string; src: string; href: string };
+
+export function hubAssetRefView(value: string): HubAssetView {
+    const ref = String(value || "").trim();
+    const display = hubAssetDisplayUrl(ref);
+    return { ref, display, src: display, href: display };
+}
+
 /**
  * 单图上传（POST /api/asset/upload）。
  *

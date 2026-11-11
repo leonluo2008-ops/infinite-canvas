@@ -46,6 +46,8 @@ import {
     errorText,
     getHubTask,
     groupHubRows,
+    hubAssetDisplayUrl,
+    hubAssetRefView,
     hubOutputUrl,
     postHubAsset,
     probeHubAssets,
@@ -963,7 +965,7 @@ function GroupFrame({ group, className = "" }: { group: HubCardGroup; className?
         const probe = new Image();
         probe.onload = () => apply(probe);
         probe.onerror = () => apply(null);
-        probe.src = url;
+        probe.src = hubAssetDisplayUrl(url); // AT-16 B1a：取图同样走显示层换算点（与 <img src> 同源）
         apply(probe);
         return () => {
             alive = false;
@@ -993,7 +995,7 @@ function GroupFrame({ group, className = "" }: { group: HubCardGroup; className?
                     data-hub-frame-state={boxRow ? "precise" : "unlocated"}
                 >
                     {url ? (
-                        <AntdImage src={url} width={stage.w} height={stage.h} style={{ objectFit: "contain", display: "block" }} alt={`#${group.主行} 主行代表帧`} />
+                        <AntdImage src={hubAssetDisplayUrl(url)} width={stage.w} height={stage.h} style={{ objectFit: "contain", display: "block" }} alt={`#${group.主行} 主行代表帧`} />
                     ) : (
                         <div className="flex size-full flex-col items-center justify-center gap-1 px-2 text-center text-xs text-stone-400 dark:text-stone-500">
                             <ImageOff className="size-4" />
@@ -1388,7 +1390,7 @@ function FrameWithPosition({ card, className = "" }: { card: HubAssetCard; class
         const probe = new Image();
         probe.onload = () => apply(probe);
         probe.onerror = () => apply(null);
-        probe.src = url;
+        probe.src = hubAssetDisplayUrl(url); // AT-16 B1a：取图同样走显示层换算点（与 <img src> 同源）
         apply(probe);
         return () => {
             alive = false;
@@ -1439,7 +1441,7 @@ function FrameWithPosition({ card, className = "" }: { card: HubAssetCard; class
                 >
                     {url ? (
                         <AntdImage
-                            src={url}
+                            src={hubAssetDisplayUrl(url)}
                             width={stage.w}
                             height={stage.h}
                             style={{ objectFit: "contain", display: "block" }}
@@ -1607,16 +1609,28 @@ function FrameWithPosition({ card, className = "" }: { card: HubAssetCard; class
     );
 }
 
-/** 资产引用健康态（AT-14 B3）：显示 URL → local|ok|expired|unknown。由 Drawer 顶层注入，
+/** 资产引用健康态（AT-14 B3）：ref 原串 → local|ok|expired|unknown。由 Drawer 顶层注入，
  *  卡片深处（AssetUploadZone）直接取——避免把一份只读映射逐层穿过七个子组件。 */
 const AssetStateContext = createContext<Record<string, string>>({});
 
-/**
- * 已传图缩略块（AT-14 B3 旧 URL 三态）：正常引用照常出图；确证失效（403/404/410 → expired）
- * 出「图已过期，请重传」；未证实（超时/网络 → unknown）出「图片不可用，请重试」。
- * 两态都**不**自行猜本地副本、也不把破图当成功——重传走既有退回置换通道（同一上传区）。
- */
-function UploadedThumb({ url, state, n }: { url: string; state: string; n: number }) {
+/* hub-asset-exit:begin —— 受控资产出口（AT-16 B1a）。
+   全 drawer **唯一**允许把资产引用赋给 <img src> / <a href> 的地方：只收 ref 原串，
+   内部过 hubAssetRefView()（= hub-api 显示层唯一换算点 hubAssetDisplayUrl）出 src/href。
+   外部防再漏检查（web/scripts/probe-at16-b1a.mjs）按这对标记划白名单——标记之外任何
+   「.url / ref 来源表达式（含 props 间接传入）直接赋给 src=/href=」一律判红。 */
+export function UploadedThumb({
+    assetRef,
+    state,
+    alt,
+    thumbClass,
+}: {
+    /** 数据层原串（local:任务号/asset-uploads/xxx.png 或旧公网直链）；健康态查键也用它。 */
+    assetRef: string;
+    /** local|ok|expired|unknown；缺省=未探测，照常出图。 */
+    state?: string;
+    alt: string;
+    thumbClass?: string;
+}) {
     if (state === "expired" || state === "unknown") {
         const expired = state === "expired";
         return (
@@ -1629,12 +1643,19 @@ function UploadedThumb({ url, state, n }: { url: string; state: string; n: numbe
             </div>
         );
     }
+    const view = hubAssetRefView(assetRef);
     return (
-        <a href={url} target="_blank" rel="noreferrer" className="block">
-            <img src={url} alt={`#${n} 换图`} className="aspect-video w-40 rounded-md border border-emerald-300 bg-stone-100 object-contain dark:border-emerald-700 dark:bg-stone-900" />
+        <a href={view.href} target="_blank" rel="noreferrer" className="block" data-hub-asset-exit="link">
+            <img
+                src={view.src}
+                alt={alt}
+                data-hub-asset-exit="img"
+                className={thumbClass || "aspect-video w-40 rounded-md border border-emerald-300 bg-stone-100 object-contain dark:border-emerald-700 dark:bg-stone-900"}
+            />
         </a>
     );
 }
+/* hub-asset-exit:end */
 
 /** 传图/清空并排的上传区（本地资产引用 → 定向写清单；组卡传代表行=全组联动）。 */
 function AssetUploadZone({
@@ -1711,7 +1732,9 @@ function AssetUploadZone({
         <div className="flex min-w-0 flex-1 flex-col justify-center gap-1.5">
             {uploaded.length ? (
                 <div className="flex flex-wrap items-stretch gap-2">
-                    {uploaded.map((url) => <UploadedThumb key={url} url={url} state={states[url] || ""} n={n} />)}
+                    {uploaded.map((assetRef) => (
+                        <UploadedThumb key={assetRef} assetRef={assetRef} state={states[assetRef] || ""} alt={`#${n} 换图`} />
+                    ))}
                 </div>
             ) : null}
             <div className="flex flex-wrap items-center gap-2">
