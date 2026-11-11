@@ -61,6 +61,7 @@ import {
     type HubAssetCard,
     type HubCardGroup,
     type HubSelfCheckItem,
+    type HubSuggestion,
     type HubTaskDetail,
     type HubTaskSummary,
 } from "./hub-api";
@@ -330,11 +331,15 @@ function HeaderActions({ summary, busy, onRequestDelete }: { summary: HubTaskSum
     );
 }
 
-/** Agent 建议区：必须换/建议准备主展示带理由与镜次；可沿用全折叠；待核对显式标「尚无建议·待核对」，禁归可沿用。 */
-function SuggestionSection({ detail }: { detail: HubTaskDetail }) {
+/**
+ * Agent 建议区：必须换/建议准备主展示带理由与镜次；可沿用全折叠；待核对显式标「尚无建议·待核对」，禁归可沿用。
+ * AT-16 B3：每行挂画面锚点——复用 FrameWithPosition / GroupFrame（既有框与比例处理，红线 25 不另画一套框），
+ * 数据源=asset_cards 已透出的代表帧；建议行 #n 与资产卡编号同源（同一份清单行号）→ 无卡/无帧的行诚实占位不造图。
+ */
+export function SuggestionSection({ detail }: { detail: HubTaskDetail }) {
     const suggestions = detail.suggestions;
-    const cards = detail.asset_cards;
-    const shortNameOf = (n: number) => cards.find((card) => card.n === n)?.短名 || "";
+    // 行号 → 资产卡：建议行 #n 就是清单行号，卡按同一行号索引（同源，不做二次编号）。
+    const cardMap = new Map(detail.asset_cards.map((card) => [card.n, card]));
 
     if (!suggestions.length) {
         return (
@@ -357,13 +362,13 @@ function SuggestionSection({ detail }: { detail: HubTaskDetail }) {
 
             <div className="mt-3 space-y-2">
                 {must.map((item) => (
-                    <SuggestionRow key={item.n} item={item} name={shortNameOf(item.n)} tone="must" />
+                    <SuggestionRow key={item.n} item={item} card={cardMap.get(item.n)} tone="must" />
                 ))}
                 {prepare.map((item) => (
-                    <SuggestionRow key={item.n} item={item} name={shortNameOf(item.n)} tone="prepare" />
+                    <SuggestionRow key={item.n} item={item} card={cardMap.get(item.n)} tone="prepare" />
                 ))}
                 {unverified.map((item) => (
-                    <SuggestionRow key={item.n} item={item} name={shortNameOf(item.n)} tone="unverified" />
+                    <SuggestionRow key={item.n} item={item} card={cardMap.get(item.n)} tone="unverified" />
                 ))}
             </div>
 
@@ -375,7 +380,7 @@ function SuggestionSection({ detail }: { detail: HubTaskDetail }) {
                     </summary>
                     <div className="space-y-2 border-t border-stone-200 px-3 py-2.5 dark:border-stone-800">
                         {keep.map((item) => (
-                            <SuggestionRow key={item.n} item={item} name={shortNameOf(item.n)} tone="keep" />
+                            <SuggestionRow key={item.n} item={item} card={cardMap.get(item.n)} tone="keep" />
                         ))}
                     </div>
                 </details>
@@ -384,8 +389,71 @@ function SuggestionSection({ detail }: { detail: HubTaskDetail }) {
     );
 }
 
-function SuggestionRow({ item, name, tone }: { item: HubTaskDetail["suggestions"][number]; name: string; tone: "must" | "prepare" | "keep" | "unverified" }) {
+/** 建议行锚点缩放：只缩「显示」（几何仍由 frame-overlay 同一套函数算，不另画框）；缩略图里图例 rail 不可读，
+ *  故建议行关图例——框内 #行号 角标 + 行文本里的 #编号 承担识别。 */
+const SUGGEST_ANCHOR_SCALE = 0.5;
+
+/**
+ * AT-16 B3 建议行视觉锚点（四类行同款）：
+ *  组成员 → GroupFrame（组卡=一张代表帧+主行一框，与置换区口径一致）；
+ *  有帧   → FrameWithPosition（本行帧+框，他人框淡显，三态照旧诚实）；
+ *  无帧/无卡 → 诚实占位（不造图，不搬别的行的帧）。
+ */
+function SuggestionAnchor({ item, card }: { item: HubSuggestion; card?: HubAssetCard }) {
+    const frame = "w-[168px] shrink-0";
+    if (!card) {
+        return (
+            <div className={frame} data-hub-suggest-anchor={item.n} data-hub-suggest-anchor-source="none" data-hub-suggest-no-frame="missing-card">
+                <NoFrameBox title="无对应资产卡" note="建议行没有对应的资产卡，取不到画面帧" />
+            </div>
+        );
+    }
+    const group = card.组;
+    if (group) {
+        if (!(group.代表帧.url || "").trim()) {
+            return (
+                <div className={frame} data-hub-suggest-anchor={item.n} data-hub-suggest-anchor-source="none" data-hub-suggest-no-frame="group-no-frame">
+                    <NoFrameBox title="无对应帧" note={`组成员 #${group.成员.join("、#")} 没有可用画面帧`} />
+                </div>
+            );
+        }
+        return (
+            <div className={frame} data-hub-suggest-anchor={item.n} data-hub-suggest-anchor-source="group" data-hub-suggest-group-key={group.键}>
+                <GroupFrame group={group} scale={SUGGEST_ANCHOR_SCALE} />
+            </div>
+        );
+    }
+    if (!frameUrlOf(card)) {
+        return (
+            <div className={frame} data-hub-suggest-anchor={item.n} data-hub-suggest-anchor-source="none" data-hub-suggest-no-frame="no-frame">
+                <NoFrameBox title="无对应帧" note="该行没有可定位的画面帧（不造图）" />
+            </div>
+        );
+    }
+    return (
+        <div className={frame} data-hub-suggest-anchor={item.n} data-hub-suggest-anchor-source="frame">
+            <FrameWithPosition card={card} scale={SUGGEST_ANCHOR_SCALE} showLegend={false} />
+        </div>
+    );
+}
+
+/** 无帧占位（建议区专用）：虚线空框 + 明说取不到帧，绝不用别的行/别的镜的帧顶替。 */
+function NoFrameBox({ title, note }: { title: string; note: string }) {
+    return (
+        <div
+            className="flex h-[104px] w-full flex-col items-center justify-center gap-1 rounded-md border border-dashed border-stone-300 bg-stone-50 px-2 text-center text-[11px] leading-tight text-stone-500 dark:border-stone-700 dark:bg-stone-900 dark:text-stone-400"
+            data-hub-suggest-placeholder
+        >
+            <ImageOff className="size-4" />
+            <span className="font-medium">{title}</span>
+            <span className="text-[10px] text-stone-400 dark:text-stone-500">{note}</span>
+        </div>
+    );
+}
+
+function SuggestionRow({ item, card, tone }: { item: HubSuggestion; card?: HubAssetCard; tone: "must" | "prepare" | "keep" | "unverified" }) {
     const shots = item.镜次.length ? `第 ${item.镜次.join("、")} 镜` : "";
+    const name = (card?.短名 || "").trim();
     const badge =
         tone === "must" ? (
             <Tag color="red" className="m-0">必须换</Tag>
@@ -397,12 +465,21 @@ function SuggestionRow({ item, name, tone }: { item: HubTaskDetail["suggestions"
             <Tag className="m-0">可沿用</Tag>
         );
     return (
-        <div className={`flex flex-wrap items-baseline gap-x-2 gap-y-0.5 rounded-md px-2 py-1.5 text-sm ${tone === "must" ? "bg-red-50/70 dark:bg-red-950/20" : tone === "prepare" ? "bg-blue-50/60 dark:bg-blue-950/20" : tone === "unverified" ? "bg-amber-50/70 dark:bg-amber-950/20" : ""}`}>
-            {badge}
-            <span className="font-mono text-xs text-stone-400 dark:text-stone-500">#{item.n}</span>
-            {name ? <span className="font-medium">{name}</span> : null}
-            {shots ? <span className="text-xs text-stone-400 dark:text-stone-500">{shots}</span> : null}
-            {item.理由 ? <span className="min-w-0 flex-basis-full break-words text-xs text-stone-500 dark:text-stone-400">理由：{item.理由}</span> : null}
+        <div
+            className={`flex items-start gap-2.5 rounded-md px-2 py-1.5 text-sm ${tone === "must" ? "bg-red-50/70 dark:bg-red-950/20" : tone === "prepare" ? "bg-blue-50/60 dark:bg-blue-950/20" : tone === "unverified" ? "bg-amber-50/70 dark:bg-amber-950/20" : ""}`}
+            data-hub-suggest-row={item.n}
+            data-hub-suggest-tone={tone}
+        >
+            <SuggestionAnchor item={item} card={card} />
+            <div className="min-w-0 flex-1">
+                <div className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5">
+                    {badge}
+                    <span className="font-mono text-xs text-stone-400 dark:text-stone-500">#{item.n}</span>
+                    {name ? <span className="font-medium">{name}</span> : null}
+                    {shots ? <span className="text-xs text-stone-400 dark:text-stone-500">{shots}</span> : null}
+                </div>
+                {item.理由 ? <div className="mt-0.5 break-words text-xs text-stone-500 dark:text-stone-400">理由：{item.理由}</div> : null}
+            </div>
         </div>
     );
 }
@@ -946,8 +1023,9 @@ function GroupCard({
  * AT-11 M2 合并卡代表帧（§3.1.2 单帧单框）：帧与唯一框同源自主行投影（组.代表帧/组.单框），
  * 帧上**恰一枚框**（data-hub-box-row=主行）；主行无自身框 → 不画任何框+「主行未定位」诚实文案
  * （绝不搬组内其他行的框充数、不跨镜拼框）。几何口径与 AT-10 相同：contain 内容盒 + 百分比框。
+ * AT-16 B3：scale（默认 1）只缩显示——建议区组成员行用 0.5 缩略图，框仍同源自主行投影。
  */
-function GroupFrame({ group, className = "" }: { group: HubCardGroup; className?: string }) {
+function GroupFrame({ group, className = "", scale = 1 }: { group: HubCardGroup; className?: string; scale?: number }) {
     const url = (group.代表帧.url || "").trim();
     const [ratio, setRatio] = useState<number | null>(null);
     const stageRef = useRef<HTMLDivElement | null>(null);
@@ -983,14 +1061,19 @@ function GroupFrame({ group, className = "" }: { group: HubCardGroup; className?
     const caption = located
         ? [typeof shot === "number" && shot > 0 ? `第${shot}镜` : "", formatSeconds(group.代表帧.秒), "AI粗标"].filter(Boolean).join(" · ")
         : "未能定位到该资产出现的镜头 · 暂用整片画面";
+    const scaled = scale !== 1;
 
     return (
-        <div className={className} data-hub-group-frame data-hub-frame-state={boxRow ? "precise" : "unlocated"}>
-            <div className="relative">
+        <div className={className} data-hub-group-frame data-hub-frame-state={boxRow ? "precise" : "unlocated"} data-hub-frame-scale={scale}>
+            <div className="relative" style={scaled ? { width: Math.round(stage.w * scale), height: Math.round(stage.h * scale) } : undefined}>
                 <div
                     ref={stageRef}
                     className="relative shrink-0 overflow-hidden rounded-md bg-stone-100 dark:bg-stone-900"
-                    style={{ width: stage.w, height: stage.h }}
+                    style={{
+                        width: stage.w,
+                        height: stage.h,
+                        ...(scaled ? { transform: `scale(${scale})`, transformOrigin: "top left" } : null),
+                    }}
                     data-hub-frame-stage
                     data-hub-frame-state={boxRow ? "precise" : "unlocated"}
                 >
@@ -1031,7 +1114,7 @@ function GroupFrame({ group, className = "" }: { group: HubCardGroup; className?
                     ) : null}
                 </div>
             </div>
-            <div className="mt-1 max-w-full px-0.5 text-left text-[11px] text-stone-500 dark:text-stone-400">
+            <div className="mt-1 max-w-full px-0.5 text-left text-[11px] text-stone-500 dark:text-stone-400" data-hub-frame-caption>
                 <div>{caption}{located ? "（点图放大）" : ""}</div>
                 {url && !boxRow ? (
                     <Tag color="warning" className="m-0 mt-0.5 !text-[10px]" data-hub-group-degraded>
@@ -1356,17 +1439,35 @@ const BOX_ACCENT: Record<string, string> = {
 };
 const accentOf = (label: string) => BOX_ACCENT[label] || BOX_ACCENT["可沿用"];
 
+/** 帧取图口径（代表帧优先、旧字段兜底）——FrameWithPosition 与建议区锚点共用同一份解析，禁第二套。 */
+function frameUrlOf(card: HubAssetCard): string {
+    return (card.代表帧.url || "").trim() || card.帧.map((frame) => (frame.url || "").trim()).find(Boolean) || "";
+}
+
 /**
  * 共享帧 + 同帧多红框（AT-10 C3）：overlay 与图片共用 contain 后**实际内容盒**（不是外框），
  * 九宫格百分比直接落内容盒；全部框保留红色边界，本卡加粗实红、其他行红半透明；
  * 图例 rail 逐行号排布（行号·短名·角标），引线汇聚到各自框——同格多框也逐行号可见可分。
  * 三态诚实：未定位→不画框不标镜次+「未能定位到该资产出现的镜头·暂用整片画面」；
  * 无自身位置→帧与镜次照给、他人框照画、描述首句+「未能标注位置」。旧字段（帧[]/画面位置）仍驱动 legacy 分支。
+ * AT-16 B3：scale（默认 1）只缩显示不动几何——建议区锚点用 0.5 缩略图，置换区仍 1:1；
+ * showLegend=false 供缩略图关掉不可读的图例 rail（框与角标照画）。
  */
-function FrameWithPosition({ card, className = "" }: { card: HubAssetCard; className?: string }) {
+function FrameWithPosition({
+    card,
+    className = "",
+    scale = 1,
+    showLegend = true,
+}: {
+    card: HubAssetCard;
+    className?: string;
+    /** 显示缩放（1=原样）；几何仍由 frame-overlay 同一套函数算，不另画一套框。 */
+    scale?: number;
+    /** 是否渲染右侧图例 rail（缩略图里不可读 → 建议区关掉）。 */
+    showLegend?: boolean;
+}) {
     const state = frameState(card);
-    const legacyUrl = card.帧.map((frame) => (frame.url || "").trim()).find(Boolean) || "";
-    const url = (card.代表帧.url || "").trim() || legacyUrl;
+    const url = frameUrlOf(card);
     const [ratio, setRatio] = useState<number | null>(null);
     const [hoverRow, setHoverRow] = useState<number | null>(null);
     const stageRef = useRef<HTMLDivElement | null>(null);
@@ -1406,7 +1507,7 @@ function FrameWithPosition({ card, className = "" }: { card: HubAssetCard; class
     const laid = boxes
         .map((box) => ({ box, rect: boxRect(box, content) }))
         .sort((a, b) => Number(a.box.本卡) - Number(b.box.本卡));
-    const legend = layoutLegend(laid.map(({ box, rect }) => ({ 行: box.行, box: rect })), stage);
+    const legend = layoutLegend(showLegend ? laid.map(({ box, rect }) => ({ 行: box.行, box: rect })) : [], stage);
 
     const legacyPosition = state === "legacy" ? card.画面位置 : null;
     const legacyRect =
@@ -1427,10 +1528,24 @@ function FrameWithPosition({ card, className = "" }: { card: HubAssetCard; class
     const others = otherBoxCount(laid.map(({ box }) => box));
     const wrapperW = legend.chips.length ? legend.x + legend.w : stage.w;
     const wrapperH = Math.max(stage.h, legend.height);
+    // AT-16 B3：scale≠1 时用一层定尺寸壳子占位（transform 不改布局），壳内仍按 1:1 几何渲染后整体缩放——
+    // 框/内容盒/图例全部同源缩放，不存在第二套坐标；**说明文字留在外层**（按容器宽排，不跟着缩成一条）。
+    const scaled = scale !== 1;
 
     return (
-        <div className={className} data-hub-frame-state={state}>
-            <div className="relative flex items-start" style={{ width: wrapperW, height: wrapperH }}>
+        <div className={className} data-hub-frame-state={state} data-hub-frame-scale={scale}>
+            <div
+                className="relative"
+                style={scaled ? { width: Math.round(wrapperW * scale), height: Math.round(wrapperH * scale) } : undefined}
+            >
+                <div
+                    className="relative flex items-start"
+                    style={{
+                        width: wrapperW,
+                        height: wrapperH,
+                        ...(scaled ? { transform: `scale(${scale})`, transformOrigin: "top left" } : null),
+                    }}
+                >
                 {/* 舞台：尺寸按帧真实宽高比定（竖屏窄、横屏宽）；overflow 只裁图片圆角，标签全在舞台之外 */}
                 <div
                     ref={stageRef}
@@ -1582,9 +1697,10 @@ function FrameWithPosition({ card, className = "" }: { card: HubAssetCard; class
                         </ul>
                     </>
                 ) : null}
+                </div>
             </div>
 
-            <div className="mt-1 max-w-full px-0.5 text-left text-[11px] text-stone-500 dark:text-stone-400">
+            <div className="mt-1 max-w-full px-0.5 text-left text-[11px] text-stone-500 dark:text-stone-400" data-hub-frame-caption>
                 {state === "unlocated" ? (
                     <span className="text-amber-700 dark:text-amber-300">{caption.main}</span>
                 ) : (
