@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""一条命令串四步：拆解 → 待确认清单 → 意图建议回填 → 渲染提示词（两阶段 + 断点续跑）。
+"""一条命令串五步：拆解 → 待确认清单 → 意图建议回填 → 渲染提示词 → 拆解产物门禁（两阶段 + 断点续跑；门禁见 AT-15 R1）。
 
 为什么要有它：下游命令各自都能跑，但「跑完拆解 → 清单 → 意图建议回填 → 人改清单 → 再渲染」这个来回，
 每换一条片子都要手工敲多遍 `--id` 和路径，敲错一个字符就落到另一个目录。
@@ -394,8 +394,13 @@ def run_child(script_rel: str, args: list[str]) -> int:
 
 def stage_extract(video: Path, video_id: str, outdir: Path, extract_mod, intent: str = "",
                   model: str | None = None, base_url: str | None = None,
-                  api_key: str | None = None) -> tuple[int, str]:
-    """视频指纹与当前意图都未变且十层合格 → 跳过；否则真跑一次拆解。"""
+                  api_key: str | None = None, diagnosis: Path | None = None,
+                  force: bool = False) -> tuple[int, str]:
+    """视频指纹与当前意图都未变且十层合格 → 跳过；否则真跑一次拆解。
+
+    AT-15 R1 自动重拆：diagnosis=门禁诊断文件（非标题形态追加任务书末尾）、force=True
+    绕过「指纹没变就跳过」——门禁判它不合格，这一版必须重跑，不能用缓存交差。
+    """
     disc = outdir / DISC_NAME
     fp_path = outdir / FP_NAME
 
@@ -418,7 +423,7 @@ def stage_extract(video: Path, video_id: str, outdir: Path, extract_mod, intent:
         print(f"ERROR 读不了拆解输入（算不出视频或意图指纹）：{exc}", file=sys.stderr)
         return EXIT_INPUT, "失败"
 
-    if disc.is_file():
+    if disc.is_file() and not force:
         stored = read_fingerprint(fp_path)
         if stored is None:
             print(f"[重跑] {DISC_NAME} 在，但没有源视频指纹（{FP_NAME}）——"
@@ -458,11 +463,16 @@ def stage_extract(video: Path, video_id: str, outdir: Path, extract_mod, intent:
                 else:
                     print(f"[重跑] 指纹没变但十层不齐（{detail}）→ 重新拆解")
     else:
-        print(f"[拆解] {outdir.name}/ 下没有 {DISC_NAME}，开始拆解")
+        if force:
+            print(f"[重拆] 门禁判不合格 → 按诊断重跑拆解（{DISC_NAME} 覆盖写）")
+        else:
+            print(f"[拆解] {outdir.name}/ 下没有 {DISC_NAME}，开始拆解")
 
     child_args = [display_path(video), "--id", video_id]
     if intent:
         child_args.extend(["--intent", intent])
+    if diagnosis is not None:
+        child_args.extend(["--diagnosis", str(diagnosis)])
     if (model or "").strip():
         child_args.extend(["--model", model.strip()])
     if (base_url or "").strip():
@@ -578,12 +588,38 @@ def stage_render(video_id: str, template: str) -> int:
     return run_child(RENDER_REL, ["--id", video_id, "--template", tpl_name])
 
 
+# ---------------------------------------------------------------- AT-15 R1 拆解产物门禁
+
+def load_dissect_gate():
+    """按路径加载 pipeline/reverse/dissect_gate.py（不新增包；顶层无重依赖）。"""
+    spec = importlib.util.spec_from_file_location("_reverse_dissect_gate",
+                                                  REVERSE_DIR / "dissect_gate.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def gate_session_key(video: Path, intent: str, model: str | None) -> str:
+    """门禁计数会话键：同片 + 同意图 + 同模型 = 同一会话（重拆轮次续算，断点续跑不重置）。
+
+    换了片子/意图/模型就是另一件事，轮次从 0 起——不然上一部片用掉的两次重拆
+    会把新片子的重拆额度吃掉。
+    """
+    try:
+        stat = video.stat()
+        basis = (f"{video.resolve()}|{stat.st_size}|{stat.st_mtime_ns}|"
+                 f"{intent}|{(model or '').strip()}")
+    except OSError:
+        basis = f"{video}|0|0|{intent}|{(model or '').strip()}"
+    return hashlib.sha256(basis.encode("utf-8")).hexdigest()[:16]
+
+
 # ---------------------------------------------------------------- 主流程
 
 def main(argv: list[str] | None = None) -> int:
     use_line_buffering()
     parser = argparse.ArgumentParser(
-        description="一条命令串四步：拆解 → 待确认清单 → 意图建议回填 → 渲染提示词（两阶段 + 断点续跑）")
+        description="一条命令串五步：拆解 → 待确认清单 → 意图建议回填 → 渲染提示词 → 拆解产物门禁（两阶段 + 断点续跑；门禁见 AT-15 R1）")
     parser.add_argument("video", nargs="?", help="参考视频路径")
     parser.add_argument("--id", dest="video_id", help="产物目录名（默认由文件名推出）")
     parser.add_argument("--template", default=DEFAULT_TEMPLATE,
@@ -641,7 +677,7 @@ def main(argv: list[str] | None = None) -> int:
               f"｜模板：{tpl_name}｜意图：有")
 
     # 1) 拆解
-    banner("[1/4] 拆解：参考视频 → 十层 Markdown")
+    banner("[1/5] 拆解：参考视频 → 十层 Markdown")
     mark_stage(outdir, "抽帧")           # 预检/抽帧/看帧判定先跑；「大拆解」由 extract.py 自己标
     code, state = stage_extract(video, video_id, outdir, extract_mod, current_intent,
                                 model=args.model, base_url=args.base_url, api_key=args.api_key)
@@ -651,7 +687,7 @@ def main(argv: list[str] | None = None) -> int:
     disc = outdir / DISC_NAME
 
     # 2) 先生成清单，保证意图模型拿到稳定的行号索引。
-    banner("[2/4] 待确认清单：十层 → 四类实体（全预填）")
+    banner("[2/5] 待确认清单：十层 → 四类实体（全预填）")
     mark_stage(outdir, "汇总")           # 十层 Markdown 汇总成四类实体清单
     code, _check_state = stage_confirm(
         disc, outdir, current_intent, refresh=(state == "重跑")
@@ -662,7 +698,7 @@ def main(argv: list[str] | None = None) -> int:
     check = outdir / CHECK_NAME
 
     # 3) 再生成意图建议，并按行号回填清单第 7 列。
-    banner("[3/4] 意图建议：清单行号 + 用户意图 → 三档建议")
+    banner("[3/5] 意图建议：清单行号 + 用户意图 → 三档建议")
     mark_stage(outdir, "专项判定")       # 按清单逐行判三档建议
     code, _intent_state = stage_intent(disc, check, outdir, current_intent)
     if code != EXIT_OK:
@@ -688,7 +724,7 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_OK
 
     # 4) 渲染
-    banner(f"[4/4] 渲染：十层 + 清单 → 提示词-{tpl_name}.md ＋ 资产清单.md")
+    banner(f"[4/5] 渲染：十层 + 清单 → 提示词-{tpl_name}.md ＋ 资产清单.md")
     mark_stage(outdir, "投影")           # 提示词 + 资产清单落盘（轮询端「拉投影」读的就是它）
     code = stage_render(video_id, tpl_name)
     if code != EXIT_OK:
@@ -703,12 +739,61 @@ def main(argv: list[str] | None = None) -> int:
         mark_stage(outdir, "失败", f"渲染报成功但缺产物：{'、'.join(missing)}")
         return EXIT_LAYER
 
+    # 5) 拆解产物门禁（AT-15 R1）：判下游真正消费的东西；不合格 → 按诊断自动重拆（上限 2 次）
+    banner("[5/5] 拆解产物门禁：D1–D7（不合格自动重拆，上限 2 次；到顶如实标红）")
+    mark_stage(outdir, "门禁")
+
+    def rework(diagnosis: str) -> tuple[bool, str]:
+        """门禁 FAIL → 只重跑 视觉模型+提取+清单+意图+渲染（实测/抽帧不重跑）。"""
+        existing = sorted(outdir.glob("门禁诊断-第*轮.md"))
+        diag_path = outdir / f"门禁诊断-第{len(existing) + 1}轮.md"
+        diag_path.write_text(diagnosis, encoding="utf-8")
+        print(f"[重拆] 诊断落盘：{display_path(diag_path)}")
+        code, _state = stage_extract(video, video_id, outdir, extract_mod, current_intent,
+                                     model=args.model, base_url=args.base_url,
+                                     api_key=args.api_key, diagnosis=diag_path, force=True)
+        if code != EXIT_OK:
+            return False, f"视觉模型/提取失败 exit={code}"
+        code, _ = stage_confirm(disc, outdir, current_intent, refresh=True)
+        if code != EXIT_OK:
+            return False, f"清单重建失败 exit={code}"
+        code, _ = stage_intent(disc, check, outdir, current_intent)
+        if code != EXIT_OK:
+            return False, f"意图建议失败 exit={code}"
+        code = stage_render(video_id, tpl_name)
+        if code != EXIT_OK:
+            return False, f"渲染失败 exit={code}"
+        return True, "重拆完成（视觉模型+提取+清单+意图+渲染）"
+
+    gate = load_dissect_gate()
+    try:
+        gate_result = gate.run(
+            outdir, bridge_id=video_id, local_id=video_id,
+            session_key=gate_session_key(video, current_intent, args.model),
+            layer_check=lambda path: local_layer_check(path, extract_mod),
+            rework=rework, max_rounds=2,
+            stage=lambda message: (mark_stage(outdir, str(message)),
+                                   print(f"[门禁] {message}", flush=True)),
+        )
+    except Exception as exc:                        # noqa: BLE001 —— 门禁是质量信号，不是交付闸门
+        # 产物已经落盘交付了：门禁自己炸掉要如实留痕，但不能把一次成功的拆解判成失败。
+        print(f"WARN 门禁没跑成（{type(exc).__name__}: {exc}）；产物照常交付", file=sys.stderr)
+        gate_result = {"verdict": "WARN", "状态": f"门禁环境故障（{type(exc).__name__}）",
+                       "缺项": [], "告警": [f"{type(exc).__name__}: {exc}"], "轮次": 0,
+                       "上限": 2, "checks": [], "历史": []}
+    print(gate.render(gate_result))
+    gate_failed = gate_result["verdict"] == "FAIL"
+    gate_line = (f"{gate_result['状态']}｜{len(gate_result.get('缺项') or [])} FAIL / "
+                 f"{len(gate_result.get('告警') or [])} WARN｜重拆 {gate_result['轮次']}/"
+                 f"{gate_result['上限']} 次")
+
     banner("完成")
-    mark_stage(outdir, "完成")
+    mark_stage(outdir, f"完成·门禁{gate_line}" if gate_failed else "完成")
     print(f"拆解　　　：{display_path(disc)}（{disc.stat().st_size} 字节）")
     print(f"待确认清单：{display_path(check)}（{check.stat().st_size} 字节）")
     print(f"提示词　　：{display_path(prompt_path)}（{prompt_path.stat().st_size} 字节）")
     print(f"资产清单　：{display_path(assets_path)}（{assets_path.stat().st_size} 字节）")
+    print(f"门禁　　　：{gate_line}（{display_path(outdir / '门禁.json')}）")
     return EXIT_OK
 
 

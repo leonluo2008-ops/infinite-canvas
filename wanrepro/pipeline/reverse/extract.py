@@ -246,8 +246,26 @@ def _inject_camera_contract(body: str) -> str:
     return body.replace(placeholder, section)
 
 
+def build_diagnosis_block(diagnosis: str) -> str:
+    """门禁诊断 → 追加到本轮任务书末尾（AT-15 R1 自动重拆用）。
+
+    纪律（红线 24 / 20）：
+      · **非标题形态**：整段只用【…】与「- 」列表，`#` 一律去掉——平级标题会把任务书的
+        「一~十」十层结构撕开（2026-11-06 契约注入踩过：角色错认、资产截图对位全错）。
+      · 写法指导式：告诉模型「该写成什么样」，不是把上一版骂一遍。
+      · 不引入新的拆解目标：十层立场不变（只描述参考片里真实存在的东西）。
+    文本由 pipeline/reverse/dissect_gate.py:build_diagnosis 组装（判据与下游同源）。
+    """
+    body = str(diagnosis or "").strip()
+    if not body:
+        return ""
+    body = re.sub(r"(?m)^[ \t]*#{1,6}[ \t]*", "", body)
+    return "\n\n" + body + "\n"
+
+
 def build_prompt(base_text: str, intent: str, facts: dict | None = None,
-                 frame_facts: dict | None = None, inject: str = "fields") -> str:
+                 frame_facts: dict | None = None, inject: str = "fields",
+                 diagnosis: str = "") -> str:
     """把用户意图追加到视频拆解提示词；空意图必须保持原文逐字不变。
 
     2026-10-30 实测教训：初版写的是「围绕这条意图更有针对性地观察与拆解」，
@@ -288,7 +306,7 @@ def build_prompt(base_text: str, intent: str, facts: dict | None = None,
         text += build_tail_brand_block(frame_facts,
                                        (facts or {}).get("duration") if facts else None)
     if not intent:
-        return text
+        return text + build_diagnosis_block(diagnosis)
     return (
         text
         + "\n\n【本次用户意图（仅供你判断哪些细节要多写两句，不是你这次的任务）】\n"
@@ -302,7 +320,7 @@ def build_prompt(base_text: str, intent: str, facts: dict | None = None,
         + "「资产准备」这类为替换服务的措辞；第九层（资产）照旧只列片子里看得见的东西，"
         + "不许写用户要另外准备什么。\n"
         + "5. 不许把用户意图里的第一人称原句写进十层正文。"
-    )
+    ) + build_diagnosis_block(diagnosis)
 
 
 def write_intent(outdir: Path, intent: str) -> None:
@@ -1486,7 +1504,7 @@ def run_check_only(check_path: Path) -> int:
 def run_extract(video_path: Path, video_id: str, outdir: Path, timeout: float, intent: str = "",
                 frames: str = FRAMES_DEFAULT, inject: str = "fields",
                 model: str | None = None, base_url: str | None = None,
-                api_key: str | None = None) -> int:
+                api_key: str | None = None, diagnosis: str = "") -> int:
     # 1. 预检（含 --frames 的解析：认不出就当场退出，不去花错的钱）
     try:
         probe = probe_video(video_path)
@@ -1518,7 +1536,7 @@ def run_extract(video_path: Path, video_id: str, outdir: Path, timeout: float, i
     # 1.5 看帧判定：缺就先自动跑一次（默认首帧窗口 0:0.5、3 帧）；失败只留痕，不拦拆解
     frame_facts, frame_problem = ensure_frame_facts(
         Path(video_path), Path(outdir), probe, api_key, timeout, windows)
-    prompt = build_prompt(base_prompt, intent, probe, frame_facts, inject)
+    prompt = build_prompt(base_prompt, intent, probe, frame_facts, inject, diagnosis=diagnosis)
     try:
         write_intent(Path(outdir), intent)
     except OSError as exc:
@@ -1559,7 +1577,8 @@ def run_extract(video_path: Path, video_id: str, outdir: Path, timeout: float, i
         if frame_facts and _is_content_block(exc):
             print("[看帧] 上游内容审核拦下了带判定的请求，去掉注入重试一次"
                   "（判定仍留在 看帧.json，可事后核对）", file=sys.stderr, flush=True)
-            prompt = build_prompt(base_prompt, intent, probe, frame_facts, "off")
+            prompt = build_prompt(base_prompt, intent, probe, frame_facts, "off",
+                                  diagnosis=diagnosis)
             inject_problem = "带看帧判定的请求被上游内容审核拦下，本次未注入"
             try:
                 if _progress is not None:
@@ -1637,6 +1656,9 @@ def main(argv=None) -> int:
                         help="渠道 base URL：不带版本段自动补 /v1beta，显式带则尊重")
     parser.add_argument("--api-key", default=None,
                         help="渠道密钥（默认读 JXIN_API_KEY / .env；不给就落回原读法）")
+    parser.add_argument("--diagnosis", default=None,
+                        help="门禁诊断文件（自动重拆用）：正文以非标题形态追加到任务书末尾；"
+                             "不给 = 与旧版逐字节一致")
     args = parser.parse_args(argv)
 
     if args.check_only:
@@ -1645,11 +1667,20 @@ def main(argv=None) -> int:
     if not args.video:
         parser.error("缺少视频路径（或改用 --check-only <拆解.md>）")
 
+    diagnosis = ""
+    if args.diagnosis:
+        try:
+            diagnosis = Path(args.diagnosis).expanduser().read_text(encoding="utf-8").strip()
+        except OSError as exc:
+            print(f"ERROR 读不到门禁诊断 {args.diagnosis}：{exc}", file=sys.stderr)
+            return 2
+
     video_path = Path(args.video).expanduser()
     video_id = args.video_id or make_video_id(video_path)
     outdir = Path(args.outdir).expanduser() if args.outdir else REPO_ROOT / "analysis" / "reverse" / video_id
     return run_extract(video_path, video_id, outdir, args.timeout, args.intent, args.frames, args.inject,
-                       model=args.model, base_url=args.base_url, api_key=args.api_key)
+                       model=args.model, base_url=args.base_url, api_key=args.api_key,
+                       diagnosis=diagnosis)
 
 
 if __name__ == "__main__":

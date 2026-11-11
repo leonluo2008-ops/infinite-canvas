@@ -913,7 +913,19 @@ def spans_from_text(text: str) -> list:
 
 
 def spans_from_appearance(appear: str, shot_times: dict) -> list:
-    """「出现于」原文 → 时段数组：镜号走分镜表换算，`00:00-00:05` 直接用，`全片` 取整片。"""
+    """「出现于」原文 → 时段数组（AT-15 R1：复合写法两路都认）。
+
+    认三种写法：
+      · `00:00-00:03 / 镜1-3`（复合：**时段与镜号都给**）→ 取显式时间码。时间码是这一条
+        自己的刻度，比分镜表更直接，也不怕分镜表整表被拒（pop-1 现场就是表被拒 → 全兜底）；
+        旧实现先认镜号，表读不出时这段就成了「无时段」，白丢一条证据。
+      · `镜 1、7` / `镜 3-6` → 按分镜表换算（表里没有这镜 → []，交给下一跳兜底）。
+      · `全片` → 首镜起 → 末镜止。
+    时段解析不猜：时间码按 confirm.clock_to_seconds 的既有口径，读不出就不认。
+    """
+    explicit = spans_from_text(appear)
+    if explicit:
+        return explicit
     numbers = shot_numbers(appear)
     if numbers:
         pairs = [shot_times[number] for number in numbers if number in shot_times]
@@ -921,7 +933,7 @@ def spans_from_appearance(appear: str, shot_times: dict) -> list:
     if "全片" in (appear or ""):
         whole = whole_span(shot_times)
         return [whole] if whole else []
-    return spans_from_text(appear)
+    return []
 
 
 def entry_position(label: str, body: str = "") -> dict | None:
