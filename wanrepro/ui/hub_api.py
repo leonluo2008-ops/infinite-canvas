@@ -434,6 +434,28 @@ def _stage_recorder(task_dir: Path):
     return _emit
 
 
+def _log_only(task_dir: Path):
+    """**只追加 拆解日志.txt** 的回调（等待心跳专用，AT-16 B4b）。
+
+    与 _stage_recorder 的分工（B4a 双锚合同）：
+      · _stage_recorder = 阶段写侧唯一落点：每次调用都写 lapian_stage + lapian_stage_at；
+      · 本函数 = 心跳写侧：**只**追加日志行，绝不写任务.json 的 lapian_* 任何字段——
+        心跳每 60s 一次，若借道阶段回调就会把「本阶段已等待」清零（假冻结换成假重置）。
+    时间戳格式与 _stage_recorder 的日志行一致（[HH:mm:ss]），日志里两类行可同读。
+    """
+    log = task_dir / DISCUSS_LOG
+
+    def _emit(msg: str) -> None:
+        line = f"[{datetime.now().strftime('%H:%M:%S')}] {msg}"
+        try:
+            with log.open("a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except OSError:
+            pass
+
+    return _emit
+
+
 def _reset_lapian_anchors(task_dir: Path) -> None:
     """新 job 起手重置双锚（重拆/重试不得继承上一轮计时）。"""
     at = _now()
@@ -454,6 +476,7 @@ def _spawn_discuss(task_dir: Path, first_line: str) -> dict:
     """拆解后台执行体（发起拆解与 failed 重试共用；重跑即续语义全在 discuss.run_discuss）。"""
     _reset_lapian_anchors(task_dir)
     emit = _stage_recorder(task_dir)
+    heartbeat = _log_only(task_dir)      # 心跳：只追加日志行，不碰 lapian_stage / 阶段锚
     emit(first_line)
 
     def _run(td: Path):
@@ -461,7 +484,8 @@ def _spawn_discuss(task_dir: Path, first_line: str) -> dict:
         # 会**跳过 else**，成功终态行从来没落过（B4a 实测：成功任务 ended_at 恒空、进度无终态文案）。
         # 改成先取结果、再收尾 emit 终态，成功/失败都留终态行与停表锚。
         try:
-            result = discuss.run_discuss(td, verbose=False, on_stage=emit)
+            result = discuss.run_discuss(td, verbose=False, on_stage=emit,
+                                         on_heartbeat=heartbeat)
         except discuss.DiscussError as e:
             emit(f"终态：失败（{e}）", terminal=True)
             raise
@@ -475,7 +499,7 @@ def _spawn_discuss(task_dir: Path, first_line: str) -> dict:
 
 
 def start_discuss(local_id: str) -> dict:
-    """拆解（1–3 分钟）——异步，阶段变化落 拆解日志.txt + lapian_stage，前端轮询可见。"""
+    """拆解——异步，阶段变化落 拆解日志.txt + lapian_stage，前端轮询可见（远程模型通常 5–15 分钟）。"""
     return _spawn_discuss(_task_dir(local_id), "拆解启动")
 
 

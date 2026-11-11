@@ -152,7 +152,7 @@ def main() -> int:
         tdir_run = make_task(TASK_RUN, "ingested", "probe-b4a-run")
         stage_marks: dict[str, dict] = {}
 
-        def fake_run(td: Path, *, verbose: bool = True, on_stage=None) -> str:
+        def fake_run(td: Path, *, verbose: bool = True, on_stage=None, on_heartbeat=None) -> str:
             """假拆解：两阶段 + 每段留 1.3s 等待窗（探针在窗内读真实任务文件）。"""
             state.transition(td, "discussing", note="probe-at16-b4a 假拆解")
             on_stage("阶段A：提交拆解（已 3s）")
@@ -214,7 +214,7 @@ def main() -> int:
 
         tdir_fail = make_task(TASK_FAIL, "ingested", "probe-b4a-fail")
 
-        def fake_fail(td: Path, *, verbose: bool = True, on_stage=None) -> str:
+        def fake_fail(td: Path, *, verbose: bool = True, on_stage=None, on_heartbeat=None) -> str:
             state.transition(td, "discussing", note="probe-at16-b4a 假失败")
             on_stage("阶段A：提交拆解（已 3s）")
             time.sleep(1.1)

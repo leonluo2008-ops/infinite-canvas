@@ -22,6 +22,7 @@ sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 POLL_INTERVAL = 3        # 秒
 POLL_MAX_SECONDS = 1800  # 与桥端 analyze 子进程上限一致：长片大拆解实测可超 10 分钟
+HEARTBEAT_INTERVAL = 60  # 远程等待心跳间隔（秒）：等待期每 60s 追加一行「还在等」日志
 BUSY_RETRY_MAX = 60      # 409 排队：最多等 60 次 × 5s = 5 分钟
 BUSY_RETRY_INTERVAL = 5
 
@@ -71,18 +72,48 @@ def _products_ready(bridge_id: str) -> bool:
     return bool(p and p["has_disc"] and p["has_check"] and p["has_prompt"])
 
 
-def start_and_wait(task: dict, on_stage=None) -> str:
+def _fmt_wait(seconds: float) -> str:
+    """等待时长人话：65 →「1分5秒」，7 →「7秒」（心跳行与阶段行同一口径）。"""
+    total = max(0, int(seconds))
+    if total < 60:
+        return f"{total}秒"
+    return f"{total // 60}分{total % 60}秒"
+
+
+def start_and_wait(task: dict, on_stage=None, on_heartbeat=None,
+                   heartbeat_interval: float | None = None) -> str:
     """POST lapian/run（409 排队重试）→ 轮询 job 至 done/error。返回 job id。
 
     on_stage(msg)：阶段回调（排队/提交/每次 stage 变化）——hub 工作台用它落
     拆解日志.txt 并回写任务.json 的 lapian_stage；CLI 模式不传。
+
+    on_heartbeat(msg)：**远程等待心跳**（AT-16 B4b），与 on_stage **分离**是硬合同：
+      · 等待期每 heartbeat_interval 秒（默认 HEARTBEAT_INTERVAL=60）调一次，行内含总耗时，
+        文案只说「本地等待循环仍在运行」+ 预期时长——桥端 /api/job 只回 status/stage，
+        没有可采信的远程百分比，编一个就是假进度；
+      · 绝不能走 on_stage：hub 侧 on_stage 每次回写 lapian_stage 与 lapian_stage_at，
+        心跳借道就等于每次把阶段等待计时清零（B4a 双锚作废，正是本批要绕开的覆盖）；
+      · 终态（done/error/超时/异常）后不再心跳——心跳只在轮询循环体内、终态判定之后发，
+        done 那一轮直接 return，不会补发。
     """
+
     def _emit(msg: str) -> None:
         if on_stage:
             try:
                 on_stage(msg)
             except Exception:  # noqa: BLE001 —— 进度回调失败不拖垮拆解主链
                 pass
+
+    def _beat(elapsed: float) -> None:
+        """等待心跳（AT-16 B4b）：**只**调 on_heartbeat——hub 侧该回调只追加 拆解日志.txt，
+        不写任务.json 任何 lapian_* 字段（阶段文案与阶段起点都归 on_stage 独有）。"""
+        if not on_heartbeat:
+            return
+        try:
+            on_heartbeat("等待中：本地等待循环仍在运行"
+                         f"（总耗时 {_fmt_wait(elapsed)}；远程模型通常 5–15 分钟，慢时更久，不用重开）")
+        except Exception:  # noqa: BLE001 —— 心跳失败不拖垮拆解主链
+            pass
 
     for attempt in range(BUSY_RETRY_MAX):
         try:
@@ -101,10 +132,13 @@ def start_and_wait(task: dict, on_stage=None) -> str:
             raise
     else:
         raise DiscussError(f"桥持续忙 {BUSY_RETRY_MAX} 次，放弃（任务未失败，重跑本命令续）")
-    _emit(f"已提交拆解（job={job}），通常 1–3 分钟，远程模型慢时会更久")
+    _emit(f"已提交拆解（job={job}），远程模型通常 5–15 分钟，慢时更久，不用重开")
 
     waited = 0
     last_stage = ""
+    beat_every = HEARTBEAT_INTERVAL if heartbeat_interval is None else float(heartbeat_interval)
+    t0 = time.monotonic()
+    next_beat = beat_every
     while waited < POLL_MAX_SECONDS:
         try:
             rec = bridge.get(f"/api/job/{job}")
@@ -130,13 +164,20 @@ def start_and_wait(task: dict, on_stage=None) -> str:
             _emit(f"{stage}（已 {rec.get('elapsed', waited)}s）")
         time.sleep(POLL_INTERVAL)
         waited += POLL_INTERVAL
+        # 心跳只在**等待期**发：终态分支在上面已 return，所以 done/error 之后不会有心跳补发
+        if beat_every > 0:
+            elapsed = time.monotonic() - t0
+            if elapsed >= next_beat:
+                _beat(elapsed)
+                next_beat = elapsed + beat_every      # 一次只补一行，不追赶补发
     raise DiscussError(f"拆解超 {POLL_MAX_SECONDS}s 未完成（job={job}）——不判失败，可重跑续查")
 
 
-def run_discuss(task_dir: Path, *, verbose: bool = True, on_stage=None) -> str:
+def run_discuss(task_dir: Path, *, verbose: bool = True, on_stage=None, on_heartbeat=None) -> str:
     """执行拆解到 awaiting_assets。返回终态。
 
     on_stage(msg)：阶段回调透传给 start_and_wait（hub 工作台落日志/回写状态）。
+    on_heartbeat(msg)：远程等待心跳回调，透传给 start_and_wait（只追加日志行，不碰阶段/锚）。
 
     失败语义分级（审计 WARN「busy=排队不记 failed」同类）：
       · 任务级失败（桥报 error / done 但产物缺 / job 丢失且产物未齐）
@@ -175,7 +216,7 @@ def run_discuss(task_dir: Path, *, verbose: bool = True, on_stage=None) -> str:
     if cur == "ingested":
         state.transition(task_dir, "discussing", note="拆解启动")
     try:
-        job = start_and_wait(task, on_stage=on_stage)
+        job = start_and_wait(task, on_stage=on_stage, on_heartbeat=on_heartbeat)
         # done 后核产物（失败即失败：桥说 done 但产物缺 → 如实报）
         if not _products_ready(task["bridge_id"]):
             raise DiscussError("桥报 done 但 has_disc/has_check/has_prompt 不全——如实记失败")
