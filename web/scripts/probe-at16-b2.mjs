@@ -48,6 +48,18 @@ const apiBuilt = await esbuild.build({
     define: { "import.meta.env": "{}" },
 });
 check("[A] esbuild 打包 hub-api.ts 成功", apiBuilt.errors.length === 0, apiBuilt.errors.map((e) => e.text).join("; "));
+// AT-16 B5a-2：hub-api 参与 UI 模块图（快捷入口复用 gen-settings 的准入校验 → store），
+// 纯 node 里 import 前必须先补最小浏览器全局（原先这段在 SSR 打包之后，早于 import 就晚了）。
+if (!globalThis.localStorage) {
+    const store = new Map();
+    globalThis.localStorage = {
+        getItem: (key) => (store.has(key) ? store.get(key) : null),
+        setItem: (key, value) => store.set(key, String(value)),
+        removeItem: (key) => store.delete(key),
+        clear: () => store.clear(),
+    };
+}
+if (!globalThis.window) globalThis.window = globalThis;
 const hubApi = await import(pathToFileURL(apiBundle).href + `?t=${Date.now()}`);
 
 console.log("1) normalizeSelfCheck 透传（说明字段 / 旧结构降级 / 畸形兜底）");

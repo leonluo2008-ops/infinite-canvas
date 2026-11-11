@@ -25,8 +25,8 @@ import {
     genRatioRows,
     genResolutionRows,
     genResolveSize,
-    genSubmitIssues,
     genUiFlags,
+    readApprovedSignature,
     readGenDraft,
     saveApprovedSignature,
     saveGenDraft,
@@ -49,17 +49,22 @@ import {
     hubAssetDisplayUrl,
     hubAssetRefView,
     hubOutputUrl,
+    hubQuickAction,
+    hubQuickChannels,
+    hubQuickPhaseText,
     postHubAsset,
     probeHubAssets,
     retryHubTask,
     revokeHubTask,
     rollbackHubTask,
+    runHubQuickAction,
     startLapianRun,
     submitHubTask,
     ungroupHubRows,
     uploadHubImage,
     type HubAssetCard,
     type HubCardGroup,
+    type HubQuickAction,
     type HubSelfCheckItem,
     type HubSuggestion,
     type HubTaskDetail,
@@ -173,6 +178,50 @@ export function TaskDetailDrawer({
     // 三处（列表 / 详情头 / 抽屉顶部）同一来源 = hub_api._summary → automation/submit_view.build。
     const submitView = detail?.submit ?? summary?.submit ?? undefined;
 
+    // AT-16 B5a-2：抽屉顶部重提 / 续查入口（缺陷 D6：真机实证入口埋在 4-5 屏深）。
+    // 判定与执行全走 hub-api 的 hubQuickAction / runHubQuickAction——与列表行内、底部 submitOnly 同一条链。
+    const config = useConfigStore((cfg) => cfg.config);
+    const quickChannels = useMemo(() => hubQuickChannels(config), [config]);
+    const [quickBusy, setQuickBusy] = useState(false);
+    const quick = hubQuickAction({
+        localId,
+        state,
+        submit: submitView,
+        cloudTaskId: detail?.cloud_task_id || "",
+        channels: quickChannels,
+        approvedSignature: readApprovedSignature(localId),
+        draft: readGenDraft(localId),
+        busy: quickBusy || busy !== null,
+    });
+    const fireQuick = useCallback(
+        async (action: HubQuickAction) => {
+            if (!action.enabled) {
+                message.warning(action.reason || "这个入口现在不可用");
+                return;
+            }
+            setQuickBusy(true);
+            try {
+                await runHubQuickAction(localId, action, {
+                    onPhase: (phase, phaseState, note) => {
+                        const line = hubQuickPhaseText(phase, phaseState);
+                        const text = note || line.text;
+                        if (!text) return;
+                        if (line.level === "success") message.success(text);
+                        else if (line.level === "warning") message.warning(text);
+                        else message.info(text);
+                    },
+                });
+                await load();
+                onRefresh();
+            } catch (quickError) {
+                message.error(errorText(quickError));      // 后端原文（如「已有提交在跑」409）直接透出
+            } finally {
+                setQuickBusy(false);
+            }
+        },
+        [load, localId, message, onRefresh],
+    );
+
     const reload = useCallback(() => void load(), [load]);
 
     const act = useCallback(
@@ -212,6 +261,30 @@ export function TaskDetailDrawer({
                 <div className="flex min-w-0 flex-wrap items-center gap-2 pr-8">
                     <span className="truncate text-base font-semibold">{titleName}</span>
                     <HubStateTag state={state} submit={submitView} />
+                    {/* AT-16 B5a-2：顶部快捷入口——重提 / 续查一眼可及（判定=hubQuickAction，执行=runHubQuickAction） */}
+                    {quick.kind !== "none" ? (
+                        <Tooltip title={quick.enabled ? quick.hint : quick.reason}>
+                            <span>
+                                <Button
+                                    size="small"
+                                    type={quick.kind === "submit" ? "primary" : "default"}
+                                    ghost
+                                    loading={quickBusy}
+                                    disabled={!quick.enabled || quickBusy}
+                                    data-hub-drawer-quick-action={quick.kind}
+                                    data-hub-drawer-quick-enabled={quick.enabled ? "1" : "0"}
+                                    data-hub-drawer-quick-source={quick.source}
+                                    data-hub-drawer-quick-needs-config={quick.needsConfig ? "1" : "0"}
+                                    onClick={(event) => {
+                                        event.stopPropagation();
+                                        void fireQuick(quick);
+                                    }}
+                                >
+                                    {quick.label}
+                                </Button>
+                            </span>
+                        </Tooltip>
+                    ) : null}
                 </div>
             }
         >
@@ -2471,21 +2544,50 @@ function GenSettingsSection({ detail, busy, act }: { detail: HubTaskDetail; busy
         );
     };
 
+    /**
+     * 提交生成（抽屉底部按钮）：AT-16 B5a-2 起与列表行内、抽屉顶部**同一条链**——
+     * 准入=hubQuickAction（按批准渠道取 key；active / blocksRetry / sizeBlocked 同一套守卫），
+     * 执行=runHubQuickAction（HTTP 受理只报「提交处理中」，轮询确认 generating/done 才报云端已收单）。
+     */
+    const submitAction = hubQuickAction({
+        localId,
+        state,
+        submit: detail.submit ?? null,
+        cloudTaskId: detail.cloud_task_id || "",
+        channels: hubQuickChannels(config),
+        approvedSignature: readApprovedSignature(localId),
+        // 凭据只认「批准快照 → 落盘草稿」；面板里那份从全局默认派生的初始草稿**不算凭据**
+        // （否则会拿画布全局默认渠道的 key 顶批准渠道——卡片明确禁止）。
+        draft: readGenDraft(localId),
+        busy: busy !== null,
+    });
+
     const submitOnly = () => {
         if (!draft) return;
-        const issues = genSubmitIssues(draft, channel, apiKey);
-        if (issues.length) {
-            message.error(issues[0]);
+        if (submitAction.kind !== "submit" || !submitAction.enabled) {
+            message.error(submitAction.reason || "当前不能提交生成");
             return;
         }
-        void act(
-            "submit",
-            async () => {
-                await submitHubTask(localId, apiKey);
-            },
-            "已提交生成，等待成片",
-        );
+        void act("submit", async () => {
+            await runHubQuickAction(localId, submitAction, {
+                onPhase: (phase, phaseState, note) => {
+                    const line = hubQuickPhaseText(phase, phaseState);
+                    const text = note || line.text;
+                    if (!text) return;
+                    if (line.level === "success") message.success(text);
+                    else if (line.level === "warning") message.warning(text);
+                    else message.info(text);
+                },
+            });
+        });
     };
+
+    /** 底部按钮的悬挂说明：先说「必须先做什么」（重批 / 守卫 / 缺配置），再做渠道提示。 */
+    const submitBlockReason = needsReapproval
+        ? "批准后配置变过（渠道身份 / 模型 / 模式 / 参数）——先「撤销批准」，改完再批准一次"
+        : !submitAction.enabled
+          ? submitAction.reason
+          : "";
 
     const revoke = () => {
         modal.confirm({
@@ -2769,16 +2871,22 @@ function GenSettingsSection({ detail, busy, act }: { detail: HubTaskDetail; busy
                             <Button ghost loading={busy === "revoke"} disabled={busy !== null} onClick={revoke} data-hub-gen-revoke>
                                 撤销批准（改配置）
                             </Button>
-                            <Button
-                                type="primary"
-                                loading={busy === "submit"}
-                                disabled={busy !== null || needsReapproval || blocked.blocksRetry || sizeBlocked}
-                                onClick={submitOnly}
-                                data-hub-gen-submit
-                                data-hub-gen-submit-size-blocked={sizeBlocked ? "1" : "0"}
-                            >
-                                提交生成
-                            </Button>
+                            <Tooltip title={submitBlockReason || submitAction.hint}>
+                                <span>
+                                    <Button
+                                        type="primary"
+                                        loading={busy === "submit"}
+                                        disabled={busy !== null || needsReapproval || blocked.blocksRetry || sizeBlocked || !submitAction.enabled}
+                                        onClick={submitOnly}
+                                        data-hub-gen-submit
+                                        data-hub-gen-submit-size-blocked={sizeBlocked ? "1" : "0"}
+                                        data-hub-gen-submit-enabled={submitAction.enabled ? "1" : "0"}
+                                        data-hub-gen-submit-source={submitAction.source}
+                                    >
+                                        提交生成
+                                    </Button>
+                                </span>
+                            </Tooltip>
                         </>
                     ) : null}
 

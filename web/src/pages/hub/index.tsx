@@ -1,9 +1,22 @@
 import { History, LoaderCircle, Plus, RefreshCw } from "lucide-react";
-import { Button, Table, Tag, Tooltip, type TableColumnsType } from "antd";
+import { App, Button, Table, Tag, Tooltip, type TableColumnsType } from "antd";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 
-import { errorText, listHubTasks, type HubTaskSummary } from "./hub-api";
+import { readApprovedSignature, readGenDraft } from "@/lib/hub/gen-settings";
+import { useConfigStore } from "@/stores/use-config-store";
+
+import {
+    errorText,
+    hubQuickAction,
+    hubQuickChannels,
+    hubQuickPhaseText,
+    listHubTasks,
+    runHubQuickAction,
+    type HubQuickAction,
+    type HubQuickChannel,
+    type HubTaskSummary,
+} from "./hub-api";
 import { deleteGuard, HubStateTag, SubmitResultLine } from "./hub-status";
 import { lapianClockTexts, lapianStageName, useLapianClock } from "./lapian-clock";
 import { LegacyHubView } from "./legacy-view";
@@ -24,6 +37,9 @@ export default function HubPage() {
 }
 
 function HubTableView() {
+    const { message } = App.useApp();
+    const config = useConfigStore((state) => state.config);
+    const channels = useMemo(() => hubQuickChannels(config), [config]);
     const [tasks, setTasks] = useState<HubTaskSummary[]>([]);
     const [loading, setLoading] = useState(true);
     const [refreshing, setRefreshing] = useState(false);
@@ -31,6 +47,8 @@ function HubTableView() {
     const [createOpen, setCreateOpen] = useState(false);
     const [openId, setOpenId] = useState<string | null>(null);
     const [deleteTarget, setDeleteTarget] = useState<HubTaskSummary | null>(null);
+    /** AT-16 B5a-2：行内快捷入口正在处理的任务号（同一时刻只允许一条）。 */
+    const [quickBusy, setQuickBusy] = useState("");
 
     const load = useCallback(async (manual = false) => {
         if (manual) setRefreshing(true);
@@ -70,6 +88,39 @@ function HubTableView() {
     );
 
     const askDelete = useCallback((task: HubTaskSummary) => setDeleteTarget(task), []);
+
+    /**
+     * 行内快捷入口（AT-16 B5a-2）：与抽屉顶部 / 底部按钮**同一条链**（hubQuickAction → runHubQuickAction）。
+     * 受理只报「提交处理中」；轮询确认 generating / done 才报「云端已收单」；重复点击被拒（本地在跑 + 后端 409）。
+     */
+    const fireQuick = useCallback(
+        async (task: HubTaskSummary, action: HubQuickAction) => {
+            if (!action.enabled) {
+                message.warning(action.reason || "这个入口现在不可用");
+                return;
+            }
+            setQuickBusy(task.local_id);
+            try {
+                await runHubQuickAction(task.local_id, action, {
+                    onPhase: (phase, state, note) => {
+                        const line = hubQuickPhaseText(phase, state);
+                        const text = note || line.text;
+                        if (!text) return;
+                        if (line.level === "success") message.success(text);
+                        else if (line.level === "warning") message.warning(text);
+                        else message.info(text);
+                    },
+                });
+                void load(true);
+            } catch (quickError) {
+                // 后端原文（如「已有提交在跑」409）直接透出——不吞、不美化
+                message.error(errorText(quickError));
+            } finally {
+                setQuickBusy("");
+            }
+        },
+        [load, message],
+    );
 
     const columns: TableColumnsType<HubTaskSummary> = [
         {
@@ -121,9 +172,11 @@ function HubTableView() {
         {
             title: "操作",
             key: "actions",
-            width: 150,
+            width: 230,
             render: (_, task) => {
                 const guard = deleteGuard(task);
+                // AT-16 B5a-2：行内重提 / 续查入口（缺陷 D6：入口不再埋在抽屉 4-5 屏深）
+                const quick = hubRowQuickAction(task, channels, quickBusy === task.local_id);
                 const deleteButton = (
                     <Button
                         size="small"
@@ -151,6 +204,29 @@ function HubTableView() {
                         >
                             打开
                         </Button>
+                        {quick.kind !== "none" ? (
+                            <Tooltip title={quick.enabled ? quick.hint : quick.reason}>
+                                <span>
+                                    <Button
+                                        size="small"
+                                        type={quick.kind === "submit" ? "primary" : "default"}
+                                        ghost
+                                        loading={quickBusy === task.local_id}
+                                        disabled={!quick.enabled || quickBusy === task.local_id}
+                                        data-hub-quick-action={quick.kind}
+                                        data-hub-quick-enabled={quick.enabled ? "1" : "0"}
+                                        data-hub-quick-source={quick.source}
+                                        data-hub-quick-needs-config={quick.needsConfig ? "1" : "0"}
+                                        onClick={(event) => {
+                                            event.stopPropagation();
+                                            void fireQuick(task, quick);
+                                        }}
+                                    >
+                                        {quick.label}
+                                    </Button>
+                                </span>
+                            </Tooltip>
+                        ) : null}
                         {guard.disabled ? <Tooltip title={guard.reason || "运行中不可删"}>{deleteButton}</Tooltip> : deleteButton}
                     </div>
                 );
@@ -241,6 +317,26 @@ function HubTableView() {
             <TaskDeleteModal task={deleteTarget} open={Boolean(deleteTarget)} onClose={() => setDeleteTarget(null)} onDeleted={handleDeleted} />
         </div>
     );
+}
+
+/**
+ * 行内快捷入口的准入判定（AT-16 B5a-2；导出给探针直测纯函数）。
+ *
+ * 凭据解析（按批准渠道匹配 key）与守卫（active / blocksRetry / sizeBlocked / 缺 key）全在
+ * `hub-api.hubQuickAction` 一处——这里只负责把列表摘要 + 本机批准签名 / 任务草稿喂进去。
+ * 抽屉顶部入口与底部 submitOnly 也调同一个函数，所以「同承接同凭据同守卫」只有一份实现。
+ */
+export function hubRowQuickAction(task: HubTaskSummary, channels: HubQuickChannel[], busy = false) {
+    return hubQuickAction({
+        localId: task.local_id,
+        state: String(task.state || ""),
+        submit: task.submit,
+        cloudTaskId: task.submit?.cloud_task_id || "",
+        channels,
+        approvedSignature: readApprovedSignature(task.local_id),
+        draft: readGenDraft(task.local_id),
+        busy,
+    });
 }
 
 function formatCreatedAt(value: string) {

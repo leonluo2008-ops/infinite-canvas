@@ -271,6 +271,18 @@ const apiBuilt = await esbuild.build({
     define: { "import.meta.env": "{}" },
 });
 check("[3] esbuild 打包 hub-api.ts 成功", apiBuilt.errors.length === 0, apiBuilt.errors.map((e) => e.text).join("; "));
+// AT-16 B5a-2：hub-api 参与 UI 模块图（快捷入口复用 gen-settings 的准入校验 → store），
+// 纯 node 里 import 前必须先补最小浏览器全局（store / i18n 在 import 期读 localStorage）。
+if (!globalThis.localStorage) {
+    const store = new Map();
+    globalThis.localStorage = {
+        getItem: (key) => (store.has(key) ? store.get(key) : null),
+        setItem: (key, value) => store.set(key, String(value)),
+        removeItem: (key) => store.delete(key),
+        clear: () => store.clear(),
+    };
+}
+if (!globalThis.window) globalThis.window = globalThis;
 const hubApi = await import(pathToFileURL(apiBundle).href + `?t=${Date.now()}`);
 const REF = "local:auto-9501/asset-uploads/e955c2ea7800b90c.png";
 const EXPECT_LOCAL = "/api/hub/asset-file/auto-9501/e955c2ea7800b90c.png";

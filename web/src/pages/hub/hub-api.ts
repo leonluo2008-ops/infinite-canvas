@@ -8,7 +8,10 @@
  */
 
 import type { IngestOutcome } from "@/lib/hub/ingest-hit";
-import type { HubSubmitForm, HubSubmitView } from "@/lib/hub/gen-settings";
+// AT-16 B5a-2：快捷入口的准入判定**复用**抽屉 submitOnly 用的同一套前置校验
+// （genSubmitIssues / genResolveSize / genFamily / findGenChannel）——不另写第二套规则。
+import { findGenChannel, genFamily, genResolveSize, genSubmitIssues } from "@/lib/hub/gen-settings";
+import type { GenChannelDesc, GenDraft, HubSubmitForm, HubSubmitView } from "@/lib/hub/gen-settings";
 
 export type { HubSubmitForm, HubSubmitView };
 
@@ -870,4 +873,344 @@ export async function ungroupHubRows(localId: string, rows: number[]): Promise<{
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ rows }),
     });
+}
+
+// ---------------------------------------------------------------- AT-16 B5a-2 共享重提 / 续查入口
+
+/**
+ * 快捷入口（AT-16 B5a-2，缺陷 D6 动作面）：列表行内 + 抽屉顶部同一份「重提 / 续查」。
+ *
+ * 红线 25：**不新造提交链**——动作仍是抽屉 submitOnly 那一条（POST /api/hub/submit，key 一次性
+ * 透传），这里只把三件事收口成一份共享实现：
+ *   ① `hubQuickAction`  纯函数：状态 + 摘要 + 画布渠道 + 批准快照 → 可点否 / 用哪条渠道的 key（探针直测）
+ *   ② `runHubQuickAction` 执行：HTTP 受理只报「提交处理中」，轮询确认 generating/done 才报「云端已收单」
+ *   ③ `hubQuickPhaseText` 阶段人话（两处入口同一份文案，禁各写一套 toast）
+ * 两个入口（index.tsx 行内按钮、task-detail-drawer.tsx 顶部入口与底部 submitOnly）都只调这三个，
+ * 所以「同承接（同一 API + 同一 key 解析）／同凭据（按批准渠道取 key）／同守卫（blocksRetry /
+ * sizeBlocked / active）三个断言在代码上只有一份实现。
+ */
+
+/** 画布渠道最小形状（结构类型：接口层不 import store 类型，渠道映射由 hubQuickChannels 一处做）。 */
+export type HubQuickChannel = { id: string; name: string; baseUrl: string; apiFormat: string; apiKey: string };
+
+/**
+ * 画布 AiConfig.channels → 快捷入口用的渠道表（缺字段一律空串，不猜）。
+ *
+ * 只取身份与 key；模型候选不走这里（AT-14 §3.2 同源规则不变）。
+ */
+export function hubQuickChannels(config: { channels?: unknown } | null | undefined): HubQuickChannel[] {
+    const rows = config && Array.isArray(config.channels) ? (config.channels as unknown[]) : [];
+    return rows
+        .map((raw) => (raw && typeof raw === "object" ? (raw as Record<string, unknown>) : {}))
+        .map((row) => ({
+            id: hubText(row.id).trim(),
+            name: hubText(row.name).trim(),
+            baseUrl: hubText(row.baseUrl).trim(),
+            apiFormat: hubText(row.apiFormat).trim(),
+            apiKey: hubText(row.apiKey).trim(),
+        }))
+        .filter((row) => row.id);
+}
+
+/** 快捷入口动作：submit=重提（提交生成）/ resume=按 taskId 续查（只查不重提）/ none=此任务没有入口。 */
+export type HubQuickKind = "none" | "submit" | "resume";
+
+export type HubQuickAction = {
+    kind: HubQuickKind;
+    /** 可点否（false 时按钮禁用，原因见 reason——不空发、不静默） */
+    enabled: boolean;
+    label: string;
+    /** 可点时的补充说明（渠道来源等，空=无需说明） */
+    hint: string;
+    /** 不可点的原因（人话，含真实配置入口指引） */
+    reason: string;
+    channelId: string;
+    channelName: string;
+    /** 凭据来源：approved=批准时固化的渠道（真源）/ draft=本机任务草稿 / none=都没对上 */
+    source: "approved" | "draft" | "none";
+    /** 一次性提交 key（wan 允许空串；缺 key 时 enabled=false 且 needsConfig=true） */
+    key: string;
+    /** 缺渠道/缺 key/配置不合法 → 必须先到画布「设置 → 渠道」或详情改配置（禁止空发） */
+    needsConfig: boolean;
+    /** 当前画幅渠道不生效（与抽屉 sizeBlocked 同源：genResolveSize） */
+    sizeBlocked: boolean;
+    cloudTaskId: string;
+};
+
+export type HubQuickInput = {
+    localId: string;
+    state: string;
+    /** 摘要/详情同一份提交诊断（B5a-1 的 submit 字段）；旧 bridge 缺 → null */
+    submit?: HubSubmitView | null;
+    /** 详情透出的云端 taskId（列表摘要里用 submit.cloud_task_id） */
+    cloudTaskId?: string;
+    /** 画布渠道表（hubQuickChannels(config)） */
+    channels: HubQuickChannel[];
+    /** 批准时点签名（readApprovedSignature(localId)）——「按批准渠道匹配」的真源 */
+    approvedSignature?: string;
+    /** 本机任务草稿（readGenDraft(localId)） */
+    draft?: GenDraft | null;
+    /** 本 UI 上一次点击还没结束 */
+    busy?: boolean;
+};
+
+/** 批准快照（genDraftSignature 落盘的那份 JSON）：渠道身份 + 模型 + 参数，**不含 key**。 */
+type ApprovedSnapshot = { channelId: string; baseUrl: string; apiFormat: string; name: string; draft: GenDraft };
+
+function approvedSnapshotOf(raw: string | undefined): ApprovedSnapshot | null {
+    const text = String(raw || "").trim();
+    if (!text) return null;
+    let value: unknown = null;
+    try {
+        value = JSON.parse(text);
+    } catch {
+        return null;                                  // 畸形签名 = 没有批准基线（不拿它猜渠道）
+    }
+    if (!value || typeof value !== "object") return null;
+    const row = value as Record<string, unknown>;
+    const params = (row.params && typeof row.params === "object" ? row.params : {}) as Record<string, unknown>;
+    const channelId = hubText(row.channelId).trim();
+    const baseUrl = hubText(row.baseUrl).trim();
+    const apiFormat = hubText(row.apiFormat).trim();
+    const name = hubText(row["渠道名"]).trim();
+    if (!channelId && !name) return null;
+    const duration = Number(params.duration);
+    const mode = hubText(row.mode).trim();
+    return {
+        channelId,
+        baseUrl,
+        apiFormat,
+        name,
+        draft: {
+            channelId,
+            model: hubText(row.model).trim(),
+            mode: mode === "reference" ? "reference" : mode === "frames" ? "frames" : "",
+            size: hubText(params.size).trim() || "auto",
+            rawSize: hubText(params.rawSize).trim(),
+            vquality: hubText(params.vquality).trim() || "720",
+            duration: Number.isFinite(duration) && duration > 0 ? Math.round(duration) : 0,
+            audio: params.audio === undefined ? true : Boolean(params.audio),
+        },
+    };
+}
+
+/**
+ * 按**批准渠道**匹配画布渠道：先按 id，id 变了再按批准时固化的身份三元组（渠道名 + baseUrl + apiFormat）。
+ * 匹配不到 → null（由调用方给「去配置」的引导，**绝不**从全局默认挑一条顶上）。
+ */
+function matchApprovedChannel(channels: GenChannelDesc[], snap: ApprovedSnapshot): GenChannelDesc | null {
+    if (snap.channelId) {
+        const byId = findGenChannel(channels, snap.channelId);
+        if (byId) return byId;
+    }
+    if (!snap.name) return null;
+    return (
+        channels.find(
+            (channel) =>
+                channel.name.trim() === snap.name &&
+                channel.baseUrl.trim() === snap.baseUrl &&
+                String(channel.apiFormat || "").trim().toLowerCase() === snap.apiFormat.trim().toLowerCase(),
+        ) || null
+    );
+}
+
+const HUB_QUICK_EMPTY: Omit<HubQuickAction, "kind" | "label"> = {
+    enabled: false,
+    hint: "",
+    reason: "",
+    channelId: "",
+    channelName: "",
+    source: "none",
+    key: "",
+    needsConfig: false,
+    sizeBlocked: false,
+    cloudTaskId: "",
+};
+
+/**
+ * 快捷入口准入判定（纯函数，探针直测；两个入口同一份）。
+ *
+ * 凭据口径（卡片红线）：取**草稿 / 批准渠道**的 key——批准快照优先（那是服务端真正固化的配置），
+ * 没有批准基线才退本机草稿；**从不**按全局默认渠道（genDefaultChannelId）挑一条。
+ * 守卫口径：active（提交在跑）/ blocks_retry（后端说禁重提）/ sizeBlocked（画幅渠道不接）/ 缺 key
+ * 任一命中 → enabled=false + 人话原因；缺 key 的文案直接复用 genSubmitIssues 的生产者原文
+ * （「到画布「设置 → 渠道」补上」），所以「缺 key → 引导配置、不空发」不是新写的一套话术。
+ */
+export function hubQuickAction(input: HubQuickInput): HubQuickAction {
+    const state = String(input.state || "");
+    const channels = (input.channels || []) as unknown as GenChannelDesc[];
+    const submit = input.submit && input.submit.form !== "none" ? input.submit : null;
+    const cloudTaskId = String(input.cloudTaskId || submit?.cloud_task_id || "").trim();
+    const active = Boolean(submit?.active_submit);
+    const busy = Boolean(input.busy) || hubQuickRunning(input.localId);
+
+    // ① 凭据：批准快照优先（按批准渠道匹配），其次本机草稿；都没有 → source=none（不许猜）
+    const snap = approvedSnapshotOf(input.approvedSignature);
+    let source: HubQuickAction["source"] = "none";
+    let channel: GenChannelDesc | null = null;
+    let configDraft: GenDraft | null = null;
+    if (snap) {
+        source = "approved";                          // 有批准基线就只认它（哪怕没匹配上渠道，也不退草稿）
+        channel = matchApprovedChannel(channels, snap);
+        configDraft = snap.draft;
+    } else if (input.draft && String(input.draft.channelId || "").trim()) {
+        channel = findGenChannel(channels, String(input.draft.channelId).trim());
+        configDraft = channel ? input.draft : null;
+        source = channel ? "draft" : "none";
+    }
+
+    const family = channel ? genFamily(channel.apiFormat) : "";
+    const key = family === "wan" ? "" : String(channel?.apiKey || "").trim();
+    const sizeInfo = configDraft ? genResolveSize(configDraft.size, channel) : null;
+    const sizeBlocked = Boolean(sizeInfo && (!sizeInfo.valid || !sizeInfo.accepted));
+
+    // ② 动作种类：approved → 重提（提交生成）；有确定云端 taskId 才给续查（只查不重提）
+    const canResume = submit ? Boolean(submit.can_resume) : state === "generating" && Boolean(cloudTaskId);
+    let kind: HubQuickKind = "none";
+    if (state === "approved") kind = "submit";
+    else if (canResume && cloudTaskId) kind = "resume";
+    if (kind === "none") return { ...HUB_QUICK_EMPTY, kind, label: "", reason: "", cloudTaskId };
+
+    const label = kind === "submit" ? "提交生成" : "续查";
+    const hint = channel
+        ? `用${source === "approved" ? "批准时的渠道" : "任务草稿的渠道"}「${channel.name || channel.id}」${family === "wan" ? "（万相固定模型 · 允许空 key）" : "的 key"}提交（一次性透传，不落盘）`
+        : "";
+
+    // ③ 守卫（顺序=人先看最要紧的那条）：本 UI 在处理 → active → 后端禁重提 → 凭据/配置 → 画幅
+    if (busy) {
+        return { ...HUB_QUICK_EMPTY, kind, label, hint, reason: "提交处理中：上一次点击还在处理，别重复点（重复提交会重复扣费）", channelId: channel?.id || "", channelName: channel?.name || "", source, key, sizeBlocked, cloudTaskId };
+    }
+    if (active) {
+        return { ...HUB_QUICK_EMPTY, kind, label, hint, reason: "这个任务已有提交在跑（排队 / 已发出等回执）——别重复点，等它出结果", channelId: channel?.id || "", channelName: channel?.name || "", source, key, sizeBlocked, cloudTaskId };
+    }
+    if (kind === "resume") {
+        // 续查只查不重提：key/画幅都不影响（后端 generating 分支不创建），但必须有云端 taskId
+        return { ...HUB_QUICK_EMPTY, kind, label, hint, enabled: true, sizeBlocked, channelId: channel?.id || "", channelName: channel?.name || "", source, key, cloudTaskId };
+    }
+    if (submit?.blocks_retry) {
+        const why = submit.conclusion || submit.label || "提交被阻断";
+        return { ...HUB_QUICK_EMPTY, kind, label, hint, reason: `${why}——按上面的指引核对 / 续查，解除阻断后才能重提`, channelId: channel?.id || "", channelName: channel?.name || "", source, key, sizeBlocked, cloudTaskId };
+    }
+    // 凭据来源：批准快照匹配不到渠道 / 本机根本没有批准基线 → 明确说清，不许拿「全局默认渠道」顶上
+    if (!channel) {
+        const reason = snap
+            ? "批准时的渠道已不在画布配置里（被删或改了 id）——到画布「设置 → 渠道」恢复它，或撤销批准后重新挑渠道批准。"
+            : "本机没有这条任务的批准配置（换过浏览器 / 在命令行批的）——先在这台浏览器里批准一次，或撤销批准后重新批准；别用别处的渠道 key 顶。";
+        return {
+            ...HUB_QUICK_EMPTY,
+            kind,
+            label,
+            hint,
+            reason,
+            needsConfig: Boolean(snap),               // 渠道被删=真配置问题；本机无基线=要先重新批准
+            source,
+            key,
+            sizeBlocked,
+            cloudTaskId,
+        };
+    }
+    const issues = genSubmitIssues(configDraft, channel, key);
+    if (issues.length) {
+        return {
+            ...HUB_QUICK_EMPTY,
+            kind,
+            label,
+            hint,
+            reason: issues[0],
+            needsConfig: true,
+            channelId: channel.id,
+            channelName: channel.name,
+            source,
+            key,
+            sizeBlocked,
+            cloudTaskId,
+        };
+    }
+    return { ...HUB_QUICK_EMPTY, kind, label, hint, enabled: true, channelId: channel?.id || "", channelName: channel?.name || "", source, key, sizeBlocked, cloudTaskId };
+}
+
+/** 正在处理的快捷入口（同一任务第二次点击直接拒，不发第二个请求）。 */
+const HUB_QUICK_RUNNING = new Set<string>();
+
+export function hubQuickRunning(localId: string): boolean {
+    return HUB_QUICK_RUNNING.has(String(localId || ""));
+}
+
+export type HubQuickPhase = "accepted" | "confirmed" | "timeout" | "rejected";
+
+export type HubQuickRunResult = { phase: HubQuickPhase; state: string; note: string };
+
+/** 阶段人话（两处入口同一份；颜色由调用方按 level 映射到 message.xxx）。 */
+export function hubQuickPhaseText(phase: HubQuickPhase, state = ""): { level: "success" | "info" | "warning"; text: string } {
+    if (phase === "accepted") {
+        // HTTP 200 只代表「服务端接住了请求」——不在这里说「云端已收单」（D6 的原病灶）
+        return { level: "info", text: "提交处理中：请求已受理，等云端回执（确认收单后才算成功）" };
+    }
+    if (phase === "confirmed") {
+        if (state === "failed") return { level: "warning", text: "云端已回执：失败——按详情原文处理（可重试）" };
+        return { level: "success", text: state === "done" ? "云端已收单：成片已出（云端 taskId 已确认）" : "云端已收单：已转 generating，等成片" };
+    }
+    if (phase === "timeout") {
+        return { level: "info", text: "提交仍在处理中：还没转成 generating——前端超时 ≠ 云端失败，5 秒刷新会自己跟上；按 taskId 可续查" };
+    }
+    return { level: "warning", text: "" };            // rejected：由 reason 覆盖
+}
+
+export type HubQuickRunDeps = {
+    /** 提交（默认=既有 submitHubTask，POST /api/hub/submit；续查也是它——后端 generating 分支只查不建） */
+    submit?: (localId: string, key: string) => Promise<unknown>;
+    /** 读任务（默认=getHubTask；轮询确认用） */
+    fetchTask?: (localId: string) => Promise<{ state?: string }>;
+    sleep?: (ms: number) => Promise<void>;
+    intervalMs?: number;
+    maxPolls?: number;
+    onPhase?: (phase: HubQuickPhase, state: string, note: string) => void;
+};
+
+/**
+ * 执行快捷动作（两个入口共用这一条链）。
+ *
+ * 节奏是本次验收的核心：POST 返回 → 只报「提交处理中」（accepted）；再轮询详情，**看到
+ * generating / done（或云端明确 failed）** 才报「云端已收单」；超时如实说「仍在处理中」。
+ * 重复点击：同任务在跑直接 rejected（不发第二个请求）；后端还有 active 409 兜底。
+ * 提交失败（如 409 已有提交在跑）**原样抛出**，由调用方把后端原文透出（不吞、不美化）。
+ */
+export async function runHubQuickAction(localId: string, action: HubQuickAction, deps: HubQuickRunDeps = {}): Promise<HubQuickRunResult> {
+    const say = deps.onPhase || (() => undefined);
+    const reject = (note: string): HubQuickRunResult => {
+        say("rejected", "", note);
+        return { phase: "rejected", state: "", note };
+    };
+    if (action.kind === "none") return reject("这个任务现在没有可用的重提 / 续查入口");
+    if (!action.enabled) return reject(action.reason || "这个入口现在不可用");
+    if (HUB_QUICK_RUNNING.has(localId)) return reject("提交处理中：上一次点击还在处理，别重复点（重复提交会重复扣费）");
+
+    HUB_QUICK_RUNNING.add(localId);
+    const submit = deps.submit || ((id: string, key: string) => submitHubTask(id, key));
+    const fetchTask = deps.fetchTask || ((id: string) => getHubTask(id));
+    const sleep = deps.sleep || ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+    const intervalMs = deps.intervalMs ?? 2000;
+    const maxPolls = deps.maxPolls ?? 20;
+    try {
+        await submit(localId, action.key);            // 受理（HTTP 2xx）
+        say("accepted", "", "");
+        for (let i = 0; i < maxPolls; i += 1) {
+            await sleep(intervalMs);
+            let task: { state?: string } | null = null;
+            try {
+                task = await fetchTask(localId);
+            } catch {
+                continue;                             // 读失败不是终态：继续轮询，别把网络抖动说成「已收单」
+            }
+            const state = String(task?.state || "");
+            if (state === "generating" || state === "done" || state === "failed") {
+                say("confirmed", state, "");
+                return { phase: "confirmed", state, note: "" };
+            }
+        }
+        say("timeout", "", "");
+        return { phase: "timeout", state: "", note: "" };
+    } finally {
+        HUB_QUICK_RUNNING.delete(localId);
+    }
 }
