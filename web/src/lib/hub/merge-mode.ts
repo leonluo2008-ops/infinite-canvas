@@ -3,8 +3,10 @@
  *
  * 合同 = docs/nodes/AT-11.md v4 §3.1/§3.1.1/§3.6 + AT-12 N1（勾选式合并，替换模式切换）：
  * - 勾选态只存**行号**（I2：轮询换 detail 对象不丢选中，合并成功清空、失败保留）；
- * - 每张非组卡左上常驻 checkbox（不再有「进入/退出多选模式」）；已确认组卡不挂 checkbox、
- *   品牌视觉行置灰并给出原因——两处后端同样硬拒，前端只做先行拦截；
+ * - 每张非组卡左上常驻 checkbox（不再有「进入/退出多选模式」）；已确认组卡不挂 checkbox
+ *   （先在组里=先拆开）——前端只做先行拦截，后端同规则硬拒；
+ * - AT-16 B7：**品牌视觉行与普通行同权可合并**（片尾可能无品牌露出、品牌标签可能就是产品本身），
+ *   前后端都不再有品牌专用拒绝——通用拒绝只剩「已在组/按原片/已移除/行不存在」；
  * - 按原片行（dismissed / keep_origin）已从置换区折叠移除，不可勾选；
  * - 已传图三分支（B3）：零图 / 恰一张唯一图 / 多张不同图（多张必须用户点名保留一张，绝不悄悄任选）；
  * - 合并卡（单帧单框）：徽标「#1+#3+#5 已合并」、框恒=主行自身框那一枚；主行无框 → null（诚实降级，
@@ -17,11 +19,14 @@ import { isOriginDecision } from "@/lib/hub/row-decision";
 /** 一张卡在勾选态里可选吗：selectable=false 时 reason 是给用户看的置灰原因（非空）。 */
 export type MergeSelectable = { selectable: boolean; reason: string };
 
-/** 可选性判定（§3.1/§3.1.1 + AT-12）：按原片行 → 已折叠；已确认组 → 先拆开；品牌行 → 品牌行单独处理。 */
+/**
+ * 可选性判定（§3.1/§3.1.1 + AT-12；AT-16 B7 取消品牌例外）：
+ * 按原片行 → 已折叠；已确认组 → 先拆开；其余（含品牌视觉行）一律可选。
+ * 入参形状保留「类别」只为卡对象直传，判定不再按类别分支。
+ */
 export function mergeSelectable(card: Pick<HubAssetCard, "类别" | "同实体确认"> & { 决策?: string }): MergeSelectable {
     if (isOriginDecision(card.决策)) return { selectable: false, reason: "已移除（按原片）·不参与合并" };
     if (card.同实体确认.length >= 2) return { selectable: false, reason: "已确认组·先拆开" };
-    if (card.类别.includes("品牌视觉")) return { selectable: false, reason: "品牌行单独处理" };
     return { selectable: true, reason: "" };
 }
 

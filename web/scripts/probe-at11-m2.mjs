@@ -5,7 +5,7 @@
  * 覆盖（对应执行卡质量门）：
  *   ① 多选态进入退出（行号 Set 纯切换、退出清空、taskId 清理）
  *   ② 选中跨轮询保留（Set 不挂 detail 对象引用；成功清空失败保留的接线在源码护栏）
- *   ③ 组卡置灰（已确认组=先拆开；品牌行=品牌行单独处理）
+ *   ③ 组卡置灰（已确认组=先拆开；品牌视觉行与普通行同权可选——AT-16 B7 取消品牌例外）
  *   ④ 确认窗三分支（零图 / 一张唯一图 / 多张不同图点名保留）
  *   ⑤ 单帧单框（恰一枚框且=主行；主行无框 → null 诚实降级）+ 徽标文字非空
  *
@@ -58,7 +58,7 @@ check("Set 里只有行号（number），无卡对象引用", [...sel2].every((x
 
 // ---------------------------------------------------------------- ③ 组卡置灰（可选性判定）
 check("已确认组卡置灰=先拆开", mod.mergeSelectable({ 类别: "主产品", 同实体确认: [1, 5] }).selectable === false && mod.mergeSelectable({ 类别: "主产品", 同实体确认: [1, 5] }).reason.includes("先拆开"));
-check("品牌视觉行置灰=品牌行单独处理", mod.mergeSelectable({ 类别: "品牌视觉", 同实体确认: [] }).selectable === false && mod.mergeSelectable({ 类别: "品牌视觉", 同实体确认: [] }).reason.includes("品牌行单独处理"));
+check("品牌视觉行与普通行同权可选（AT-16 B7：片尾可能无品牌露出/品牌标签可能就是产品本身）", mod.mergeSelectable({ 类别: "品牌视觉", 同实体确认: [] }).selectable === true && mod.mergeSelectable({ 类别: "品牌视觉", 同实体确认: [] }).reason === "");
 check("普通行可选（reason 空）", mod.mergeSelectable({ 类别: "主产品特写", 同实体确认: [] }).selectable === true && mod.mergeSelectable({ 类别: "主产品特写", 同实体确认: [] }).reason === "");
 check("疑似（未确认）不拦可选", mod.mergeSelectable({ 类别: "主产品", 同实体确认: [] }).selectable === true);
 

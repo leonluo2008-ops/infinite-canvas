@@ -899,9 +899,11 @@ def group_rows(local_id: str, rows: list[int], primary: int | None = None,
                name: str | None = None) -> dict:
     """成组：校验行号在清单、≥2 行、都不在别的组 → 写 sidecar『同实体确认』。
 
-    AT-11 §3.1.1/§3.2 追加两拒绝：品牌视觉行不可入组（品牌位不读图不占号，
-    render.py 品牌分支）；行有 keep_origin 不可入组（先降级再合并会留半组替换，
-    先恢复再合并）。
+    AT-11 §3.1.1/§3.2：行有 keep_origin/dismissed 不可入组（先降级再合并会留半组替换，
+    先恢复再合并）。AT-16 B7：**取消品牌视觉行入组拒绝**——片尾可能无品牌露出、品牌标签
+    可能就是产品本身，品牌行与普通行同权；品牌行无图时照旧不占号（图号 0，见
+    render.effective_units），绑定组图后与组内同号同提交单位。通用拒绝不变（已在组/按原片/
+    已移除/行不存在）。
     AT-11 §3.1.2（M2 确认小窗）：primary=主行（必须 ∈ rows，缺省=最小行）、
     name=组名——给了任一就落盘『组元数据』{组键: {主行, 组名}}，刷新不回跳最小行。
     """
@@ -919,10 +921,6 @@ def group_rows(local_id: str, rows: list[int], primary: int | None = None,
         missing = [n for n in rows if n not in by_no]
         if missing:
             raise HubError(f"行号不在清单里: {missing}（现有 {sorted(by_no)}）")
-        brand = [n for n in rows if str(by_no[n].get("cat") or "").startswith("品牌视觉")]
-        if brand:
-            raise HubError(f"行 {brand} 是品牌视觉行（品牌位不读图不占号），"
-                           f"不可入组——品牌行单独处理")
         ko = [n for n in rows if n in replace.load_row_decisions(bridge)]
         if ko:
             raise HubError(f"行 {ko} 已按原片/已移除（keep_origin/dismissed），先恢复再合并"

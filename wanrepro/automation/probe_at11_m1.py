@@ -16,8 +16,9 @@
   [4] keep_origin 次序（B2）：确认置换同锁内有效决策——屏蔽行的 pending 不进
       assets_confirmed、『按原片确认』同快照落账；有效图全被屏蔽 → empty_confirm
       合同落账；发号前胜出（正文无 @图片N）。
-  [5] 校验/边界（B3）：品牌视觉行入组拒绝；先降后合拒绝；解组清理『组元数据』
-      键且『行决策覆盖』不无故清（不留半组替换的任何残留路径）。
+  [5] 校验/边界（B3；AT-16 B7 取消品牌禁合）：品牌+产品跨类成组正例（同图两行同号）、
+      组外同 URL 独立发号、已组先拆/已移除先恢复照旧拒绝、未合并品牌零回归（自带图独立发号）；
+      先降后合拒绝；解组清理『组元数据』键且『行决策覆盖』不无故清（不留半组替换的任何残留路径）。
   [6] cards 组卡投影（B4）：成员卡挂同一『组』投影（主行/代表帧/单框同源自主行，
       镜次并集）；主行无自身框 → 单框=None+单框降级（不搬他人框）；无组卡 组=None。
   [7] M5 缺陷（roll call 组=纯图号）：pop-4-variant 夹具（#1 命名=参考片旧描述
@@ -26,15 +27,16 @@
       自检四项全 PASS；反例：同夹具不成组 → roll call 仍保留命名（只清组、不越界
       清洗单行）。
 
-真数据只读：pop-4 清单/sidecar、auto-0012 任务文件探针前后 SHA256 必须相同；
+真数据只读：auto-0043 清单/sidecar 与任务文件探针前后 SHA256 必须相同（原 pop-4/auto-0012
+已被所有者删除，[6] 真实锚点随之换到现存任务）；
 夹具目录 analysis/reverse/probe-at11-m1/ 与临时任务目录用完即删（零残留）。
 
 夹具自包含（AT-13 B4）：清单 md / 组 sidecar / 拆解 / 意图建议一律读**探针自带夹具**
 `tests/fixtures/at11-m1/`（B1 验收时坐实的真数据漂移债：真实 pop-4 后来被 UI 写入了 #5 资产图与
 `同实体确认/组元数据/行决策覆盖`，[4] 的「keep_origin 行不占号」与「自检四项」两条断言因此假红——
 产品没坏，是探针吃了活的用户盘面）。夹具 = pop-4 基线快照（#1 有图 / #5 无图 / sidecar 组与决策清空），
-断言语义零改动；真数据只读校验段（SHA 前后不变）保留不动。[6] 组卡投影仍读真实 pop-4（代表帧/看帧
-缓存是二进制产物，不做夹具化，只读）。
+断言语义零改动；真数据只读校验段（SHA 前后不变）保留不动。[6] 组卡投影仍读真实任务（代表帧/看帧
+缓存是二进制产物，不做夹具化，只读）——现锚点 auto-0043 / analysis/reverse/3。
 """
 from __future__ import annotations
 
@@ -56,8 +58,12 @@ sys.path.insert(0, str(ROOT))
 from automation import cards, replace, selfcheck, state  # noqa: E402
 import importlib.util                                    # noqa: E402
 
-POP4 = ROOT / "analysis" / "reverse" / "pop-4"
-REAL_TASK_DIR = ROOT / "automation" / "projects" / "auto-0012"
+# [6] 组卡投影的真实只读锚点：原 pop-4 / auto-0012 已被所有者删除（项目盘面清理），
+# 改用现存的 auto-0043 + analysis/reverse/3（同一形态：真组 [[1,5,6]]、真代表帧、真单框、含品牌行 #9）。
+ANCHOR_TASK_ID = "auto-0043"
+ANCHOR_BRIDGE = "3"
+REAL_TASK_DIR = ROOT / "automation" / "projects" / ANCHOR_TASK_ID
+ANCHOR_BRIDGE_DIR = ROOT / "analysis" / "reverse" / ANCHOR_BRIDGE
 FIXTURE_BRIDGE = "probe-at11-m1"
 FIXTURE_DIR = ROOT / "analysis" / "reverse" / FIXTURE_BRIDGE
 FIXTURE_SRC = ROOT / "tests" / "fixtures" / "at11-m1"   # 探针自带夹具（自包含，不读用户盘面）
@@ -85,11 +91,33 @@ def load_hub():
 hub = load_hub()
 render = selfcheck._load_render()
 REAL_TASK = state.load(REAL_TASK_DIR)
-BASE_MD = (FIXTURE_SRC / "待确认清单.md").read_text(encoding="utf-8-sig")
+BASE_MD_RAW = (FIXTURE_SRC / "待确认清单.md").read_text(encoding="utf-8-sig")
+
+
+def _strip_brand_image(md: str) -> str:
+    """夹具基线：把品牌视觉行的「资产图」清空。
+
+    AT-16 B1b 起品牌行**有图即占号**（五点同源）；本节 [1]/[2]/[4]/[7] 的基线判据是
+    「品牌行无图 → 图号 0、不参与发号/提交」形态，故基线清空品牌行图；[5a] 要验
+    「品牌行有图 → 与产品同组同号」时显式贴图，不靠夹具残留。
+    """
+    out = []
+    for line in md.splitlines():
+        cells = replace.row_cells(line)
+        if cells and re.fullmatch(r"\d+", cells[0] or "") and str(cells[1]).startswith("品牌视觉"):
+            while len(cells) < 8:
+                cells.append("")
+            cells[4] = ""
+            line = "| " + " | ".join(cells) + " |"
+        out.append(line)
+    return "\n".join(out)
+
+
+BASE_MD = _strip_brand_image(BASE_MD_RAW)
 BASE_SIDE = (FIXTURE_SRC / "待确认清单.json").read_text(encoding="utf-8-sig")
 
 TMP_TASK = Path(tempfile.mkdtemp(prefix="probe-at11-m1-task-"))
-READONLY_WATCH = [POP4 / "待确认清单.md", POP4 / "待确认清单.json",
+READONLY_WATCH = [ANCHOR_BRIDGE_DIR / "待确认清单.md", ANCHOR_BRIDGE_DIR / "待确认清单.json",
                   REAL_TASK_DIR / "任务.json"]
 
 
@@ -382,16 +410,61 @@ def main() -> int:
                   all(x["结论"] == "PASS" for x in by.values()),
                   json.dumps({k: v["证据"] for k, v in by.items()}, ensure_ascii=False)[:360])
 
-        # ================================================= [5] 校验/边界（B3）
-        print("[5] 边界：品牌行入组拒绝；先降后合拒绝；解组清组元数据、行覆盖不无故清")
+        # ================================================= [5] 校验/边界（B3；AT-16 B7 品牌可合并）
+        print("[5] 边界：品牌+产品跨类成组正例；组外同 URL 独立发号；已组先拆/已移除先恢复；未合并品牌零回归")
         with _Patches(scenario()):
             install_task([])
+            check("[5a] 前置：基线品牌行 #7 无图（品牌有图才占号，图号 0 见 [5d]）",
+                  next(r for r in replace.parse_rows((FIXTURE_DIR / "待确认清单.md").read_text(encoding="utf-8-sig"))
+                       if r["no"] == 7)["cur_assets"] == "", "夹具品牌行仍有图")
+            out = hub.group_rows("probe-at11-m1", [1, 7])
+            check("[5a] 品牌视觉行 + 主体成组成功（AT-16 B7 正例：无品牌专用拒绝）",
+                  out.get("组") == [[1, 7]], str(out))
+            hub.set_asset("probe-at11-m1", 1, image_url=url1)      # 组写 → 全组联动
+            rows = {r["no"]: r["cur_assets"] for r in
+                    replace.parse_rows((FIXTURE_DIR / "待确认清单.md").read_text(encoding="utf-8-sig"))}
+            check("[5a] 组写联动到品牌行（#1/#7 同 URL）",
+                  rows.get(1) == rows.get(7) == url1, json.dumps(rows, ensure_ascii=False)[:160])
+            ents = render.parse_checklist(FIXTURE_DIR / "待确认清单.md")
+            render.assign_numbers(ents, replace.load_groups(FIXTURE_BRIDGE),
+                                  replace.load_row_decisions(FIXTURE_BRIDGE))
+            mapping = {e.row_no: e.no for e in ents if e.no}
+            check("[5a] 同图两行同号（品牌+产品=一个发号单位 {1:1, 7:1}）",
+                  mapping == {1: 1, 7: 1}, str(mapping))
+            hub.set_asset("probe-at11-m1", 2, image_url=url1)      # 组外同一 URL
+            ents = render.parse_checklist(FIXTURE_DIR / "待确认清单.md")
+            render.assign_numbers(ents, replace.load_groups(FIXTURE_BRIDGE),
+                                  replace.load_row_decisions(FIXTURE_BRIDGE))
+            mapping = {e.row_no: e.no for e in ents if e.no}
+            check("[5a] 组外同 URL 独立发号（{1:1, 7:1, 2:2}，禁 URL 去重偷改语义）",
+                  mapping == {1: 1, 7: 1, 2: 2}, str(mapping))
             try:
-                hub.group_rows("probe-at11-m1", [1, 7])
-                check("拒绝：品牌视觉行入组", False, "未拒绝")
+                hub.group_rows("probe-at11-m1", [7, 3])
+                check("[5b] 拒绝：已在组的品牌行再入组（先拆开）", False, "未拒绝")
             except hub.HubError as e:
-                check("拒绝：品牌视觉行入组（品牌位不读图不占号）",
-                      "品牌视觉" in str(e) and "7" in str(e), str(e))
+                check("[5b] 拒绝：已在组的品牌行再入组（先拆开）", "已在组" in str(e), str(e))
+            hub.set_asset("probe-at11-m1", 2, decision="dismissed")
+            try:
+                hub.group_rows("probe-at11-m1", [3, 2])
+                check("[5b] 拒绝：已移除行入组（先恢复再合并）", False, "未拒绝")
+            except hub.HubError as e:
+                check("[5b] 拒绝：已移除行入组（先恢复再合并）",
+                      "dismissed" in str(e) and "先恢复再合并" in str(e), str(e))
+            hub.set_asset("probe-at11-m1", 2, decision="restore")
+            out = hub.group_rows("probe-at11-m1", [3, 2])
+            check("[5b] 恢复后成组成功（#2+#3）", out.get("组") == [[1, 7], [2, 3]], str(out))
+            hub.ungroup_rows("probe-at11-m1", [1, 7])
+            hub.ungroup_rows("probe-at11-m1", [2, 3])
+            ents = render.parse_checklist(FIXTURE_DIR / "待确认清单.md")
+            render.assign_numbers(ents, replace.load_groups(FIXTURE_BRIDGE),
+                                  replace.load_row_decisions(FIXTURE_BRIDGE))
+            by_no = {e.row_no: e for e in ents}
+            check("[5c] 未合并品牌行零回归：不在任何组、有图独立发号（解组保留当前传图=组写归一值）",
+                  replace.load_groups(FIXTURE_BRIDGE) == [] and by_no[7].no == 3
+                  and by_no[7].image == url1, f"no={by_no[7].no} image={by_no[7].image!r}")
+
+        with _Patches(scenario()):
+            install_task([])
             hub.set_asset("probe-at11-m1", 5, decision="keep_origin")
             try:
                 hub.group_rows("probe-at11-m1", [1, 5])
@@ -423,53 +496,55 @@ def main() -> int:
         print("[6] cards 组卡投影：主行代表帧/单框同源；镜次并集；诚实降级不搬他人框")
         saved_groups = replace.load_groups
         saved_meta = replace.load_group_meta
+        anchor_ok = (REAL_TASK_DIR / "任务.json").is_file() and (ANCHOR_BRIDGE_DIR / "待确认清单.md").is_file()
+        check("[6] 前置：真实只读锚点在场（auto-0043 + analysis/reverse/3）", anchor_ok,
+              f"缺 {REAL_TASK_DIR} 或 {ANCHOR_BRIDGE_DIR}")
 
-        def groups_pop4(_bridge):
-            return [[1, 5]]
+        def groups_156(_bridge):
+            return [[1, 5, 6]]
 
-        def meta_pop4(_bridge):
-            return {"1-5": {"主行": 5, "组名": "紫色管状产品"}}
+        def meta_156(_bridge):
+            return {"1-5-6": {"主行": 5, "组名": "本品主体·同件道具A"}}
         try:
-            with patch.object(replace, "load_groups", groups_pop4), \
-                 patch.object(replace, "load_group_meta", meta_pop4):
-                cbs = cards.build("pop-4", "auto-0012")
-            by_no = {c["n"]: c for c in cbs}
-            g1, g5 = by_no[1]["组"], by_no[5]["组"]
-            check("成员卡挂同一『组』投影（主行=组元数据落盘值 5）",
-                  g1 and g5 and g1 == g5 and g5["主行"] == 5 and g5["组名"] == "紫色管状产品",
-                  json.dumps(g5, ensure_ascii=False, default=str)[:200])
-            check("组代表帧同源自主行 #5（键镜3，非成员并集帧）",
-                  g5["代表帧"] and g5["代表帧"].get("镜次") == 3,
-                  json.dumps(g5["代表帧"], ensure_ascii=False)[:160])
-            check("组单框=主行自身框（行=5，恰一框）",
-                  g5["单框"] and g5["单框"]["行"] == 5 and g5["单框降级"] is False,
-                  json.dumps(g5["单框"], ensure_ascii=False)[:160])
-            check("镜次并集=成员位置键/意图建议镜次（含 3）",
-                  3 in g5["镜次并集"] and g5["镜次并集"] == sorted(set(g5["镜次并集"])),
-                  str(g5["镜次并集"]))
-            check("无组卡 组=None（#2）", by_no[2]["组"] is None, str(by_no[2]["组"]))
+            if anchor_ok:
+                with patch.object(replace, "load_groups", groups_156),                      patch.object(replace, "load_group_meta", meta_156):
+                    cbs = cards.build(ANCHOR_BRIDGE, ANCHOR_TASK_ID)
+                by_no = {c["n"]: c for c in cbs}
+                g1, g5, g6 = by_no[1]["组"], by_no[5]["组"], by_no[6]["组"]
+                check("成员卡挂同一『组』投影（主行=组元数据落盘值 5）",
+                      g1 and g5 and g6 and g1 == g5 == g6 and g5["主行"] == 5
+                      and g5["组名"] == "本品主体·同件道具A",
+                      json.dumps(g5, ensure_ascii=False, default=str)[:200])
+                check("组代表帧同源自主行 #5（不搬成员并集帧）",
+                      g5["代表帧"] and g5["代表帧"] == by_no[5].get("代表帧"),
+                      json.dumps(g5["代表帧"], ensure_ascii=False, default=str)[:200])
+                check("组单框=主行自身框（行=5，恰一框）",
+                      g5["单框"] and g5["单框"]["行"] == 5 and g5["单框降级"] is False,
+                      json.dumps(g5["单框"], ensure_ascii=False, default=str)[:160])
+                check("镜次并集=成员位置键/意图建议镜次（升序去重，含镜3）",
+                      3 in g5["镜次并集"] and g5["镜次并集"] == sorted(set(g5["镜次并集"])),
+                      str(g5["镜次并集"]))
+                check("无组卡 组=None（#2）", by_no[2]["组"] is None, str(by_no[2]["组"]))
 
-            def meta_primary7(_bridge):
-                return {"1-5": {"主行": 7, "组名": ""}}   # 非成员 → 落回缺省最小行
-            with patch.object(replace, "load_groups", groups_pop4), \
-                 patch.object(replace, "load_group_meta", meta_primary7):
-                cbs = cards.build("pop-4", "auto-0012")
-            g = next(c for c in cbs if c["n"] == 1)["组"]
-            check("主行非法（非成员）→ 缺省最小行 1，不猜不炸", g["主行"] == 1, str(g["主行"]))
+                def meta_primary7(_bridge):
+                    return {"1-5-6": {"主行": 7, "组名": ""}}   # 非成员 → 落回缺省最小行
+                with patch.object(replace, "load_groups", groups_156),                      patch.object(replace, "load_group_meta", meta_primary7):
+                    cbs = cards.build(ANCHOR_BRIDGE, ANCHOR_TASK_ID)
+                g = next(c for c in cbs if c["n"] == 1)["组"]
+                check("主行非法（非成员）→ 缺省最小行 1，不猜不炸", g["主行"] == 1, str(g["主行"]))
 
-            def groups_57(_bridge):
-                return [[5, 7]]
+                def groups_19(_bridge):
+                    return [[1, 9]]        # #9 = 品牌视觉（置换位），无自身框
 
-            def meta_57(_bridge):
-                return {"5-7": {"主行": 7, "组名": ""}}   # #7 无自身框 → 诚实降级
-            with patch.object(replace, "load_groups", groups_57), \
-                 patch.object(replace, "load_group_meta", meta_57):
-                cbs = cards.build("pop-4", "auto-0012")
-            by_no = {c["n"]: c for c in cbs}
-            g = by_no[5]["组"]
-            check("主行无自身框 → 单框=None + 单框降级=True（绝不搬 #5 的框充数）",
-                  g["主行"] == 7 and g["单框"] is None and g["单框降级"] is True,
-                  json.dumps({k: g[k] for k in ("主行", "单框", "单框降级")}, ensure_ascii=False))
+                def meta_19(_bridge):
+                    return {"1-9": {"主行": 9, "组名": ""}}   # 主行无自身框 → 诚实降级
+                with patch.object(replace, "load_groups", groups_19),                      patch.object(replace, "load_group_meta", meta_19):
+                    cbs = cards.build(ANCHOR_BRIDGE, ANCHOR_TASK_ID)
+                by_no = {c["n"]: c for c in cbs}
+                g = by_no[9]["组"]
+                check("主行无自身框 → 单框=None + 单框降级=True（绝不搬 #1 的框充数）",
+                      g["主行"] == 9 and g["单框"] is None and g["单框降级"] is True,
+                      json.dumps({k: g[k] for k in ("主行", "单框", "单框降级")}, ensure_ascii=False, default=str))
         finally:
             replace.load_groups = saved_groups
             replace.load_group_meta = saved_meta
@@ -528,7 +603,7 @@ def main() -> int:
         no_fixture = not FIXTURE_DIR.exists() and not TMP_TASK.exists()
         print(f"[cleanup] 夹具清理：fixture_removed={not FIXTURE_DIR.exists()} "
               f"task_tmp_removed={not TMP_TASK.exists()} 真数据只读={unchanged}")
-        check("真数据只读（pop-4 清单/sidecar、auto-0012 任务文件 SHA256 不变）", unchanged,
+        check("真数据只读（auto-0043 清单/sidecar 与任务文件 SHA256 不变）", unchanged,
               "有文件被改动！" if not unchanged else "")
         check("跑后零残留（夹具目录与临时任务目录已删）", no_fixture, "")
 

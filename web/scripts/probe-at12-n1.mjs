@@ -65,20 +65,20 @@ const cards = [
     { n: 1, 类别: "主体", 同实体确认: [] },
     { n: 2, 类别: "场景", 同实体确认: [] },
     { n: 3, 类别: "道具", 同实体确认: [2, 3] },      // 被成组（轮询中变化）
-    { n: 5, 类别: "品牌视觉", 同实体确认: [] },       // 品牌行
+    { n: 5, 类别: "品牌视觉", 同实体确认: [] },       // 品牌行（AT-16 B7：与普通行同权可选）
     { n: 7, 类别: "主体", 同实体确认: [], 决策: "dismissed" }, // 被移除
 ];
 const keep = merge.pruneSelection(new Set([1, 2, 3, 5, 7, 9]), cards);
-check("轮询收口：只留仍存在且可选的行（成组/品牌/移除/消失剔除）",
-    keep.size === 2 && keep.has(1) && keep.has(2), JSON.stringify([...keep]));
+check("轮询收口：只留仍存在且可选的行（成组/移除/消失剔除；品牌行不再被判不可选）",
+    keep.size === 3 && keep.has(1) && keep.has(2) && keep.has(5), JSON.stringify([...keep]));
 const sameRef = merge.pruneSelection(new Set([1, 2]), cards);
 check("轮询无变化 → 返回原 Set 引用（不触发重渲染）", sameRef instanceof Set);
 const stable = new Set([1, 2]);
 check("轮询无变化 → 引用相等", merge.pruneSelection(stable, cards) === stable);
 check("浮条计数文案=「已勾选 N 项」（N3：浮条承载合并+移除，中性标题）", merge.mergeBarText(3) === "已勾选 3 项");
-check("品牌行置灰=品牌行单独处理",
-    merge.mergeSelectable({ 类别: "品牌视觉", 同实体确认: [] }).selectable === false &&
-    merge.mergeSelectable({ 类别: "品牌视觉", 同实体确认: [] }).reason.includes("品牌行单独处理"));
+check("品牌行可选=跨类合并正例（AT-16 B7 取消品牌例外）",
+    merge.mergeSelectable({ 类别: "品牌视觉", 同实体确认: [] }).selectable === true &&
+    merge.mergeSelectable({ 类别: "品牌视觉", 同实体确认: [] }).reason === "");
 check("已确认组卡不参与合并（先拆开）",
     merge.mergeSelectable({ 类别: "主体", 同实体确认: [1, 5] }).selectable === false &&
     merge.mergeSelectable({ 类别: "主体", 同实体确认: [1, 5] }).reason.includes("先拆开"));
@@ -140,7 +140,7 @@ check("删除旧「合并资产」模式入口与退出逻辑（无 data-hub-mer
     !drawer.includes("data-hub-merge-enter") && !drawer.includes("data-hub-merge-exit") && !drawer.includes("mergeMode"));
 check("常驻 checkbox：data-hub-check-row + 勾选态 data-hub-check-state",
     drawer.includes("data-hub-check-row={card.n}") && drawer.includes("data-hub-check-state"));
-check("checkbox 置灰原因（品牌行）经 Tooltip 透出", drawer.includes("checkDisabledReason") && drawer.includes("<Tooltip title={checkDisabledReason}>"));
+check("checkbox 置灰原因（组卡/已移除行）经 Tooltip 透出", drawer.includes("checkDisabledReason") && drawer.includes("<Tooltip title={checkDisabledReason}>"));
 check("勾选态存行号 Set（useState<Set<number>>）", drawer.includes("useState<Set<number>>(new Set())"));
 check("taskId 切换清空勾选（I2）",
     /useEffect\(\(\) => \{[\s\S]*?setSelectedRows\(new Set\(\)\);[\s\S]*?\}, \[taskId\]\)/.test(drawer));

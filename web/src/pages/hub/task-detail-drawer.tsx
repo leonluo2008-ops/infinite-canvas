@@ -672,7 +672,7 @@ function AssetSection({
         setSelectedRows((prev) => pruneSelection(prev, detail.asset_cards));
     }, [detail.asset_cards]);
 
-    // 逐卡可选性（按原片行已折叠不在列；品牌视觉行置灰=品牌行单独处理）。
+    // 逐卡可选性（按原片行已折叠不在列；品牌视觉行与普通行同权，判定全在 mergeSelectable）。
     const selectableMap = new Map<number, { selectable: boolean; reason: string }>();
     for (const card of cards) selectableMap.set(card.n, mergeSelectable(card));
     // 合并候选=勾选且仍可选的行（轮询中变为不可选的行不计入，浮条数字诚实）。
