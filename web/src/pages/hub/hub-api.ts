@@ -10,7 +10,7 @@
 import type { IngestOutcome } from "@/lib/hub/ingest-hit";
 // AT-16 B5a-2：快捷入口的准入判定**复用**抽屉 submitOnly 用的同一套前置校验
 // （genSubmitIssues / genResolveSize / genFamily / findGenChannel）——不另写第二套规则。
-import { findGenChannel, genFamily, genResolveSize, genSubmitIssues } from "@/lib/hub/gen-settings";
+import { findGenChannel, genFamily, genResolveSize, genSubmitIssues, readApprovedSignature } from "@/lib/hub/gen-settings";
 import type { GenChannelDesc, GenDraft, HubSubmitForm, HubSubmitView } from "@/lib/hub/gen-settings";
 
 export type { HubSubmitForm, HubSubmitView };
@@ -821,6 +821,24 @@ export async function revokeHubTask(localId: string, note?: string): Promise<{ o
     });
 }
 
+/**
+ * 解除「未知收单」阻断（AT-16 B5b ①；后端端点 **早已存在**：POST /api/hub/task/<id>/release
+ * → hub_api.release_submit_unknown，人工动作必须 confirm:true）。
+ *
+ * 这里只是把既有端点接到界面上——**不新造机制**（红线 25）：阻断判定与清理仍在后端同一处，
+ * 前端不猜结果、不清标记。调用方必须先让所有者到渠道控制台核对「没有这一单」。
+ */
+export async function releaseHubTask(localId: string, note?: string): Promise<{ ok?: boolean; state?: string; dispatch?: unknown }> {
+    return request<{ ok?: boolean; state?: string; dispatch?: unknown }>(`/api/hub/task/${encodeURIComponent(localId)}/release`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+            confirm: true,                                  // 人工动作：后端无 confirm 一律 400，前端永远显式带上
+            note: note || "人工核对渠道无单后解除阻断",
+        }),
+    });
+}
+
 /** failed 态续跑入口（AT-9 B5：POST /api/hub/task/<id>/retry；非 failed 桥端 409，错误原文透出）。 */
 export async function retryHubTask(localId: string): Promise<{ state?: string; job_id?: string }> {
     return request<{ state?: string; job_id?: string }>(`/api/hub/task/${encodeURIComponent(localId)}/retry`, { method: "POST" });
@@ -1014,6 +1032,19 @@ function matchApprovedChannel(channels: GenChannelDesc[], snap: ApprovedSnapshot
     );
 }
 
+/**
+ * 本机「批准时记下的配置基线」（AT-16 B5b ④ 无草稿边界用）：读 hub-gen-approved:<id> 那份签名。
+ *
+ * 用途只有一个——草稿丢了的时候**如实**告诉界面「这份是已批准配置，不是待改草稿」，
+ * 而不是拿画布全局默认派生一份顶上冒充任务配置。返回 null = 本机确实没有基线（换过浏览器 /
+ * 在命令行批的），调用方必须明说，不许假装读到快照。
+ */
+export function readApprovedDraft(localId: string): { draft: GenDraft; channelId: string; channelName: string; model: string } | null {
+    const snap = approvedSnapshotOf(readApprovedSignature(localId));
+    if (!snap) return null;
+    return { draft: snap.draft, channelId: snap.channelId, channelName: snap.name, model: snap.draft.model };
+}
+
 const HUB_QUICK_EMPTY: Omit<HubQuickAction, "kind" | "label"> = {
     enabled: false,
     hint: "",
@@ -1127,6 +1158,154 @@ export function hubQuickAction(input: HubQuickInput): HubQuickAction {
         };
     }
     return { ...HUB_QUICK_EMPTY, kind, label, hint, enabled: true, channelId: channel?.id || "", channelName: channel?.name || "", source, key, sizeBlocked, cloudTaskId };
+}
+
+// ---------------------------------------------------------------- 撤销重批起态门（AT-16 B5b ①/②/③/④）
+
+/** 起态门形态：none=这条任务没有「撤销重批」这条路 / allowed=允许态（有阻断也没有）/ blocked=提交在跑 / unknown=结果未知。 */
+export type HubReworkMode = "none" | "allowed" | "blocked" | "unknown";
+
+/** 阻断种类（顺序与后端 hub_api._submit_block_kind 一致：active → dispatch → unknown；空=无阻断）。 */
+export type HubReworkBlockKind = "" | "active" | "dispatch" | "unknown";
+
+export type HubReworkGate = {
+    mode: HubReworkMode;
+    /** 可否展示并启用「撤销批准」（起态门**唯一**判据；未知态一律 false，不许引导撤销） */
+    allowed: boolean;
+    blockKind: HubReworkBlockKind;
+    title: string;
+    /** 人话原因 + 下一步（未知态明确说「先核对渠道」） */
+    reason: string;
+    /** 未知态才出现的「人工解除阻断」（既有 POST /api/hub/task/<id>/release，不是新机制） */
+    showRelease: boolean;
+    /** 未知态下是否给「按云端 taskId 续查」（只查不重提） */
+    canResume: boolean;
+    cloudTaskId: string;
+    /** 允许态的三步顺序（撤销 → 改模型 → 批准提交）；其它形态为空 */
+    steps: string[];
+    /** 心血不作废承诺（允许态才给；与后端探针的逐字节断言同口径） */
+    keep: string;
+};
+
+export type HubReworkInput = {
+    state: string;
+    /** B5a-1 的提交诊断（摘要/详情同源）；旧 bridge 缺 → 由下面三个兜底事实判定 */
+    submit?: HubSubmitView | null;
+    cloudTaskId?: string;
+    /** 兜底：活跃提交（后端 _active_submit） */
+    activeSubmit?: boolean;
+    /** 兜底：未知收单标记 */
+    submitUnknown?: boolean;
+    /** 兜底：dispatch 阶段（prepared / dispatched = 结果未知） */
+    dispatchPhase?: string;
+};
+
+const HUB_REWORK_NONE: HubReworkGate = {
+    mode: "none",
+    allowed: false,
+    blockKind: "",
+    title: "",
+    reason: "",
+    showRelease: false,
+    canResume: false,
+    cloudTaskId: "",
+    steps: [],
+    keep: "",
+};
+
+/** 允许态的三步（真机顺序：撤销 → 改模型 → 批准提交；非 awaiting_approval 态配置只读，所以必须先撤销）。 */
+const HUB_REWORK_STEPS = [
+    "①「撤销批准」：回到待批准（配置快照作废，配置从只读变可编辑）。",
+    "② 换模型 / 渠道 / 参数：只在待批准态能改，改完即落成本任务草稿。",
+    "③「批准出片」：用新配置重算快照 v2（版本仍是 2，不递增）并提交生成。",
+];
+
+/** 心血不作废口径（与 Python 探针逐字节断言一一对应，禁止只写一句安慰话）。 */
+const HUB_REWORK_KEEP =
+    "心血不作废：撤销批准只作废「配置快照」——资产确认 / 上传流水 / 置换确认 / 提示词.md 逐字节不动，行决策也不动；变的只有渠道 / 模型 / 参数和本次批准的快照 hash。";
+
+/**
+ * 撤销重批起态门（纯函数，探针直测；抽屉里撤销按钮与指引段**只**读它）。
+ *
+ * 判定源与后端同一套事实（B5a-1 的 submit 透出；缺字段用兜底事实），顺序也照后端
+ * `hub_api._submit_block_kind`：active → dispatch → unknown。三者任一命中都**不引导撤销**
+ * （撤销会连根清掉 approval + 提交链运行时键，等于绕过「未知收单先核对」防线）：
+ *   · active   → 等结果，撤销按钮不出现
+ *   · dispatch → 未知态：先核对渠道 → 「解除阻断」→ 需要时续查
+ *   · unknown  → 同上（解除用的是既有 release 端点，不新造）
+ * 允许态（approved 且无任何阻断）才给出「撤销 → 改模型 → 批准提交」三步 + 心血不作废承诺。
+ * 非 approved（待批准 / 生成中 / 已完成…）→ none：待批准态配置本来就可编辑，没有要撤销的东西。
+ */
+export function hubReworkGate(input: HubReworkInput): HubReworkGate {
+    const state = String(input.state || "");
+    const submit = input.submit && input.submit.form !== "none" ? input.submit : null;
+    const cloudTaskId = String(input.cloudTaskId || submit?.cloud_task_id || "").trim();
+
+    if (state !== "approved") return { ...HUB_REWORK_NONE };
+
+    const phase = String(submit?.dispatch_phase || input.dispatchPhase || "").trim();
+    const active = submit ? Boolean(submit.active_submit) : Boolean(input.activeSubmit);
+    const unknown = submit ? Boolean(submit.submit_unknown) : Boolean(input.submitUnknown);
+    const dispatchStuck = phase === "prepared" || phase === "dispatched";
+
+    if (active) {
+        return {
+            ...HUB_REWORK_NONE,
+            mode: "blocked",
+            blockKind: "active",
+            title: "提交在跑：等结果，这时不能撤销批准",
+            reason: "这个任务有提交在排队 / 执行中——撤销会和正在跑的提交抢配置。等它出结果（成片或失败红条）再改配置。",
+            cloudTaskId,
+        };
+    }
+    if (dispatchStuck) {
+        return {
+            ...HUB_REWORK_NONE,
+            mode: "unknown",
+            blockKind: "dispatch",
+            title: `结果未知（dispatch=${phase || "未完结"}）：先核对渠道，别撤销批准`,
+            reason: "上次提交没拿到确定回执，云端可能已收单——撤销批准会把「未知收单」标记一起清掉，可能重复扣费。"
+                + "先到渠道控制台按时间 / 提示词核对有没有这一单。",
+            showRelease: true,
+            canResume: Boolean(cloudTaskId),
+            cloudTaskId,
+        };
+    }
+    if (unknown) {
+        return {
+            ...HUB_REWORK_NONE,
+            mode: "unknown",
+            blockKind: "unknown",
+            title: "提交结果未知：先核对渠道，别撤销批准",
+            reason: `${submit?.conclusion || "云端可能已收单，不能当作没提交"}——撤销批准会连「未知收单」标记一起清掉，可能重复扣费。`,
+            showRelease: true,
+            canResume: Boolean(cloudTaskId),
+            cloudTaskId,
+        };
+    }
+    return {
+        mode: "allowed",
+        allowed: true,
+        blockKind: "",
+        title: "要换模型 / 渠道？按这个顺序来（资产与提示词不会作废）",
+        reason: "",
+        showRelease: false,
+        canResume: false,
+        cloudTaskId,
+        steps: HUB_REWORK_STEPS,
+        keep: HUB_REWORK_KEEP,
+    };
+}
+
+/** 未知态的三步指引（核对 → 解除 → 续查/再撤销）；允许态用 HUB_REWORK_STEPS。 */
+export function hubReworkUnknownSteps(gate: HubReworkGate): string[] {
+    if (gate.mode !== "unknown" && gate.mode !== "blocked") return [];
+    if (gate.mode === "blocked") return ["进度 5 秒自动刷新；结果出来（成片 / 失败）后再改配置。", "这期间撤销批准与重提都不可用。"];
+    return [
+        "到渠道控制台按时间 / 提示词核对有没有这一单（只读核对，不许直接重提）。",
+        gate.canResume ? `核对到单 → 按云端 taskId 续查（只查不重提）。` : "核对到单 → 先拿到云端 taskId，再按该 id 续查。",
+        "确认渠道确实没有这一单 → 点「已核对，解除阻断」；解除后配置才会重新开放编辑（换模型就先改配置，再批准）。",
+    ];
 }
 
 /** 正在处理的快捷入口（同一任务第二次点击直接拒，不发第二个请求）。 */

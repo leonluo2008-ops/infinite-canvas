@@ -16,6 +16,7 @@ import {
     genDraftSignature,
     genDraftStaleNote,
     genDraftSummary,
+    genDispatchPhase,
     genFailureHint,
     genFamily,
     genIssue,
@@ -52,8 +53,12 @@ import {
     hubQuickAction,
     hubQuickChannels,
     hubQuickPhaseText,
+    hubReworkGate,
+    hubReworkUnknownSteps,
     postHubAsset,
     probeHubAssets,
+    readApprovedDraft,
+    releaseHubTask,
     retryHubTask,
     revokeHubTask,
     rollbackHubTask,
@@ -65,6 +70,8 @@ import {
     type HubAssetCard,
     type HubCardGroup,
     type HubQuickAction,
+    type HubQuickPhase,
+    type HubReworkGate,
     type HubSelfCheckItem,
     type HubSuggestion,
     type HubTaskDetail,
@@ -87,7 +94,7 @@ const OVERLAY_COLORS = [
 
 const POST_DECOMPOSE_STATES = ["awaiting_assets", "rendering", "awaiting_approval", "approved", "generating", "done", "failed"];
 
-type BusyKind = "upload" | "confirm" | "empty" | "approve" | "submit" | "retry" | "rollback" | "revoke" | "group" | "ungroup" | "discuss" | "decision" | "dismiss-batch" | null;
+type BusyKind = "upload" | "confirm" | "empty" | "approve" | "submit" | "retry" | "rollback" | "revoke" | "release" | "group" | "ungroup" | "discuss" | "decision" | "dismiss-batch" | null;
 
 /**
  * 任务详情全屏 Drawer（AT-9 §五）：头部 → Agent 建议 → 资产置换 → 提示词 → 审批/生成/成片。
@@ -2450,6 +2457,16 @@ function GenSettingsSection({ detail, busy, act }: { detail: HubTaskDetail; busy
     const [draft, setDraft] = useState<GenDraft | null>(null);
     const initRef = useRef("");
 
+    /**
+     * AT-16 B5b ④ 无本地草稿边界：这份面板里的配置到底是从哪来的？
+     *   draft    = 本机落盘的任务草稿（真·待改草稿）
+     *   approved = 草稿丢了，退回「批准时记下的配置基线」（已批准配置，**不是**待改草稿）
+     *   none     = 两者都没有（换过浏览器 / 在命令行批的）→ 只是画布默认占位，必须明说
+     * 老实现一律 `stored ?? defaultGenDraft(...)`：草稿一丢就把画布全局默认当真配置显示，
+     * 等于假装读到了快照——本条修正的就是这个。
+     */
+    const [draftOrigin, setDraftOrigin] = useState<"draft" | "approved" | "none">("draft");
+
     // 草稿按任务加载（切任务重读；轮询不重置输入）。全局 videoModel 只作默认值参考，从不回写。
     useEffect(() => {
         if (!localId || initRef.current === localId) return;
@@ -2457,15 +2474,35 @@ function GenSettingsSection({ detail, busy, act }: { detail: HubTaskDetail; busy
         const configNow = configRef.current;
         const list = genChannelsOf(configNow);
         const stored = readGenDraft(localId);
+        const approved = stored ? null : readApprovedDraft(localId);
         const preferred = configNow.videoModel ? configNow.videoModel.split("::")[0] : "";
-        const channel = stored ? findGenChannel(list, stored.channelId) : findGenChannel(list, genDefaultChannelId(list, preferred));
-        setDraft(stored ?? defaultGenDraft(channel, genSeedOf(configNow), configNow));
+        const channel = stored
+            ? findGenChannel(list, stored.channelId)
+            : approved
+              ? findGenChannel(list, approved.channelId)
+              : findGenChannel(list, genDefaultChannelId(list, preferred));
+        setDraftOrigin(stored ? "draft" : approved ? "approved" : "none");
+        setDraft(stored ?? approved?.draft ?? defaultGenDraft(channel, genSeedOf(configNow), configNow));
     }, [localId]);
 
     const channel = draft ? findGenChannel(channels, draft.channelId) : null;
     const ui = genUiFlags(channel);
     const staleNote = genDraftStaleNote(draft, channels);
     const needsReapproval = draft && readOnly ? genNeedsReapproval(localId, draft, channel) : false;
+
+    /**
+     * AT-16 B5b ①/②/③：撤销重批起态门。判据只有一份（hub-api.hubReworkGate）：
+     * 只在允许态（approved 且无活跃提交 / 无 submit_unknown / dispatch 已完结）才引导撤销；
+     * 未知态改走「已核对 → 解除阻断（既有 release 端点）+ 续查」，**绝不**引导撤销。
+     */
+    const reworkGate: HubReworkGate = hubReworkGate({
+        state,
+        submit: detail.submit ?? null,
+        cloudTaskId: detail.cloud_task_id || "",
+        activeSubmit: detail.active_submit,
+        submitUnknown: Boolean(detail.submit_unknown),
+        dispatchPhase: genDispatchPhase(detail),
+    });
 
     const update = (patch: Partial<GenDraft>) => {
         setDraft((prev) => {
@@ -2562,12 +2599,11 @@ function GenSettingsSection({ detail, busy, act }: { detail: HubTaskDetail; busy
         busy: busy !== null,
     });
 
-    const submitOnly = () => {
-        if (!draft) return;
-        if (submitAction.kind !== "submit" || !submitAction.enabled) {
-            message.error(submitAction.reason || "当前不能提交生成");
-            return;
-        }
+    /**
+     * 唯一执行点（底部「提交生成」与未知态「续查」共用）：runHubQuickAction 只在 HTTP 受理时报
+     * 「提交处理中」，轮询到 generating/done 才报「云端已收单」——两处不各写一套 toast。
+     */
+    const runSubmitAction = () => {
         void act("submit", async () => {
             await runHubQuickAction(localId, submitAction, {
                 onPhase: (phase, phaseState, note) => {
@@ -2582,6 +2618,24 @@ function GenSettingsSection({ detail, busy, act }: { detail: HubTaskDetail; busy
         });
     };
 
+    const submitOnly = () => {
+        if (!draft) return;
+        if (submitAction.kind !== "submit" || !submitAction.enabled) {
+            message.error(submitAction.reason || "当前不能提交生成");
+            return;
+        }
+        runSubmitAction();
+    };
+
+    /** 未知态指引段里的「续查」：同一个 hubQuickAction / runHubQuickAction（只查不重提）。 */
+    const resumeFromGate = () => {
+        if (submitAction.kind !== "resume" || !submitAction.enabled) {
+            message.error(submitAction.reason || "现在没有可续查的云端任务");
+            return;
+        }
+        runSubmitAction();
+    };
+
     /** 底部按钮的悬挂说明：先说「必须先做什么」（重批 / 守卫 / 缺配置），再做渠道提示。 */
     const submitBlockReason = needsReapproval
         ? "批准后配置变过（渠道身份 / 模型 / 模式 / 参数）——先「撤销批准」，改完再批准一次"
@@ -2589,16 +2643,41 @@ function GenSettingsSection({ detail, busy, act }: { detail: HubTaskDetail; busy
           ? submitAction.reason
           : "";
 
+    /**
+     * 撤销批准（起态门允许态才可点）：先确认，确认文案把「心血不作废」讲清楚——
+     * 只作废配置快照，资产确认 / 上传流水 / 置换确认 / 提示词一动不动。
+     */
     const revoke = () => {
+        if (!reworkGate.allowed) {
+            message.warning(reworkGate.reason || "当前状态不能撤销批准——先按上面的指引核对 / 解除阻断");
+            return;
+        }
         modal.confirm({
             title: "撤销批准？（改配置后重批）",
-            content: "撤销后回到待批准，改完配置再批准一次（新配置会重算快照）。资产与提示词都保留。",
+            content: "撤销后回到待批准，改完配置再批准一次（新配置会重算快照 v2）。资产确认 / 上传流水 / 置换确认 / 提示词都原样保留，不会被作废。",
             okText: "撤销批准",
             onOk: () =>
                 act("revoke", async () => {
                     await revokeHubTask(localId);
                     clearApprovedSignature(localId);
-                }, "已撤销批准，改完配置再批准一次"),
+                }, "已撤销批准，改配置后再批准一次"),
+        });
+    };
+
+    /**
+     * 未知态的人工解除（AT-16 B5b ①）：走既有 POST /api/hub/task/<id>/release（confirm:true）。
+     * 前端不猜结果、不自己清标记——核对是人的动作，解除后由后端记 history。
+     */
+    const releaseUnknown = () => {
+        modal.confirm({
+            title: "已在渠道控制台核对过「没有这一单」？",
+            content: "解除会清掉「未知收单」标记并写入任务历史，之后才能重新提交——重提会再扣一次费。确认渠道确实没有这一单再解。",
+            okText: "已核对，解除阻断",
+            okButtonProps: { danger: true },
+            onOk: () =>
+                act("release", async () => {
+                    await releaseHubTask(localId);
+                }, "已解除阻断：可以重新批准 / 提交了"),
         });
     };
 
@@ -2626,6 +2705,21 @@ function GenSettingsSection({ detail, busy, act }: { detail: HubTaskDetail; busy
 
     const blocked = genIssue(detail);
 
+    /**
+     * 无本地草稿边界文案（④）：既要如实说清「手上这份是什么」，又不能在实际改不了的态里
+     * 引导撤销（未知态撤销会清掉未知标记）——所以按起态门分岔。
+     */
+    const draftBoundaryText =
+        draftOrigin === "approved"
+            ? reworkGate.allowed
+                ? "本机没有这条任务的待改草稿——下面这份是「已批准配置」（批准时记下的基线，不是草稿）。要改就按顺序：撤销批准 → 换模型 → 批准出片；资产与提示词不受影响。"
+                : "本机没有这条任务的待改草稿——下面这份是「已批准配置」（批准时记下的基线，不是草稿）。现在结果待核对，先按上面的指引核对 / 解除阻断，解除之后才能改配置；资产与提示词不受影响。"
+            : readOnly
+              ? reworkGate.allowed
+                  ? "本机既没有待改草稿、也没有批准时的配置基线（换过浏览器 / 在命令行批的）——下面只是画布默认占位，不代表这条任务已固化的配置。要改配置请先「撤销批准」，再重新挑渠道 / 模型。"
+                  : "本机既没有待改草稿、也没有批准时的配置基线（换过浏览器 / 在命令行批的）——下面只是画布默认占位，不代表这条任务已固化的配置。现在结果待核对：先按上面的指引核对 / 解除阻断，解除之后才能改配置。"
+              : "本机没有这条任务的草稿——下面是从画布默认派生的初始值（还没落盘）；改任一字段就会存成这条任务自己的草稿。";
+
     return (
         <>
             <GenIssueSection detail={detail} busy={busy} act={act} />
@@ -2634,7 +2728,11 @@ function GenSettingsSection({ detail, busy, act }: { detail: HubTaskDetail; busy
                 <div className="flex flex-wrap items-center justify-between gap-2">
                     <h2 className="text-sm font-semibold">生成设置</h2>
                     <span className="text-xs text-stone-500 dark:text-stone-400">
-                        {readOnly ? "已随批准固化（快照 v2）；要改先撤销批准" : "与会话画布同源；批准时固化本次配置"}
+                        {readOnly
+                            ? reworkGate.mode === "unknown" || reworkGate.mode === "blocked"
+                                ? "已随批准固化（只读）——结果待核对，先别撤销"
+                                : "已随批准固化（快照 v2）；要改先撤销批准"
+                            : "与会话画布同源；批准时固化本次配置"}
                     </span>
                 </div>
                 <div className="mt-1 text-xs text-stone-500 dark:text-stone-400">
@@ -2642,6 +2740,17 @@ function GenSettingsSection({ detail, busy, act }: { detail: HubTaskDetail; busy
                         ? `已提交的配置由服务端快照固化；本地草稿口径：${genDraftSummary(draft, channel)}`
                         : "改任一有效字段（渠道身份 / 模型 / 模式 / 参数）＝快照失效，需重新批准；只换 key 不失效。"}
                 </div>
+
+                {/* AT-16 B5b ④ 无本地草稿边界：草稿丢了就说清手上这份是什么，不假装读到快照 */}
+                {draftOrigin !== "draft" ? (
+                    <div
+                        className="mt-2 rounded-md border border-sky-200 bg-sky-50 px-3 py-2 text-xs text-sky-800 dark:border-sky-950 dark:bg-sky-950/20 dark:text-sky-300"
+                        data-hub-gen-draft-boundary={draftOrigin}
+                        data-hub-gen-draft-boundary-readonly={readOnly ? "1" : "0"}
+                    >
+                        {draftBoundaryText}
+                    </div>
+                ) : null}
 
                 {staleNote ? (
                     <div className="mt-2 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-700 dark:border-amber-950 dark:bg-amber-950/20 dark:text-amber-300" data-hub-gen-stale>
@@ -2842,6 +2951,50 @@ function GenSettingsSection({ detail, busy, act }: { detail: HubTaskDetail; busy
                     </div>
                 ) : null}
 
+                {/* AT-16 B5b ①②：撤销重批引导（判据=起态门 hubReworkGate）。允许态给三步顺序 + 心血不作废；
+                    未知态只给「核对 → 解除阻断（既有 release 端点）→ 续查」，**不引导撤销**。 */}
+                {reworkGate.mode !== "none" ? (
+                    <div
+                        className={
+                            reworkGate.allowed
+                                ? "mt-3 rounded-md border border-stone-300 bg-stone-50 px-3 py-2 text-xs text-stone-700 dark:border-stone-700 dark:bg-stone-900/40 dark:text-stone-300"
+                                : "mt-3 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-700 dark:border-amber-950 dark:bg-amber-950/20 dark:text-amber-300"
+                        }
+                        data-hub-gen-rework={reworkGate.mode}
+                        data-hub-gen-rework-allowed={reworkGate.allowed ? "1" : "0"}
+                        data-hub-gen-rework-block={reworkGate.blockKind}
+                    >
+                        <div className="font-medium">{reworkGate.title}</div>
+                        {reworkGate.reason ? <div className="mt-1 break-words">{reworkGate.reason}</div> : null}
+                        <ol className="mt-1 list-decimal space-y-0.5 pl-5">
+                            {(reworkGate.allowed ? reworkGate.steps : hubReworkUnknownSteps(reworkGate)).map((step) => (
+                                <li key={step} className="break-words">
+                                    {step}
+                                </li>
+                            ))}
+                        </ol>
+                        {reworkGate.keep ? (
+                            <div className="mt-1 break-words" data-hub-gen-rework-keep>
+                                {reworkGate.keep}
+                            </div>
+                        ) : null}
+                        {reworkGate.showRelease || reworkGate.canResume ? (
+                            <div className="mt-2 flex flex-wrap justify-end gap-2">
+                                {reworkGate.canResume ? (
+                                    <Button size="small" loading={busy === "submit"} disabled={busy !== null} onClick={resumeFromGate} data-hub-gen-rework-resume>
+                                        按云端 taskId 续查（只查不重提）
+                                    </Button>
+                                ) : null}
+                                {reworkGate.showRelease ? (
+                                    <Button size="small" danger loading={busy === "release"} disabled={busy !== null} onClick={releaseUnknown} data-hub-gen-release>
+                                        已核对，解除阻断
+                                    </Button>
+                                ) : null}
+                            </div>
+                        ) : null}
+                    </div>
+                ) : null}
+
                 <div className="mt-3 flex flex-wrap items-center justify-end gap-2">
                     {state === "awaiting_approval" ? (
                         <>
@@ -2868,9 +3021,13 @@ function GenSettingsSection({ detail, busy, act }: { detail: HubTaskDetail; busy
 
                     {state === "approved" ? (
                         <>
-                            <Button ghost loading={busy === "revoke"} disabled={busy !== null} onClick={revoke} data-hub-gen-revoke>
-                                撤销批准（改配置）
-                            </Button>
+                            {/* 起态门：只有允许态（无活跃提交 / 无未知收单 / dispatch 已完结）才给撤销入口。
+                                未知态不给按钮——上面指引段直接说「先核对渠道」，撤销会清掉未知标记。 */}
+                            {reworkGate.allowed ? (
+                                <Button ghost loading={busy === "revoke"} disabled={busy !== null} onClick={revoke} data-hub-gen-revoke data-hub-gen-revoke-allowed="1">
+                                    撤销批准（改配置）
+                                </Button>
+                            ) : null}
                             <Tooltip title={submitBlockReason || submitAction.hint}>
                                 <span>
                                     <Button
