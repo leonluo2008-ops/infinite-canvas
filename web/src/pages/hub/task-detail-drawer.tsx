@@ -11,6 +11,7 @@ import {
     defaultGenDraft,
     findGenChannel,
     genApproveIssues,
+    genChannelModelRows,
     genDefaultChannelId,
     genDraftSignature,
     genDraftStaleNote,
@@ -18,6 +19,7 @@ import {
     genFailureHint,
     genFamily,
     genIssue,
+    genModelPick,
     genModelRows,
     genNeedsReapproval,
     genRatioRows,
@@ -1893,7 +1895,7 @@ function RetryButton({ localId, busy, act, disabled = false }: { localId: string
 
 // ---------------------------------------------------------------- AT-13 B3：生成设置 + 提交链 UI
 
-/** 画布 AiConfig.channels → 纯渠道描述（lib 不吃 store，探针直接断言纯函数）。 */
+/** 画布 AiConfig.channels → 纯渠道描述（lib 不吃 store 状态，探针直接断言纯函数）。 */
 function genChannelsOf(config: AiConfig): GenChannelDesc[] {
     return (config.channels || []).map((channel) => ({
         id: channel.id,
@@ -1901,10 +1903,11 @@ function genChannelsOf(config: AiConfig): GenChannelDesc[] {
         baseUrl: channel.baseUrl,
         apiKey: channel.apiKey,
         apiFormat: channel.apiFormat,
+        // 模型候选不在这里派生（AT-14 §3.2）：hub 直接用画布共享函数 selectableModelsByCapability，
+        // 渠道描述只留渠道身份；带模型脚本的判定也由共享数据（AiConfig.channels[].models[].script）给出。
         models: (channel.models || []).map((model) => ({
             name: model.name,
             capability: model.capability,
-            hasScript: Boolean(String(model.script || "").trim()),
         })),
     }));
 }
@@ -1996,7 +1999,8 @@ function GenIssueSection({ detail, busy, act }: { detail: HubTaskDetail; busy: B
 /**
  * 生成设置（§2.1/§2.2/§2.10）：
  *  - 渠道 + 模型（复用 ModelPicker(capability=video)）→ 按「渠道+模型引用」存任务草稿（不写全局 videoModel）
- *  - 协议矩阵：只列 SDGF / 万相可选，gemini/openai/模型脚本标「画布专用」禁选
+ *  - 模型候选＝画布视频模型全集（AT-14 §3.2 档位 a，共享函数 selectableModelsByCapability 派生）；
+ *    执行范围层三态：SDGF/wan 可选、openai/gemini 禁用标「画布可用·工作台暂不承接」、模型脚本禁用标「画布专用（模型脚本）」
  *  - wan 如实 UI：固定 wan3.0 · 自动多图参考，model / mode 控件不渲染
  *  - 参数面板枚举与画布同源（media-size.ts）；渠道不接的值照列 + 显式提示
  *  - 批准带 config（无 key）；提交带 key（一次性）；改配置＝快照失效需重批（撤销批准）
@@ -2025,7 +2029,7 @@ function GenSettingsSection({ detail, busy, act }: { detail: HubTaskDetail; busy
         const stored = readGenDraft(localId);
         const preferred = configNow.videoModel ? configNow.videoModel.split("::")[0] : "";
         const channel = stored ? findGenChannel(list, stored.channelId) : findGenChannel(list, genDefaultChannelId(list, preferred));
-        setDraft(stored ?? defaultGenDraft(channel, genSeedOf(configNow)));
+        setDraft(stored ?? defaultGenDraft(channel, genSeedOf(configNow), configNow));
     }, [localId]);
 
     const channel = draft ? findGenChannel(channels, draft.channelId) : null;
@@ -2043,7 +2047,8 @@ function GenSettingsSection({ detail, busy, act }: { detail: HubTaskDetail; busy
 
     const pickChannel = (channelId: string) => {
         const next = findGenChannel(channels, channelId);
-        const rows = genModelRows(next);
+        // 默认模型只从该渠道内的候选里挑（同源共享函数；绝不跨渠道抓别人的模型）
+        const rows = genChannelModelRows(config, channelId);
         update({
             channelId,
             model: genFamily(next?.apiFormat) === "sdgf" ? rows.find((row) => row.selectable)?.name || "" : "",
@@ -2051,10 +2056,28 @@ function GenSettingsSection({ detail, busy, act }: { detail: HubTaskDetail; busy
         });
     };
 
-    const pickModel = (value: string) => update({ model: value.includes("::") ? value.slice(value.indexOf("::") + 2) : value });
+    /**
+     * 选模型（AT-14 §3.2 档位 a）：列表是画布视频模型全集，模型值自带渠道身份 —— 选中别家渠道的模型
+     * 必须同步切渠道，否则会拿 A 渠道的 baseUrl/apiFormat 派 B 渠道的模型（渠道身份与模型错配）。
+     */
+    const pickModel = (value: string) => {
+        const picked = genModelPick(value);
+        if (!picked.channelId) {
+            update({ model: picked.model });
+            return;
+        }
+        const family = genFamily(findGenChannel(channels, picked.channelId)?.apiFormat);
+        update({
+            channelId: picked.channelId,
+            model: family === "sdgf" ? picked.model : "",
+            mode: family === "sdgf" ? draft?.mode || "frames" : "",
+        });
+    };
 
     const apiKey = String(channel?.apiKey || "").trim();
     const ratioRows = genRatioRows(channel);
+    // 模型区行：候选全集＝画布视频模型全集（同源共享函数），禁用差异只来自执行范围层
+    const modelRows = genModelRows(channel, config);
     const resolutionRows = genResolutionRows();
     // 画幅规约（AT-14 §3.1）：自定义 W×H 走画布 inferVideoRatio 就地规约，禁像素串外传
     const sizeInfo = draft ? genResolveSize(draft.size, channel) : genResolveSize("auto", channel);
@@ -2192,9 +2215,9 @@ function GenSettingsSection({ detail, busy, act }: { detail: HubTaskDetail; busy
                         />
                     </label>
 
-                    {/* 模型：wan 族不渲染（固定 wan3.0），SDGF 族走 ModelPicker(capability=video) */}
+                    {/* 模型：wan 族不渲染（固定 wan3.0）；SDGF 族＝画布视频模型全集（档位 a：三态标注） */}
                     {ui.showModel ? (
-                        <div className="space-y-1.5">
+                        <div className="space-y-1.5" data-hub-gen-models data-hub-gen-model-count={modelRows.length} data-hub-gen-model-blocked={modelRows.filter((row) => !row.selectable).length}>
                             <span className="text-xs font-medium text-stone-500 dark:text-stone-400">模型</span>
                             {readOnly ? (
                                 <div className="flex h-8 items-center rounded-full border border-input px-3 text-sm">{draft.model || "未选模型"}</div>
@@ -2205,10 +2228,10 @@ function GenSettingsSection({ detail, busy, act }: { detail: HubTaskDetail; busy
                                     onChange={pickModel}
                                     capability="video"
                                     fullWidth
-                                    placeholder="选视频模型"
-                                    options={genModelRows(channel).map((row) => row.value)}
-                                    optionDisabled={(value) => !(genModelRows(channel).find((row) => row.value === value)?.selectable ?? true)}
-                                    optionSuffix={(value) => genModelRows(channel).find((row) => row.value === value)?.note || ""}
+                                    placeholder={modelRows.length ? "选视频模型（含画布同款）" : "画布还没配视频模型"}
+                                    options={modelRows.map((row) => row.value)}
+                                    optionDisabled={(value) => !(modelRows.find((row) => row.value === value)?.selectable ?? true)}
+                                    optionSuffix={(value) => modelRows.find((row) => row.value === value)?.note || ""}
                                 />
                             )}
                         </div>

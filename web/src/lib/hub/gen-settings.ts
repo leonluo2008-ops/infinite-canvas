@@ -1,8 +1,10 @@
 /**
  * AT-13 B3 生成设置（§2.1 / §2.2 / §2.10 + §三 数据合同）——纯逻辑层。
  *
- * 只吃纯数据（渠道描述 / 草稿 / get_task 透传字段），不 import zustand / i18n / React：
+ * 只吃纯数据（渠道描述 / 画布 AiConfig / 草稿 / get_task 透传字段），不渲染 React、不读 zustand 状态：
  * 探针 probe-at13-b3.mjs 用 esbuild 打包本文件直接断言真值，不复制实现。
+ * （AT-14 B2 起模型候选直接 import 画布共享函数 `selectableModelsByCapability`（use-config-store.ts）——
+ *   这是红线 25 要求的「复用既有落点」，因此本文件会加载 store 模块；探针以 localStorage 兜底垫片打包。）
  *
  * 覆盖：
  *   ① 协议承接矩阵：SDGF 族 + wan 族可选；gemini/openai/模型脚本族＝「画布专用」禁选（不摆「选中必错路由」）
@@ -12,6 +14,8 @@
  *   ④ approve 请求体（config，无 key）/ submit 请求体（key，一次性）
  *   ⑤ 草稿按「渠道 + 模型引用」存任务草稿，且不写全局 videoModel
  *   ⑥ 提交链阻断态（active_submit / submit_unknown / dispatch / 疑似孤儿三步）→ UI 引导文案
+ *   ⑦ 模型候选同源（AT-14 §3.2 档位 a）：候选全集＝画布视频模型全集（共享函数派生），
+ *      执行范围层叠在上面做三态标注（已承接可选 / 协议不承接禁用 / 模型脚本禁用）
  */
 import {
     clampVideoSeconds,
@@ -23,6 +27,9 @@ import {
     VIDEO_SECONDS_MIN,
     videoRatioOptions,
 } from "@/lib/media-size";
+// 候选全集同源（AT-14 §3.2 / 红线 25）：模型候选**只由画布共享函数派生**，hub 不再自造
+// 「capability 字面过滤 + 协议白名单」政策层。此处直接 import 现函数，禁复制实现。
+import { decodeChannelModel, modelOptionName, resolveModelScript, selectableModelsByCapability, type AiConfig } from "@/stores/use-config-store";
 
 // ---------------------------------------------------------------- 协议矩阵（真源：media-size.ts + bridge 接收域）
 
@@ -33,6 +40,8 @@ export type GenFamily = "sdgf" | "wan" | "canvas-only";
 export const GEN_WAN_FIXED_NOTE = "固定 wan3.0 · 自动多图参考";
 /** 禁选项标注（§2.1：标「画布专用」，不列「选中必错路由」项）。 */
 export const GEN_CANVAS_ONLY_TAG = "画布专用";
+/** 画布能用、hub 后端还没承接的协议族标注（AT-14 §3.2 档位 a：照列 + 禁用 + 如实标注，不隐藏）。 */
+export const GEN_HUB_UNSUPPORTED_TAG = "画布可用·工作台暂不承接";
 
 /** 画布画幅全集（与 media-size.ts videoRatioOptions 同源，探针断言两者一致）。 */
 export const GEN_CANVAS_RATIOS: string[] = videoRatioOptions.map((item) => item.value);
@@ -45,7 +54,7 @@ export const GEN_DURATION_MIN = VIDEO_SECONDS_MIN;
 export const GEN_DURATION_MAX = VIDEO_SECONDS_MAX;
 
 /** 渠道描述（由 AiConfig.channels 映射而来，保持 lib 与 store 解耦）。 */
-export type GenChannelModelDesc = { name: string; capability: string; hasScript: boolean };
+export type GenChannelModelDesc = { name: string; capability: string };
 export type GenChannelDesc = {
     id: string;
     name: string;
@@ -105,20 +114,76 @@ export function genDefaultChannelId(channels: GenChannelDesc[], preferredChannel
     return wan ? wan.id : "";
 }
 
-/** 模型行（仅当前渠道内）：视频能力模型全列；带模型脚本的标「画布专用（模型脚本）」禁选。 */
-export type GenModelRow = { name: string; value: string; selectable: boolean; note: string };
+/**
+ * 模型行（AT-14 §3.2 档位 a）。
+ *
+ * 候选全集＝**画布视频模型全集**（`selectableModelsByCapability` 派生，行序与画布 ModelPicker 一致）；
+ * 执行范围层叠在上面做三态标注（这层是 AT-13 后端承接面的诚实表达，不是画布语义）：
+ *   ① SDGF / wan 族 → hub 后端已承接 → 可选
+ *   ② openai / gemini 族 → 照列 + 禁用 + 「画布可用·工作台暂不承接」
+ *   ③ 带模型脚本 → 照列 + 禁用 + 「画布专用（模型脚本）」
+ */
+export type GenModelRow = {
+    /** 编码值 `渠道id::模型名`（与画布 ModelPicker 同一编码，行序可直接逐行对比）。 */
+    value: string;
+    /** 裸模型名（approve 的 model 字段只用它）。 */
+    name: string;
+    channelId: string;
+    channelName: string;
+    apiFormat: string;
+    family: GenFamily;
+    /** 执行范围层：hub 后端已承接 → true（候选全集里禁用项＝这层差异，不是画布差异）。 */
+    selectable: boolean;
+    note: string;
+};
 
-export function genModelRows(channel: GenChannelDesc | null): GenModelRow[] {
+/** 画布视频模型候选全集（同源：use-config-store#selectableModelsByCapability；行序保序、同值去重与 ModelPicker 同口径）。 */
+export function genModelCandidates(config: AiConfig | null | undefined): GenModelRow[] {
+    if (!config) return [];
+    const rows: GenModelRow[] = [];
+    for (const value of new Set(selectableModelsByCapability(config, "video"))) {
+        const decoded = decodeChannelModel(value);
+        const channel = decoded ? (config.channels || []).find((item) => item.id === decoded.channelId) : undefined;
+        const family = genFamily(channel?.apiFormat);
+        const supported = family !== "canvas-only";
+        // 模型脚本＝画布专用（脚本在浏览器里跑，hub 后端没有执行面）：最强拒绝理由优先于协议层
+        const scripted = Boolean(String(resolveModelScript(config, value) || "").trim());
+        rows.push({
+            value,
+            name: decoded?.model || modelOptionName(value),
+            channelId: channel?.id || "",
+            channelName: channel?.name || "",
+            apiFormat: String(channel?.apiFormat || ""),
+            family,
+            selectable: supported && !scripted,
+            note: scripted ? `${GEN_CANVAS_ONLY_TAG}（模型脚本）` : supported ? "" : GEN_HUB_UNSUPPORTED_TAG,
+        });
+    }
+    return rows;
+}
+
+/** 单渠道内候选（切渠道挑默认模型用：绝不跨渠道抓别人的模型）。 */
+export function genChannelModelRows(config: AiConfig | null | undefined, channelId: string): GenModelRow[] {
+    if (!channelId) return [];
+    return genModelCandidates(config).filter((row) => row.channelId === channelId);
+}
+
+/**
+ * 模型区行：wan 族＝固定模型（不列模型行）；画布专用渠道不可选 → 空；SDGF 族＝候选全集（档位 a）。
+ * 行序即画布顺序——禁用差异只来自执行范围层。
+ */
+export function genModelRows(channel: GenChannelDesc | null, config: AiConfig | null | undefined): GenModelRow[] {
     if (!channel) return [];
-    if (genFamily(channel.apiFormat) !== "sdgf") return []; // wan＝固定模型；画布专用渠道不可选
-    return (channel.models || [])
-        .filter((model) => String(model.capability || "") === "video")
-        .map((model) => ({
-            name: model.name,
-            value: `${channel.id}::${model.name}`,
-            selectable: !model.hasScript,
-            note: model.hasScript ? `${GEN_CANVAS_ONLY_TAG}（模型脚本）` : "",
-        }));
+    if (genFamily(channel.apiFormat) !== "sdgf") return [];
+    return genModelCandidates(config);
+}
+
+/** 选中模型 → 草稿补丁（编码值自带渠道身份：渠道身份与模型必须同源，否则会拿 A 渠道身份派 B 渠道模型）。 */
+export function genModelPick(value: string): { channelId: string; model: string } {
+    const raw = String(value || "").trim();
+    const decoded = decodeChannelModel(raw);
+    if (!decoded) return { channelId: "", model: modelOptionName(raw) };
+    return { channelId: decoded.channelId, model: decoded.model };
 }
 
 /** wan 如实化：model 下拉与 mode 切换不渲染（不摆无效控件）。 */
@@ -252,9 +317,10 @@ export type GenDraft = {
 export type GenDraftSeed = { videoSeconds?: string; vquality?: string; size?: string; videoMode?: string; videoGenerateAudio?: string };
 
 /** 从画布全局默认派生初始草稿（只读取，不回写全局 videoModel / videoSeconds）。 */
-export function defaultGenDraft(channel: GenChannelDesc | null, seed: GenDraftSeed = {}): GenDraft {
+export function defaultGenDraft(channel: GenChannelDesc | null, seed: GenDraftSeed = {}, config: AiConfig | null | undefined = null): GenDraft {
     const family = channel ? genFamily(channel.apiFormat) : "sdgf";
-    const rows = genModelRows(channel);
+    // 默认模型＝该渠道内候选全集里第一个可选项（同源共享函数，不另立白名单）
+    const rows = genChannelModelRows(config, channel?.id || "");
     const seedSize = String(seed.size || "").trim();
     // 画布全局默认画幅同样走规约（WxH → 枚举，禁像素串外传）
     const ratio = genResolveSize(seedSize || "auto", channel).size || "auto";

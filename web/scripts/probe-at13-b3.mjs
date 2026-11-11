@@ -5,14 +5,19 @@
  * 覆盖（对应执行卡质量门 1~7）：
  *   ① 枚举同源：画幅/清晰度/时长选项＝media-size.ts 派生（含 21:9 / 自适应 / WxH）
  *   ② 协议矩阵：SDGF+wan 可选；gemini/openai/模型脚本标「画布专用」禁选
+ *   ②b 模型候选同源（AT-14 §3.2 / §五.2）：候选全集＝画布 selectableModelsByCapability 输出，
+ *      行序逐行对比 + 三态标注（可选 / 画布可用·工作台暂不承接 / 画布专用（模型脚本））+ 负例必红
  *   ③ wan 如实 UI：固定 wan3.0·自动多图参考，model/mode 控件不渲染
  *   ④ approve 请求体带 config 且**无 key**；submit 请求体带 key（一次性）
  *   ⑤ 草稿按「渠道+模型」存任务草稿；失效引用显式提示；key 不进签名（只换 key 不失效）
  *   ⑥ 提交链阻断：active_submit / submit_unknown / dispatch / 孤儿三步 → 引导文案 + 禁重提
  *   ⑦ JSX/API 接线护栏（红条、阻断入口、续查、撤销批准、无直接重提按钮）
+ *   ⑨ 画幅规约（AT-14 §3.1）：与 PY 探针共享 sdgf-dialect/cases.json 的 size 用例
  *
  * 跑法：cd web && node scripts/probe-at13-b3.mjs   （失败 rc=1）
  * 注：离线无 DOM runtime，真机 DOM 可见性/点选由 B5 收口；本探针管逻辑真值 + JSX 接线。
+ *     模型候选的「两侧对比」= 画布真入口函数（store.selectableModelsByCapability）对 hub 模型区行，
+ *     并在同一断言上跑旧行为替身做负例（防恒真，L2 审计 B-07）。
  */
 import { createRequire } from "node:module";
 import { mkdirSync, readFileSync } from "node:fs";
@@ -21,6 +26,17 @@ import { pathToFileURL } from "node:url";
 
 const require = createRequire(path.resolve("package.json"));
 const esbuild = require("esbuild");
+
+// AT-14 B2 起 gen-settings.ts 直接 import 画布共享函数（use-config-store.ts#selectableModelsByCapability）——
+// 该模块加载时读 localStorage（i18n 取语言），node 侧给最小垫片；打包平台改用 node
+// （store 依赖链里有 nanoid → node:crypto，neutral 平台打不过）。
+const memory = new Map();
+globalThis.localStorage = {
+    getItem: (key) => (memory.has(key) ? memory.get(key) : null),
+    setItem: (key, value) => memory.set(key, String(value)),
+    removeItem: (key) => memory.delete(key),
+    clear: () => memory.clear(),
+};
 
 const outDir = path.resolve("node_modules/.probe");
 mkdirSync(outDir, { recursive: true });
@@ -35,13 +51,13 @@ function check(name, condition, detail = "") {
     fails.push(`${name}${detail ? ` — ${detail}` : ""}`);
 }
 
-async function bundle(entry, outName) {
+async function bundle(entry, outName, platform = "node") {
     const outFile = path.join(outDir, outName);
     await esbuild.build({
         entryPoints: [path.resolve(entry)],
         bundle: true,
         format: "esm",
-        platform: "neutral",
+        platform,
         outfile: outFile,
         logLevel: "silent",
         alias: { "@": path.resolve("src") },
@@ -51,6 +67,8 @@ async function bundle(entry, outName) {
 
 const gen = await bundle("src/lib/hub/gen-settings.ts", "at13-gen-settings.mjs");
 const media = await bundle("src/lib/media-size.ts", "at13-media-size.mjs");
+// 画布侧真入口（AT-14 B2 两侧对比用）：ModelPicker 默认路径就是它
+const canvasStore = await bundle("src/stores/use-config-store.ts", "at14-config-store.mjs");
 
 // ---------------------------------------------------------------- 夹具：三族渠道
 const sdgfChannel = {
@@ -60,10 +78,9 @@ const sdgfChannel = {
     apiKey: "sk-fake-sdgf",
     apiFormat: "sdgf",
     models: [
-        { name: "sdgf-2.5-pro", capability: "video", hasScript: false },
-        { name: "sdgf-2.0", capability: "video", hasScript: false },
-        { name: "scripted-video", capability: "video", hasScript: true }, // 模型脚本族 → 画布专用
-        { name: "seedream-4", capability: "image", hasScript: false },
+        { name: "sdgf-2.5-pro", capability: "video" },
+        { name: "sdgf-2.0", capability: "video" },
+        { name: "seedream-4", capability: "image" },
     ],
 };
 const wanChannel = {
@@ -72,7 +89,7 @@ const wanChannel = {
     baseUrl: "http://127.0.0.1:8779",
     apiKey: "",
     apiFormat: "wan",
-    models: [{ name: "wan3.0", capability: "video", hasScript: false }],
+    models: [{ name: "wan3.0", capability: "video" }],
 };
 const geminiChannel = {
     id: "ch-gemini",
@@ -80,9 +97,58 @@ const geminiChannel = {
     baseUrl: "https://generativelanguage.googleapis.com",
     apiKey: "sk-fake-gemini",
     apiFormat: "gemini",
-    models: [{ name: "veo-3", capability: "video", hasScript: false }],
+    models: [{ name: "veo-3", capability: "video" }],
 };
 const channels = [sdgfChannel, wanChannel, geminiChannel];
+
+// ---------------------------------------------------------------- 模型候选夹具（AT-14 §五.2：归一配置，五族各置一模型）
+// 画布侧真入口的入参形状＝AiConfig（use-config-store.ts 的类型）；这里只要函数用到的字段。
+const aiConfig = {
+    channelMode: "local",
+    baseUrl: "",
+    apiFormat: "sdgf",
+    model: "sdgf-2.5-pro",
+    imageModel: "seedream-4",
+    videoModel: "ch-sdgf::sdgf-2.5-pro",
+    textModel: "",
+    audioModel: "",
+    models: [],
+    channels: [
+        {
+            id: "ch-sdgf",
+            name: "聚鑫 SDGF",
+            baseUrl: "https://sdapi.jxinai.com",
+            apiFormat: "sdgf",
+            models: [
+                { name: "sdgf-2.5-pro", capability: "video" },
+                { name: "sdgf-2.0", capability: "video" },
+                { name: "scripted-video", capability: "video", script: "module.exports = () => ({})" },
+                { name: "seedream-4", capability: "image" },
+            ],
+        },
+        {
+            id: "ch-wan",
+            name: "本地万相",
+            baseUrl: "http://127.0.0.1:8779",
+            apiFormat: "wan",
+            models: [{ name: "wan3.0", capability: "video" }],
+        },
+        {
+            id: "ch-openai",
+            name: "OpenAI 直连",
+            baseUrl: "https://api.openai.com",
+            apiFormat: "openai",
+            models: [{ name: "sora-2", capability: "video" }],
+        },
+        {
+            id: "ch-gemini",
+            name: "Gemini 直连",
+            baseUrl: "https://generativelanguage.googleapis.com",
+            apiFormat: "gemini",
+            models: [{ name: "veo-3", capability: "video" }],
+        },
+    ],
+};
 
 // ---------------------------------------------------------------- ① 枚举同源
 const ratioRows = gen.genRatioRows(sdgfChannel);
@@ -133,13 +199,13 @@ check("渠道列表：SDGF/wan 可选，gemini 禁选",
     channelRows.find((row) => row.id === "ch-gemini").selectable === false);
 check("禁选渠道标「画布专用」（不是「选中必错路由」项）",
     channelRows.find((row) => row.id === "ch-gemini").note.includes(gen.GEN_CANVAS_ONLY_TAG));
-const modelRows = gen.genModelRows(sdgfChannel);
+const modelRows = gen.genModelRows(sdgfChannel, aiConfig);
 check("模型列表只列视频能力模型（图像模型不进视频选择）",
-    modelRows.every((row) => !row.name.startsWith("seedream")) && modelRows.length === 3);
+    modelRows.every((row) => !row.name.startsWith("seedream")) && modelRows.length > 0);
 check("模型脚本族禁选 + 标「画布专用（模型脚本）」",
-    modelRows.find((row) => row.name === "scripted-video").selectable === false &&
-    modelRows.find((row) => row.name === "scripted-video").note.includes(gen.GEN_CANVAS_ONLY_TAG));
-check("wan 渠道不产模型选项（固定模型，不摆无效控件）", gen.genModelRows(wanChannel).length === 0);
+    modelRows.find((row) => row.name === "scripted-video")?.selectable === false &&
+    String(modelRows.find((row) => row.name === "scripted-video")?.note || "").includes(gen.GEN_CANVAS_ONLY_TAG));
+check("wan 渠道不产模型选项（固定模型，不摆无效控件）", gen.genModelRows(wanChannel, aiConfig).length === 0);
 const wanUi = gen.genUiFlags(wanChannel);
 check("wan 如实 UI：model 下拉与 mode 切换都不渲染",
     wanUi.showModel === false && wanUi.showMode === false);
@@ -148,6 +214,75 @@ check("wan 固定文案＝「固定 wan3.0 · 自动多图参考」",
 const sdgfUi = gen.genUiFlags(sdgfChannel);
 check("SDGF 族：model 与 mode 控件都在",
     sdgfUi.showModel === true && sdgfUi.showMode === true && sdgfUi.fixedNote === "");
+
+// ------------------------------------------------ ②b 模型候选同源（AT-14 §3.2 档位 a / §五.2）+ 防恒真
+// 画布侧真入口：ModelPicker **没有 options 覆盖**时的默认路径就是 selectableModelsByCapability(config, capability)
+// （model-picker.tsx:37）。这里直接调该真函数取候选，与 hub 模型区行逐行对比。
+const canvasValues = canvasStore.selectableModelsByCapability(aiConfig, "video");
+
+/** 两侧逐行对比（行序 + 集合）；返回差异清单，空数组＝一致。 */
+function modelParityFails(hubRows, canvasRowValues) {
+    const fails = [];
+    const hubValues = hubRows.map((row) => row.value);
+    if (hubValues.length !== canvasRowValues.length) fails.push(`行数 ${hubValues.length} ≠ 画布 ${canvasRowValues.length}`);
+    const shared = Math.min(hubValues.length, canvasRowValues.length);
+    for (let index = 0; index < shared; index += 1) {
+        if (hubValues[index] !== canvasRowValues[index]) fails.push(`第 ${index + 1} 行 ${hubValues[index]} ≠ 画布 ${canvasRowValues[index]}`);
+    }
+    const canvasSet = new Set(canvasRowValues);
+    for (const value of hubValues) if (!canvasSet.has(value)) fails.push(`hub 多出画布没有的行 ${value}`);
+    for (const value of canvasRowValues) if (!hubValues.includes(value)) fails.push(`hub 少了画布有的行 ${value}`);
+    return fails;
+}
+
+const parityFails = modelParityFails(modelRows, canvasValues);
+check("候选全集＝画布视频模型全集（行序逐行一致，不缺不添）", parityFails.length === 0, parityFails.join("；"));
+check("画布候选夹具齐全（sdgf×3 含脚本 / wan / openai / gemini，图像模型不进）",
+    canvasValues.length === 6 && !canvasValues.some((value) => value.includes("seedream")), canvasValues.join(","));
+
+// 负例（L2 审计 B-07 闭合项）：把候选源换成 B3 旧行为（只当前渠道 + 自造 capability 字面过滤）——
+// 同一断言必须红；红的过程贴出来，证明这不是「自证恒真」的断言。
+const legacyGenModelRows = (channel) =>
+    (channel.models || [])
+        .filter((model) => String(model.capability || "") === "video")
+        .map((model) => ({ value: `${channel.id}::${model.name}`, name: model.name }));
+const legacyFails = modelParityFails(legacyGenModelRows(sdgfChannel), canvasValues);
+check("负例：旧 genModelRows 行为（仅当前渠道 + 自造过滤）必须红", legacyFails.length > 0, legacyFails.join("；"));
+const reversedFails = modelParityFails([...modelRows].reverse(), canvasValues);
+check("负例：行序被打乱必须红", reversedFails.length > 0, reversedFails.join("；"));
+const hiddenFails = modelParityFails(modelRows.filter((row) => row.channelId === "ch-sdgf"), canvasValues);
+check("负例：只留当前渠道的行（画布能用 hub 不见）必须红", hiddenFails.length > 0, hiddenFails.join("；"));
+check("负例：候选为空（模型区空白）必须红", modelParityFails([], canvasValues).length > 0);
+console.log(`  [负例红样本 旧行为] ${legacyFails.join(" / ")}`);
+console.log(`  [负例红样本 行序反转] ${reversedFails.slice(0, 3).join(" / ")}`);
+
+// disabled 差异＝执行范围层三态（画布侧无禁用；hub 侧只禁用「协议不承接」与「模型脚本」）
+const rowOf = (value) => modelRows.find((row) => row.value === value) || {};
+check("① SDGF 族＝hub 后端已承接 → 可选（无标注）",
+    rowOf("ch-sdgf::sdgf-2.5-pro").selectable === true && rowOf("ch-sdgf::sdgf-2.0").selectable === true &&
+    rowOf("ch-sdgf::sdgf-2.5-pro").note === "");
+check("① wan 族＝hub 后端已承接 → 可选（渠道可切；模型区仍走固定文案）",
+    rowOf("ch-wan::wan3.0").selectable === true && rowOf("ch-wan::wan3.0").note === "");
+check("② openai/gemini 族 → 照列 + 禁用 + 「画布可用·工作台暂不承接」",
+    ["ch-openai::sora-2", "ch-gemini::veo-3"].every((value) =>
+        rowOf(value) && rowOf(value).selectable === false && rowOf(value).note === gen.GEN_HUB_UNSUPPORTED_TAG));
+check("③ 带模型脚本 → 照列 + 禁用 + 「画布专用（模型脚本）」（脚本优先于协议层标注）",
+    rowOf("ch-sdgf::scripted-video").selectable === false &&
+    rowOf("ch-sdgf::scripted-video").note === `${gen.GEN_CANVAS_ONLY_TAG}（模型脚本）`);
+check("hub 禁用集合＝执行范围层那几行（不是画布差异）",
+    JSON.stringify(modelRows.filter((row) => !row.selectable).map((row) => row.value)) ===
+        JSON.stringify(["ch-sdgf::scripted-video", "ch-openai::sora-2", "ch-gemini::veo-3"]),
+    modelRows.filter((row) => !row.selectable).map((row) => row.value).join(","));
+
+// 选模型＝渠道身份同步（模型值自带渠道 id：否则会拿 A 渠道身份派 B 渠道模型）
+check("选别家渠道的模型 → 渠道身份同步（wan3.0 → ch-wan）",
+    gen.genModelPick("ch-wan::wan3.0").channelId === "ch-wan" && gen.genModelPick("ch-wan::wan3.0").model === "wan3.0");
+check("裸模型名（无渠道编码）→ 不动渠道",
+    gen.genModelPick("sdgf-2.0").channelId === "" && gen.genModelPick("sdgf-2.0").model === "sdgf-2.0");
+check("切渠道默认模型只取该渠道内候选（不跨渠道抓模型）",
+    JSON.stringify(gen.genChannelModelRows(aiConfig, "ch-wan").map((row) => row.value)) === JSON.stringify(["ch-wan::wan3.0"]) &&
+    gen.genChannelModelRows(aiConfig, "ch-sdgf").every((row) => row.channelId === "ch-sdgf"));
+check("空配置 → 候选空列表（不臆造模型）", gen.genModelCandidates(null).length === 0);
 
 // ---------------------------------------------------------------- ④ approve 带 config 无 key / submit 带 key
 const sdgfDraft = {
@@ -229,7 +364,7 @@ check("批准后改画幅 → 需要重新批准",
 check("没有本地批准基线（别处批准）→ 不臆造「需要重批」",
     gen.genNeedsReapproval("auto-0002", sdgfDraft, sdgfChannel, memoryStorage()) === false);
 check("默认草稿从画布全局默认派生且不写全局（size 比例化 / 时长夹紧）", (() => {
-    const draft = gen.defaultGenDraft(sdgfChannel, { videoSeconds: "999", vquality: "1080p", size: "1920x1080", videoMode: "reference" });
+    const draft = gen.defaultGenDraft(sdgfChannel, { videoSeconds: "999", vquality: "1080p", size: "1920x1080", videoMode: "reference" }, aiConfig);
     return draft.duration === gen.GEN_DURATION_MAX && draft.vquality === "1080" && draft.size === "16:9" && draft.mode === "reference" && draft.model === "sdgf-2.5-pro";
 })());
 check("默认渠道避开画布专用渠道（不预选 gemini/openai）",
@@ -346,12 +481,24 @@ check("21:9 提交值仍是 21:9（不静默换成别的比例）", gen.genSizeF
 const drawer = readFileSync(path.resolve("src/pages/hub/task-detail-drawer.tsx"), "utf8");
 const api = readFileSync(path.resolve("src/pages/hub/hub-api.ts"), "utf8");
 const picker = readFileSync(path.resolve("src/components/model-picker.tsx"), "utf8");
+const genSrc = readFileSync(path.resolve("src/lib/hub/gen-settings.ts"), "utf8");
 
 check("drawer 接 ModelPicker（capability=video，非 model-select-modal）",
     drawer.includes("<ModelPicker") && drawer.includes('capability="video"') && !drawer.includes("model-select-modal"));
-check("drawer 模型选项由 genModelRows 派生（渠道内视频模型 + 脚本禁选）",
-    drawer.includes("options={genModelRows(channel).map((row) => row.value)}") &&
-    drawer.includes("optionDisabled={") && drawer.includes("optionSuffix={"));
+check("drawer 模型区选项＝同源候选行（modelRows 由 genModelRows(channel, config) 派生，逐行渲染）",
+    drawer.includes("const modelRows = genModelRows(channel, config);") &&
+    drawer.includes("options={modelRows.map((row) => row.value)}") &&
+    drawer.includes("optionDisabled={(value) => !(modelRows.find((row) => row.value === value)?.selectable ?? true)}") &&
+    drawer.includes("optionSuffix={(value) => modelRows.find((row) => row.value === value)?.note || \"\"}"));
+check("drawer 选模型走 genModelPick（渠道身份与模型绑定，防跨渠道错配）",
+    drawer.includes("const picked = genModelPick(value);") && drawer.includes("channelId: picked.channelId,"));
+check("drawer 模型区带 DOM 钩子（候选行数 / 禁用行数，B5 真机逐行读）",
+    drawer.includes("data-hub-gen-model-count={modelRows.length}") && drawer.includes("data-hub-gen-model-blocked="));
+check("gen-settings 直调画布共享函数（禁复制实现）",
+    genSrc.includes("selectableModelsByCapability(config, \"video\")") &&
+    genSrc.includes("} from \"@/stores/use-config-store\";"));
+check("gen-settings 不再自造 capability 字面过滤（旧行为已删）",
+    !genSrc.includes('String(model.capability || "") === "video"') && !genSrc.includes("model.hasScript"));
 check("ModelPicker 支持显式 options / 禁选 / 后缀（复用改造，不改画布默认行为）",
     picker.includes("optionsOverride ?? selectableModelsByCapability(config, capability)") &&
     picker.includes("disabled={optionDisabled?.(model) ?? false}"));
