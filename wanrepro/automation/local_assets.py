@@ -105,7 +105,7 @@ def store(local_id: str, data: bytes, raw_name: str) -> str:
         raise LocalAssetError("参考图是空的（0 字节）——请重传")
     if len(data) > MAX_BYTES:
         raise LocalAssetError(f"参考图太大（{len(data) / 1048576:.1f} MB），上限 20 MB")
-    return store_at(asset_dir(local_id), local_id, data, raw_name)
+    return store_at(asset_dir(local_id).parent, local_id, data, raw_name)
 
 
 def store_at(task_dir: Path, local_id: str, data: bytes, raw_name: str) -> str:
