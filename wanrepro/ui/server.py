@@ -1890,6 +1890,11 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/hub/tasks":
             self.send_json({"tasks": hub_api.list_tasks()})
             return
+        if path == "/api/hub/where":
+            # 数据根自述（诊断面）：探针跑前据此断言「服务端写入目录 == 探针读取目录」，
+            # 读/写分家的伪隔离直接拒跑（AT-14 B2 P0：真实任务 auto-0001 被误删）
+            self.send_json(hub_api.where())
+            return
         m = re.fullmatch(r"/api/hub/task/([^/]+)", path)
         if m:
             self.send_json({"task": hub_api.get_task(urllib.parse.unquote(m.group(1)))})

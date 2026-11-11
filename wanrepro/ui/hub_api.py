@@ -11,6 +11,7 @@ automation 以子包 import（server.py 启动 cwd 不确定时由 _ensure_path 
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import sys
@@ -26,9 +27,13 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from automation import cards, discuss, frames, generate, ingest, replace, selfcheck, state  # noqa: E402
+from automation import cards, config as auto_config, discuss, frames, generate, ingest, replace, selfcheck, state  # noqa: E402
 
-TASKS_DIR = ROOT / "automation" / "projects"
+# 任务目录根的**唯一来源** = automation.config.PROJECTS_DIR（认 WANREPRO_AUTO_DIR）。
+# 禁止在这里另写一个 ROOT/"automation"/"projects"：硬编码会让「设 env 起隔离实例」变成
+# 读真实目录/写隔离目录的伪隔离，探针按隔离目录首投得到的 id 去删真实任务（AT-14 B2 P0，
+# 真实任务 auto-0001 已被误删一次）。
+TASKS_DIR = auto_config.PROJECTS_DIR
 VIDEO_FILE = "成片.mp4"
 UPLOADS_DIR = ROOT / "uploads"
 TOMBSTONES = TASKS_DIR / ".tombstones.json"     # 删除墓碑（数据合同 B0）
@@ -162,6 +167,23 @@ def _summary(task: dict, task_dir: Path) -> dict:
         "gen_progress": task.get("gen_progress"),
         "has_pending_replace": bool(task.get("pending_replace")),
         "has_output": out,
+    }
+
+
+def where() -> dict:
+    """数据根自述（诊断面，`GET /api/hub/where`）——探针跑前用它证明「读写同源」。
+
+    AT-14 B2 P0：TASKS_DIR 曾硬编码，隔离实例读真实/写隔离，探针误删真实任务。
+    这里把服务端**实际用于读写任务**的目录原样报出，让探针能断言
+    「服务端 TASKS_DIR == 我的 PROJECTS_DIR」，不一致就拒跑。
+    """
+    return {
+        "tasks_dir": str(Path(TASKS_DIR).resolve()),
+        "tasks_dir_raw": str(TASKS_DIR),
+        "auto_dir_env": os.environ.get("WANREPRO_AUTO_DIR"),
+        "uploads_dir": str(UPLOADS_DIR.resolve()),
+        "tombstones": str(TOMBSTONES),
+        "pid": os.getpid(),
     }
 
 
