@@ -150,16 +150,47 @@ def _replaced_count(bridge_id: str) -> str:
     return f"{filled}/{must}"
 
 
+LAPIAN_STAGE = "lapian_stage"          # 阶段文案（纯字符串，旧合同）
+LAPIAN_STARTED = "lapian_started_at"   # 拆解启动锚（job 开始时刻）
+LAPIAN_STAGE_AT = "lapian_stage_at"    # 当前阶段开始锚
+LAPIAN_ENDED = "lapian_ended_at"       # 终态冻结依据（成功/失败时刻）
+
+
+def _stage_text(value) -> str:
+    """阶段文案唯一口径（AT-16 B4a 透传合同）：lapian_stage 恒为纯字符串。
+
+    历史/异构值（对象、None、数字）一律降级为空串——绝不把对象 repr（"{'stage': …}"）
+    漏给摘要层 str() 或前端；时间戳另走 lapian_* 独立字段，不塞进这条字符串。
+    """
+    return value.strip() if isinstance(value, str) else ""
+
+
+def _lapian_anchors(task: dict) -> dict:
+    """双锚透出（AT-16 B4a 读侧唯一出口）：启动锚 / 阶段锚 / 终态冻结锚。
+
+    只透真值：字段缺失或空 → 空串（前端据此显示「计时不可用」）。**禁止**在这里拿
+    created_at、日志尾行 [HH:mm:ss]、日志行内「已 Xs」凑数——那些都不可证明：
+    摘要日志只回末 15 行、[HH:mm:ss] 无日期跨日不唯一、「已 Xs」是 job 总耗时快照。
+    """
+    return {
+        "started_at": str(task.get(LAPIAN_STARTED) or ""),
+        "stage_at": str(task.get(LAPIAN_STAGE_AT) or ""),
+        "ended_at": str(task.get(LAPIAN_ENDED) or ""),
+    }
+
+
 def _summary(task: dict, task_dir: Path) -> dict:
     out = (task_dir / VIDEO_FILE).is_file()
     # AT-9 B1 表格摘要三字段（数据合同）：任务名/阶段/已换数——列表页不拉详情
     task_name = f"{task['local_id']}·{(task.get('ingestion') or {}).get('video_name', '')}"
-    stage = str(task.get("lapian_stage") or "") if task["state"] == "discussing" else ""
+    stage = _stage_text(task.get(LAPIAN_STAGE)) if task["state"] == "discussing" else ""
     return {
         "local_id": task["local_id"],
         "bridge_id": task.get("bridge_id"),
         "task_name": task_name,
         "stage": stage,
+        # AT-16 B4a：双锚独立透出（列表也要走表，不能只靠详情）。
+        "lapian": _lapian_anchors(task),
         "replaced": _replaced_count(str(task.get("bridge_id") or "")),
         "state": task["state"],
         "intent": task.get("intent", ""),
@@ -285,7 +316,7 @@ def get_task(local_id: str) -> dict:
         "error": (task.get("history") or [{}])[-1].get("note", "")
         if task["state"] == "failed" else "",
         "gen": task.get("gen") or {},
-        "lapian_stage": task.get("lapian_stage") or "",
+        "lapian_stage": _stage_text(task.get(LAPIAN_STAGE)),
         "log_tail": _log_tail(task_dir),
         # ---- AT-13 B2 提交链透出（§2.4 孤儿三步）——只读，不在读路径上迁移状态 ----
         "gen_error": task.get("gen_error") or "",
@@ -352,10 +383,19 @@ DISCUSS_LOG = "拆解日志.txt"
 
 
 def _stage_recorder(task_dir: Path):
-    """拆解阶段记录器：每次 stage 变化 → 追加 拆解日志.txt + 回写任务.json lapian_stage。"""
+    """拆解阶段记录器：每次 stage 变化 → 追加 拆解日志.txt + 回写任务.json 双锚。
+
+    AT-16 B4a 双锚合同的**唯一写侧**：
+      · lapian_started_at —— 拆解 job 启动锚（_spawn_discuss 每次新 job 重置，重拆不继承）
+      · lapian_stage_at   —— 当前阶段开始锚（每次阶段文案变化即重置）
+      · lapian_ended_at   —— 终态冻结依据（成功/失败时刻；写后前端停表）
+    lapian_stage 仍是**纯字符串**（摘要层 _stage_text() 与前端 hubText() 的透传合同不变）；
+    时间戳走独立字段，不从日志 [HH:mm:ss] 反推；日志行内「已 Xs」是 job 总耗时快照，
+    不是阶段起点（前端不得拿它当阶段锚重算）。
+    """
     log = task_dir / DISCUSS_LOG
 
-    def _emit(msg: str) -> None:
+    def _emit(msg: str, *, terminal: bool = False) -> None:
         line = f"[{datetime.now().strftime('%H:%M:%S')}] {msg}"
         try:
             with log.open("a", encoding="utf-8") as f:
@@ -363,29 +403,57 @@ def _stage_recorder(task_dir: Path):
         except OSError:
             pass
         try:
-            _write_task(task_dir, lambda t: t.__setitem__("lapian_stage", msg))
+            at = _now()
+
+            def mutate(t: dict) -> None:
+                t[LAPIAN_STAGE] = msg
+                t[LAPIAN_STAGE_AT] = at
+                if terminal:
+                    t[LAPIAN_ENDED] = at
+
+            _write_task(task_dir, mutate)
         except Exception:  # noqa: BLE001 —— 状态回写失败不拖垮拆解
             pass
 
     return _emit
 
 
+def _reset_lapian_anchors(task_dir: Path) -> None:
+    """新 job 起手重置双锚（重拆/重试不得继承上一轮计时）。"""
+    at = _now()
+
+    def mutate(t: dict) -> None:
+        t[LAPIAN_STARTED] = at     # job 开始时刻 = hub 发起拆解 job 的时刻（排队重试在 job 内）
+        t[LAPIAN_STAGE_AT] = at    # 紧随其后的 emit(first_line) 会补成首条阶段锚
+        t[LAPIAN_ENDED] = ""       # 上一轮的终态冻结作废，否则新 job 一开就停表
+        t[LAPIAN_STAGE] = ""
+
+    try:
+        _write_task(task_dir, mutate)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _spawn_discuss(task_dir: Path, first_line: str) -> dict:
     """拆解后台执行体（发起拆解与 failed 重试共用；重跑即续语义全在 discuss.run_discuss）。"""
+    _reset_lapian_anchors(task_dir)
     emit = _stage_recorder(task_dir)
     emit(first_line)
 
     def _run(td: Path):
+        # 注意：旧写法是 `return discuss.run_discuss(...)` + else 收尾——Python 里 try 内 return
+        # 会**跳过 else**，成功终态行从来没落过（B4a 实测：成功任务 ended_at 恒空、进度无终态文案）。
+        # 改成先取结果、再收尾 emit 终态，成功/失败都留终态行与停表锚。
         try:
-            return discuss.run_discuss(td, verbose=False, on_stage=emit)
+            result = discuss.run_discuss(td, verbose=False, on_stage=emit)
         except discuss.DiscussError as e:
-            emit(f"终态：失败（{e}）")
+            emit(f"终态：失败（{e}）", terminal=True)
             raise
         except Exception as e:  # noqa: BLE001
-            emit(f"终态：环境故障（{e}）——状态保留，重跑续")
+            emit(f"终态：环境故障（{e}）——状态保留，重跑续", terminal=True)
             raise
-        else:
-            emit("终态：awaiting_assets（等置换）")
+        emit("终态：awaiting_assets（等置换）", terminal=True)
+        return result
 
     return _spawn("hub-discuss", _run, task_dir)
 

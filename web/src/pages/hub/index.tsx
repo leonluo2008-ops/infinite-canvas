@@ -5,6 +5,7 @@ import { Link, useSearchParams } from "react-router-dom";
 
 import { errorText, listHubTasks, type HubTaskSummary } from "./hub-api";
 import { deleteGuard, HubStateTag } from "./hub-status";
+import { lapianClockTexts, lapianStageName, useLapianClock } from "./lapian-clock";
 import { LegacyHubView } from "./legacy-view";
 import { NewTaskModal } from "./new-task-modal";
 import { TaskDeleteModal } from "./task-delete-modal";
@@ -91,12 +92,7 @@ function HubTableView() {
             render: (_, task) => (
                 <div className="space-y-1">
                     <HubStateTag state={task.state} />
-                    {task.state === "discussing" && task.stage ? (
-                        <div className="flex items-center gap-1 text-xs text-stone-500 dark:text-stone-400">
-                            <LoaderCircle className="size-3 animate-spin" />
-                            {task.stage}
-                        </div>
-                    ) : null}
+                    {task.state === "discussing" ? <LapianStageCell task={task} /> : null}
                 </div>
             ),
         },
@@ -249,4 +245,30 @@ function formatCreatedAt(value: string) {
     const date = new Date(value);
     if (Number.isNaN(date.getTime())) return value;
     return date.toLocaleString("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false });
+}
+
+/**
+ * 主表「状态」列的拆解进度行（AT-16 B4a）：阶段文案 + 两个计时值（总耗时 / 本阶段已等待）。
+ *
+ * 走表口径全部来自 ./lapian-clock（1 秒展示钟与 5 秒列表轮询解耦，读数不随轮询冻结）；
+ * 缺锚 → 明说「计时不可用」，不拿 created_at / 日志尾行凑数。抽成组件是为了让探针
+ * 与详情的 ProgressSection 用**同一份**渲染代码断言两处覆盖（红线 25）。
+ */
+export function LapianStageCell({ task }: { task: HubTaskSummary }) {
+    const clock = useLapianClock(task.lapian);
+    const texts = lapianClockTexts(clock);
+    return (
+        <div className="space-y-0.5 text-xs text-stone-500 dark:text-stone-400" data-hub-lapian-cell>
+            <div className="flex items-center gap-1">
+                <LoaderCircle className="size-3 animate-spin" />
+                <span className="truncate" data-hub-lapian-stage-name>{lapianStageName(task.stage) || "拆解中"}</span>
+            </div>
+            <Tooltip title={texts.note || undefined}>
+                <div className="flex flex-wrap items-center gap-x-2 font-mono text-[11px] tabular-nums" data-hub-lapian-frozen={clock.frozen ? "1" : "0"}>
+                    <span data-hub-lapian-total>{texts.total}</span>
+                    <span data-hub-lapian-stage-wait>{texts.stage}</span>
+                </div>
+            </Tooltip>
+        </div>
+    );
 }

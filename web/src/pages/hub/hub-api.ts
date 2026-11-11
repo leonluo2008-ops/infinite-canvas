@@ -27,9 +27,28 @@ export type HubTaskSummary = {
     task_name?: string;
     /** discussing 时的拆解阶段（实时计算，不落盘）。 */
     stage?: string;
+    /**
+     * AT-16 B4a 拆解双锚（读层真实透出；旧 bridge 缺 → 归一为三空串）。
+     * 缺锚 = 计时不可用，**禁止**用 created_at / 日志尾行反推。
+     */
+    lapian?: HubLapianAnchors;
     /** 已换资产数 "已换/必换"（实时计算，如 "1/2"）。 */
     replaced?: string;
     has_pending_replace?: boolean;
+};
+
+/**
+ * 拆解双锚（AT-16 B4a 透传合同）：
+ * - started_at 拆解启动锚（job 开始时刻，重拆按新 job 重置）
+ * - stage_at   当前阶段开始锚（阶段变化即重置）
+ * - ended_at   终态冻结依据（成功/失败时刻；有值即停表）
+ * 三值恒为字符串，缺/坏 → 空串；lapian_stage 仍是纯字符串（hubText 透传），
+ * 时间戳走这三个独立字段，不从字符串解析。
+ */
+export type HubLapianAnchors = {
+    started_at?: string;
+    stage_at?: string;
+    ended_at?: string;
 };
 
 export type HubPairLine = {
@@ -294,9 +313,10 @@ export async function listHubTasks(): Promise<HubTaskSummary[]> {
         ...row,
         // AT-9 B1 摘要三字段：旧 bridge 缺 → 归一兜底（计算式字段，缺了就空串，表格列自己再兜）。
         task_name: hubText(row.task_name) || row.local_id,
-        stage: hubText(row.stage),
+        stage: contractText(row.stage),
         replaced: hubText(row.replaced),
         bridge_id: hubText(row.bridge_id) || undefined,
+        lapian: normalizeLapianAnchors(row.lapian),
     }));
 }
 
@@ -318,7 +338,34 @@ export async function getHubTask(localId: string): Promise<HubTaskDetail> {
         cloud_task_id: hubText(task.cloud_task_id),
         active_submit: Boolean(task.active_submit),
         submit_lost: normalizeSubmitLost(task.submit_lost),
+        lapian: normalizeLapianAnchors(task.lapian),
+        // 阶段文案与锚同一条透传口径（异构历史值 → 空串，不出 repr）
+        stage: contractText(task.stage),
+        lapian_stage: contractText(task.lapian_stage),
     };
+}
+
+/**
+ * 拆解双锚归一（AT-16 B4a）：只认字符串真值，缺/畸形一律空串——空串 = 「计时不可用」，
+ * 读层（hub_api._lapian_anchors）与本函数同口径，两边都不造锚。
+ */
+export function normalizeLapianAnchors(value: unknown): HubLapianAnchors {
+    const raw = (value && typeof value === "object" ? value : {}) as JsonRecord;
+    return {
+        started_at: contractText(raw.started_at),
+        stage_at: contractText(raw.stage_at),
+        ended_at: contractText(raw.ended_at),
+    };
+}
+
+/**
+ * 合同字符串归一（AT-16 B4a 透传口径）：只认字符串，其余（数字/对象/null）→ 空串。
+ *
+ * 与读层 `_stage_text()` 同口径：阶段文案与锚字段都是**合同字符串**，宁可空着（前端显示
+ * 「计时不可用」/不显示阶段），也绝不把 `[object Object]` 这类 repr 糊到界面上。
+ */
+function contractText(value: unknown): string {
+    return typeof value === "string" ? value.trim() : "";
 }
 
 /** 未知收单标记归一：只有真对象/true 才算（字符串/空 → null，UI 视为未阻断）。 */

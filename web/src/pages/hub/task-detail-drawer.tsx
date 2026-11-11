@@ -65,6 +65,7 @@ import {
     type HubTaskDetail,
     type HubTaskSummary,
 } from "./hub-api";
+import { lapianClockTexts, lapianStageName, useLapianClock } from "./lapian-clock";
 import { deleteGuard, HubStateTag } from "./hub-status";
 
 /** 九宫格粗标配色（同帧多目标分色，AT-9 层1）。 */
@@ -484,16 +485,29 @@ function SuggestionRow({ item, card, tone }: { item: HubSuggestion; card?: HubAs
     );
 }
 
-/** 拆解/入库进度（只读）：stage + log_tail 尾部（拆解进度必须界面可见）。 */
-function ProgressSection({ detail, state }: { detail: HubTaskDetail; state: string }) {
-    const stage = detail.lapian_stage || detail.stage || "";
+/**
+ * 拆解/入库进度（只读）：stage + 双锚计时 + log_tail 尾部（拆解进度必须界面可见）。
+ *
+ * AT-16 B4a：计时值全部来自 ./lapian-clock（与主表同一份口径/同一个 1 秒展示钟）——
+ * 总耗时 = now − 拆解启动锚，本阶段已等待 = now − 阶段锚；缺锚诚实显示「计时不可用」，
+ * 终态（成功/失败）按 ended_at 停表。日志行里的「已 Xs」是 job 总耗时快照，不当阶段起点。
+ */
+export function ProgressSection({ detail, state }: { detail: HubTaskDetail; state: string }) {
+    const stage = lapianStageName(detail.lapian_stage || detail.stage || "");
     const logLines = (detail.log_tail || "").split("\n").filter(Boolean);
+    const clock = useLapianClock(detail.lapian);
+    const texts = lapianClockTexts(clock);
     return (
-        <section className="rounded-lg border border-stone-200 bg-card p-4 dark:border-stone-800">
+        <section className="rounded-lg border border-stone-200 bg-card p-4 dark:border-stone-800" data-hub-progress-section>
             <div className="flex flex-wrap items-center gap-2 text-sm">
                 <LoaderCircle className="size-4 animate-spin text-stone-400" />
                 <span className="font-medium">{state === "rendering" ? "正在渲染提示词（由后台推进，几秒完成）" : state === "ingesting" ? "参考片入库中…" : "拆解中（通常 1–3 分钟），完成后自动进入待置换"}</span>
                 {stage ? <Tag color="blue" className="m-0">{stage}</Tag> : null}
+            </div>
+            <div className="mt-1.5 flex flex-wrap items-center gap-x-4 gap-y-1 font-mono text-xs tabular-nums text-stone-600 dark:text-stone-300" data-hub-lapian-clock data-hub-lapian-frozen={clock.frozen ? "1" : "0"}>
+                <span data-hub-lapian-total>{texts.total}</span>
+                <span data-hub-lapian-stage-wait>{texts.stage}</span>
+                {texts.note ? <span className="font-sans text-[11px] text-stone-400 dark:text-stone-500" data-hub-lapian-note>{texts.note}</span> : null}
             </div>
             {logLines.length ? (
                 <pre className="thin-scrollbar mt-2 max-h-40 overflow-auto whitespace-pre-wrap rounded-md bg-stone-50 px-3 py-2 text-xs leading-5 text-stone-600 dark:bg-stone-900 dark:text-stone-300">
