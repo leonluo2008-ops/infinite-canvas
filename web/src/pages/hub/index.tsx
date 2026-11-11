@@ -17,11 +17,11 @@ import {
     type HubQuickChannel,
     type HubTaskSummary,
 } from "./hub-api";
-import { deleteGuard, HubStateTag, SubmitResultLine } from "./hub-status";
+import { HubStateTag, SubmitResultLine } from "./hub-status";
 import { lapianClockTexts, lapianStageName, useLapianClock } from "./lapian-clock";
 import { LegacyHubView } from "./legacy-view";
 import { NewTaskModal } from "./new-task-modal";
-import { TaskDeleteModal } from "./task-delete-modal";
+import { TaskDeleteButton } from "./task-delete-confirm";
 import { TaskDetailDrawer } from "./task-detail-drawer";
 
 /**
@@ -46,7 +46,6 @@ function HubTableView() {
     const [error, setError] = useState("");
     const [createOpen, setCreateOpen] = useState(false);
     const [openId, setOpenId] = useState<string | null>(null);
-    const [deleteTarget, setDeleteTarget] = useState<HubTaskSummary | null>(null);
     /** AT-16 B5a-2：行内快捷入口正在处理的任务号（同一时刻只允许一条）。 */
     const [quickBusy, setQuickBusy] = useState("");
 
@@ -78,6 +77,7 @@ function HubTableView() {
     const openTask = useMemo(() => tasks.find((item) => item.local_id === openId) || null, [tasks, openId]);
 
     // 删除成功：从列表摘除；若删的是打开中的任务 → 关 Drawer。
+    // 二键确认件（TaskDeleteButton）在列表行内与抽屉头共用，成功后都回调这里。
     const handleDeleted = useCallback(
         (localId: string) => {
             setTasks((prev) => prev.filter((item) => item.local_id !== localId));
@@ -86,8 +86,6 @@ function HubTableView() {
         },
         [load],
     );
-
-    const askDelete = useCallback((task: HubTaskSummary) => setDeleteTarget(task), []);
 
     /**
      * 行内快捷入口（AT-16 B5a-2）：与抽屉顶部 / 底部按钮**同一条链**（hubQuickAction → runHubQuickAction）。
@@ -174,23 +172,8 @@ function HubTableView() {
             key: "actions",
             width: 230,
             render: (_, task) => {
-                const guard = deleteGuard(task);
                 // AT-16 B5a-2：行内重提 / 续查入口（缺陷 D6：入口不再埋在抽屉 4-5 屏深）
                 const quick = hubRowQuickAction(task, channels, quickBusy === task.local_id);
-                const deleteButton = (
-                    <Button
-                        size="small"
-                        danger
-                        ghost
-                        disabled={guard.disabled}
-                        onClick={(event) => {
-                            event.stopPropagation();
-                            setDeleteTarget(task);
-                        }}
-                    >
-                        删除
-                    </Button>
-                );
                 return (
                     <div className="flex items-center gap-1.5" onClick={(event) => event.stopPropagation()}>
                         <Button
@@ -227,7 +210,9 @@ function HubTableView() {
                                 </span>
                             </Tooltip>
                         ) : null}
-                        {guard.disabled ? <Tooltip title={guard.reason || "运行中不可删"}>{deleteButton}</Tooltip> : deleteButton}
+                        {/* AT-16 B6：删除=二键确认（危险红钮），不再手输任务名；运行中由 deleteGuard 禁用。
+                            与详情头同一个组件（同承接同守卫），确认后自动带任务号作 confirm_name。 */}
+                        <TaskDeleteButton task={task} size="small" stopPropagation onDeleted={handleDeleted} />
                     </div>
                 );
             },
@@ -310,11 +295,9 @@ function HubTableView() {
                     onClose={() => setOpenId(null)}
                     onStateChange={patchState}
                     onRefresh={() => void load()}
-                    onRequestDelete={askDelete}
+                    onDeleted={handleDeleted}
                 />
             ) : null}
-
-            <TaskDeleteModal task={deleteTarget} open={Boolean(deleteTarget)} onClose={() => setDeleteTarget(null)} onDeleted={handleDeleted} />
         </div>
     );
 }

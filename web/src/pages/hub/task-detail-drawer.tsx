@@ -78,7 +78,8 @@ import {
     type HubTaskSummary,
 } from "./hub-api";
 import { lapianClockTexts, lapianStageName, useLapianClock } from "./lapian-clock";
-import { deleteGuard, HubStateTag, SubmitResultLine } from "./hub-status";
+import { HubStateTag, SubmitResultLine } from "./hub-status";
+import { TaskDeleteButton } from "./task-delete-confirm";
 
 /** 九宫格粗标配色（同帧多目标分色，AT-9 层1）。 */
 const OVERLAY_COLORS = [
@@ -107,14 +108,15 @@ export function TaskDetailDrawer({
     onClose,
     onStateChange,
     onRefresh,
-    onRequestDelete,
+    onDeleted,
 }: {
     task: HubTaskSummary | null;
     open: boolean;
     onClose: () => void;
     onStateChange: (localId: string, state: string) => void;
     onRefresh: () => void;
-    onRequestDelete: (task: HubTaskSummary) => void;
+    /** 删除成功（AT-16 B6：确认在 TaskDeleteButton 内二键完成，父级只收结果）。 */
+    onDeleted: (localId: string) => void;
 }) {
     const { message } = App.useApp();
     const [detail, setDetail] = useState<HubTaskDetail | null>(null);
@@ -332,7 +334,7 @@ export function TaskDetailDrawer({
                             <HeaderActions
                                 summary={summary}
                                 busy={busy}
-                                onRequestDelete={onRequestDelete}
+                                onDeleted={onDeleted}
                             />
                         </div>
                     </section>
@@ -398,26 +400,15 @@ export function TaskDetailDrawer({
     );
 }
 
-/** 头部动作：删除入口（运行中禁用+tooltip；awaiting_* 走任务名确认弹窗，由父级承载）。 */
-function HeaderActions({ summary, busy, onRequestDelete }: { summary: HubTaskSummary; busy: BusyKind; onRequestDelete: (task: HubTaskSummary) => void }) {
-    const guard = deleteGuard(summary);
-    const button = (
-        <Button
-            danger
-            ghost
-            disabled={guard.disabled || busy !== null}
-            onClick={() => onRequestDelete(summary)}
-        >
-            删除任务
-        </Button>
-    );
-    return guard.disabled ? (
-        <Tooltip title={guard.reason || "运行中不可删"}>
-            {button}
-        </Tooltip>
-    ) : (
-        button
-    );
+/**
+ * 头部动作：删除入口（AT-16 B6）。
+ *
+ * 与列表行内**同一个组件**（TaskDeleteButton）：Popconfirm 二键确认（危险红钮）+ 取消零请求，
+ * 不再是「输任务名」的 Modal；运行中由 deleteGuard 禁用 + tooltip，桥端 409 仍是第二道。
+ * 写操作在跑（busy）时连入口一并禁用，避免与传图/确认置换互踩。
+ */
+function HeaderActions({ summary, busy, onDeleted }: { summary: HubTaskSummary; busy: BusyKind; onDeleted: (localId: string) => void }) {
+    return <TaskDeleteButton task={summary} label="删除任务" disabled={busy !== null} onDeleted={onDeleted} />;
 }
 
 /**
