@@ -111,17 +111,17 @@ def main() -> int:
 
     # ── 2. 守卫负例（不花钱不动状态） ─────────────────────────
     print("2) 停点守卫")
-    s, d = req("/api/hub/submit/auto-0001", "POST", b"{}")
+    s, d = req("/api/hub/submit/auto-0002", "POST", b"{}")
     check("未批准 submit → 409 + 人话错误", s == 409 and "approved" in str(d.get("error", "")),
           f"{s} {str(d)[:100]}")
-    # 「无可确认置换」负例只在 auto-0001 真处于 awaiting_assets 且无 pending 时成立；
+    # 「无可确认置换」负例只在夹具任务（auto-0002，2026-11-11 起替代已误删的 auto-0001）真处于 awaiting_assets 且无 pending 时成立；
     # 真实任务可能被所有者退回置换留了 pending（2026-11-10 实况）——此时盲发 confirm 会
     # 真确认推进真实任务（探针红线：真实任务只读）。先读状态，前置不满足 → 如实跳过不发包。
-    s, d = req("/api/hub/task/auto-0001")
-    t0001 = (d.get("task") or {}) if isinstance(d, dict) else {}
-    st0001, pending0001 = t0001.get("state"), bool(t0001.get("pair_lines"))
-    if st0001 == "awaiting_assets" and not pending0001:
-        s, d = req("/api/hub/confirm/auto-0001", "POST", b"{}")
+    s, d = req("/api/hub/task/auto-0002")
+    t0002 = (d.get("task") or {}) if isinstance(d, dict) else {}
+    st0002, pending0002 = t0002.get("state"), bool(t0002.get("pair_lines"))
+    if st0002 == "awaiting_assets" and not pending0002:
+        s, d = req("/api/hub/confirm/auto-0002", "POST", b"{}")
         check("无可确认置换 confirm → 409", s == 409, f"{s} {str(d)[:100]}")
     else:
         check(f"无可确认置换 confirm → 409（auto-0001 当前 {st0001}"
