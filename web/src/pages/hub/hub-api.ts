@@ -155,11 +155,30 @@ export type HubAssetWriteResult = {
     锁点剩余?: number[];
 };
 
-/** 自检结果单条（AT-9 B5 数据合同：projects/<id>/自检.json 每条 {项,结论,证据}；结论 PASS|FAIL）。 */
+/** 自检结果单条（AT-9 B5 数据合同：projects/<id>/自检.json 每条 {项,结论,证据}；结论 PASS|FAIL）。
+ *  AT-16 B2：生产者（automation/selfcheck.py）追加「说明」——结论人话/原因/怎么处理/结构化发现；
+ *  前端只渲染它，**不解析「证据」文字重判**（红线 25）。旧任务（如 auto-0042）没有「说明」→ 降级显示。 */
+export type HubSelfCheckFinding = {
+    /** 检查器自己发现的行号（没有 → null；前端不猜）。 */
+    行号: number | null;
+    /** 检查器自己发现的图号（没有 → null）。 */
+    图号: number | null;
+    文字: string;
+};
+
+export type HubSelfCheckExplain = {
+    结论人话: string;
+    原因: string;
+    处理: string;
+    发现: HubSelfCheckFinding[];
+};
+
 export type HubSelfCheckItem = {
     项: string;
     结论: string;
     证据: string;
+    /** AT-16 B2 话术（生产者侧同源）；旧结构缺失 → undefined（读层降级，不改历史文件）。 */
+    说明?: HubSelfCheckExplain;
 };
 
 export type HubTaskDetail = HubTaskSummary & {
@@ -342,17 +361,46 @@ function normalizeSubmitLost(value: unknown): HubSubmitLost | null {
     };
 }
 
-/** 自检归一：无文件/畸形 → null（「未检查」）；条目缺字段逐项兜底，结论非 PASS 一律按 ⚠ 显示。 */
-function normalizeSelfCheck(value: unknown): HubSelfCheckItem[] | null {
+/** 自检归一：无文件/畸形 → null（「未检查」）；条目缺字段逐项兜底，结论非 PASS 一律按 ⚠ 显示。
+ *  AT-16 B2：生产者话术字段（说明）**原样透传**——不在这里读「证据」文字派生任何结论
+ *  （红线 25）；缺说明（旧结构）→ undefined，由展示层降级。 */
+export function normalizeSelfCheck(value: unknown): HubSelfCheckItem[] | null {
     if (!Array.isArray(value) || !value.length) return null;
     return value.map((raw) => {
         const item = (raw && typeof raw === "object" ? raw : {}) as JsonRecord;
-        return {
+        const row: HubSelfCheckItem = {
             项: hubText(item["项"]) || "未命名检查项",
             结论: hubText(item["结论"]) || "FAIL",
             证据: hubText(item["证据"]),
         };
+        const 说明 = normalizeSelfCheckExplain(item["说明"]);
+        if (说明) row.说明 = 说明;
+        return row;
     });
+}
+
+/** 行号/图号归一：正整数才算（字符串 "3" 也收，畸形 → null；前端不猜数字）。 */
+function selfCheckNo(value: unknown): number | null {
+    const n = Number(value);
+    return Number.isInteger(n) && n > 0 ? n : null;
+}
+
+/** 说明归一：只搬生产者字段 + 结构化发现；一个真字段都没有 → undefined（=旧结构）。 */
+function normalizeSelfCheckExplain(value: unknown): HubSelfCheckExplain | undefined {
+    if (!value || typeof value !== "object") return undefined;
+    const raw = value as JsonRecord;
+    const 发现: HubSelfCheckFinding[] = (Array.isArray(raw["发现"]) ? raw["发现"] : [])
+        .map((entry) => (entry && typeof entry === "object" ? (entry as JsonRecord) : {}))
+        .map((entry) => ({ 行号: selfCheckNo(entry["行号"]), 图号: selfCheckNo(entry["图号"]), 文字: hubText(entry["文字"]) }))
+        .filter((entry) => entry.文字 || entry.行号 !== null || entry.图号 !== null);
+    const explain: HubSelfCheckExplain = {
+        结论人话: hubText(raw["结论人话"]),
+        原因: hubText(raw["原因"]),
+        处理: hubText(raw["处理"]),
+        发现,
+    };
+    const hasText = explain.结论人话 || explain.原因 || explain.处理 || explain.发现.length;
+    return hasText ? explain : undefined;
 }
 
 /** 代表帧归一（AT-10 C1 合同）：url 文本、秒 有限数字否则 0、镜次 正整数否则 null、定位 文本；缺 → 未定位兜底（旧 bridge 不炸页面）。 */

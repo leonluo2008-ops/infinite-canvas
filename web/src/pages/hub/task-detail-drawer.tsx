@@ -289,7 +289,7 @@ export function TaskDetailDrawer({
                         </section>
                     ) : null}
 
-                    {/* ④ 提示词段（全文默认折叠可展开 + 自检结论占位；B5 才有自检数据） */}
+                    {/* ④ 提示词段（AT-16 B2：标题一行 + 正文默认展开可收起 + 自检/门禁独立整宽区） */}
                     {detail && POST_DECOMPOSE_STATES.includes(state) ? <PromptSection detail={detail} /> : null}
 
                     {/* ⑤ 审批/生成/成片段（§四各状态动作） */}
@@ -1806,119 +1806,221 @@ function AssetUploadZone({
 /** 拆解门禁条目名（与 automation/selfcheck.GATE_ITEM_NAME 同值；数据由服务端读路径汇总进 自检 束）。 */
 const GATE_ITEM_NAME = "拆解门禁";
 
-/** 提示词段：全文默认折叠可展开 + 自检结论（AT-9 B5：渲染完成自动跑；无文件=「未检查」）。 */
-function PromptSection({ detail }: { detail: HubTaskDetail }) {
+/** 提示词段（AT-16 B2 布局）：标题行只放「提示词」+ 操作按钮（一行收住）；正文默认展开、
+ *  可用按钮收起；自检/门禁的异常详情走下方**独立整宽区域**（不进标题行 flex，展开时标题与
+ *  正文边界不互挤）。 */
+export function PromptSection({ detail }: { detail: HubTaskDetail }) {
     const prompt = detail.prompt_md || "";
+    const [collapsed, setCollapsed] = useState(false);          // 正文默认展开（折叠改成可选收起）
     // AT-15 R2：拆解门禁条目从自检束里拆出来单独渲染（绿Tag=绿项数摘要；FAIL/WARN 红条=缺项+重拆轮次）。
     const gateItem = detail.自检?.find((item) => item.项 === GATE_ITEM_NAME) ?? null;
     const checkItems = detail.自检?.filter((item) => item.项 !== GATE_ITEM_NAME) ?? null;
     return (
-        <section className="rounded-lg border border-stone-200 bg-card p-4 dark:border-stone-800">
-            <div className="flex flex-wrap items-center justify-between gap-2">
-                <h2 className="flex items-center gap-1.5 text-sm font-semibold">
+        <section className="rounded-lg border border-stone-200 bg-card p-4 dark:border-stone-800" data-hub-prompt-section>
+            <div className="flex min-w-0 flex-wrap items-center gap-2" data-hub-prompt-head>
+                <h2 className="flex min-w-0 items-center gap-1.5 text-sm font-semibold">
                     <FileText className="size-4" />
                     提示词
                 </h2>
-                <SelfCheckBadge items={checkItems} />
+                {prompt ? (
+                    <Button
+                        size="small"
+                        type="text"
+                        className="ml-auto shrink-0"
+                        data-hub-prompt-toggle
+                        onClick={() => setCollapsed((value) => !value)}
+                    >
+                        {collapsed ? "展开正文" : "收起正文"}
+                    </Button>
+                ) : null}
             </div>
-            {gateItem ? <GateBadge item={gateItem} /> : null}
+            {/* 自检/门禁：独立整宽区（块级流，与标题行并列，不嵌进标题行 flex） */}
+            <SelfCheckPanel items={checkItems} gateItem={gateItem} />
             {prompt ? (
-                <details className="mt-2 rounded-md border border-stone-200 dark:border-stone-800">
-                    <summary className="flex cursor-pointer list-none items-center justify-between gap-2 px-3 py-2 text-sm [&::-webkit-details-marker]:hidden">
-                        <span className="text-stone-600 dark:text-stone-300">提示词全文（默认折叠，展开查看）</span>
-                        <span className="text-xs text-stone-400 dark:text-stone-500">展开 / 收起</span>
-                    </summary>
-                    <div className="agent-streamdown thin-scrollbar max-h-96 overflow-auto border-t border-stone-200 px-3 py-2 text-sm dark:border-stone-800">
+                collapsed ? null : (
+                    <div
+                        className="agent-streamdown thin-scrollbar mt-3 max-h-96 w-full overflow-auto rounded-md border border-stone-200 px-3 py-2 text-sm dark:border-stone-800"
+                        data-hub-prompt-body
+                        data-expanded="1"
+                    >
                         <Streamdown>{prompt}</Streamdown>
                     </div>
-                </details>
+                )
             ) : (
-                <div className="mt-2 rounded-md border border-dashed border-stone-300 px-3 py-4 text-sm text-stone-500 dark:border-stone-700 dark:text-stone-400">提示词尚未生成（确认置换后由后台渲染产出）。</div>
+                <div className="mt-3 w-full rounded-md border border-dashed border-stone-300 px-3 py-4 text-sm text-stone-500 dark:border-stone-700 dark:text-stone-400" data-hub-prompt-empty>
+                    提示词尚未生成（确认置换后由后台渲染产出）。
+                </div>
             )}
         </section>
     );
 }
 
-/** 自检结论（AT-9 B5 数据合同）：✓N 项全绿；有异常 ⚠N/M 必显，可展开逐项证据。
- *  FAIL 不拦截审批（可 override——图像内容是否真对仍属人工走查），但结论与证据必须可见。 */
-function SelfCheckBadge({ items }: { items: HubSelfCheckItem[] | null }) {
-    if (!items || !items.length) {
-        return (
-            <Tooltip title="这条任务渲染于自检上线前，没有自检结果文件（自检.json）。">
-                <Tag className="m-0">自检结论：未检查</Tag>
-            </Tooltip>
-        );
-    }
-    const failed = items.filter((item) => item.结论 !== "PASS");
+/** 自检面板（AT-9 B5 + AT-16 B2）：独立整宽区域，有异常默认展开。
+ *  用户话（结论 + 原因 + 怎么处理 + 发现的行号/图号）全部由自检生产者产出（
+ *  automation/selfcheck.py「说明」字段）——前端只渲染，**不解析证据文字重判**（红线 25）。
+ *  旧任务没有话术字段（auto-0042 那批）→ 降级显示原始证据，并明说没有处理指引，不改历史文件。 */
+function SelfCheckPanel({ items, gateItem }: { items: HubSelfCheckItem[] | null; gateItem: HubSelfCheckItem | null }) {
+    const all = items ?? [];
+    const failed = all.filter((item) => item.结论 !== "PASS");
+    const passed = all.filter((item) => item.结论 === "PASS");
     return (
-        <details className="min-w-0">
-            <summary className="flex cursor-pointer list-none items-center [&::-webkit-details-marker]:hidden">
-                <Tag color={failed.length ? "red" : "green"} className="m-0">
-                    {failed.length
-                        ? `自检 ⚠ ${failed.length}/${items.length} 项异常（点开看证据）`
-                        : `自检 ✓ ${items.length} 项通过`}
-                </Tag>
-            </summary>
-            <div className="mt-2 w-[min(560px,80vw)] space-y-2 rounded-md border border-stone-200 bg-stone-50 p-2 text-left dark:border-stone-800 dark:bg-stone-900">
-                {items.map((item) => (
-                    <div key={item.项} className="text-xs leading-5">
-                        <div className="flex items-center gap-1.5">
-                            {item.结论 === "PASS" ? (
-                                <CheckCircle2 className="size-3.5 shrink-0 text-emerald-600" />
-                            ) : (
-                                <CircleAlert className="size-3.5 shrink-0 text-red-600" />
-                            )}
-                            <span className="font-medium">{item.项}</span>
-                            <Tag color={item.结论 === "PASS" ? "green" : "red"} className="mr-0 px-1 py-0 text-[10px]">
-                                {item.结论 === "PASS" ? "通过" : "异常"}
-                            </Tag>
-                        </div>
-                        {item.证据 ? (
-                            <div className="mt-0.5 break-words whitespace-pre-wrap pl-5 text-stone-500 dark:text-stone-400">{item.证据}</div>
-                        ) : null}
-                    </div>
-                ))}
+        <div className="mt-2 w-full space-y-2" data-hub-selfcheck>
+            <div className="flex flex-wrap items-center gap-2" data-hub-selfcheck-head>
+                {!all.length ? (
+                    <Tooltip title="这条任务渲染于自检上线前，没有自检结果文件（自检.json）。">
+                        <Tag className="m-0" data-hub-selfcheck-unchecked>
+                            自检结论：未检查
+                        </Tag>
+                    </Tooltip>
+                ) : (
+                    <Tag
+                        color={failed.length ? "red" : "green"}
+                        className="m-0"
+                        data-hub-selfcheck-badge
+                        data-hub-selfcheck-state={failed.length ? "fail" : "pass"}
+                    >
+                        {failed.length ? `自检 ⚠ ${failed.length}/${all.length} 项异常` : `自检 ✓ ${all.length} 项通过`}
+                    </Tag>
+                )}
             </div>
-        </details>
+            {failed.length ? (
+                <div className="w-full space-y-2.5 rounded-md border border-red-200 bg-red-50/60 p-2.5 dark:border-red-950 dark:bg-red-950/20" data-hub-selfcheck-detail>
+                    {failed.map((item) => (
+                        <SelfCheckRow key={item.项} item={item} />
+                    ))}
+                    {passed.length ? (
+                        <details className="w-full min-w-0" data-hub-selfcheck-passed>
+                            <summary className="cursor-pointer list-none text-xs text-stone-500 [&::-webkit-details-marker]:hidden dark:text-stone-400">
+                                {passed.length} 项通过（展开看证据）
+                            </summary>
+                            <div className="mt-1.5 space-y-2.5">
+                                {passed.map((item) => (
+                                    <SelfCheckRow key={item.项} item={item} />
+                                ))}
+                            </div>
+                        </details>
+                    ) : null}
+                </div>
+            ) : null}
+            {gateItem ? <GateBadge item={gateItem} /> : null}
+        </div>
     );
 }
 
-/** 拆解门禁（AT-15 R2 数据合同）：PASS → 绿 Tag 带摘要（状态/绿项数/重拆轮次）；
- *  FAIL/WARN → 红条（可展开）写明缺项/告警逐条 + 重拆轮次。数据是 selfcheck.load_gate_item
- *  在读路径汇总的「拆解门禁」条目，这里只做渲染不解释（红线 25）。 */
+/** 一条自检：生产者话术优先（结论人话/原因/怎么处理/发现）；旧结构（无说明）只显原始证据。 */
+function SelfCheckRow({ item }: { item: HubSelfCheckItem }) {
+    const say = item.说明;
+    const failed = item.结论 !== "PASS";
+    return (
+        <div
+            className="w-full text-xs leading-5"
+            data-hub-selfcheck-item
+            data-hub-selfcheck-state={failed ? "fail" : "pass"}
+            data-hub-selfcheck-legacy={say ? "0" : "1"}
+        >
+            <div className="flex flex-wrap items-center gap-1.5">
+                {failed ? <CircleAlert className="size-3.5 shrink-0 text-red-600" /> : <CheckCircle2 className="size-3.5 shrink-0 text-emerald-600" />}
+                <span className="font-medium">{item.项}</span>
+                <Tag color={failed ? "red" : "green"} className="mr-0 px-1 py-0 text-[10px]">
+                    {failed ? "异常" : "通过"}
+                </Tag>
+            </div>
+            {say ? (
+                <div className="mt-1 space-y-0.5 pl-5">
+                    {say.结论人话 ? (
+                        <div className="break-words text-stone-700 dark:text-stone-200" data-hub-selfcheck-conclusion>
+                            {say.结论人话}
+                        </div>
+                    ) : null}
+                    {say.原因 ? (
+                        <div className="break-words whitespace-pre-wrap text-stone-600 dark:text-stone-300" data-hub-selfcheck-reason>
+                            <span className="text-stone-400 dark:text-stone-500">原因：</span>
+                            {say.原因}
+                        </div>
+                    ) : null}
+                    {say.处理 ? (
+                        <div
+                            className={`break-words ${failed ? "text-red-700 dark:text-red-300" : "text-stone-600 dark:text-stone-300"}`}
+                            data-hub-selfcheck-how
+                        >
+                            <span className="font-medium">怎么处理：</span>
+                            {say.处理}
+                        </div>
+                    ) : null}
+                    {say.发现.length ? (
+                        <ul className="space-y-0.5 text-stone-500 dark:text-stone-400" data-hub-selfcheck-findings>
+                            {say.发现.map((finding, index) => (
+                                <li key={index} className="break-words">
+                                    {finding.行号 !== null ? <span className="mr-1 font-mono">#{finding.行号}</span> : null}
+                                    {finding.图号 !== null ? <span className="mr-1 font-mono">图{finding.图号}</span> : null}
+                                    {finding.文字}
+                                </li>
+                            ))}
+                        </ul>
+                    ) : null}
+                    {item.证据 ? (
+                        <details className="w-full min-w-0" data-hub-selfcheck-raw>
+                            <summary className="cursor-pointer list-none text-[11px] text-stone-400 [&::-webkit-details-marker]:hidden dark:text-stone-500">
+                                原始证据
+                            </summary>
+                            <div className="mt-0.5 break-words whitespace-pre-wrap text-stone-500 dark:text-stone-400">{item.证据}</div>
+                        </details>
+                    ) : null}
+                </div>
+            ) : (
+                <div className="mt-1 space-y-0.5 pl-5" data-hub-selfcheck-legacy-note>
+                    <div className="text-stone-500 dark:text-stone-400">
+                        这条任务的检查结果早于「人话说明」上线：只有当时的原始证据，没有处理指引。
+                    </div>
+                    <div className="break-words whitespace-pre-wrap text-stone-500 dark:text-stone-400" data-hub-selfcheck-evidence>
+                        {item.证据}
+                    </div>
+                </div>
+            )}
+        </div>
+    );
+}
+
+/** 拆解门禁（AT-15 R2 数据合同）：PASS → 绿 Tag 带摘要；FAIL/WARN → 整宽红条（缺项/告警逐条 +
+ *  重拆轮次 + 怎么处理）。摘要与逐条明细都来自 selfcheck.load_gate_item 的「说明」，
+ *  这里只渲染不解释（红线 25：不拆证据字符串重判）。 */
 function GateBadge({ item }: { item: HubSelfCheckItem }) {
-    const lines = (item.证据 || "").split("\n").map((line) => line.trim()).filter(Boolean);
-    const summary = lines[0] ?? "";
-    const details = lines.slice(1);
-    if (item.结论 === "PASS") {
+    const say = item.说明;
+    const failed = item.结论 !== "PASS";
+    const summary = say?.结论人话 || "拆解门禁结果";
+    const details = say?.发现.map((finding) => finding.文字) ?? [];
+    if (!failed && item.结论 !== "WARN") {
         return (
-            <div className="mb-2">
-                <Tag color="green" className="m-0">拆解门禁 ✓ {summary}</Tag>
+            <div className="w-full" data-hub-gate data-hub-gate-state="pass">
+                <Tag color="green" className="m-0">
+                    拆解门禁 ✓ {summary}
+                </Tag>
             </div>
         );
     }
-    const failed = item.结论 !== "WARN";
     return (
-        <details className="mb-2 min-w-0">
-            <summary className="flex cursor-pointer list-none items-center [&::-webkit-details-marker]:hidden">
-                <Tag color={failed ? "red" : "gold"} className="m-0">
-                    {failed
-                        ? `拆解门禁 ✗ ${summary}（点开看缺项）`
-                        : `拆解门禁 ⚠ ${summary}（点开看告警）`}
-                </Tag>
-            </summary>
-            <div className="mt-2 w-[min(560px,80vw)] space-y-1 rounded-md border border-red-300 bg-red-50 p-2 text-left dark:border-red-900 dark:bg-red-950">
-                {details.length ? (
-                    details.map((line, index) => (
+        <div className="w-full" data-hub-gate data-hub-gate-state={failed ? "fail" : "warn"}>
+            <details className="w-full min-w-0" open>
+                <summary className="flex cursor-pointer list-none flex-wrap items-center gap-1.5 [&::-webkit-details-marker]:hidden">
+                    <Tag color={failed ? "red" : "gold"} className="m-0">
+                        {failed ? `拆解门禁 ✗ ${summary}` : `拆解门禁 ⚠ ${summary}`}
+                    </Tag>
+                </summary>
+                <div className="mt-2 w-full space-y-1 rounded-md border border-red-300 bg-red-50 p-2 dark:border-red-900 dark:bg-red-950" data-hub-gate-detail>
+                    {details.map((line, index) => (
                         <div key={index} className="break-words whitespace-pre-wrap text-xs leading-5 text-stone-600 dark:text-stone-300">
                             {line}
                         </div>
-                    ))
-                ) : (
-                    <div className="text-xs leading-5 text-stone-600 dark:text-stone-300">{summary}</div>
-                )}
-            </div>
-        </details>
+                    ))}
+                    {say?.处理 ? (
+                        <div className="break-words text-xs leading-5 text-red-700 dark:text-red-300" data-hub-gate-how>
+                            <span className="font-medium">怎么处理：</span>
+                            {say.处理}
+                        </div>
+                    ) : null}
+                </div>
+            </details>
+        </div>
     );
 }
 
