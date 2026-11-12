@@ -217,7 +217,9 @@ const drawerSrc = read("src/pages/hub/task-detail-drawer.tsx");
 check("[D] 列表：import TaskDeleteButton from ./task-delete-confirm",
     indexSrc.includes('import { TaskDeleteButton } from "./task-delete-confirm";'));
 check("[D] 列表：行内操作列渲染 TaskDeleteButton（带 stopPropagation，点删除不开抽屉）",
-    indexSrc.includes("<TaskDeleteButton task={task} size=\"small\" stopPropagation onDeleted={handleDeleted} />"));
+    // AT-18 B3b：行内操作列抽成导出组件 HubRowActions（探针要能 SSR 真渲染同一份代码），
+    // 按钮仍是同一个 TaskDeleteButton + 同一个 stopPropagation；断言改为语义匹配而非整行字面量。
+    /<TaskDeleteButton\s+task=\{task\}\s+size="small"\s+stopPropagation/.test(indexSrc));
 check("[D] 列表：删完回调 handleDeleted（摘行 + 关 Drawer 若有）",
     indexSrc.includes("onDeleted={handleDeleted}") && indexSrc.includes("const handleDeleted = useCallback("));
 check("[D] 列表：旧的 deleteTarget 状态 / TaskDeleteModal 渲染全部删除",

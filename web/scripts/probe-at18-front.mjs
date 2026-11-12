@@ -287,7 +287,11 @@ check("[F] 坏时间原样返回（不抛、不显示 Invalid Date）", ssr.hubC
 console.log("7) 改动边界：白名单内改动，render.py / 抽屉 / 表格页零交集");
 
 const git = (...args) => execFileSync("git", args, { cwd: REPO, encoding: "utf-8" }).trim();
-const headFiles = git("show", "--name-only", "--pretty=format:", "HEAD").split(/\r?\n/).filter(Boolean);
+// AT-18 B3b（后续卡）起 HEAD 不再是 B3 交付：表格页/抽屉由 t_a69f0e22 接入强制结束，
+// 所以本探针的「本卡范围」锚定**诞生本探针的那个 commit**（B3 交付），而不是 HEAD——
+// 否则后续卡一动 HEAD，这条范围守卫就会拿别人的文件清单来判 B3。
+const probeCommit = git("log", "-1", "--diff-filter=A", "--format=%H", "--", "web/scripts/probe-at18-front.mjs");
+const headFiles = probeCommit ? git("show", "--name-only", "--pretty=format:", probeCommit).split(/\r?\n/).filter(Boolean) : [];
 const workingFiles = [...git("diff", "--name-only", "HEAD").split(/\r?\n/), ...git("ls-files", "--others", "--exclude-standard").split(/\r?\n/)].filter(Boolean);
 const WHITELIST = /^web\/(src\/pages\/hub\/(task-card|hub-status|hub-api|task-delete-confirm)\.(tsx|ts)|scripts\/(probe-at18-front|probe-at16-b6)\.mjs)$/;
 // 已提交 → 以 HEAD 那份 commit 的文件清单为准（本卡交付物范围）；未提交则看工作区。

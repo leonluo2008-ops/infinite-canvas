@@ -46,6 +46,7 @@ import {
     approveHubTask,
     confirmHubReplace,
     errorText,
+    forceFinishHubTask,
     getHubTask,
     groupHubRows,
     hubAssetDisplayUrl,
@@ -82,7 +83,8 @@ import {
 // AT-16 B9：解除阻断后的换配置直达条（判定=起态门 + dispatch=cleared，动作=既有撤销批准链）
 import { GenClearedBar, hubClearedDirect } from "./gen-cleared";
 import { lapianClockTexts, lapianStageName, useLapianClock } from "./lapian-clock";
-import { HubStateTag, SubmitResultLine } from "./hub-status";
+import { HubStateTag, SubmitResultLine, forceFinishGuard } from "./hub-status";
+import { FORCE_FINISH_CONFIRM_TITLE, ForceFinishButton, ForceFinishConfirmBody } from "./task-card";
 import { TaskDeleteButton } from "./task-delete-confirm";
 
 /** 九宫格粗标配色（同帧多目标分色，AT-9 层1）。 */
@@ -130,6 +132,8 @@ export function TaskDetailDrawer({
     // AT-14 B3：资产引用健康态（显示 URL → local|ok|expired|unknown）；旧任务里失效图床直链据此
     // 出「图已过期，请重传 / 图片不可用，请重试」，正常引用不打扰（缺键=不显示）。
     const [assetStates, setAssetStates] = useState<Record<string, string>>({});
+    /** AT-18 B3b：抽屉内动作的接口错误原文（行内可见，不吞、不白屏）。 */
+    const [actionError, setActionError] = useState("");
     const seqRef = useRef(0);
     const reportedStateRef = useRef("");
 
@@ -343,11 +347,24 @@ export function TaskDetailDrawer({
                                     <span className="mr-1 font-medium text-stone-500 dark:text-stone-400">改造意图：</span>
                                     {summary.intent || "（未填写意图）"}
                                 </div>
+                                {/* AT-18 B3b：抽屉内动作（强制结束）失败 → 原文留在头部，不靠一闪而过的 toast */}
+                                {actionError ? (
+                                    <div className="mt-2 flex items-start gap-2 rounded-md border border-red-200 bg-red-50 px-2 py-1.5 text-xs text-red-700 dark:border-red-950 dark:bg-red-950/20 dark:text-red-300" data-hub-drawer-action-error={summary.local_id}>
+                                        <CircleAlert className="mt-0.5 size-3.5 shrink-0" />
+                                        <span className="min-w-0 flex-1 break-words">{actionError}</span>
+                                        <button type="button" className="shrink-0 text-red-500 underline decoration-dotted dark:text-red-400" onClick={() => setActionError("")}>
+                                            知道了
+                                        </button>
+                                    </div>
+                                ) : null}
                             </div>
                             <HeaderActions
                                 summary={summary}
                                 busy={busy}
                                 onDeleted={onDeleted}
+                                onStateChange={onStateChange}
+                                onRefresh={onRefresh}
+                                onError={setActionError}
                             />
                         </div>
                     </section>
@@ -414,14 +431,104 @@ export function TaskDetailDrawer({
 }
 
 /**
- * 头部动作：删除入口（AT-16 B6）。
+ * 头部动作：强制结束（AT-18 §5.1 登记的后续项）+ 删除（AT-16 B6）。
  *
- * 与列表行内**同一个组件**（TaskDeleteButton）：Popconfirm 二键确认（危险红钮）+ 取消零请求，
- * 不再是「输任务名」的 Modal；运行中由 deleteGuard 禁用 + tooltip，桥端 409 仍是第二道。
- * 写操作在跑（busy）时连入口一并禁用，避免与传图/确认置换互踩。
+ * 两个入口都复用既有件，不新造第二套：
+ *  · 强制结束 = `ForceFinishButton` + `FORCE_FINISH_CONFIRM_TITLE` + `ForceFinishConfirmBody`
+ *    （与卡片流/表格行**同一颗按钮、同一段确认文案**，可见性仍是 `hub-status.forceFinishGuard`）；
+ *  · 删除 = `TaskDeleteButton`（Popconfirm 二键确认，运行中由 deleteGuard 禁用）。
+ * 写操作在跑（busy）时把强制结束一并置忙态，避免与传图/确认置换互踩。
  */
-function HeaderActions({ summary, busy, onDeleted }: { summary: HubTaskSummary; busy: BusyKind; onDeleted: (localId: string) => void }) {
-    return <TaskDeleteButton task={summary} label="删除任务" disabled={busy !== null} onDeleted={onDeleted} />;
+function HeaderActions({
+    summary,
+    busy,
+    onDeleted,
+    onStateChange,
+    onRefresh,
+    onError,
+}: {
+    summary: HubTaskSummary;
+    busy: BusyKind;
+    onDeleted: (localId: string) => void;
+    onStateChange: (localId: string, state: string) => void;
+    onRefresh: () => void;
+    onError: (text: string) => void;
+}) {
+    return (
+        <div className="flex flex-wrap items-center gap-1.5">
+            <DrawerForceFinishEntry task={summary} busy={busy !== null} onStateChange={onStateChange} onRefresh={onRefresh} onError={onError} />
+            <TaskDeleteButton task={summary} label="删除任务" disabled={busy !== null} onDeleted={onDeleted} />
+        </div>
+    );
+}
+
+/**
+ * 抽屉内的「强制结束」入口（AT-18 B3b；方案 §5.1 把抽屉内的强制结束登记为后续独立项）。
+ *
+ * 语义与卡片流逐字一致：只有 discussing/rendering/generating 三种真实运行态渲染按钮；
+ * 二次确认正文写死「不删任何文件 / 不杀进程」——那些字面量**只从 task-card 导入**，这里不复制；
+ * 取消 = 只关弹层（零请求）；成功后立刻 `onStateChange(localId,"failed")` + `onRefresh()`（不删产物，可重试/删除）。
+ * 接口拒绝原文进抽屉头部行内（onError），不吞、不白屏。
+ */
+export function DrawerForceFinishEntry({
+    task,
+    busy = false,
+    onStateChange,
+    onRefresh,
+    onError,
+}: {
+    task: HubTaskSummary;
+    busy?: boolean;
+    onStateChange: (localId: string, state: string) => void;
+    onRefresh: () => void;
+    onError: (text: string) => void;
+}) {
+    const { message } = App.useApp();
+    const [forceOpen, setForceOpen] = useState(false);
+    const [forceBusy, setForceBusy] = useState(false);
+    const guard = forceFinishGuard(task);
+    if (!guard.visible) return null;
+
+    const forceFinish = async () => {
+        if (forceBusy) return;
+        setForceBusy(true);
+        onError("");
+        try {
+            const data = await forceFinishHubTask(task.local_id);
+            setForceOpen(false);
+            onStateChange(task.local_id, data.state || "failed");
+            message.success(data.already ? `任务 ${task.local_id} 已是失败状态` : `已强制结束：${task.local_id} 置为失败（产物全保留，可重试或删除）`);
+            onRefresh();
+        } catch (error) {
+            // 409「任务当前不是运行态…」/400「需二次确认…」原样透出到头部行内
+            const text = errorText(error);
+            setForceOpen(false);
+            onError(`强制结束失败：${text}`);
+            message.error(`强制结束失败：${text}`);
+        } finally {
+            setForceBusy(false);
+        }
+    };
+
+    return (
+        <>
+            <ForceFinishButton task={task} busy={busy || forceBusy} onAsk={() => setForceOpen(true)} />
+            <Modal
+                open={forceOpen}
+                title={FORCE_FINISH_CONFIRM_TITLE}
+                okText="确认强制结束"
+                cancelText="取消"
+                okButtonProps={{ danger: true, "data-hub-force-confirm-ok": task.local_id }}
+                cancelButtonProps={{ "data-hub-force-confirm-cancel": task.local_id }}
+                confirmLoading={forceBusy}
+                onOk={() => void forceFinish()}
+                onCancel={() => setForceOpen(false)}
+                destroyOnHidden
+            >
+                <ForceFinishConfirmBody task={task} />
+            </Modal>
+        </>
+    );
 }
 
 /**
