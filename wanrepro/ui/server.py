@@ -2554,7 +2554,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/hub/asset":
             # AT-8 B2 写路径（数据合同 v3）：{task_id,n,image_url} 覆盖 / {…,clear:true} 清空 /
-            # {…,text} 写命名；AT-11/AT-12 扩展：{…,decision} 行决策（keep_origin/dismissed/restore，与上互斥）
+            # {…,text} 写命名；AT-11/AT-12 扩展：{…,decision} 行决策（keep_origin/dismissed/restore，与上互斥）；
+            # AT-22 E3 扩展：{…,desc,expect_desc?,rerender?} 写「用我的描述」列（awaiting_approval 时
+            # 同一请求内重渲染 + 自检/门禁重跑），与上面各支互斥。
             payload = self.read_json()
             try:
                 n = int(payload.get("n"))
@@ -2562,12 +2564,17 @@ class Handler(BaseHTTPRequestHandler):
                 raise ApiError(400, "n 必须是整数（待确认清单的行号）") from None
             text = payload.get("text")
             decision = payload.get("decision")
+            desc = payload.get("desc")
+            expect_desc = payload.get("expect_desc")
             self.send_json(hub_api.set_asset(
                 str(payload.get("task_id") or ""), n,
                 image_url=(str(payload.get("image_url") or "").strip() or None),
                 clear=bool(payload.get("clear")),
                 text=None if text is None else str(text),
                 decision=str(decision) if decision else None,
+                desc=None if desc is None else str(desc),
+                expect_desc=None if expect_desc is None else str(expect_desc),
+                rerender=bool(payload.get("rerender")),
             ))
             return
         if path == "/api/asset/upload":

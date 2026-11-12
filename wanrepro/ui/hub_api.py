@@ -2346,6 +2346,159 @@ def _display_refs(urls: list) -> list[str]:
     return out
 
 
+# ---------------------------------------------------------------- AT-22 E3：行内改描述（单请求闭环）
+
+DESC_MAX_CHARS = 500
+# 可改描述的两态（E3 §4.5 状态守卫矩阵的唯一口径；前端起态门读同一张表）
+DESC_EDIT_STATES = ("awaiting_assets", "awaiting_approval")
+# 拒绝文案点名**真实出口**（禁编造按钮）：done/generating 这类只有重开任务一条路。
+DESC_EDIT_REFUSALS = {
+    "ingested": "任务还没开始拆解：先点「发起拆解」，拆完进待置换区再改描述",
+    "ingesting": "视频还在入库：等它进待置换区再改描述",
+    "discussing": "拆解还没跑完：等它进待置换区再改描述",
+    "rendering": "正在渲染：等提示词出来（待审批）再改描述",
+    "approved": "已批准：先点「撤销批准」回到待批准，再改描述",
+    "generating": "正在生成：改描述会让提示词和已提交的片子对不上；等成片后再动",
+    "done": "已完成：成片已出，这条不能再改描述——新需求请新建一条任务",
+    "failed": "失败态：先点「重试」回到可编辑状态，再改描述",
+}
+
+
+def _desc_of(row: dict) -> str:
+    return str((row or {}).get("my_desc") or "")
+
+
+def _set_row_desc(local_id: str, task_dir: Path, bridge: str, n: int, *,
+                  desc: str, expect_desc: str | None, rerender: bool) -> dict:
+    """写清单第 8 列（「用我的描述」），awaiting_approval 时在同一次请求里跑完重渲染闭环。
+
+    语义（E3 §3.2/§3.4/§3.6）：
+      · 换行/连续空白折叠成单空格——描述要进 `@图片N 名字（描述）` 括号，换行会撕表格；
+      · 同一把 `task_lock`（与传图/确认/回退/三态互斥）+ 写侧全程持 `replace.CHECKLIST_LOCK`；
+      · 幂等：值与现值相同且没要求重渲染 → `unchanged`，不写不渲染（连点两次只产生一代提示词）；
+      · 乐观锁：给了 `expect_desc` 且与盘上现值不等 → 409 人话（别处改过这一行）；
+      · 组内行（`同实体确认` ≥2）整组写同一个描述（组=同一件东西，禁止一行一个描述）。
+    """
+    clean = re.sub(r"\s+", " ", str(desc)).strip()
+    if len(clean) > DESC_MAX_CHARS:
+        raise HubInputError(f"描述太长（{len(clean)} 字）：上限 {DESC_MAX_CHARS} 字"
+                            "（它会进正文的图片括号里，太长会把镜头句冲散）")
+    with task_lock(local_id):
+        task = state.load(task_dir)
+        cur_state = str(task["state"])
+        if cur_state not in DESC_EDIT_STATES:
+            raise HubError(DESC_EDIT_REFUSALS.get(
+                cur_state, f"当前状态（{cur_state}）不能改描述"), status=409)
+        # AT-22 B0 锁序（task_lock → CHECKLIST_LOCK 单向）：校验读与写入必须在**同一段锁内**，
+        # 否则「读到旧值 → 别的链整文件重写 → 我按旧值写」会把对方的写吃掉（E3 并发探针实测到
+        # 一次空读：读到写了一半的清单 → 行号校验判「没有第 1 行」）。RLock 可重入，set_row/set_group_write
+        # 内部再拿同一把锁是直通。
+        with replace.CHECKLIST_LOCK:
+            md = replace.checklist_path(bridge).read_text(encoding="utf-8-sig")
+            by_no = {r["no"]: r for r in replace.parse_rows(md)}
+            if n not in by_no:
+                raise HubError(f"待确认清单里没有第 {n} 行（现有 {sorted(by_no)}）", status=404)
+            current = _desc_of(by_no[n])
+            if expect_desc is not None and str(expect_desc) != current:
+                raise HubError(
+                    f"第 {n} 行刚被别处改过（现为：{current or '空'}）——刷新后按最新值再改；"
+                    "若要用你的输入覆盖，再点一次「保存并重渲染」", status=409)
+            members = replace.group_members(bridge, n)
+            targets = list(members) if len(members) >= 2 else [n]
+            changed = [m for m in targets if _desc_of(by_no.get(m) or {}) != clean]
+            if not changed and not rerender:
+                return {"ok": True, "task_id": local_id, "n": n, "我的描述": current,
+                        "组": list(members), "unchanged": True, "state": cur_state,
+                        "重渲染": {"做了": False}}
+            try:
+                if len(members) >= 2:
+                    rows = replace.set_group_write(task_dir, n, desc=clean)["rows"]
+                else:
+                    rows = [replace.set_row(bridge, n, desc=clean)]
+            except replace.ReplaceError as exc:
+                raise HubError(f"保存失败：{exc}；清单未改", status=500) from None
+        echo: dict = {
+            "ok": True, "task_id": local_id, "n": n, "我的描述": clean,
+            "组": list(members),
+            "rows": [{"n": r["no"], "我的描述": _desc_of(r),
+                      "已传图": _display_refs(cards.split_urls(r.get("cur_assets") or "")),
+                      "命名": r.get("name") or ""} for r in rows],
+        }
+        if cur_state == "awaiting_assets":
+            # 待置换区只写清单：确认置换时会自然带上（不在这里白跑一次渲染）
+            echo.update({"state": cur_state, "重渲染": {"做了": False},
+                         "说明": "已保存：确认置换时按新描述重渲染"})
+            return echo
+        render = _rerender_after_desc(task_dir, bridge, n=n, reason=f"改描述（第 {n} 行）")
+    task = state.load(task_dir)
+    echo.update({
+        "state": task["state"], "重渲染": render,
+        "自检": selfcheck.load_selfcheck(task_dir),
+        "prompt_md": _read(_prompt_path(task_dir, task)),
+        "prompt_edited_at": str(task.get("prompt_edited_at") or ""),
+        "approval_snapshot": str(task.get("approval_snapshot") or ""),
+        "audio_gate": task.get("audio_gate") or None,
+    })
+    return echo
+
+
+def _rerender_after_desc(task_dir: Path, bridge: str, *, n: int, reason: str) -> dict:
+    """改描述后的原地闭环：取正文 → **受控回退** → 确认 → 渲染（自检/门禁随渲染重跑）。
+
+    Codex A4（B0 拍定，本卡执行）：awaiting_approval 内的编辑走「受控回退 → 确认 → 渲染」，
+    不在 awaiting_approval 里直接换正文。理由是**五者同代**：提示词、`approval_snapshot`、
+    `assets_confirmed`、`自检.json`、`audio_gate` 必须属于同一代清单/正文；回退→确认→渲染是
+    现成链路里唯一能把五者一起重算的路径（原地换正文只重算正文与快照，确认快照与自检重放
+    口径会停在新描述之前）。状态机本身零改动（用的都是既有受控回退边与确认链）。
+
+    失败语义（E3 §3.5 + 本卡设计）：**取正文放在回退之前**——bridge 抽风/正文过短时状态与
+    产物一格不动（"描述已保存，但重渲染失败"，原地重试即可）；回退之后才失败才落 failed 并
+    如实说明（绝不把任务吊死在 rendering）。
+    """
+    task = state.load(task_dir)
+    mode = str(task.get("audio_mode") or "").strip()
+    try:
+        prompt = generate.fetch_prompt(bridge, mode)
+    except Exception as exc:                     # noqa: BLE001 —— bridge 层异常原文给员工看
+        raise HubError(f"描述已保存，但重渲染失败（渲染服务没取回提示词：{exc}）。"
+                       "点「再试一次重渲染」即可，描述不用重填",
+                       status=502, extra={"描述已保存": True}) from None
+    if len(prompt.strip()) < 200:
+        raise HubError(f"描述已保存，但重渲染失败：渲染正文过短（{len(prompt.strip())} 字）不像提示词",
+                       status=502, extra={"描述已保存": True})
+    try:
+        state.rollback_to_assets(task_dir, note=f"{reason}：受控回退后按新描述重渲染")
+    except state.StateError as exc:
+        raise HubError(str(exc)) from None
+    try:
+        confirmed = replace.effective_entries(bridge)
+        replace.run_replace(task_dir, assets=None, map_spec=None, name_spec=None,
+                            confirm=True, verbose=False, empty_confirm=not confirmed)
+    except (replace.ReplaceError, state.StateError) as exc:
+        raise HubError(f"描述已保存，但重渲染失败：{exc}"
+                       "（已退回待置换区，点「确认置换」可重试）",
+                       status=500, extra={"描述已保存": True}) from None
+    try:
+        out = generate.do_render(task_dir, "5,9:16", verbose=False,
+                                 audio_mode=mode or None, prompt_text=prompt)
+    except Exception as exc:                     # noqa: BLE001
+        try:
+            if state.load(task_dir)["state"] == "rendering":
+                state.transition(task_dir, "failed", note=f"改描述重渲染失败（原文）：{exc}")
+        except Exception:                        # noqa: BLE001 —— 状态回写失败不吞原异常
+            pass
+        raise HubError(f"描述已保存，但重渲染失败：{exc}",
+                       status=500, extra={"描述已保存": True}) from None
+    # 留痕：提示词是被「用户动作」改过的（AT-21 手改提示词共用同一字段，语义=最近一次人为改正文）
+    task = state.load(task_dir)
+    task["prompt_edited_at"] = state._now()
+    task["prompt_edit_reason"] = reason
+    state.save(task_dir, task)
+    return {"做了": True, "prompt_chars": int(out.get("prompt_chars") or len(prompt)),
+            "snapshot": str(out.get("snapshot") or ""),
+            "阶段": ["重出提示词", "受控回退", "确认置换", "重渲染", "自检重跑", "音频门禁重跑"]}
+
+
 # AT-22 B0 顺带项（双路审计 m-3）：清单进入「批准 / 生成中」之后，置换台的三支写
 # （重传图 / 沿用清空 / 改命名）一律拒绝——提交只读 `assets_confirmed` 快照，改清单不会拦住
 # 在跑的付费提交，却会让自检重放口径与快照漂移。出口照人话说：撤销批准后可改；要换图走重试
@@ -2355,7 +2508,8 @@ ASSET_WRITE_LOCKED_STATES = ("approved", "generating")
 
 def set_asset(local_id: str, n: int, *, image_url: str | None = None,
               clear: bool = False, text: str | None = None,
-              decision: str | None = None) -> dict:
+              decision: str | None = None, desc: str | None = None,
+              expect_desc: str | None = None, rerender: bool = False) -> dict:
     """POST /api/hub/asset —— 置换台逐卡定向写（数据合同 v3 写合同 + AT-11 §3.5 扩展）。
 
     {task_id, n, image_url}     重传 = 覆盖该行资产图（fill_row 覆盖模式，不追加）
@@ -2363,8 +2517,11 @@ def set_asset(local_id: str, n: int, *, image_url: str | None = None,
     {task_id, n, text}          品牌视觉卡的文字，写清单「命名」列
     {task_id, n, decision}      AT-11/AT-12 行决策：keep_origin（这行不换了，按原片）/
                                 dismissed（已移除，不需要替换，按原片处理）/ restore（恢复，清键）
+    {task_id, n, desc, expect_desc?, rerender?}  AT-22 E3 改「用我的描述」列：awaiting_approval 时
+                                同一次请求内跑完「写清单 → 重出提示词 → 受控回退 → 确认 →
+                                重渲染 → 自检/音频门禁重跑」（见 `_set_row_desc` / `_rerender_after_desc`）
     回显真源是清单 md（不是 pending_replace）。
-    该行在确认组里（sidecar『同实体确认』）→ 图/文走 replace.set_group_write 单点整组联动；
+    该行在确认组里（sidecar『同实体确认』）→ 图/文/描述走 replace.set_group_write 单点整组联动；
     decision 走行级路径且**拒绝组内行**（组=原子单位，组内单行降级先拆开——AT-11 §3.2）；
     decision 需 awaiting_assets（确认后覆盖表锁定不可改——B2 次序合同）；
     image_url / clear / text 三支在 approved/generating 态一律拒绝（AT-22 B0 顺带项 m-3：
@@ -2373,9 +2530,15 @@ def set_asset(local_id: str, n: int, *, image_url: str | None = None,
 
     B5 复用说明：不新建端点——既有 set_asset 已有任务锁/行号校验/前端 postHubAsset 传输层；
     既有 clear 只清图片列+流水、无恢复语义与行决策状态，故加 decision 参数而非塞 clear。
+    AT-22 E3 同理：改描述不新开 `/row-desc` 端点（任务锁/组联动/流水/传输层全在这里）。
     """
     task_dir = _task_dir(local_id)
     bridge = _bridge_of(task_dir)
+    if desc is not None:
+        if image_url or clear or text is not None or decision is not None:
+            raise HubError("desc 与 image_url / clear / text / decision 互斥，只能给一个")
+        return _set_row_desc(local_id, task_dir, bridge, n, desc=desc,
+                             expect_desc=expect_desc, rerender=bool(rerender))
     if decision is not None:
         if decision not in ("keep_origin", "dismissed", "restore"):
             raise HubError(f"decision 只能是 keep_origin / dismissed / restore，收到 {decision!r}")

@@ -76,15 +76,21 @@ def free_port() -> int:
 
 
 class StubBridge:
-    """进程内假 bridge（只实现 ingest 用到的两个面）——隔离跑时不许打真实 bridge。
+    """进程内假 bridge（只实现探针用到的几个面）——隔离跑时不许打真实 bridge。
 
     ingest 只用 `POST /api/video/upload`（→ ok/id/name/size）和 `GET /api/tasks`（校验 id 存在）。
     打真实 bridge 会往真实 `uploads/` 落 `片名-N.mp4` 副本（历史上攒了 100+ 个），
     所以隔离跑把这条依赖也换成假的。用法：`with StubBridge() as stub: env["WANREPRO_BRIDGE"]=stub.base`。
+
+    AT-22 E3 追加 `render_fn`：`GET /api/render/{bridge}/{template}` 交给调用方给的函数出正文
+    （探针要断言「写清单 → 重出提示词」的**次序**，就必须让假渲染器真的读到那一刻的清单）。
+    `renders` 记下每次渲染请求的 path——用来量「这一次动作打了几次渲染」。
     """
 
-    def __init__(self) -> None:
+    def __init__(self, render_fn=None) -> None:
         self.ids: list[str] = []
+        self.renders: list[str] = []
+        self.render_fn = render_fn
         self._lock = threading.Lock()
         outer = self
 
@@ -120,7 +126,21 @@ class StubBridge:
                         tasks = [{"id": i} for i in outer.ids]
                     self._send(200, {"tasks": tasks})
                     return
-                self._send(404, {"error": "stub bridge 只认 /api/tasks"})
+                if self.path.startswith("/api/render/"):
+                    with outer._lock:
+                        outer.renders.append(self.path)
+                        fn = outer.render_fn
+                    if fn is None:
+                        self._send(404, {"error": "stub bridge 没配 render_fn"})
+                        return
+                    try:
+                        text = fn(self.path)
+                    except Exception as err:          # noqa: BLE001 —— 假渲染器故障要如实回给探针
+                        self._send(500, {"error": f"stub render_fn 失败：{err}"})
+                        return
+                    self._send(200, {"text": text})
+                    return
+                self._send(404, {"error": "stub bridge 只认 /api/tasks、/api/render/*"})
 
         self.port = free_port()
         self.httpd = ThreadingHTTPServer(("127.0.0.1", self.port), Handler)

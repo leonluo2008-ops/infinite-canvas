@@ -521,6 +521,9 @@ def build(bridge_id: str, local_id: str) -> list[dict]:
             "帧内框": boxes,
             "已传图": split_urls(row.get("cur_assets") or ""),
             "描述": row.get("desc") or "",
+            # AT-22 E3 §4.1 读侧新增：清单第 8 列「用我的描述」（已解码原文；空=未填）。
+            # 前端行内编辑块的预填与「留空＝沿用原物描述」提示都读它。
+            "我的描述": row.get("my_desc") or "",
             "画面位置": payload.get("画面位置"),
             "同实体疑似": payload.get("同实体疑似") or [],
             # AT-9 B2 确认组：该行所属组（升序）；无组 = []（合同：空数组行为同现状）

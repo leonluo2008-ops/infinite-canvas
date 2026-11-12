@@ -220,9 +220,11 @@ class OverlapWindow:
         self._fill_row = replace.fill_row
         self._read_text = server.read_text
 
-        def slow_fill_row(md_text, no, asset_urls, name, overwrite=False):
+        def slow_fill_row(md_text, no, asset_urls, name, overwrite=False, *args, **kwargs):
+            # AT-22 E3：fill_row 新增 desc 关键字——代理必须透传，否则 B0 的并发窗口会把
+            # 「签名变了」误报成「两链并发写异常」。
             time.sleep(delay)
-            return self._fill_row(md_text, no, asset_urls, name, overwrite)
+            return self._fill_row(md_text, no, asset_urls, name, overwrite, *args, **kwargs)
 
         def slow_read_text(path):
             out = self._read_text(path)

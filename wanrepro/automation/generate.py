@@ -183,25 +183,35 @@ def fetch_prompt(bridge_id: str, audio_mode: str = "") -> str:
 
 
 def do_render(task_dir: Path, set_spec: str, verbose: bool = True,
-              audio_mode: str | None = None) -> dict:
+              audio_mode: str | None = None, prompt_text: str | None = None) -> dict:
     """rendering → 渲染 → awaiting_approval（回显预演，等人工 approve）。
 
     `audio_mode`：音频三态（AT-17 B2a），本函数负责把它**带进 bridge 请求**——
     GET /api/render 没有 body，参数不加在 query 上就到不了渲染器（附注 11）。
     缺省取任务.json 的 `audio_mode`（B2c 拆解完成时落的盘）；都没有就不带，渲染器自己推导。
+
+    `prompt_text`（AT-22 E3）：调用方已经取到的正文（改描述闭环里「先取正文、再进状态机」用的）。
+    给了就用它、不再打一次 bridge——取正文是唯一会因 bridge 抽风失败的一步，把它挪到
+    「受控回退之前」做，失败时状态与产物一格不动，用户原地重试即可（不再有「已进 rendering
+    却取不回正文」的中间态）。
     """
     task = state.load(task_dir)
     if task["state"] != "rendering":
         raise GenError(f"render 需 rendering 状态（先完成置换确认），当前 {task['state']}")
     params = {**DEFAULT_PARAMS, **parse_set(set_spec)}
     mode = str(audio_mode if audio_mode is not None else task.get("audio_mode") or "").strip()
-    prompt = fetch_prompt(str(task["bridge_id"]), mode)
+    prompt = prompt_text if prompt_text is not None else fetch_prompt(str(task["bridge_id"]), mode)
 
     # 结构性校验（不假设模板格式——红线 14）：非空且够长即视为正文；
     # 模板差异（lumi 带 # 标题头 / seedance-flow 纯正文流）不是合同的一部分
     if len(prompt.strip()) < 200:
         raise GenError(f"渲染正文过短（{len(prompt.strip())} 字）不像提示词: {prompt[:120]}")
-    (task_dir / PROMPT_FILE).write_text(prompt, encoding="utf-8")
+    # AT-22 E3 §4.3：正文落盘改「临时文件 + os.replace」——结构上不可能出现半截正文
+    # （自检.json / 审批快照都与这一份正文同代，半写会让两者读到残缺内容）。
+    prompt_path = task_dir / PROMPT_FILE
+    prompt_tmp = prompt_path.with_name(PROMPT_FILE + ".tmp")
+    prompt_tmp.write_text(prompt, encoding="utf-8")
+    prompt_tmp.replace(prompt_path)
     # 快照按任务自身版本算（老任务=v1 旧算法；已升 v2 的任务按 v2）——AT-13 §2.5 版本分流
     snap = state.snapshot_for({**task, "gen_params": params}, prompt)
     state.transition(task_dir, "awaiting_approval",

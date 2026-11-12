@@ -1093,6 +1093,17 @@ def decode_user_desc(value: str) -> str:
             .replace("&#13;", chr(13)).replace("&#38;", "&"))
 
 
+def encode_user_desc(value: str) -> str:
+    """清单第 8 列的写入编码（与 `decode_user_desc` 成对——格式所有者一处，AT-22 E3 §4.4）。
+
+    `&` 必须最先换：后换会把已生成的 `&#124;` 再编码成 `&#38;#124;`（解码回来是字面量，
+    用户的 `|` 就丢了）。换行/回车编码是为了「描述进 `@图片N 名字（描述）` 括号」时
+    不把表格行撕成两行。
+    """
+    return (str(value).replace("&", "&#38;").replace("|", "&#124;")
+            .replace(chr(13), "&#13;").replace(chr(10), "&#10;"))
+
+
 def sanitize_with_user_desc(line: str, ents: list[Entity]) -> str:
     """清洗参考片文本，但把用户手填描述整段保护起来。"""
     protected: list[tuple[str, str]] = []

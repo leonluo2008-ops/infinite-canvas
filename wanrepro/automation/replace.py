@@ -90,7 +90,12 @@ def row_cells(raw: str) -> list[str]:
 
 
 def parse_rows(md_text: str) -> list[dict]:
-    """读层归一：行号/类别/描述/命名/现有资产图列/建议。容全角竖线（红线：不假设格式）。"""
+    """读层归一：行号/类别/描述/命名/现有资产图列/建议/我的描述。容全角竖线（红线：不假设格式）。
+
+    AT-22 E3（§4.1 一处读层）：第 8 列「用我的描述」在这里解一次，`cards`（资产卡预填）与
+    `hub_api.set_asset`（现值/幂等/乐观锁）共用——不另写第二份正则或解码器。解码走
+    `render.decode_user_desc`（格式所有者一处：写侧 `render.encode_user_desc` 与它成对）。
+    """
     rows = []
     for raw in md_text.splitlines():
         cells = row_cells(raw)
@@ -102,16 +107,24 @@ def parse_rows(md_text: str) -> list[dict]:
                      "desc": cells[2],
                      "name": cells[3],
                      "cur_assets": cells[4],
-                     "advice": cells[6] if len(cells) > 6 else ""})
+                     "advice": cells[6] if len(cells) > 6 else "",
+                     "my_desc": _decode_desc_cell(cells[7] if len(cells) > 7 else "")})
     return rows
 
 
+def _decode_desc_cell(value: str) -> str:
+    """「用我的描述」列解码：只认 render 的格式所有者（写侧 encode_user_desc 与它成对）。"""
+    return render_module().decode_user_desc(str(value or ""))
+
+
 def fill_row(md_text: str, no: int, asset_urls: list[str], name: str | None,
-             overwrite: bool = False) -> str:
-    """按 # 写「资产图」列（与「命名」列）。返回新全文。行格式以解析到的原样为准。
+             overwrite: bool = False, desc: str | None = None) -> str:
+    """按 # 写「资产图」列（与「命名」列 / 「用我的描述」列）。返回新全文。行格式以解析到的原样为准。
 
     缺省（overwrite=False）与历史行为一致：资产图列**追加**（多图逗号隔开）。
     overwrite=True = 置换台定向重传/「沿用」清空：整格替换（asset_urls 为空即清空该行绑定）。
+    desc（AT-22 E3）：给了就整格替换第 8 列（空串 = 清回「按原物描述渲染」）；编码只走
+    `render.encode_user_desc`（与读侧 decode 成对，格式所有者一处）。
     """
     out = []
     hit = False
@@ -120,6 +133,8 @@ def fill_row(md_text: str, no: int, asset_urls: list[str], name: str | None,
         if cells and re.fullmatch(r"\d+", cells[0] or "") and int(cells[0]) == no:
             while len(cells) < 8:
                 cells.append("")
+            if desc is not None:
+                cells[7] = render_module().encode_user_desc(str(desc))
             joined = ",".join(asset_urls)
             if overwrite:
                 cells[4] = joined
@@ -133,24 +148,68 @@ def fill_row(md_text: str, no: int, asset_urls: list[str], name: str | None,
             out.append(raw)
     if not hit:
         raise ReplaceError(f"清单里没有第 {no} 行")
+    if desc is not None:
+        out = _ensure_desc_column(out)
     return "\n".join(out) + ("\n" if md_text.endswith("\n") else "")
 
 
+DESC_HEADER = "用我的描述"
+
+
+def _ensure_desc_column(lines: list[str]) -> list[str]:
+    """老清单（AT-22 E3 之前 = 7 列）→ 补表头与分隔行的第 8 列，让新列在表格里真的出现。
+
+    只认**表头行**（次格 == 「类别」）与其下一行分隔行；两行本来就有 8 格就一格不动（幂等）。
+    写行已在 fill_row 里补到 8 格——表头不补的话 markdown 会渲染出「无名第 8 列」，用户看不到列名。
+    """
+    out = list(lines)
+    for i, raw in enumerate(out):
+        cells = row_cells(raw)
+        if len(cells) >= 2 and cells[1] == "类别" and len(cells) < 8:
+            while len(cells) < 8:
+                cells.append("")
+            cells[7] = DESC_HEADER
+            out[i] = "| " + " | ".join(cells[:8]) + " |"
+            if i + 1 < len(out):
+                sep = row_cells(out[i + 1])
+                if _is_sep_row(sep) and len(sep) < 8:
+                    while len(sep) < 8:
+                        sep.append("")
+                    sep[7] = "------------"
+                    out[i + 1] = "| " + " | ".join(sep[:8]) + " |"
+            return out
+    return out
+
+
+def _is_sep_row(cells: list[str]) -> bool:
+    """markdown 分隔行？全格是 `---`（可带对齐冒号）或空格子，且至少一格是 `---`。"""
+    def is_sep(cell: str) -> bool:
+        return bool(re.fullmatch(r":?-{2,}:?", (cell or "").strip()))
+
+    return bool(cells) and all(is_sep(c) or not (c or "").strip() for c in cells) \
+        and any(is_sep(c) for c in cells)
+
+
 def set_row(bridge_id: str, no: int, *, image_urls: list[str] | None = None,
-            name: str | None = None, overwrite: bool = False) -> dict:
-    """定向写清单一行（AT-8 置换台写路径）：资产图列覆盖/清空 + 命名列。返回写后该行。
+            name: str | None = None, overwrite: bool = False,
+            desc: str | None = None) -> dict:
+    """定向写清单一行（AT-8 置换台写路径）：资产图列覆盖/清空 + 命名列 +「用我的描述」列。
 
     写路径格式定死（数据合同 v3）：前端先走 uguu 拿 URL，再调这里写 md；不新增 multipart。
     AT-22 B0：读-改-整文件重写**全程持 CHECKLIST_LOCK**（与画布链 `_update_checklist_cell`
     同一把锁）——读在锁内才是关键：锁外读、锁内写照样丢更新。
     """
-    if image_urls is None and name is None:
-        raise ReplaceError("没有要写的东西：给 image_urls 或 name 之一")
+    if image_urls is None and name is None and desc is None:
+        raise ReplaceError("没有要写的东西：给 image_urls / name / desc 之一")
     path = checklist_path(bridge_id)
     with CHECKLIST_LOCK:
         before = path.read_text(encoding="utf-8")
-        after = fill_row(before, no, list(image_urls or []), name, overwrite=overwrite)
+        after = fill_row(before, no, list(image_urls or []), name, overwrite=overwrite,
+                         desc=desc)
         if after != before:
+            # 保持整文件 write_text（AT-22 B0 的并发合同：所有写者持 CHECKLIST_LOCK，读者也持锁后
+            # 结构上读不到半截）。故意不用 tmp+os.replace：Windows 上无锁写者的 replace 会抛
+            # PermissionError(13)（B0 反向对照实测），把「零丢失」的语义换成「抛异常」不是这里要的。
             path.write_text(after, encoding="utf-8")
     row = next((r for r in parse_rows(after) if r["no"] == no), None)
     if row is None:
@@ -325,11 +384,14 @@ def save_row_decisions(bridge_id: str, decisions: dict[int, str]) -> dict[int, s
 
 
 def set_group_write(task_dir: Path, no: int, *, image_url: str | None = None,
-                    clear: bool = False, text: str | None = None) -> dict:
+                    clear: bool = False, text: str | None = None,
+                    desc: str | None = None) -> dict:
     """确认组写路径**单点**（AT-9 §六层3）：校验组存在 → 整组写清单 → 同步上传流水 → 写后回显组内全行。
 
     同实体疑似**不联动**（组里没有就抛错，调用方走单行路径）；任一行写失败如实抛
     ReplaceError（错误不报整组成功）；调用方持任务级串行锁。
+    desc（AT-22 E3 §3.2 组联动）：组=同一个东西，整组写同一个描述——不静默只改一行，否则
+    同一张图在正文里出现两个描述。
     """
     task = state.load(task_dir)
     bridge = str(task.get("bridge_id") or "")
@@ -346,6 +408,8 @@ def set_group_write(task_dir: Path, no: int, *, image_url: str | None = None,
                     rows.append(set_row(bridge, m, image_urls=[image_url], overwrite=True))
                 elif clear:
                     rows.append(set_row(bridge, m, image_urls=[], overwrite=True))
+                elif desc is not None:
+                    rows.append(set_row(bridge, m, desc=desc))
                 else:
                     rows.append(set_row(bridge, m, name=str(text or "")))
             except ReplaceError as e:

@@ -51,12 +51,14 @@ import {
     groupHubRows,
     hubAssetDisplayUrl,
     hubAssetRefView,
+    hubDescEditGate,
     hubOutputUrl,
     hubQuickAction,
     hubQuickChannels,
     hubQuickPhaseText,
     hubReworkGate,
     hubReworkUnknownSteps,
+    normalizeSelfCheck,
     postHubAsset,
     probeHubAssets,
     readApprovedDraft,
@@ -71,6 +73,7 @@ import {
     ungroupHubRows,
     uploadHubImage,
     type HubAssetCard,
+    type HubAssetWriteResult,
     type HubCardGroup,
     type HubQuickAction,
     type HubQuickPhase,
@@ -84,6 +87,7 @@ import {
 } from "./hub-api";
 // AT-16 B9：解除阻断后的换配置直达条（判定=起态门 + dispatch=cleared，动作=既有撤销批准链）
 import { GenClearedBar, hubClearedDirect } from "./gen-cleared";
+import { HubTextEditor, type SaveResult } from "./hub-text-editor";
 import { lapianClockTexts, lapianStageName, useLapianClock } from "./lapian-clock";
 import { HubStateTag, SubmitResultLine, forceFinishGuard } from "./hub-status";
 import { CloudFailurePanel, FORCE_FINISH_CONFIRM_TITLE, ForceFinishButton, ForceFinishConfirmBody, RemoteWaitLine } from "./task-card";
@@ -420,7 +424,9 @@ export function TaskDetailDrawer({
                     ) : null}
 
                     {/* ④ 提示词段（AT-16 B2：标题一行 + 正文默认展开可收起 + 自检/门禁独立整宽区） */}
-                    {detail && POST_DECOMPOSE_STATES.includes(state) ? <PromptSection detail={detail} /> : null}
+                    {detail && POST_DECOMPOSE_STATES.includes(state) ? (
+                        <PromptSection detail={detail} busy={busy} onWritten={reload} />
+                    ) : null}
 
                     {/* ⑤ 审批/生成/成片段（§四各状态动作） */}
                     {detail ? <OutcomeSection detail={detail} busy={busy} act={act} /> : null}
@@ -1952,6 +1958,24 @@ function FrameWithPosition({
  *  卡片深处（AssetUploadZone）直接取——避免把一份只读映射逐层穿过七个子组件。 */
 const AssetStateContext = createContext<Record<string, string>>({});
 
+/** AT-22 E3：自检异常 → 行内改这一行的描述。
+ *
+ *  只搬四件事：资产卡（预填「用我的描述」与原物描述）、起态门（`hubDescEditGate` 唯一口径）、
+ *  保存函数（`postHubAsset` 的 desc 支）、保存后刷新。**不搬判定**——能不能改、改完算不算通过
+ *  都由服务端与 `hubDescEditGate` 说话，卡片只渲染（红线 25）。
+ */
+type DescEditApi = {
+    cardsByNo: Record<number, HubAssetCard>;
+    gate: { enabled: boolean; reason: string };
+    busy: boolean;
+    /** 当前打开着行内编辑块的行号（**行级互斥**：同时只允许一个，切换时不会静默丢草稿）。 */
+    editingRow: number | null;
+    setEditingRow: (n: number | null) => void;
+    save: (n: number, next: string, expect: string) => Promise<HubAssetWriteResult>;
+    onSaved: () => void;
+};
+const DescEditContext = createContext<DescEditApi | null>(null);
+
 /* hub-asset-exit:begin —— 受控资产出口（AT-16 B1a）。
    全 drawer **唯一**允许把资产引用赋给 <img src> / <a href> 的地方：只收 ref 原串，
    内部过 hubAssetRefView()（= hub-api 显示层唯一换算点 hubAssetDisplayUrl）出 src/href。
@@ -2147,14 +2171,47 @@ const GATE_ITEM_NAME = "拆解门禁";
 
 /** 提示词段（AT-16 B2 布局）：标题行只放「提示词」+ 操作按钮（一行收住）；正文默认展开、
  *  可用按钮收起；自检/门禁的异常详情走下方**独立整宽区域**（不进标题行 flex，展开时标题与
- *  正文边界不互挤）。 */
-export function PromptSection({ detail }: { detail: HubTaskDetail }) {
+ *  正文边界不互挤）。
+ *
+ *  AT-22 E3：本段同时是「行内改描述」的**作用域**——自检每条 finding 上的「改这一行的描述」
+ *  通过 DescEditContext 拿到资产卡（预填）、起态门与保存函数；保存成功后 `onWritten()` 重取
+ *  详情，面板就地刷新（不跳页、不开新窗）。 */
+export function PromptSection({
+    detail,
+    busy,
+    onWritten,
+}: {
+    detail: HubTaskDetail;
+    busy?: BusyKind;
+    onWritten?: () => void;
+}) {
     const prompt = detail.prompt_md || "";
     const [collapsed, setCollapsed] = useState(false);          // 正文默认展开（折叠改成可选收起）
+    const [editingRow, setEditingRow] = useState<number | null>(null);
     // AT-15 R2：拆解门禁条目从自检束里拆出来单独渲染（绿Tag=绿项数摘要；FAIL/WARN 红条=缺项+重拆轮次）。
     const gateItem = detail.自检?.find((item) => item.项 === GATE_ITEM_NAME) ?? null;
     const checkItems = detail.自检?.filter((item) => item.项 !== GATE_ITEM_NAME) ?? null;
+    const localId = detail.local_id || "";
+    const cardsByNo = useMemo(() => {
+        const map: Record<number, HubAssetCard> = {};
+        for (const card of detail.asset_cards ?? []) map[card.n] = card;
+        return map;
+    }, [detail.asset_cards]);
+    const descGate = useMemo(() => hubDescEditGate(detail.state || ""), [detail.state]);
+    const saveDesc = useCallback(
+        async (n: number, next: string, expect: string) =>
+            postHubAsset(localId, { n, desc: next, expect_desc: expect }),
+        [localId],
+    );
+    const descApi = useMemo<DescEditApi>(
+        () => ({
+            cardsByNo, gate: descGate, busy: Boolean(busy), editingRow, setEditingRow,
+            save: saveDesc, onSaved: onWritten || (() => undefined),
+        }),
+        [cardsByNo, descGate, busy, editingRow, saveDesc, onWritten],
+    );
     return (
+        <DescEditContext.Provider value={descApi}>
         <section className="rounded-lg border border-stone-200 bg-card p-4 dark:border-stone-800" data-hub-prompt-section>
             <div className="flex min-w-0 flex-wrap items-center gap-2" data-hub-prompt-head>
                 <h2 className="flex min-w-0 items-center gap-1.5 text-sm font-semibold">
@@ -2191,6 +2248,7 @@ export function PromptSection({ detail }: { detail: HubTaskDetail }) {
                 </div>
             )}
         </section>
+        </DescEditContext.Provider>
     );
 }
 
@@ -2351,11 +2409,18 @@ function SelfCheckFold({ item }: { item: HubSelfCheckItem }) {
 }
 
 /** 一张 finding 卡：位置段（第 N 行「短名」·共用图·缩略图·定位）→ 命中词 → 上下文高亮 → 动作位。 */
-function SelfCheckCardView({ card }: { card: SelfCheckCard }) {
+function SelfCheckCardView({ card, itemKey }: { card: SelfCheckCard; itemKey: string }) {
     const { message } = App.useApp();
     const assetStates = useContext(AssetStateContext);
+    const descApi = useContext(DescEditContext);
+    const lastWrite = useRef<HubAssetWriteResult | null>(null);
     const first = card.findings[0];
     const rowNo = card.行号;
+    // AT-22 E3：行内改描述（就地展开，不弹窗不换页）；打开状态由 PromptSection 统一持有
+    // （行级互斥：同任务同时只开一个编辑块，别的行按钮置灰但不静默丢草稿）。
+    const editing = rowNo !== null && descApi?.editingRow === rowNo;
+    const otherEditorOpen = Boolean(descApi && descApi.editingRow !== null && !editing);
+    const assetCard = rowNo !== null && descApi ? descApi.cardsByNo[rowNo] : undefined;
     const label = first.行称呼 || first.类别 || "";
     const others = (first.组 ?? []).filter((no) => no !== rowNo);
     const words = [...new Set(card.findings.map((finding) => finding.词).filter((word): word is string => Boolean(word)))]
@@ -2440,9 +2505,22 @@ function SelfCheckCardView({ card }: { card: SelfCheckCard }) {
             ) : null}
             {fixable || words.length ? (
                 <div className="flex flex-wrap items-center gap-1.5" data-hub-selfcheck-actions>
-                    {fixable ? (
-                        <Tooltip title="行内改描述在 UI 内闭环（E3 落地后可用）">
-                            <Button size="small" disabled data-hub-selfcheck-fix>改这一行的描述</Button>
+                    {fixable && rowNo !== null && descApi ? (
+                        <Tooltip
+                            title={descApi.gate.enabled
+                                ? (otherEditorOpen
+                                    ? "先把上面那个编辑器收起来（同一个任务同时只改一行）"
+                                    : "在本页改这一行的描述：保存后自动重出提示词、重跑自检（不离开这页）")
+                                : descApi.gate.reason}
+                        >
+                            <Button
+                                size="small"
+                                disabled={!descApi.gate.enabled || descApi.busy || otherEditorOpen}
+                                onClick={() => descApi.setEditingRow(editing ? null : rowNo)}
+                                data-hub-selfcheck-fix
+                            >
+                                改这一行的描述
+                            </Button>
                         </Tooltip>
                     ) : null}
                     {words.map((word) => (
@@ -2451,6 +2529,42 @@ function SelfCheckCardView({ card }: { card: SelfCheckCard }) {
                         </Tooltip>
                     ))}
                 </div>
+            ) : null}
+            {editing && rowNo !== null && descApi ? (
+                <HubTextEditor
+                    variant="cell"
+                    value={assetCard?.我的描述 || ""}
+                    baseline={assetCard?.我的描述 || ""}
+                    placeholder="留空＝沿用原物描述（原物词会被带回正文）"
+                    hint="这一行在提示词里出现的描述；写完点「保存并重渲染」——提示词按新描述重出、自检自动重跑。"
+                    before={assetCard?.描述 ? { label: "原物描述（只读）", text: assetCard.描述 } : null}
+                    maxLength={500}
+                    softMax={200}
+                    saveLabel="保存并重渲染"
+                    onSave={async (next, expect) => {
+                        const out = await descApi.save(rowNo, next, expect);
+                        lastWrite.current = out;
+                        return out;
+                    }}
+                    onCancel={() => descApi.setEditingRow(null)}
+                    onSaved={(result) => {
+                        const items = normalizeSelfCheck(lastWrite.current?.自检 ?? null);
+                        const mine = items?.find((item) => item.项 === itemKey) ?? null;
+                        const stillFail = mine ? mine.结论 !== "PASS" : false;
+                        descApi.onSaved();
+                        if (result.unchanged) {
+                            message.info("值没变：没有重跑渲染（自检还是上一代结论）");
+                            return;
+                        }
+                        if (stillFail) {
+                            // 成功但该项仍 FAIL（合法结果：词表不由描述缩小）——同位置替换，允许继续迭代
+                            message.warning("已保存并重渲染：这一项自检还有异常，见刷新后的发现");
+                            return;
+                        }
+                        message.success("已保存并重渲染：这一项自检已通过 ✓");
+                        descApi.setEditingRow(null);
+                    }}
+                />
             ) : null}
         </article>
     );
@@ -2491,7 +2605,7 @@ function SelfCheckItemView({ item }: { item: HubSelfCheckItem }) {
                         </div>
                     ) : null}
                     {shown.map((card) => (
-                        <SelfCheckCardView key={card.key} card={card} />
+                        <SelfCheckCardView key={card.key} card={card} itemKey={item.项} />
                     ))}
                     {rest.length ? (
                         <div className="break-words text-stone-500 dark:text-stone-400" data-hub-selfcheck-more>

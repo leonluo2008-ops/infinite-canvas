@@ -198,6 +198,8 @@ export type HubAssetCard = {
     帧内框: HubCardBox[];
     已传图: string[];
     描述: string;
+    /** AT-22 E3：清单第 8 列「用我的描述」（已解码原文；空=未填，行内编辑块预填用）。 */
+    我的描述: string;
     同实体疑似: number[];
     /** 同实体确认组（B2 写路径联动；空数组=不在任何确认组）。 */
     同实体确认: number[];
@@ -236,6 +238,19 @@ export type HubAssetWriteResult = {
     决策?: string;
     覆盖?: Record<string, string>;
     锁点剩余?: number[];
+    /** AT-22 E3 改描述回显（真源=清单第 8 列，写后再回读的原文）。 */
+    我的描述?: string;
+    /** 值没变且没要求重渲染 → 什么都没做（幂等，连点两次只产生一代提示词）。 */
+    unchanged?: boolean;
+    state?: string;
+    说明?: string;
+    /** 重渲染做了没有 + 阶段（`重渲染.阶段` 是这次闭环真跑过的步骤，前端如实展示、不自造）。 */
+    重渲染?: { 做了?: boolean; prompt_chars?: number; snapshot?: string; 阶段?: string[] };
+    /** 响应里直接带的这一代自检（与 GET /api/hub/task 同一束，前端只渲染不重判）。 */
+    自检?: unknown;
+    prompt_md?: string;
+    prompt_edited_at?: string;
+    approval_snapshot?: string;
 };
 
 /** 自检结果单条（AT-9 B5 数据合同：projects/<id>/自检.json 每条 {项,结论,证据}；结论 PASS|FAIL）。
@@ -925,6 +940,7 @@ export function normalizeAssetCards(value: unknown): HubAssetCard[] {
                 .filter((box): box is HubCardBox => box !== null),
             已传图: urls.map((url) => hubText(url)).filter(Boolean),
             描述: hubText(item["描述"]),
+            我的描述: hubText(item["我的描述"]),
             同实体疑似: twins.map((x) => Number(x)).filter((x) => Number.isFinite(x) && x > 0),
             同实体确认: group.map((x) => Number(x)).filter((x) => Number.isFinite(x) && x > 0),
             画面位置: normalizePosition(item["画面位置"]),
@@ -1010,12 +1026,47 @@ export async function confirmHubReplace(localId: string, emptyConfirm = false, a
  *  - {n, decision}   AT-11/AT-12 行决策：keep_origin（旧·按原片）/ dismissed（移除，不需要替换）/
  *                    restore（恢复，后端清键），与上三者互斥（单行降级/移除用）
  */
-export async function postHubAsset(localId: string, payload: { n: number; image_url?: string; clear?: boolean; text?: string; decision?: string }): Promise<HubAssetWriteResult> {
+export async function postHubAsset(localId: string, payload: {
+    n: number;
+    image_url?: string;
+    clear?: boolean;
+    text?: string;
+    decision?: string;
+    /** AT-22 E3：改「用我的描述」列（与上面四支互斥）；awaiting_approval 时服务端同请求内重渲染。 */
+    desc?: string;
+    /** 乐观锁：前端发来的基线值；与盘上现值不等 → 409（别处改过这一行）。 */
+    expect_desc?: string;
+    /** 只重渲染、不改字（「再试一次重渲染」用）。 */
+    rerender?: boolean;
+}): Promise<HubAssetWriteResult> {
     return request<HubAssetWriteResult>("/api/hub/asset", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ task_id: localId, ...payload }),
     });
+}
+
+/** 行内改描述的起态门（AT-22 E3 §4.5 唯一口径，与后端 hub_api.DESC_EDIT_REFUSALS 同序）。
+ *
+ *  可改 = awaiting_assets（只写清单，确认置换时生效）/ awaiting_approval（写 + 原地重渲染闭环）；
+ *  其余状态**一律不给编辑入口**，按钮置灰 + tooltip 用这里的 reason（与后端 409 文案同义）。
+ *  纯函数：探针直接 import 断言，不在页面里复制第二份状态表。
+ */
+export function hubDescEditGate(state: string): { enabled: boolean; reason: string } {
+    const s = String(state || "");
+    if (s === "awaiting_assets") return { enabled: true, reason: "" };
+    if (s === "awaiting_approval") return { enabled: true, reason: "" };
+    const reasons: Record<string, string> = {
+        ingested: "任务还没开始拆解：先点「发起拆解」",
+        ingesting: "视频还在入库：等它进待置换区",
+        discussing: "拆解还没跑完：等它进待置换区",
+        rendering: "正在渲染：等提示词出来（待审批）再改",
+        approved: "已批准：先点「撤销批准」回到待批准，再改描述",
+        generating: "正在生成：改描述会让提示词和已提交的片子对不上",
+        done: "已完成：成片已出，这条不能再改描述",
+        failed: "失败态：先点「重试」回到可编辑状态",
+    };
+    return { enabled: false, reason: reasons[s] || `当前状态（${s || "未知"}）不能改描述` };
 }
 
 /** 本地引用串形态（与 automation/local_assets.py 的 REF_RE 逐字对齐）：local:任务号/asset-uploads/16位hex.扩展名 */
