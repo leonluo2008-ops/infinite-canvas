@@ -116,7 +116,7 @@ def upload_asset(image: Path, task_id: str | None = None) -> dict:
 
     AT-14 B3 A：给 task_id 时加 X-Task-Id 头 → 服务端只落本地引用，**优先用 local
     本地引用**（提交时才装配）；不给 task_id = 旧行为，url 是公网 HTTPS 直链
-    （uguu 优先，失败降级 local-tunnel——server.py do_asset_upload），调用方须校验前缀。
+    （uguu 优先，全挂本地前置拒绝——server.py do_asset_upload），调用方须校验前缀。
     """
     encoded = urllib.parse.quote(image.name, safe="")
     headers = {"Content-Type": "application/octet-stream", "X-Filename": encoded}

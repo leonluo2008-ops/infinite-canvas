@@ -668,12 +668,11 @@ def decode_data_url(raw: str, name: str) -> tuple[bytes, str]:
 
 
 # ------------------------------------------- 参考图图床（asset/upload 与 sdgf 共用）
-# 渠道只收公网 HTTPS 直链：本地字节先留一份备份，再转传 uguu；uguu 不可用时降级到隧道直链；
-# 本机配了腾讯云 videocache 凭证时再走第三顺位。
-# **拿到 URL 必须当场验活**（AT-16 B12）：只查「是不是 https」挡不住死链——uguu 挂掉时隧道
-# 前缀照样拼出一条看着完全正常的 URL，渠道拉图失败 → 403 拒创建（auto-0043 实测）。
+# 渠道只收公网 HTTPS 直链：本地字节先留一份备份，再转传 uguu；uguu 不可用而本机又配了
+# 腾讯云 videocache 凭证时走第二顺位（出站隧道降级已废弃移除，AT-16 B12f）。
+# **拿到 URL 必须当场验活**（AT-16 B12）：只查「是不是 https」挡不住死链——格式对但拉不到
+# 的 URL 发给渠道，渠道拉图失败 → 403 拒创建（auto-0043 实测）。
 
-PUBLIC_IMAGE_TUNNEL = "https://vc-t.aistar.work/vc/"   # 图床降级直链前缀（本机 uploads/vc 的隧道入口）
 IMAGE_VERIFY_TIMEOUT = 8.0                            # 直链验活超时（秒）——验不过就当该图源不可用
 # CF 边缘对 Python-urllib 默认 UA 有内置拦截（error code 1010），验活必须带浏览器 UA
 IMAGE_VERIFY_UA = "Mozilla/5.0 (wanrepro-bridge)"
@@ -687,14 +686,14 @@ VC_UPLOAD_TIMEOUT = 60
 VC_PUBLIC_BASE = os.environ.get("WANREPRO_VC_PUBLIC_BASE", "https://vc.aistar.work/vc/")   # 渠道只收 https
 
 # 上传渠道计数（AT-14 B3 A2，/api/hub/where 透出）：local=本地引用（零图床），
-# uguu=转传成功，tunnel=降级隧道，tencent=腾讯云图床。只增不减，进程内诊断面用。
-ASSET_COUNTERS = {"local": 0, "uguu": 0, "tunnel": 0, "tencent": 0}
+# uguu=转传成功，tencent=腾讯云图床。只增不减，进程内诊断面用。
+ASSET_COUNTERS = {"local": 0, "uguu": 0, "tencent": 0}
 _ASSET_COUNTERS_LOCK = threading.Lock()
 _UGUU_LAST_ERROR = ""       # 最近一次 uguu 上传失败的短原因（人话自述用，进程内诊断面）
 
 
 def _bump_asset_counter(source: str) -> None:
-    key = {"local-tunnel": "tunnel", "tencent-videocache": "tencent"}.get(source, source)
+    key = {"tencent-videocache": "tencent"}.get(source, source)
     if key in ASSET_COUNTERS:
         with _ASSET_COUNTERS_LOCK:
             ASSET_COUNTERS[key] += 1
@@ -836,14 +835,15 @@ def _host_failure_message(tried: list[dict], skipped: list[dict]) -> str:
 def host_image_detailed(data: bytes, raw_name: str) -> dict:
     """参考图字节 → 公网 https 直链，**每个候选直链逐一验活** → {url, source, tried, skipped}。
 
-    图源顺序 uguu → 隧道 → 腾讯云 videocache（没配 TENCENT_VC_TOKEN 就如实跳过）。
-    本地一律留一份备份（uploads/vc/）——隧道源就是靠它出链。
+    图源顺序 uguu → 腾讯云 videocache（没配 TENCENT_VC_TOKEN 就如实跳过）；
+    出站隧道降级已废弃移除（AT-16 B12f）。
+    本地一律留一份备份（uploads/vc/）——M4 直链路由靠它出图。
     全部不可用抛 ImageHostError：本地前置拒绝，参考图没有公网地址就不发任何渠道请求。
     """
     safe_name = re.sub(r"[^\w.\-]", "_", raw_name or "ref.png")
     # 公网直链必须是 **ASCII 路径**：中文名的 URL 发出去要 percent-encode，渠道/隧道各按各自
     # 规矩解，实测 urllib 直接在 putrequest 上炸 UnicodeEncodeError（B12 探针撞出来的）。
-    # 本地备份也用同一个 key，于是 /vc/ 路由与隧道直链一一对得上。
+    # 本地备份也用同一个 key，于是 /vc/ 路由与备份文件一一对得上。
     stem = re.sub(r"[^0-9A-Za-z._-]", "", Path(safe_name).stem)[:40] or "ref"
     ext = Path(safe_name).suffix.lower() or ".png"
     ascii_name = f"{stem}{ext}"
@@ -873,11 +873,7 @@ def host_image_detailed(data: bytes, raw_name: str) -> dict:
         tried.append({"source": "uguu", "label": "uguu",
                       "reason": f"上传失败（{_UGUU_LAST_ERROR or '服务不可用'}）"})
 
-    got = accept("local-tunnel", "隧道", f"{PUBLIC_IMAGE_TUNNEL}{key}")   # ② 降级隧道
-    if got:
-        return got
-
-    token = os.environ.get(VC_TOKEN_ENV, "").strip()        # ③ 腾讯云 videocache
+    token = os.environ.get(VC_TOKEN_ENV, "").strip()        # ② 腾讯云 videocache
     if not token:
         skipped.append({"source": "tencent-videocache", "label": "腾讯云图床",
                         "reason": f"未配置 {VC_TOKEN_ENV}，已跳过"})
@@ -1412,7 +1408,7 @@ def sdgf_host_images(plan: dict) -> tuple[dict, list[str]]:
     换不到就报错——宁可失败也不发一条没有参考图（或图拉不到）的请求
     （那会出一版跟提示词无关的片子，渠道还会拒创建并可能扣费）。
     AT-14 B3 A5：同时返回每张图的**实际来源**（(body, sources)，序=images 序）——
-    来源 ∈ uguu / local-tunnel / tencent-videocache / url，调用点把它当 imageSources 落账。
+    来源 ∈ uguu / tencent-videocache / url，调用点把它当 imageSources 落账。
     AT-16 B12：图源全不可用时这里抛 ImageHostError（502 + stage=host_images），
     automation 认它做**前置拒绝**（零渠道请求、回 awaiting_approval），不记成「结果未知」。
     """
@@ -2117,7 +2113,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/hub/where":
             # 数据根自述（诊断面）：探针跑前据此断言「服务端写入目录 == 探针读取目录」，
             # 读/写分家的伪隔离直接拒跑（AT-14 B2 P0：真实任务 auto-0001 被误删）。
-            # AT-14 B3 A2：附上传渠道计数（local/uguu/tunnel），装配链自述可对账。
+            # AT-14 B3 A2：附上传渠道计数（local/uguu/tencent），装配链自述可对账。
             self.send_json({**hub_api.where(), "asset_counters": dict(ASSET_COUNTERS)})
             return
         m = re.fullmatch(r"/api/hub/asset-file/([^/]+)/([^/]+)", path)
@@ -2644,7 +2640,7 @@ class Handler(BaseHTTPRequestHandler):
         AT-14 B3 A 两条路（按可选头 X-Task-Id 分流，percent-encoded）：
           · 带任务号：只落本地引用（任务目录 asset-uploads/，内容寻址），**不碰任何图床、
             不写 uploads/vc**——提交时才由 generate._assemble_images 装配成渠道要的形态；
-          · 不带：旧行为一字不改（本地备份 uploads/vc + 转传 uguu，失败降级隧道直链）。
+          · 不带：旧行为一字不改（本地备份 uploads/vc + 转传 uguu，全挂本地前置拒绝）。
         2026-11-03 实测：器灵生成端拉 Cloudflare Tunnel（vc-t.aistar.work）图不稳定
         （网关过、生成挂），同图换 uguu 源即通 → 旧路全面切 uguu
         （docs/技术文档-SDGF带图生成排查与图床切换uguu-20261103.md）。

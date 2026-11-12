@@ -8,18 +8,21 @@
 403 fail_to_fetch_task 拒、思念云后台零任务。两个图源全挂——uguu /upload 404、
 降级隧道 vc-t.aistar.work HTTP 530。旧 store_public_image 只要隧道拼出的 URL 以 https
 开头就放行（**只查格式不查可达性**），死链发给渠道 → 渠道拉图失败拒创建。
+AT-16 B12f：出站隧道降级整体移除——图床链 = uguu → 腾讯云 videocache（未配如实 skipped）；
+本探针加锁「隧道删净」（server.py 源码 grep 断言，[7]）。
 
 本探针锁四态（卡片验收 ①②③④）+ 图源自述，全部走**真路**（进程内起真 HTTP 服务端、
 真 generate.do_submit、真 bridge 客户端），只把「外部世界」换成可控夹具：
 
-  [1] 双图床全挂 → 502 + stage=host_images + 人话指引，且渠道创建端点**一次都没被调用**
+  [1] uguu 挂（404）+ 腾讯云未配 → 502 + stage=host_images + 人话指引，且渠道创建端点**一次都没被调用**
   [2] 拿到 URL 但拉不到（530 / 200 但 0 字节 / 404）→ 验活拦截，不放行
   [3] 验活通过 → 正常提交链（真 do_submit + 真 run 端点；渠道拿到的是验活过的直链）
   [4] 失败路径落账：state=awaiting_approval / gen_error 带逐图源自述 /
       asset_host=这次试过的图源 / dispatch 与 submit_unknown 都不留（可改后重提 ≠ 结果未知）
-  [5] 第三图源（腾讯云 videocache）：没配凭证→人话里如实写「已跳过」（不静默）；
+  [5] 第二图源（腾讯云 videocache）：没配凭证→人话里如实写「已跳过」（不静默）；
       配了→PUT 真发出、直链验活过了才用、来源如实标 tencent-videocache
   [6] 真实数据根对账 + 夹具只删自建 + UPLOADS 打桩还原
+  [7] 隧道删净（B12f）：server.py 源码 grep 零残留（M4 下载路由与历史注释除外）
 
 守卫（硬要求）：夹具只用 auto-9831..auto-9839（隔离根内）；清理只走
 probe_guard.cleanup_created（禁裸 rmtree）；跑后 assert_no_loss。真实任务零写入。
@@ -267,7 +270,7 @@ def main() -> int:
                       "local_assets": local_assets, "submit_view": submit_view})
 
     real_uploads = server.UPLOADS
-    real_patches = (server.PUBLIC_IMAGE_TUNNEL, server.VC_UPLOAD_BASE, server.VC_PUBLIC_BASE,
+    real_patches = (server.VC_UPLOAD_BASE, server.VC_PUBLIC_BASE,
                     server.upload_uguu_bytes, server.sdgf_create, server.sdgf_run_job,
                     server._VERIFY_OPENERS)
     real_bridge_base, real_get, real_get_bytes = config.BRIDGE_BASE, bridge.get, bridge.get_bytes
@@ -298,29 +301,28 @@ def main() -> int:
         server._VERIFY_OPENERS = (HttpsShim(net.base),)   # 验活走「https」→ 本机假图床
         data_url = "data:image/png;base64," + base64.b64encode(PNG_B12).decode("ascii")
 
-        # ── [1] 双图床全挂 → 前置拒绝 + 人话指引 + 零外发 ─────────────────────
-        print("1) 双图床全挂（uguu 404 + 隧道 530）→ 前置拒绝、渠道零请求")
-        os.environ.pop("TENCENT_VC_TOKEN", None)       # 未配第三图源：必须如实说「已跳过」
+        # ── [1] uguu 挂 + 腾讯云未配 → 前置拒绝 + 人话指引 + 零外发 ────────────
+        print("1) uguu 挂（404）+ 腾讯云未配 → 前置拒绝、渠道零请求")
+        os.environ.pop("TENCENT_VC_TOKEN", None)       # 未配第二图源：必须如实说「已跳过」
         server.upload_uguu_bytes = lambda data, name: ""
         server._UGUU_LAST_ERROR = "HTTP 404"
-        server.PUBLIC_IMAGE_TUNNEL = f"{PROBE_HTTPS}dead/"
         chan.calls.clear()
         code, body = _post_run(app.base, _run_payload(data_url))
         err = str(body.get("error") or "")
-        check("[1] 双挂 → HTTP 502 + stage=host_images（机器可读，不靠文案）",
+        check("[1] 前置拒绝 → HTTP 502 + stage=host_images（机器可读，不靠文案）",
               code == 502 and body.get("stage") == "host_images",
               f"code={code} body={json.dumps(body, ensure_ascii=False)[:200]}")
         check("[1] 人话指引三要素：图床不可用 / 参考图没有公网地址 / 没发渠道请求",
               "图床不可用" in err and "参考图没有公网地址" in err and "没有向渠道发任何请求" in err,
               err[:200])
-        check("[1] 逐图源自述：uguu 上传失败（HTTP 404）+ 隧道 直链验活失败（HTTP 530）",
-              "uguu 上传失败" in err and "HTTP 404" in err and "HTTP 530" in err, err[:240])
+        check("[1] 逐图源自述：uguu 上传失败（HTTP 404），且无隧道 530 之类残留",
+              "uguu 上传失败" in err and "HTTP 404" in err and "HTTP 530" not in err, err[:240])
         check("[1] 未配腾讯云凭证 → 如实写「已跳过」，不静默",
               "未配置 TENCENT_VC_TOKEN，已跳过" in err, err[:240])
         check("[1] 渠道创建端点**零调用**（本地前置拒绝：零外发、零扣费）",
               chan.calls == [], f"被调用了 {len(chan.calls)} 次")
-        check("[1] 错误体带结构化自述（sources 两条 + skipped 一条）",
-              len(body.get("sources") or []) == 2 and len(body.get("skipped") or []) == 1,
+        check("[1] 错误体带结构化自述（sources 一条 + skipped 一条）",
+              len(body.get("sources") or []) == 1 and len(body.get("skipped") or []) == 1,
               json.dumps({"sources": body.get("sources"), "skipped": body.get("skipped")},
                          ensure_ascii=False)[:240])
 
@@ -343,19 +345,16 @@ def main() -> int:
               code == 502 and "HTTP 404" in err and chan.calls == [],
               f"code={code} err={err[:160]}")
 
-        server.upload_uguu_bytes = lambda data, name: ""
-        server._UGUU_LAST_ERROR = "HTTP 404"
-        server.PUBLIC_IMAGE_TUNNEL = f"{PROBE_HTTPS}empty/"          # 200 空体 = 文件不在
+        server.upload_uguu_bytes = lambda data, name: f"{PROBE_HTTPS}empty/ref.png"   # 200 空体 = 文件不在
         chan.calls.clear()
         code, body = _post_run(app.base, _run_payload(data_url))
         err = str(body.get("error") or "")
-        check("[2] 隧道返回 200 但 0 字节 → 同样拦下（不当活人）",
+        check("[2] uguu 返回 200 但 0 字节 → 同样拦下（不当活人）",
               code == 502 and "0 字节" in err and chan.calls == [], f"code={code} err={err[:160]}")
 
         # ── [3] 验活通过 → 正常提交链 ──────────────────────────────────────
         print("3) 验活通过 → 正常提交链（真 do_submit + 真 run 端点）")
         server.upload_uguu_bytes = lambda data, name: f"{PROBE_HTTPS}ok/ref.png"
-        server.PUBLIC_IMAGE_TUNNEL = f"{PROBE_HTTPS}dead/"
         ref = local_assets.store(TASK_CHAIN_OK, PNG_B12, "ref.png")
         tdir_ok = make_task(TASK_CHAIN_OK, ref)
         config.BRIDGE_BASE = app.base                     # bridge 客户端真打到本探针实例
@@ -381,13 +380,12 @@ def main() -> int:
               task_ok.get("asset_host") == ["uguu"], str(task_ok.get("asset_host")))
 
         # ── [4] 失败路径落账（不是「结果未知」）──────────────────────────────
-        print("4) 双挂走完整提交链 → awaiting_approval + gen_error 自述 + asset_host 落账")
-        os.environ["TENCENT_VC_TOKEN"] = "probe-vc-token"      # 本机真实状态：第三图源凭证已配
+        print("4) uguu 挂 + 腾讯直链死走完整提交链 → awaiting_approval + gen_error 自述 + asset_host 落账")
+        os.environ["TENCENT_VC_TOKEN"] = "probe-vc-token"      # 本机真实状态：第二图源凭证已配
         server.VC_UPLOAD_BASE = f"{net.base}/upload/"           # 上传走明文直连（与生产一致）
         server.VC_PUBLIC_BASE = "https://127.0.0.1:1/vc/"       # https 前缀但拉不到（生产形态）
         server.upload_uguu_bytes = lambda data, name: ""
         server._UGUU_LAST_ERROR = "HTTP 404"
-        server.PUBLIC_IMAGE_TUNNEL = f"{PROBE_HTTPS}dead/"
         ref2 = local_assets.store(TASK_CHAIN_DOWN, PNG_B12, "ref.png")
         tdir_down = make_task(TASK_CHAIN_DOWN, ref2)
         chan.calls.clear()
@@ -404,16 +402,15 @@ def main() -> int:
         check("[4] dispatch / submit_unknown 都不留（**不许**记成「结果未知」）",
               "dispatch" not in task_down and not task_down.get("submit_unknown"),
               json.dumps({k: task_down.get(k) for k in ("dispatch", "submit_unknown")}, ensure_ascii=False))
-        check("[4] gen_error 带逐图源自述（uguu / 隧道 530 / 腾讯云直链验活失败）",
+        check("[4] gen_error 带逐图源自述（uguu 上传失败 / 腾讯云直链验活失败）",
               "uguu 上传失败" in str(task_down.get("gen_error"))
-              and "HTTP 530" in str(task_down.get("gen_error"))
               and "腾讯云图床" in str(task_down.get("gen_error"))
               and "直链验活失败" in str(task_down.get("gen_error")),
               str(task_down.get("gen_error"))[:260])
-        check("[4] asset_host 落账 = 这次真试过的图源（失败路径也自述）",
-              task_down.get("asset_host") == ["uguu", "local-tunnel", "tencent-videocache"],
+        check("[4] asset_host 落账 = 这次真试过的图源（失败路径也自述，无隧道残留）",
+              task_down.get("asset_host") == ["uguu", "tencent-videocache"],
               str(task_down.get("asset_host")))
-        check("[4] 第三图源真被尝试（PUT 真发出，不是写在文案里）", len(net.puts) == 1,
+        check("[4] 第二图源真被尝试（PUT 真发出，不是写在文案里）", len(net.puts) == 1,
               f"puts={len(net.puts)}")
         check("[4] 渠道创建端点零调用", chan.calls == [], f"{len(chan.calls)} 次")
         view = submit_view.build(task_down, active_submit=False)
@@ -422,8 +419,8 @@ def main() -> int:
               json.dumps({k: view.get(k) for k in ("form", "blocks_retry", "dispatch_phase")},
                          ensure_ascii=False))
 
-        # ── [5] 第三图源：腾讯云 videocache ────────────────────────────────
-        print("5) 第三图源：配了凭证才走（PUT 真发出、验活过才用），直链死照样拦")
+        # ── [5] 第二图源：腾讯云 videocache ────────────────────────────────
+        print("5) 第二图源：配了凭证才走（PUT 真发出、验活过才用），直链死照样拦")
         os.environ["TENCENT_VC_TOKEN"] = "probe-vc-token"
         server.VC_UPLOAD_BASE = f"{net.base}/upload/"      # 上传走明文直连（与生产一致）
         server.VC_PUBLIC_BASE = f"{PROBE_HTTPS}ok/"        # 直链必须 https（渠道合同）
@@ -448,8 +445,24 @@ def main() -> int:
               f"code={code} err={err[:200]}")
         check("[5] 这次 PUT 仍真发出（换图源≠假装成功）", len(net.puts) == 1, f"puts={len(net.puts)}")
 
-        # ── [6] 对账与清理 ───────────────────────────────────────────────
-        print("6) 真实数据根对账 + 夹具只删自建")
+        # ── [6] 隧道删净（AT-16 B12f）：server.py 图床链源码零残留 ─────────
+        print("6) 隧道删净：server.py 源码 grep 断言（M4 下载路由与历史注释除外）")
+        src_lines = Path(server.__file__).read_text(encoding="utf-8").splitlines()
+        check("[6] PUBLIC_IMAGE_TUNNEL 常量零残留",
+              not any("PUBLIC_IMAGE_TUNNEL" in ln for ln in src_lines))
+        check("[6] local-tunnel 出站源零残留",
+              not any("local-tunnel" in ln for ln in src_lines))
+        tunnel_lines = [ln.strip() for ln in src_lines if "vc-t.aistar.work" in ln]
+        check("[6] vc-t.aistar.work 只剩 M4 下载路由与历史注释（逐条白名单）",
+              len(tunnel_lines) == 2
+              and all(("图床直链（M4）" in ln or "Cloudflare Tunnel" in ln) for ln in tunnel_lines),
+              str(tunnel_lines))
+        check("[6] ASSET_COUNTERS 无 tunnel 键（local/uguu/tencent 三源）",
+              set(server.ASSET_COUNTERS) == {"local", "uguu", "tencent"},
+              str(dict(server.ASSET_COUNTERS)))
+
+        # ── [7] 对账与清理 ───────────────────────────────────────────────
+        print("7) 真实数据根对账 + 夹具只删自建")
         real_after = probe_guard.projects_snapshot(real_projects)
         try:
             probe_guard.assert_no_loss(real_before, real_after)
@@ -472,7 +485,7 @@ def main() -> int:
                 if d.is_dir() and not d.is_symlink():
                     shutil.rmtree(d)
         server.UPLOADS = real_uploads
-        (server.PUBLIC_IMAGE_TUNNEL, server.VC_UPLOAD_BASE, server.VC_PUBLIC_BASE,
+        (server.VC_UPLOAD_BASE, server.VC_PUBLIC_BASE,
          server.upload_uguu_bytes, server.sdgf_create, server.sdgf_run_job,
          server._VERIFY_OPENERS) = real_patches
         config.BRIDGE_BASE = real_bridge_base

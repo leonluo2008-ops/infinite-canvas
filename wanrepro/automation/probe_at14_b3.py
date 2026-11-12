@@ -10,7 +10,7 @@
       ref_state=local；删文件后 ref_state=expired；_assemble_images 抛 GenError 含「本地资产缺失」。
   [2] 三阶段图床计数 0：①带 X-Task-Id 的上传（隔离实例走 HTTP，读 /api/hub/where 的
       asset_counters）；②replace.run_replace(confirm=False) 上传回填（bridge.upload_asset 打桩
-      返回 {local: 引用}）；③hub_api.do_approve——三阶段 uguu/tunnel 计数必须 0。
+      返回 {local: 引用}）；③hub_api.do_approve——三阶段图床计数必须 0。
   [3] 装配时序：_assemble_images 与 _dispatch_write 换记录器 → assemble < prepared < dispatched < post。
   [4] 故障矩阵 10 条（state / 创建次数 / 装配次数 / dispatch 阶段逐条对表）。
   [5] 旧 URL 三态：stub HTTP 404/500/200 → ref_state = expired/unknown/ok；
@@ -291,7 +291,7 @@ def _counting_host_stubs():
 
 
 def _isolated_upload_phase() -> bool:
-    """阶段①：隔离实例走 HTTP——带 X-Task-Id 上传只落本地引用，uguu/tunnel 计数 0。"""
+    """阶段①：隔离实例走 HTTP——带 X-Task-Id 上传只落本地引用，图床计数全 0。"""
     print("  阶段① 隔离实例 HTTP 上传（带 X-Task-Id → 只落本地引用）")
     ok = True
     tmp = Path(tempfile.mkdtemp(prefix="at14b3-iso-"))
@@ -336,9 +336,9 @@ def _isolated_upload_phase() -> bool:
                         (iso_projects / "auto-9502" / "asset-uploads" / name).is_file(), name)
             code, where2 = probe_guard.http_req(base, "/api/hub/where", timeout=10)
             counters = (where2 or {}).get("asset_counters") or {}
-            ok &= check("隔离实例三阶段计数：local=1 且 uguu/tunnel 全 0",
+            ok &= check("隔离实例三阶段计数：local=1 且 uguu/tencent 全 0",
                         counters.get("local") == 1 and counters.get("uguu") == 0
-                        and counters.get("tunnel") == 0, json.dumps(counters))
+                        and counters.get("tencent") == 0, json.dumps(counters))
     finally:
         if proc is not None:
             proc.terminate()
@@ -400,7 +400,7 @@ def probe_three_phase_counters() -> None:
     img = PROJECTS / "auto-9503.png"
     if img.is_file():
         img.unlink()
-    check("三阶段结束 uguu/tunnel 计数全 0", calls["uguu"] == 0 and calls["store"] == 0,
+    check("三阶段结束 uguu/store 计数全 0", calls["uguu"] == 0 and calls["store"] == 0,
           json.dumps(calls))
 
 
@@ -526,14 +526,15 @@ def probe_fault_matrix() -> None:
         rows.append((3, task["state"], len(stub.posts), assemble_calls["n"],
                      dispatch_phase_of(tdir)))
 
-        # ---- ④ local-tunnel 降级：uguu 空串 → sources 含 local-tunnel（不伪称 uguu）
-        # AT-16 B12 起：降级直链**必须验活**——隧道真挂着（530）时不再把死链交给调用方，
-        # 而是 ImageHostError（本地前置拒绝，零渠道请求）。这里拆两条：
-        #   ④a 隧道死 → 拒绝（新合同，B12 探针 probe_at16_b12 有真 HTTP 版）
-        #   ④b 隧道活（验活打桩）→ 来源如实标 local-tunnel（本条原本要验的「不伪称 uguu」）
+        # ---- ④ 第二图源降级：uguu 空串 → 走腾讯云 videocache（不伪称 uguu）
+        # AT-16 B12f 起：出站隧道降级已废弃移除，第二顺位是腾讯云 videocache。拆两条：
+        #   ④a uguu 挂且未配 TENCENT_VC_TOKEN → ImageHostError（skipped 如实自述，本地前置拒绝；
+        #      「格式对但拉不到不放行」的真 HTTP 版归 probe_at16_b12）
+        #   ④b 配了凭证且直链验活通过（打桩）→ 来源如实标 tencent-videocache（本条原本要验的「不伪称 uguu」）
         tid = "auto-9509"                        # 本条不建任务目录，占号只作登记顺位
         real_uguu, real_uploads = server.upload_uguu_bytes, server.UPLOADS
         real_alive = server.image_url_alive
+        real_vc, real_token = server.upload_tencent_vc, os.environ.pop("TENCENT_VC_TOKEN", None)
         tmp_up = Path(tempfile.mkdtemp(prefix="at14b3-up-"))
         server.upload_uguu_bytes = lambda data, name: ""
         server.UPLOADS = tmp_up
@@ -549,22 +550,30 @@ def probe_fault_matrix() -> None:
                 server.sdgf_host_images(plan)
             except server.ImageHostError as err:
                 refused, why = True, err.msg
-            check("④a 隧道返回死链（530）→ 拒绝放行（B12：格式对不等于拉得到）",
-                  refused and "图床不可用" in why and "HTTP 530" in why, why[:160])
+            check("④a uguu 挂且未配腾讯云凭证 → 前置拒绝（skipped 如实自述）",
+                  refused and "图床不可用" in why and "未配置 TENCENT_VC_TOKEN，已跳过" in why,
+                  why[:160])
+            os.environ["TENCENT_VC_TOKEN"] = "probe-vc-token"      # 只验来源标注，PUT 打桩不出网
+            server.upload_tencent_vc = (
+                lambda data, name, key, token: (f"https://vc.probe.invalid/vc/{key}", ""))
             server.image_url_alive = lambda url, timeout=8.0: (True, "HTTP 200")   # 只验来源标注
             try:
                 body, sources = server.sdgf_host_images(plan)
             finally:
                 server.image_url_alive = real_alive
-            check("④b uguu 空串 + 隧道验活通过 → sources 含 local-tunnel（不伪称 uguu）",
-                  "local-tunnel" in sources and "uguu" not in sources, str(sources))
-            check("④b 降级直链仍是 https（隧道前缀）",
+                server.upload_tencent_vc = real_vc
+            check("④b uguu 空串 + 腾讯云直链验活通过 → sources 含 tencent-videocache（不伪称 uguu）",
+                  "tencent-videocache" in sources and "uguu" not in sources, str(sources))
+            check("④b 降级直链仍是 https（腾讯云前缀）",
                   all(str(u).startswith("https://") for u in body.get("images") or []),
                   str(body.get("images"))[:80])
         finally:
             server.upload_uguu_bytes = real_uguu
             server.UPLOADS = real_uploads
             server.image_url_alive = real_alive
+            server.upload_tencent_vc = real_vc
+            if real_token is not None:
+                os.environ["TENCENT_VC_TOKEN"] = real_token
             shutil.rmtree(tmp_up, ignore_errors=True)
         rows.append((4, "（装配链·服务端）", 0, 0, "-"))
 
