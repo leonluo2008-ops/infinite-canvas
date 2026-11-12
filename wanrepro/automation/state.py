@@ -25,6 +25,8 @@ AT-9 增量（数据合同 B0，仅此两条）：
 """
 import hashlib
 import json
+import os
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -333,3 +335,434 @@ def probe_bridge_products(bridge_id: str) -> dict | None:
                     "has_check": bool(t.get("has_check")),
                     "has_prompt": bool(t.get("has_prompt"))}
     return None
+
+
+# ============================================================================
+# AT-18：假运行态（进程死、状态活）的「锚 + 判定 + 受控降级」
+#
+# 方案冻结稿 v2（docs/方案-假运行态判定与出清-20261112.md，卡 t_daef20d2）§1–§3。
+# 本段只做三件事，全部落在状态机模块内，其它模块只调用、不重写：
+#   · 锚：心跳侧车 `<任务目录>/心跳.json` 的读写原语（单写者、原子替换）。
+#         为什么另起文件而不写进 任务.json：transition() 是 load→改→save、**全程不持
+#         task_lock**（跨进程 CLI 也调它，线程锁根治不了），60s 心跳若也写同一份
+#         任务.json，两边必然互相覆盖——最坏情况心跳把已推进到 awaiting_assets 的
+#         状态覆盖回 discussing（状态倒退）。两个写族物理分离，读时在调用方合并。
+#   · 判定：activity_snapshot()（六源取 max）+ judge_lost_run()（纯函数，不写盘）。
+#   · 降级：fail_orphan_task()（唯一写入口；幂等；只写 5 个键，绝不删文件/产物）。
+#
+# 与 render.py 提示词链**零交集**：本段不 import render，不读不写任何渲染字段。
+# ============================================================================
+
+# 状态机里的真实运行态（与 ui/hub_api.py 的 RUNNING_STATES 同集合，但只含状态机
+# 有的三个；「ingesting」不是状态机状态，本段不认它）。
+RUNNING_STATES_MACHINE = ("discussing", "rendering", "generating")
+
+# 冻结值（方案 §2.1）：改动必须回方案评审，并重跑 tests/test_state_lostrun.py 的反例夹具。
+FAKE_RUN_SILENCE_SECONDS = 900     # 连续静默 ≥ 该值即判「假运行」（= 183s 最长合法空档的 4.9 倍）
+HEARTBEAT_SECONDS = 60             # 心跳间隔（复用 discuss.HEARTBEAT_INTERVAL=60，不新造数值）
+LOST_RUN_WATCHDOG_SECONDS = 300    # 后台对账扫描周期
+STALE_JOB_SECONDS = 900            # 僵尸 JOB 记录判定阈值（与主阈值同值，排障只记一个数）
+
+# 自动降级只覆盖这两个态（generating 永不自动降级，见 §3.2 G3）。
+FAKE_RUN_DEGRADABLE_STATES = ("discussing", "rendering")
+
+# 唯一给用户看的失败文案源（前端不得自造文案）。
+FAKE_RUN_REASONS = {
+    "discussing": "拆解进程失联，可重试或删除",
+    "rendering": "渲染进程失联，可重试或删除",
+}
+FAKE_RUN_REASON_FALLBACK = "进程失联，可重试或删除"
+
+# 活动证据六源（冻结枚举：写入 activity.source / failed_evidence.last_activity_source）。
+ACTIVITY_SOURCES = ("心跳", "状态迁移", "阶段锚", "任务目录产物", "拆解产物", "起跑锚")
+
+HEARTBEAT_FILE = "心跳.json"
+_HEARTBEAT_SCHEMA = 1
+_ARTIFACT_DEPTH = 2                # 产物清单浅扫：不递归超过 2 层
+_ARTIFACT_EXCLUDE = (_TASK_FILE, HEARTBEAT_FILE, "拆解日志.txt")   # §1.3：digest 不许自证自变
+_ACTIVITY_EXCLUDE = (_TASK_FILE, HEARTBEAT_FILE)                   # 活动证据：日志 mtime 仍算
+_ANALYSIS_REVERSE = Path(__file__).resolve().parents[1] / "analysis" / "reverse"
+
+_ORPHAN_LOCK = threading.Lock()    # 只保护 fail_orphan_task 的判定-写盘临界区；transition() 不变
+
+
+def fake_run_reason(state_name: str) -> str:
+    """该状态的失联文案（只有 discussing/rendering 有专属文案，其余给通用文案）。"""
+    return FAKE_RUN_REASONS.get(str(state_name or ""), FAKE_RUN_REASON_FALLBACK)
+
+
+# ---------------------------------------------------------------- 心跳侧车读写（锚）
+
+def heartbeat_path(task_dir: Path) -> Path:
+    return Path(task_dir) / HEARTBEAT_FILE
+
+
+def _heartbeat_blank() -> dict:
+    return {"schema": _HEARTBEAT_SCHEMA, "run_id": "", "started_at": "", "last_beat_at": "",
+            "beat_count": 0, "phase": "", "artifact_count": 0, "artifact_digest": "",
+            "ended_at": "", "outcome": ""}
+
+
+def heartbeat_read(task_dir: Path) -> dict:
+    """读心跳侧车（纯读，**不抛**）：缺文件/坏 JSON → 全空结构（=「进程从未跑起」可识别）。
+
+    全空结构 + 判定层只看 `last_beat_at`/`started_at` 是否为空，就足以把「从未起跑」
+    与「跑过但静默」分开——这正是 auto-0052 的形态所要求的。
+    """
+    out = _heartbeat_blank()
+    try:
+        raw = json.loads(heartbeat_path(task_dir).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return out
+    if not isinstance(raw, dict):
+        return out
+    for key in ("run_id", "started_at", "last_beat_at", "phase", "artifact_digest",
+                "ended_at", "outcome"):
+        value = raw.get(key)
+        out[key] = "" if value is None else str(value)
+    for key in ("schema", "beat_count", "artifact_count"):
+        try:
+            out[key] = int(raw.get(key) or 0)
+        except (TypeError, ValueError):
+            out[key] = 0
+    return out
+
+
+def _heartbeat_write(task_dir: Path, data: dict) -> dict:
+    target = heartbeat_path(task_dir)
+    tmp = target.with_name(HEARTBEAT_FILE + ".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    tmp.replace(target)            # 原子替换：中途 kill 不留半截心跳
+    return data
+
+
+def heartbeat_begin(task_dir: Path, *, run_id: str, phase: str = "") -> dict:
+    """一次 run 起手：整体覆盖写心跳（旧 run_id 作废）。**必须在起线程之前调用**。
+
+    这样「线程根本没起来」（Thread.start() 失败 / 进程在起手后崩 / 桥连不上就退出）
+    也有一份带 started_at 的心跳，判定窗口从发起时刻起算，而不是等线程内部第一次写。
+    last_beat_at 保持空串 = 本次 run 从未收到心跳（初值可被识别，不许伪造一次心跳）。
+    """
+    task_dir = Path(task_dir)
+    data = _heartbeat_blank()
+    data["run_id"] = str(run_id or "")
+    data["started_at"] = _now()
+    data["phase"] = str(phase or "")
+    data["artifact_count"], data["artifact_digest"] = _artifact_fingerprint(task_dir)
+    return _heartbeat_write(task_dir, data)
+
+
+def heartbeat_beat(task_dir: Path, *, phase: str | None = None) -> dict:
+    """一次心跳：只写心跳文件的 last_beat_at/beat_count/artifact_*（+ phase 变化时同步）。
+
+    **绝不碰 任务.json**（AT-16 B4b 合同：等待期心跳借道阶段回调会把阶段计时清零）。
+    """
+    task_dir = Path(task_dir)
+    data = heartbeat_read(task_dir)
+    data["schema"] = _HEARTBEAT_SCHEMA
+    if not data["started_at"]:
+        data["started_at"] = _now()          # 没有起手写（旧任务/异常路径）也不许伪造历史
+    data["last_beat_at"] = _now()
+    data["beat_count"] = int(data.get("beat_count") or 0) + 1
+    if phase is not None and str(phase) != "":
+        data["phase"] = str(phase)
+    data["artifact_count"], data["artifact_digest"] = _artifact_fingerprint(task_dir)
+    return _heartbeat_write(task_dir, data)
+
+
+def heartbeat_finish(task_dir: Path, *, outcome: str) -> dict:
+    """一次 run 收尾：写 ended_at + outcome（仅诊断，不参与判定）。"""
+    data = heartbeat_read(task_dir)
+    data["ended_at"] = _now()
+    data["outcome"] = str(outcome or "")
+    return _heartbeat_write(Path(task_dir), data)
+
+
+# ---------------------------------------------------------------- 产物清单与指纹（锚）
+
+def _iter_files(base: Path, *, depth: int = _ARTIFACT_DEPTH, exclude_top=()):
+    """浅层文件清单：不超 depth 层、不跟随符号链接、单条 OSError 跳过（并发删除/无权限/路径过长）。
+
+    产量 (相对路径 posix, size, mtime_ns)。目录本身不产条目——「进程从未跑起」时
+    只有空 inbox/ 目录，不该被当成产物活动。
+    """
+    base = Path(base)
+    exclude_top = frozenset(exclude_top)
+    stack = [(base, 0)]
+    while stack:
+        directory, level = stack.pop()
+        try:
+            with os.scandir(directory) as scan:
+                entries = list(scan)
+        except OSError:
+            continue                      # 目录读不了：整目录跳过，不中断判定
+        for entry in entries:
+            try:
+                if entry.is_symlink():     # 不跟随符号链接（防环、防越界）
+                    continue
+                if entry.is_dir():
+                    if level + 1 < depth:
+                        stack.append((Path(entry.path), level + 1))
+                    continue
+                if not entry.is_file():
+                    continue
+                if level == 0 and entry.name in exclude_top:
+                    continue
+                stat = entry.stat()
+            except OSError:
+                continue
+            rel = Path(entry.path).relative_to(base).as_posix()
+            yield rel, stat.st_size, stat.st_mtime_ns
+
+
+def artifact_manifest(task_dir: Path, task: dict | None = None) -> list[dict]:
+    """产物清单（口径冻结 §1.3）：任务目录（除 任务.json/心跳.json/拆解日志.txt）
+    + analysis/reverse/<bridge_id>/ 的浅层清单，元素 (相对路径, size, mtime_ns)，按路径排序。
+
+    两条排除都是硬要求：任务.json/心跳.json 会让锚自证自变；拆解日志.txt 每 60s 被心跳
+    追加，算进去则「心跳活着但产物不动」永远检不出来（日志 mtime 仍是活动证据，两套口径）。
+    """
+    task_dir = Path(task_dir)
+    items = [{"path": rel, "size": size, "mtime_ns": mtime_ns}
+             for rel, size, mtime_ns in _iter_files(task_dir, exclude_top=_ARTIFACT_EXCLUDE)]
+    bridge_id = str((task or {}).get("bridge_id") or "").strip()
+    if bridge_id:
+        base = _ANALYSIS_REVERSE / bridge_id
+        items.extend({"path": f"analysis/reverse/{bridge_id}/{rel}", "size": size,
+                      "mtime_ns": mtime_ns}
+                     for rel, size, mtime_ns in _iter_files(base))
+    items.sort(key=lambda item: item["path"])
+    return items
+
+
+def artifact_digest(task_dir: Path, task: dict | None = None) -> str:
+    """产物指纹（`sha256:` + 清单 sha256）。用途只有两条：留痕、诊断「心跳在动但产物不动」。"""
+    blob = json.dumps([[item["path"], item["size"], item["mtime_ns"]]
+                       for item in artifact_manifest(task_dir, task)],
+                      ensure_ascii=False, sort_keys=True)
+    return "sha256:" + hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def _artifact_fingerprint(task_dir: Path) -> tuple[int, str]:
+    try:
+        task = _task_or_load(task_dir, None)
+    except StateError:
+        task = {}                      # 坏任务也要能写心跳：指纹退化成「任务目录半边」
+    items = artifact_manifest(task_dir, task)
+    blob = json.dumps([[item["path"], item["size"], item["mtime_ns"]] for item in items],
+                      ensure_ascii=False, sort_keys=True)
+    return len(items), "sha256:" + hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def _max_mtime_ns(base: Path, *, exclude_top=()) -> int | None:
+    best: int | None = None
+    for _rel, _size, mtime_ns in _iter_files(base, exclude_top=exclude_top):
+        if best is None or mtime_ns > best:
+            best = mtime_ns
+    return best
+
+
+# ---------------------------------------------------------------- 活动快照与判定
+
+def _parse_iso(value) -> datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed.astimezone() if parsed.tzinfo is None else parsed
+
+
+def _iso_from_ns(mtime_ns: int) -> str:
+    return (datetime.fromtimestamp(mtime_ns / 1e9, tz=timezone.utc)
+            .astimezone().isoformat(timespec="seconds"))
+
+
+def _task_or_load(task_dir: Path, task: dict | None) -> dict:
+    return task if isinstance(task, dict) else load(Path(task_dir))
+
+
+def activity_snapshot(task_dir: Path, task: dict | None = None, *, now=None) -> dict:
+    """活动锚快照（纯读，不写盘）。六源取 max —— 「心跳与产物双零变化」的可判定写法。
+
+    判定是**时间戳证据的函数**，不是「前后两次观测的差分」：文件 mtime / 心跳时刻 /
+    history 时刻都是持久事实，所以进程或服务重启后存量任务立刻可判（不需要扫两轮）。
+    """
+    task_dir = Path(task_dir)
+    task = _task_or_load(task_dir, task)
+    now_dt = _parse_iso(now) or datetime.now(timezone.utc).astimezone()
+    scan_error = ""
+    collected: dict[str, list[str]] = {}
+
+    def _add(source: str, value) -> None:
+        if isinstance(value, str) and value.strip() and _parse_iso(value):
+            collected.setdefault(source, []).append(value.strip())
+
+    heartbeat = heartbeat_read(task_dir)
+    _add("心跳", heartbeat["last_beat_at"])
+    _add("起跑锚", heartbeat["started_at"])
+    history = task.get("history") or []
+    if isinstance(history, list) and history and isinstance(history[-1], dict):
+        _add("状态迁移", history[-1].get("at"))
+    for key in ("lapian_started_at", "lapian_stage_at"):
+        _add("阶段锚", task.get(key))
+    try:
+        latest = _max_mtime_ns(task_dir, exclude_top=_ACTIVITY_EXCLUDE)
+        if latest is not None:
+            _add("任务目录产物", _iso_from_ns(latest))
+        bridge_id = str(task.get("bridge_id") or "").strip()
+        if bridge_id:
+            latest = _max_mtime_ns(_ANALYSIS_REVERSE / bridge_id)
+            if latest is not None:
+                _add("拆解产物", _iso_from_ns(latest))
+    except OSError as exc:                      # 兜不住的单条异常：只记一条 scan_error
+        scan_error = f"{type(exc).__name__}: {exc}"
+
+    sources = {source: max(values, key=lambda v: _parse_iso(v))
+               for source, values in collected.items()}
+    if sources:
+        source = max(sources, key=lambda s: (_parse_iso(sources[s]),
+                                            -ACTIVITY_SOURCES.index(s)))
+        last_activity_at = sources[source]
+        silence_seconds = int((now_dt - _parse_iso(last_activity_at)).total_seconds())
+    else:
+        source, last_activity_at, silence_seconds = "", "", 0   # 无证据不判死（见 judge）
+
+    heartbeat_age = None
+    if _parse_iso(heartbeat["last_beat_at"]):
+        heartbeat_age = int((now_dt - _parse_iso(heartbeat["last_beat_at"])).total_seconds())
+
+    probe = {
+        "last_activity_at": last_activity_at,
+        "source": source,
+        "silence_seconds": silence_seconds,
+        "threshold_seconds": FAKE_RUN_SILENCE_SECONDS,
+        "heartbeat_at": heartbeat["last_beat_at"],
+        "heartbeat_age_seconds": heartbeat_age,
+        "heartbeat_run_id": heartbeat["run_id"],
+        "artifact_count": heartbeat["artifact_count"],
+        "artifact_digest": heartbeat["artifact_digest"],
+        "artifact_files": len(artifact_manifest(task_dir, task)),
+        "sources": sources,
+        "scanned_at": now_dt.isoformat(timespec="seconds"),
+    }
+    if scan_error:
+        probe["scan_error"] = scan_error
+    return probe
+
+
+def cloud_in_flight(task: dict) -> bool:
+    """`generating` 的云端在途证据（§3.2 G3 真值表）：有 cloud_task_id / 提交意未核销 / 结果未知。
+
+    有在途证据必须续查，判死可能导致重复付费提交（AT-13 合同）。
+    """
+    task = task or {}
+    if str(task.get("cloud_task_id") or "").strip():
+        return True
+    if dispatch_phase(task) in ("prepared", "dispatched"):
+        return True
+    return bool(task.get("submit_unknown"))
+
+
+def judge_lost_run(task: dict, probe: dict, *, now=None,
+                   held_job: bool = False) -> tuple[bool, str]:
+    """判定是否「假运行」。返回 (是否假运行, 原因码)。
+
+    原因码（冻结）：`""` 判定为假运行（可降级）／`not_running` 状态不在运行态／
+    `silence_below_threshold` 静默未满阈值／`in_flight_cloud` generating 有云端在途证据／
+    `clock_back` now < last_activity_at（时钟回拨，本轮跳过）／`held_job` 本进程内该任务的
+    job 仍活着且心跳新鲜／`manual_only_state` generating 无在途证据但自动扫描也不许降级
+    （只能走人工强制结束）。
+
+    **纯函数**：不写盘、不读 HUB_JOBS（内存态可缺失；`held_job` 由调用方作为入参传入）。
+    """
+    task = task or {}
+    probe = probe or {}
+    state_name = str(task.get("state") or "")
+    if state_name not in RUNNING_STATES_MACHINE:
+        return False, "not_running"
+    if state_name == "generating":
+        if cloud_in_flight(task):
+            return False, "in_flight_cloud"
+        return False, "manual_only_state"
+    if held_job or probe.get("held_job"):
+        return False, "held_job"
+    now_dt = _parse_iso(now) or datetime.now(timezone.utc).astimezone()
+    last_dt = _parse_iso(probe.get("last_activity_at"))
+    if last_dt is not None:
+        silence_seconds = int((now_dt - last_dt).total_seconds())
+        if silence_seconds < 0:
+            return False, "clock_back"
+    else:
+        silence_seconds = int(probe.get("silence_seconds") or 0)
+    if silence_seconds < FAKE_RUN_SILENCE_SECONDS:
+        return False, "silence_below_threshold"
+    return True, ""
+
+
+# ---------------------------------------------------------------- 受控降级（唯一写入口）
+
+def fail_orphan_task(task_dir: Path, *, reason: str, probe: dict | None = None,
+                     trigger: str = "auto_scan") -> dict:
+    """运行态 → failed 的唯一受控入口（方案 §3.3；T1/T2 两条显式边）。
+
+    返回 {"changed": bool, "state": "failed", "state_was": str, "reason": str, "at": iso}
+    · 已是 failed → changed=False / already=True，**不写 history、不刷新 failed_at**（幂等）；
+    · 状态不在运行态 → StateError("任务当前不是运行态（<state>）")；
+    · trigger="auto_scan" 时在写盘前**重新过一遍守卫**（G1 运行态 / G2 静默 ≥900s /
+      G3 无在途证据 / G4 调用方传入的 held_job），未过即拒降级——守卫不只在扫描器里；
+    · 只写 5 个键：state / history(追加一条) / failed_reason / failed_at / failed_evidence；
+    · **绝不**：删文件、清 pending_replace、清 approval、动产物、动 lapian_*。
+
+    为什么不用 transition()：它的 failed 边是「任意态可进」，会把判定窗口内**并发推进**
+    到 awaiting_assets 的任务也判死。这里写盘形态与 transition() 完全一致（history 同形状
+    + 一次 save），但在写盘前重读校验起态未变；起态变了 → 放弃本轮（changed=False）。
+    """
+    task_dir = Path(task_dir)
+    with _ORPHAN_LOCK:
+        task = load(task_dir)
+        state_was = task["state"]
+        if state_was == "failed":
+            return {"changed": False, "already": True, "state": "failed",
+                    "state_was": "failed",
+                    "reason": str(task.get("failed_reason") or ""),
+                    "at": str(task.get("failed_at") or "")}
+        if state_was not in RUNNING_STATES_MACHINE:
+            raise StateError(f"任务当前不是运行态（{state_was}）")
+        reason = str(reason or "").strip() or fake_run_reason(state_was)
+        if trigger == "auto_scan":
+            snapshot = probe if isinstance(probe, dict) else activity_snapshot(task_dir, task)
+            lost, reason_code = judge_lost_run(task, snapshot,
+                                               held_job=bool(snapshot.get("held_job")))
+            if not lost:
+                raise StateError(f"未达假运行判定（{reason_code or 'unknown'}），拒绝降级")
+            probe = snapshot
+        probe = probe or {}
+        at = _now()
+        evidence = {
+            "trigger": str(trigger or "auto_scan"),
+            "silence_seconds": int(probe.get("silence_seconds") or 0),
+            "last_activity_at": str(probe.get("last_activity_at") or ""),
+            "last_activity_source": str(probe.get("source") or ""),
+            "heartbeat_at": str(probe.get("heartbeat_at") or ""),
+            "threshold_seconds": FAKE_RUN_SILENCE_SECONDS,
+            "run_id": str(probe.get("heartbeat_run_id") or ""),
+            "decided_at": at,
+        }
+        fresh = load(task_dir)
+        if fresh.get("state") != state_was:
+            return {"changed": False, "already": fresh.get("state") == "failed",
+                    "state": str(fresh.get("state") or ""), "state_was": state_was,
+                    "reason": str(reason or ""), "at": at}
+        task["state"] = "failed"
+        task.setdefault("history", []).append({"at": at, "from": state_was,
+                                              "to": "failed", "note": str(reason)})
+        task["failed_reason"] = str(reason)
+        task["failed_at"] = at
+        task["failed_evidence"] = evidence
+        save(task_dir, task)
+        return {"changed": True, "already": False, "state": "failed",
+                "state_was": state_was, "reason": str(reason), "at": at,
+                "evidence": evidence}
+
