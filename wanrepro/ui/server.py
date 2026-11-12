@@ -56,8 +56,13 @@ import hub_api  # noqa: E402 —— 自动化工作台业务层（内部自行�
 os.environ["PYTHONPATH"] = _NOWINDOW_DIR + (os.pathsep + os.environ["PYTHONPATH"] if os.environ.get("PYTHONPATH") else "")
 import sitecustomize  # noqa: E402  （_nowindow 目录；import 即安装 subprocess 无窗口补丁）
 from automation import config as auto_config, local_assets  # noqa: E402  AT-14 B3 本地资产（config.PROJECTS_DIR 与 hub TASKS_DIR 同源）
+from automation import replace as auto_replace          # noqa: E402  AT-22 B0 清单写锁（两链同一把）
 
-ANALYSIS = ROOT / "analysis" / "reverse"
+# 拆解产物根：与 hub_api._analysis_reverse / replace.analysis_root / state 同一真源
+# （`WANREPRO_ANALYSIS_ROOT` 优先）。为什么画布链也要认它：清单是本模块与 hub 链共写的
+# 同一份文件，根不一致 = 读 A 写 B 的伪隔离（隔离探针会打到真实 analysis/reverse）。
+_ANALYSIS_ENV = (os.environ.get("WANREPRO_ANALYSIS_ROOT") or "").strip()
+ANALYSIS = Path(_ANALYSIS_ENV).expanduser() if _ANALYSIS_ENV else ROOT / "analysis" / "reverse"
 RAW = ROOT / "原始资料"
 UPLOADS = ROOT / "uploads"                 # 界面上传的新视频落这里；原始资料/ 一个字节不动
 TEMPLATES = ROOT / "templates"
@@ -336,10 +341,17 @@ def ensure_checklist_width(cells: list[str]) -> None:
 
 
 def _update_checklist_cell(task_id: str, no: int, index: int, value: str) -> bool:
+    """改清单第 no 行的第 index 列（画布链唯一写口）。
+
+    AT-22 B0（双路审计 M-3）：**读-改-整文件重写全程持 `replace.CHECKLIST_LOCK`**——hub 链
+    `set_asset → replace.set_row/set_group_write` 写的是同一份 `待确认清单.md`，从前这里用的是
+    本模块自己的 WRITE_LOCK，两把锁互不相识，并发即后写者覆盖先写者。WRITE_LOCK 从此只罩
+    资产图/视频等文件写，不再罩清单（锁序单向：task_lock → CHECKLIST_LOCK，画布链不持后者反要前者）。
+    """
     path = task_dir(task_id) / "待确认清单.md"
     if not path.is_file():
         raise ApiError(404, "待确认清单.md 不存在，先跑一次拆解")
-    with WRITE_LOCK:
+    with auto_replace.CHECKLIST_LOCK:
         lines = read_text(path).splitlines()
         for i, raw in enumerate(lines):
             cells = table_cells(raw)

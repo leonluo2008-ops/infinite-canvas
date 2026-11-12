@@ -2346,6 +2346,13 @@ def _display_refs(urls: list) -> list[str]:
     return out
 
 
+# AT-22 B0 顺带项（双路审计 m-3）：清单进入「批准 / 生成中」之后，置换台的三支写
+# （重传图 / 沿用清空 / 改命名）一律拒绝——提交只读 `assets_confirmed` 快照，改清单不会拦住
+# 在跑的付费提交，却会让自检重放口径与快照漂移。出口照人话说：撤销批准后可改；要换图走重试
+# 或复用为新版本。`done`/`failed` 的出口命名随 B3 单一写路径统一收口（拍板清单 §四）。
+ASSET_WRITE_LOCKED_STATES = ("approved", "generating")
+
+
 def set_asset(local_id: str, n: int, *, image_url: str | None = None,
               clear: bool = False, text: str | None = None,
               decision: str | None = None) -> dict:
@@ -2360,6 +2367,8 @@ def set_asset(local_id: str, n: int, *, image_url: str | None = None,
     该行在确认组里（sidecar『同实体确认』）→ 图/文走 replace.set_group_write 单点整组联动；
     decision 走行级路径且**拒绝组内行**（组=原子单位，组内单行降级先拆开——AT-11 §3.2）；
     decision 需 awaiting_assets（确认后覆盖表锁定不可改——B2 次序合同）；
+    image_url / clear / text 三支在 approved/generating 态一律拒绝（AT-22 B0 顺带项 m-3：
+    批准后清单与自检重放口径绑定，改清单只会让口径漂移）；
     疑似（同实体疑似）**不联动**——单行照常，别的行一个字不动。
 
     B5 复用说明：不新建端点——既有 set_asset 已有任务锁/行号校验/前端 postHubAsset 传输层；
@@ -2385,9 +2394,9 @@ def set_asset(local_id: str, n: int, *, image_url: str | None = None,
             raise HubError("image_url 必须是公网 HTTPS 或本地引用 "
                            f"local:任务号/asset-uploads/文件名：{image_url!r}")
     with task_lock(local_id):
+        task = state.load(task_dir)
         if decision is not None:
             # ---- AT-11 §3.2/§3.5：单行降级/恢复（行决策覆盖） ----
-            task = state.load(task_dir)
             if task["state"] != "awaiting_assets":
                 raise HubError(f"行决策需 awaiting_assets（确认后覆盖表锁定不可改），"
                                f"当前 {task['state']}")
@@ -2405,6 +2414,12 @@ def set_asset(local_id: str, n: int, *, image_url: str | None = None,
             return {"ok": True, "task_id": local_id, "n": n, "决策": decision,
                     "覆盖": {str(k): v for k, v in sorted(saved.items())},
                     "锁点剩余": lock_remaining(bridge)}
+        # ---- m-3：图/清空/命名三支的状态守卫（decision 分支上面另有自己的矩阵）----
+        if task["state"] in ASSET_WRITE_LOCKED_STATES:
+            where = "生成中" if task["state"] == "generating" else "已批准待生成"
+            raise HubError(
+                f"任务{where}，清单已锁定不可改（第 {n} 行原样保留）："
+                f"先在画布撤销批准再改；要换图请走重试或复用为新版本")
         try:
             members = replace.group_members(bridge, n)
             if len(members) >= 2:

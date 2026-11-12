@@ -19,8 +19,10 @@ P1（置换场所）所有者挂起中：本模块是「输入面 A=交 Agent」
 """
 import argparse
 import json
+import os
 import re
 import sys
+import threading
 from pathlib import Path
 
 from . import bridge, config, local_assets, state
@@ -36,9 +38,35 @@ class ReplaceError(RuntimeError):
     pass
 
 
+# ── 清单写锁（AT-22 B0 / 双路审计 M-3）──────────────────────────────────────
+# 同一份 `analysis/reverse/<bridge_id>/待确认清单.md` 有两条写路径：
+#   · hub 链  hub_api.set_asset → replace.set_row / set_group_write（读-改-整文件重写）；
+#   · 画布链  server._update_checklist_cell ← set_checklist_image/desc/name
+#     （`name_and_store` 每次上传自动预填描述，是高频写者）。
+# 两条链跑在**同一个 server 进程**里（server.py 开头 import hub_api），从前各持一把互不相识的
+# 锁（hub 链 task_lock(local_id)、画布链 server.WRITE_LOCK），并发时后写者把先写者的整份重写
+# 覆盖掉 = 丢更新。锁放在本模块：清单的唯一读写原语都在这里，hub_api/server 都已经是它的下游，
+# 谁都不用为拿锁多引一个模块。
+# 用 RLock 而不是 Lock：set_group_write 在一把锁内逐行调 set_row（整组=一次原子写），
+# 同一线程必须能重入。锁序只有 task_lock → CHECKLIST_LOCK 一个方向（画布链不反持 task_lock），
+# 不会出现环。CLI 回填 run_replace 的「上传期间长窗口」不在此锁范围内（属 B3 单一写路径收口）。
+CHECKLIST_LOCK = threading.RLock()
+
+
+def analysis_root() -> Path:
+    """拆解产物根：`WANREPRO_ANALYSIS_ROOT` 优先，否则 ROOT/analysis/reverse。
+
+    与 `ui/hub_api._analysis_reverse()`、`automation/state._ANALYSIS_REVERSE` **同一真源**：
+    清单是本模块写的、hub_api 读的同一份文件，根不一致就是「读 A 写 B」的伪隔离
+    （probe_guard 记的那类事故），所以这条也认环境变量，探针/自托管才能把父子一起指向临时根。
+    """
+    env = (os.environ.get("WANREPRO_ANALYSIS_ROOT") or "").strip()
+    return Path(env).expanduser() if env else Path(__file__).resolve().parent.parent / "analysis" / "reverse"
+
+
 def checklist_path(bridge_id: str) -> Path:
-    # ROOT=wanrepro（automation 包的上一级）；桥任务目录 analysis/reverse/<id>/
-    p = Path(__file__).resolve().parent.parent / "analysis" / "reverse" / bridge_id / LIST_NAME
+    # 桥任务目录 analysis/reverse/<id>/（根可注入，见 analysis_root）
+    p = analysis_root() / bridge_id / LIST_NAME
     if not p.is_file():
         raise ReplaceError(f"找不到清单 {p}（任务是否已拆解？）")
     return p
@@ -113,14 +141,17 @@ def set_row(bridge_id: str, no: int, *, image_urls: list[str] | None = None,
     """定向写清单一行（AT-8 置换台写路径）：资产图列覆盖/清空 + 命名列。返回写后该行。
 
     写路径格式定死（数据合同 v3）：前端先走 uguu 拿 URL，再调这里写 md；不新增 multipart。
+    AT-22 B0：读-改-整文件重写**全程持 CHECKLIST_LOCK**（与画布链 `_update_checklist_cell`
+    同一把锁）——读在锁内才是关键：锁外读、锁内写照样丢更新。
     """
     if image_urls is None and name is None:
         raise ReplaceError("没有要写的东西：给 image_urls 或 name 之一")
     path = checklist_path(bridge_id)
-    before = path.read_text(encoding="utf-8")
-    after = fill_row(before, no, list(image_urls or []), name, overwrite=overwrite)
-    if after != before:
-        path.write_text(after, encoding="utf-8")
+    with CHECKLIST_LOCK:
+        before = path.read_text(encoding="utf-8")
+        after = fill_row(before, no, list(image_urls or []), name, overwrite=overwrite)
+        if after != before:
+            path.write_text(after, encoding="utf-8")
     row = next((r for r in parse_rows(after) if r["no"] == no), None)
     if row is None:
         raise ReplaceError(f"清单里没有第 {no} 行")
@@ -133,8 +164,7 @@ GROUPS_KEY = "同实体确认"          # sidecar 顶层键：[[1,11],...]（数
 
 
 def sidecar_path(bridge_id: str) -> Path:
-    return (Path(__file__).resolve().parent.parent / "analysis" / "reverse"
-            / bridge_id / "待确认清单.json")
+    return analysis_root() / bridge_id / "待确认清单.json"
 
 
 def load_groups(bridge_id: str) -> list[list[int]]:
@@ -307,16 +337,19 @@ def set_group_write(task_dir: Path, no: int, *, image_url: str | None = None,
     if len(members) < 2:
         raise ReplaceError(f"第 {no} 行不在任何确认组里（疑似不联动，先在详情页成组）")
     rows: list[dict] = []
-    for m in members:
-        try:
-            if image_url is not None:
-                rows.append(set_row(bridge, m, image_urls=[image_url], overwrite=True))
-            elif clear:
-                rows.append(set_row(bridge, m, image_urls=[], overwrite=True))
-            else:
-                rows.append(set_row(bridge, m, name=str(text or "")))
-        except ReplaceError as e:
-            raise ReplaceError(f"组 {members} 写清单在第 {m} 行失败（不报整组成功）: {e}") from None
+    # AT-22 B0：整组写在同一把清单锁内（RLock 可重入）——组是原子单位，不许画布链的清单写
+    # 插进组内两行之间。锁只罩「读-改-写清单」，上传流水/任务文件在锁外照旧。
+    with CHECKLIST_LOCK:
+        for m in members:
+            try:
+                if image_url is not None:
+                    rows.append(set_row(bridge, m, image_urls=[image_url], overwrite=True))
+                elif clear:
+                    rows.append(set_row(bridge, m, image_urls=[], overwrite=True))
+                else:
+                    rows.append(set_row(bridge, m, name=str(text or "")))
+            except ReplaceError as e:
+                raise ReplaceError(f"组 {members} 写清单在第 {m} 行失败（不报整组成功）: {e}") from None
     # 同步上传流水（语义同 _record_pending：清=撤流水；传图=落流水；命名=改已有流水）
     pending = [dict(x) for x in (task.get("pending_replace") or []) if isinstance(x, dict)]
     descs = {r["no"]: r.get("desc") or "" for r in rows}
