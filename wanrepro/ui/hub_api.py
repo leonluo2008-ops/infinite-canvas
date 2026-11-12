@@ -585,10 +585,20 @@ def _job_local_id(value) -> str:
 
 DISCUSS_LOG = "拆解日志.txt"
 
-# DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP（Windows）/ start_new_session（POSIX）：
+# 进程分离标志（Windows 用 creationflags / POSIX 用 start_new_session）：
 # 执行体必须活过 server 的 Ctrl+C 与重启——「重启即接管」的前提正是「停服不打断执行体」。
+#
+# Windows 上**不能**用 DETACHED_PROCESS（AT-19 原来那版，实测在黑窗缺陷里现形）：
+#   DETACHED_PROCESS 让 console 子进程处在「无控制台」状态，而 Win11 默认终端（Windows Terminal
+#   接管新控制台会话）会为这种状态下启动的 console 应用新开一个终端窗口；执行体的 stdout/stderr
+#   又已合流到 拆解子进程日志.txt，于是窗口里什么都不显示 —— 就是用户看到的「纯黑控制台窗口」。
+#   而且 CREATE_NO_WINDOW 在 DETACHED_PROCESS 下被 Win32 **忽略**（文档明说），
+#   所以「DETACHED_PROCESS | CREATE_NO_WINDOW」治不了它（实测仍弹窗）。
+# 正确组合 = CREATE_NO_WINDOW（不起控制台，因而没有窗口，也不受默认终端接管）
+#            | CREATE_NEW_PROCESS_GROUP（父控制台的 Ctrl+C / Ctrl+Break 不打到执行体）。
+# 分离语义不变：子进程不共享父的控制台/进程组，父进程退出不会带走它。
 if os.name == "nt":
-    _DETACH_FLAGS = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+    _DETACH_FLAGS = subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
     _DETACH_SESSION = False
 else:
     _DETACH_FLAGS = 0
@@ -644,7 +654,7 @@ def _spawn_process(task_dir: Path, *, kind: str, argv_builder) -> dict:
 
     写序写死（任何一步失败都留得下可判定痕迹）：
       T0  heartbeat_begin(exec="child") + 任务.json.exec_run_id=run_id   ← Popen 之前
-      T0+ Popen（DETACHED / start_new_session）→ pid_created_at → heartbeat_attach
+      T0+ Popen（Windows: CREATE_NO_WINDOW|CREATE_NEW_PROCESS_GROUP / POSIX: setsid）→ pid_created_at → heartbeat_attach
       之后 父进程**不再写心跳**，beat/finish/退出码全归子进程（单写者合同）
     """
     job_id = uuid.uuid4().hex[:12]
