@@ -58,6 +58,16 @@ def _analysis_reverse() -> Path:
 
 # 提交互斥：同一时刻只允许一个生成在跑（付费红线；桥端兜底，automation 内部还有并发闸）
 HUB_JOBS: dict[str, dict] = {}
+# ── JOB 生命周期合同（审计 t_408a0867）───────────────────────────────────────────
+#   · 创建：只许 `_spawn`（线程模式）/ `_spawn_process`（独立子进程模式）两处；
+#   · 终态：只许 `_finalize_job(status=...)`，取值 ∈ JOB_TERMINAL_STATUSES
+#     （done / failed / force_finished）——线程返回、异常、派发失败、reap、人工强制结束
+#     一律走它，任何路径都不许再直接写 `rec["status"]` 的终态；
+#   · 活跃判定：只许 `_job_blocks_retry` / `_job_alive`（60s 启动宽限 + 900s 心跳豁免）。
+#     `_active_submit`（付费提交闸）也走它；真在跑的线程 job 由 `_spawn` 的周期心跳续打，
+#     所以「心跳新鲜」对线程 job 恒等价于「真的还在跑」。
+#   · 记录只在**进程内存**里：进程退出即消失，不许当业务真源（真源=任务.json + 磁盘证据）。
+JOB_TERMINAL_STATUSES = ("done", "failed", "force_finished")   # 末项与 FORCE_FINISH_JOB_STATUS 同值
 _SUBMIT_LOCK = threading.Lock()
 
 # 任务级串行锁（AT-9 §六层3）：同一任务的写路径（贴图/成组/解组/确认/回退/删除）串行，
@@ -473,10 +483,19 @@ def _prompt_path(task_dir: Path, task: dict) -> Path:
     return task_dir / "提示词.md"
 
 
-def _active_submit(local_id: str) -> bool:
-    """该任务是否有活跃提交占用（HUB_JOBS 运行中）——孤儿三步判定第①步的数据源。"""
-    return any(rec.get("local_id") == local_id and rec.get("status") == "running"
-               for rec in list(HUB_JOBS.values()))
+def _active_submit(local_id: str, *, heartbeat_at: str = "") -> bool:
+    """该任务是否有活跃提交占用 —— 判定口径与重试守卫/删除合同**同一份**（`_job_blocks_retry`）。
+
+    为什么不另写一套「status==running 就算」：付钱动作既不能被一条永久 running 的残留记录
+    锁死（本审计的根因），也不能因为「真在跑但没打心跳」被放宽。两条都由同一个谓词兜住：
+      · 真在跑的线程 job 由 `_spawn` 的 60s 周期心跳续打 → 心跳新鲜 = 真的还在跑；
+      · 僵尸（线程没了/进程重启前的残影）心跳超 900s → 豁免。
+    `start_submit` / `revoke_approval` / `recover_orphan` / 读面 `submit_view` 共用本函数。
+    """
+    if not heartbeat_at:
+        heartbeat_at = str(state.heartbeat_read(Path(TASKS_DIR) / local_id).get("last_beat_at") or "")
+    return any(_job_alive(rec, heartbeat_at=heartbeat_at)
+               for _, rec in _job_running_records(local_id))
 
 
 def _submit_block_kind(task: dict, local_id: str) -> str:
@@ -571,6 +590,39 @@ def do_ingest(video_path: Path, intent: str) -> dict:
         raise HubError(str(e)) from None
 
 
+def _finalize_job(job_id: str, status: str, *, note: str = "", local_id: str | None = None,
+                  kind: str | None = None, **fields) -> dict | None:
+    """HUB_JOBS 的**唯一终态出口**（合同见模块顶部 HUB_JOBS 声明处）。
+
+    · 只接受 JOB_TERMINAL_STATUSES 里的取值——传 running 是调用点写错了，当场 ValueError；
+    · **就地 update，绝不换 dict 对象**：后台线程（_spawn.wrap / _reap）按 job_id 持引用回写，
+      换对象会让它们手持孤本；
+    · **首个终态即权威**：人工 force_finished 之后，晚到的后台线程不得把它翻回 done/failed
+      （文件侧终态才是业务真源，内存记录只作落账面）；冲突原文记进 `terminal_conflict`；
+    · 记录不在（进程重启/被清）：给了 local_id+kind 才据此补一条，否则直接返回 None——
+      不凭空给已不存在的 job 造记录。
+    """
+    if status not in JOB_TERMINAL_STATUSES:
+        raise ValueError(f"job 终态只许 {JOB_TERMINAL_STATUSES}，收到「{status}」"
+                         "（创建请走 _spawn / _spawn_process）")
+    rec = HUB_JOBS.get(job_id)
+    if rec is None:
+        if local_id is None or kind is None:
+            return None
+        rec = HUB_JOBS.setdefault(job_id, {"local_id": local_id, "kind": kind, "started": _now()})
+    current = rec.get("status")
+    if current in JOB_TERMINAL_STATUSES:
+        if current != status:
+            fields.setdefault("terminal_conflict", f"{current}→{status}")
+    else:
+        rec["status"] = status
+    if note:
+        rec.setdefault("finish_note", note)
+    rec.setdefault("ended", _now())
+    rec.update(fields)
+    return rec
+
+
 def _spawn(job_kind: str, target, *args, heartbeat_dir: Path | None = None) -> dict:
     """统一异步：后台线程跑 target，HUB_JOBS 记状态，错误原文进 job。
 
@@ -578,7 +630,13 @@ def _spawn(job_kind: str, target, *args, heartbeat_dir: Path | None = None) -> d
     必须脱敏后再存，traceback 不许裸存（R1 实证裸 traceback 会把 key 原样带出去）。
 
     heartbeat_dir（AT-18 §1.4 ③）：非 None 时**在起线程之前**写一份带 started_at 的心跳，
-    这样「线程根本没起来」也留得下起跑锚（auto-0052 形态的可判定前提）。
+    这样「线程根本没起来」也留得下起跑锚（auto-0052 形态的可判定前提）；线程起来后由
+    本函数另起一个 60s 周期续打线程——目标体可能长时间没有阶段/进度回调（万相提交 pct
+    恒 None、渲染只打首尾），只靠目标侧 _heart 会让心跳在 900s 后判僵，把「真在跑」误判成
+    「不活跃」（`_job_blocks_retry` 是唯一判据，`_active_submit` 付费闸也读它）。
+
+    终态**只经 `_finalize_job`**：正常返回 / 任何异常（含 SystemExit 这类 BaseException）/
+    线程起不来三条路都必须落终态，否则记录会永久停在 running（本审计的根因）。
     """
     job_id = uuid.uuid4().hex[:12]
     HUB_JOBS[job_id] = {"status": "running", "kind": job_kind, "started": _now(),
@@ -589,16 +647,43 @@ def _spawn(job_kind: str, target, *args, heartbeat_dir: Path | None = None) -> d
         except Exception as exc:  # noqa: BLE001 —— 锚写失败照实报，但不挡真正的工作
             print(f"[hub] 心跳起手写失败（{job_kind}/{job_id}）：{exc}", file=sys.stderr)
 
+    beat_stop = threading.Event()
+    if heartbeat_dir is not None:
+        def _beat_loop() -> None:
+            while not beat_stop.wait(HEARTBEAT_SECONDS):
+                rec = HUB_JOBS.get(job_id) or {}
+                # 记录已进终态（含人工 force_finished）→ 本线程不再是活执行体，立刻停打。
+                # 否则「人工结束」后侧车每 60s 被自家续打线程刷新鲜，心跳半边等于没闭环。
+                if rec.get("status") != "running":
+                    return
+                try:
+                    state.heartbeat_beat(heartbeat_dir, expected_run_id=job_id)
+                except OSError:
+                    return                # 心跳写不了不拖垮工作；真跑完时终态仍照写
+        threading.Thread(target=_beat_loop, daemon=True, name=f"hub-beat-{job_id}").start()
+
     def wrap():
         try:
             result = target(*args)
-            HUB_JOBS[job_id].update({"status": "done", "result": result, "ended": _now()})
-        except Exception as e:  # noqa: BLE001 —— 失败原文如实进 job，不吞
-            HUB_JOBS[job_id].update({"status": "failed",
-                                     "error": generate.safe_error(f"{e}", "", 2000),
-                                     "stderr": generate.safe_error(traceback.format_exc(), "", 2000),
-                                     "ended": _now()})
-    threading.Thread(target=wrap, daemon=True, name=f"hub-{job_kind}-{job_id}").start()
+        except BaseException as e:  # noqa: BLE001 —— 失败原文如实进 job，不吞；BaseException 也要落终态
+            _finalize_job(job_id, "failed",
+                          error=generate.safe_error(f"{e}", "", 2000),
+                          stderr=generate.safe_error(traceback.format_exc(), "", 2000))
+            if not isinstance(e, Exception):
+                raise                 # 非普通异常（SystemExit 等）照常冒泡给线程 excepthook
+        else:
+            _finalize_job(job_id, "done", result=result)
+        finally:
+            beat_stop.set()
+
+    try:
+        threading.Thread(target=wrap, daemon=True, name=f"hub-{job_kind}-{job_id}").start()
+    except RuntimeError as exc:          # 线程起不来 = 这一轮根本没跑：当场落终态，绝不留 running
+        beat_stop.set()
+        if heartbeat_dir is not None:
+            _heartbeat_end(heartbeat_dir, "spawn_failed", expected_run_id=job_id, exit_code=-1)
+        _finalize_job(job_id, "failed", error=f"后台线程起不来：{exc}")
+        raise HubError(f"后台线程起不来（{job_kind}）：{exc}") from None
     return {"job_id": job_id}
 
 
@@ -648,9 +733,8 @@ def _spawn_failed(task_dir: Path, *, kind: str, local_id: str, run_id: str,
                                exit_code=-1)
     except OSError:
         pass
-    HUB_JOBS[run_id] = {"status": "failed", "kind": kind, "started": _now(),
-                        "local_id": local_id, "mode": "process", "pid": None,
-                        "error": message, "ended": _now()}
+    _finalize_job(run_id, "failed", local_id=local_id, kind=kind, mode="process", pid=None,
+                  error=message)
     print(f"[hub] 执行体启动失败（{local_id}）：{message}", file=sys.stderr)
     return {"job_id": run_id, "mode": "process", "pid": None, "error": message}
 
@@ -659,21 +743,21 @@ def _reap(proc, job_id: str, local_id: str) -> None:
     """父进程唯一的后台动作：等子进程退出并回写 job 记录（不持有执行体、不写任务状态）。
 
     没有它 `/api/hub/job/<id>` 会永久 running（v1 只 poll + 关句柄的老问题）。
+    终态一律经 `_finalize_job`；`proc.wait()` 自己失败也落 failed，绝不让记录停在 running。
     """
+    code = None
+    fields: dict = {"pid": proc.pid, "mode": "process"}
     try:
         code = proc.wait()
     except Exception as exc:  # noqa: BLE001
-        code = None
-        rec = HUB_JOBS.get(job_id) or {}
-        rec.update({"error": f"等待执行体失败：{type(exc).__name__}: {exc}"})
-        HUB_JOBS[job_id] = rec
+        fields["error"] = f"等待执行体失败：{type(exc).__name__}: {exc}"
+    fields["exit_code"] = code
     rec = HUB_JOBS.get(job_id) or {}
-    rec.update({"status": "done" if code == 0 else "failed", "exit_code": code,
-                "ended": _now(), "pid": proc.pid, "local_id": local_id,
-                "kind": rec.get("kind", "hub-discuss"), "mode": "process"})
-    if code not in (0, None):
-        rec.setdefault("error", f"执行体退出码 {code}（详见 {state.CHILD_LOG_FILE}）")
-    HUB_JOBS[job_id] = rec
+    job_kind = str(rec.get("kind") or "hub-discuss")
+    if code not in (0, None) and not rec.get("error"):
+        fields["error"] = f"执行体退出码 {code}（详见 {state.CHILD_LOG_FILE}）"
+    _finalize_job(job_id, "done" if code == 0 else "failed",
+                  local_id=local_id, kind=job_kind, **fields)
 
 
 def _spawn_process(task_dir: Path, *, kind: str, argv_builder) -> dict:
@@ -697,7 +781,11 @@ def _spawn_process(task_dir: Path, *, kind: str, argv_builder) -> dict:
         print(f"[hub] 心跳起手/令牌写失败（{kind}/{job_id}）：{exc}", file=sys.stderr)
     HUB_JOBS[job_id] = {"status": "running", "kind": kind, "started": _now(),
                         "local_id": local_id, "mode": "process", "pid": None}
-    argv = argv_builder(job_id)
+    try:
+        argv = argv_builder(job_id)
+    except Exception as exc:  # noqa: BLE001 —— 命令拼不出来 = 派发失败，必须落终态
+        return _spawn_failed(task_dir, kind=kind, local_id=local_id, run_id=job_id,
+                             message=f"命令行构造失败：{type(exc).__name__}: {exc}")
     env = {**os.environ,
            "PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1", "PYTHONUNBUFFERED": "1",
            "WANREPRO_EXEC_RUN_ID": job_id,
@@ -729,11 +817,22 @@ def _spawn_process(task_dir: Path, *, kind: str, argv_builder) -> dict:
         except OSError:
             pass
     created = state.pid_created_at(proc.pid)          # OS creation time（X5：不许子进程自报）
-    state.heartbeat_attach(task_dir, run_id=job_id, pid=proc.pid,
-                           pid_created_at=created)
+    try:
+        state.heartbeat_attach(task_dir, run_id=job_id, pid=proc.pid,
+                               pid_created_at=created)
+    except Exception as exc:  # noqa: BLE001 —— 附着失败不许让记录停在 running：reaper 兜底终态
+        HUB_JOBS[job_id]["attach_error"] = f"{type(exc).__name__}: {exc}"
+        print(f"[hub] 心跳附着失败（{kind}/{job_id}）：{exc}", file=sys.stderr)
     HUB_JOBS[job_id]["pid"] = proc.pid
-    threading.Thread(target=_reap, args=(proc, job_id, local_id), daemon=True,
-                     name=f"hub-reap-{job_id}").start()
+    try:
+        threading.Thread(target=_reap, args=(proc, job_id, local_id), daemon=True,
+                         name=f"hub-reap-{job_id}").start()
+    except RuntimeError as exc:
+        # 没有 reaper 就没有终态出口：当场落 failed，并在记录里点名「子进程仍在跑」。
+        _finalize_job(job_id, "failed",
+                      error=f"回收线程起不来：{exc}（执行体 pid={proc.pid} 仍在跑，"
+                            f"任务状态由磁盘证据接管）")
+        return {"job_id": job_id, "mode": "process", "pid": proc.pid, "run_id": job_id}
     return {"job_id": job_id, "mode": "process", "pid": proc.pid, "run_id": job_id}
 
 
@@ -1409,28 +1508,24 @@ def _finish_running_jobs(local_id: str, *, note: str) -> list[str]:
     """人工强制结束的**内存半边**：把 HUB_JOBS 里该任务残存的 running 记录当场置终态。
 
     为什么必须有这一半：force_finish 只把 任务.json 置 failed，`HUB_JOBS` 的 job 记录仍挂着
-    status="running"；而 `_job_running_records`（重试守卫）与 `_active_submit`（提交闸）都只认
-    这个字面值、且**无心跳豁免**——记录不自消（server 不重启就永远在），于是「人工结束 → 重试」
-    被自己留下的记录永久拒绝。
+    status="running"；而重试守卫 / 删除合同 / 提交闸（付费）都读这份内存记录——记录不自消
+    （server 不重启就永远在），于是「人工结束 → 重试/提交」被自己留下的记录永久拒绝。
 
     合同（调用方必须在 task_lock(local_id) 内调用：与任务.json 写 failed 同一把锁，单写者原子）：
       · 只改 `status=="running"` 的记录，其余原样留着——重复调用幂等：第二次无可改、不抛异常；
-      · **就地 update**，绝不换 dict 对象：后台线程（_spawn.wrap / _reap）按 job_id 持引用回写，
-        换对象会让它们手持孤本、写回一份没人看的记录；
+      · 终态一律经 `_finalize_job`（就地 update，绝不换 dict 对象：后台线程 _spawn.wrap / _reap
+        按 job_id 持引用回写，换对象会让它们手持孤本）；
       · 不杀进程、不删记录（force_finish 本就不持进程句柄；记录仍可 GET 查，落账面不丢）。
-    终态取值 `force_finished` 天然非活跃：`_job_running_records`/`_active_submit`（只认 running）
-    与 `_job_alive`（非 running 直接 False）都不会把它当存活。
+    `force_finished` 天然非活跃：`_job_blocks_retry` 只认 status=running 的记录，其余一律不阻断。
     """
     finished: list[str] = []
-    ended = _now()
     epoch = int(time.time())
     for job_id, rec in list(HUB_JOBS.items()):
         if rec.get("local_id") != local_id or rec.get("status") != "running":
             continue
-        rec.update({"status": FORCE_FINISH_JOB_STATUS, "finished_at": epoch,
-                    "finish_reason": "manual_force_finish",
-                    "finished_by": FORCE_FINISH_FINISHED_BY,
-                    "finish_note": note, "ended": ended})
+        _finalize_job(job_id, FORCE_FINISH_JOB_STATUS, finished_at=epoch,
+                      finish_reason="manual_force_finish",
+                      finished_by=FORCE_FINISH_FINISHED_BY, note=note)
         finished.append(job_id)
     return finished
 

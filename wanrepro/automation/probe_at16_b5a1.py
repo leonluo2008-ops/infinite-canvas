@@ -35,6 +35,7 @@ import os
 import shutil
 import sys
 import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -99,7 +100,10 @@ seed("auto-9809", state="approved",
 
 rows = {row["local_id"]: row for row in hub_api.list_tasks()}
 # active 夹具：HUB_JOBS 里挂一个 running 记录（等价「本进程提交在跑」）
-hub_api.HUB_JOBS["probe-job-1"] = {"local_id": "auto-9808", "status": "running", "kind": "hub-submit"}
+hub_api.HUB_JOBS["probe-job-1"] = {"local_id": "auto-9808", "status": "running", "kind": "hub-submit",
+                                 # 活跃判据收口到 _job_blocks_retry（启动 ≤60s 或心跳 ≤900s）：
+                                 # 夹具必须带新鲜 started，否则算僵尸 running（应放行）
+                                 "started": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")}
 rows = {row["local_id"]: row for row in hub_api.list_tasks()}
 
 # ════════════════════════════════════════════════════════════ [1] 四类形态

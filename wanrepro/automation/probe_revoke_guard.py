@@ -47,6 +47,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -229,7 +230,10 @@ def main() -> int:
         # ── [4] active：HUB_JOBS running → 拒 ─────────────────
         print("3) approved + 活跃提交（HUB_JOBS running）→ 拒")
         fake_job = {"job_id": "probe-rg-job-1", "kind": "hub-submit", "local_id": TASK_ACTIVE,
-                    "status": "running"}
+                    "status": "running",
+                    # 活跃判据已收口到 _job_blocks_retry（启动 ≤60s 或心跳 ≤900s）：夹具必须
+                    # 带新鲜 started，否则是「僵尸 running」——那本来就该放行（见 t_408a0867 审计）。
+                    "started": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")}
         hub_api.HUB_JOBS[fake_job["job_id"]] = fake_job
         try:
             expect_revoke_refused("[4] active：拒（消息含「提交在跑」）、文件不变",
