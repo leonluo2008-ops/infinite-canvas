@@ -129,6 +129,17 @@ def retry(local_id: str) -> tuple[str, dict]:
 
 
 def main() -> int:
+    print("=== [0] 修复前必红：同一批夹具在旧口径（纯 status==running）下会被误拒 ===")
+    # 旧实现 = `_job_running_records`（:280）纯 status 计数，无任何豁免。用同一组夹具跑旧口径，
+    # 得到「旧实现会命中阻断」的条数——这就是修复前的红；修复后走的是豁免判据（绿）。
+    OLD_FIXTURES = [("force_finished", 30), ("failed", 90), ("done", 120), ("running", 2100)]
+    old_blocked = sum(1 for st, age in OLD_FIXTURES if st == "running")
+    new_blocked = sum(1 for st, age in OLD_FIXTURES
+                      if hub_api._job_blocks_retry({"status": st, "started": iso(-age),
+                                                    "kind": "hub-discuss"}, heartbeat_at=""))
+    check("[0] 旧口径对残留记录判 1 条阻断（修复前必被拒）", old_blocked == 1, f"{old_blocked}")
+    check("[0] 新判据对同一批记录判 0 条阻断（修复后放行）", new_blocked == 0, f"{new_blocked}")
+
     print("=== [1] 残留记录不再挡重试（带豁免的统一存活判定）===")
     # ① force_finished（方案 A 的人工已结束）：心跳侧车还新鲜也照样放行
     local = "auto-9601"
@@ -257,6 +268,16 @@ def main() -> int:
     check("[5b] 放行回执里能看到被豁免的那条 force_finished",
           any("force_finished" in s for s in resp.get("ignored_stale_jobs") or []),
           f"{resp.get('ignored_stale_jobs')}")
+
+    # 幂等：连点两次强制结束后再重试，仍须走通（第二次是 already=true，不许把记录复辟成 running）
+    again = hub_api.force_finish(local, confirm=True, confirm_name=local, reason="探针：再点一次")
+    check("[5c] 第二次 force_finish 幂等（already=true / changed=false）",
+          again.get("already") is True and again.get("changed") is False, f"{again}")
+    check("[5c] 幂等重入后记录仍是 force_finished（没有被复辟成 running）",
+          (hub_api.HUB_JOBS.get("j1") or {}).get("status") == "force_finished",
+          f"{hub_api.HUB_JOBS.get('j1')}")
+    verdict, resp = retry(local)
+    check("[5c] 连续两次强制结束后再重试 → 仍成功", verdict == "ok", f"{verdict} {resp}")
 
     print("=== [6] 隔离与自清理 ===")
     after = {"projects": snapshot(REAL_PROJECTS), "analysis": snapshot(REAL_ANALYSIS),
