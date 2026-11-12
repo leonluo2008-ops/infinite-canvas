@@ -11,7 +11,7 @@
 退出码：
     0 成功（--check-only 时表示十层齐全）
     2 预检失败：文件不存在 / ffprobe 不可用 / 无法解码 / 无时长 / 无视频流 / 缺密钥 / 提示词源头异常
-    3 API 失败：重试 3 次（退避 5/10/20 秒）后仍无有效正文
+    3 API 失败：重试 3 次（退避 5/10/20 秒）后仍无有效正文（云端原文落盘 analysis/<id>/拆解错误.json）
     4 缺层：十层标题缺任一层，或某层正文为空
 """
 
@@ -43,6 +43,8 @@ BACKOFF_SECONDS = (5, 10, 20)          # 3 次重试的退避；总尝试次数 
 DEFAULT_TIMEOUT = 300.0                # 单次请求超时（秒）
 OUTPUT_NAME = "拆解.md"
 FRAME_FACTS_NAME = "看帧.json"        # pipeline/reverse/frame_facts.py 的产物
+ERROR_ARTIFACT_NAME = "拆解错误.json"  # ApiError 失败时的证据（键名已冻结，discuss.py 读取）
+RAW_RESPONSE_LIMIT = 500               # 「拆解错误.json」里 raw_response 只留前 500 字
 MAX_ID_LEN = 40
 
 
@@ -106,7 +108,18 @@ class PrecheckError(RuntimeError):
 
 
 class ApiError(RuntimeError):
-    """调用失败或响应无效（重试用尽后退出码 3）。"""
+    """调用失败或响应无效（重试用尽后退出码 3）。
+
+    消息之外可携带云端原文（cloud_message / raw_response / finish_reason），主链路据此
+    落盘「拆解错误.json」供事后追查；异常类型与 str() 语义不变（调用方照旧 except ApiError）。
+    """
+
+    def __init__(self, message: str, *, raw_response: str = "",
+                 finish_reason=None, cloud_message: str | None = None):
+        super().__init__(message)
+        self.raw_response = raw_response
+        self.finish_reason = finish_reason
+        self.cloud_message = message if cloud_message is None else cloud_message
 
 
 class EmptyResponseError(ApiError):
@@ -492,26 +505,53 @@ def _post_generate_content(opener, api_key: str, payload: dict, timeout: float) 
         return response.read().decode("utf-8", errors="replace")
 
 
+def _http_cloud_message(exc: urllib.error.HTTPError, body: str) -> str:
+    """HTTP 错误的云端原文：优先取网关 JSON 里的 error.message（完整不截断）；
+    取不到就把整个响应体当原文——绝不自己编原因。"""
+    text = (body or "").strip()
+    if text:
+        try:
+            envelope = json.loads(text)
+        except json.JSONDecodeError:
+            envelope = None
+        if isinstance(envelope, dict):
+            error = envelope.get("error")
+            if isinstance(error, dict) and isinstance(error.get("message"), str):
+                return f"HTTP {exc.code} {exc.reason}：{error['message']}"
+            if isinstance(error, str) and error:
+                return f"HTTP {exc.code} {exc.reason}：{error}"
+    return f"HTTP {exc.code} {exc.reason}" + (f"：{text}" if text else "")
+
+
 def _parse_response(raw: str):
-    """解析候选正文与用量；空正文一律抛 EmptyResponseError（不许当成功）。"""
+    """解析候选正文与用量；空正文一律抛 EmptyResponseError（不许当成功）。
+
+    失败时把云端原文挂到异常上（raw_response / finish_reason），主链路据此落盘
+    「拆解错误.json」；异常消息文本保持原样，stderr 与调用方行为都不变。
+    """
     try:
         envelope = json.loads(raw)
     except json.JSONDecodeError as exc:
-        raise ApiError(f"响应不是 JSON（前 200 字：{raw[:200]!r}）") from exc
+        raise ApiError(f"响应不是 JSON（前 200 字：{raw[:200]!r}）",
+                       raw_response=raw) from exc
     if not isinstance(envelope, dict):
-        raise ApiError("响应 JSON 顶层不是对象")
+        raise ApiError("响应 JSON 顶层不是对象", raw_response=raw)
 
     feedback = envelope.get("promptFeedback") or {}
     if feedback.get("blockReason"):
-        raise ApiError(f"请求被拦截：blockReason={feedback.get('blockReason')}")
+        raise ApiError(f"请求被拦截：blockReason={feedback.get('blockReason')}",
+                       raw_response=raw)
     if envelope.get("error"):
         error = envelope["error"]
         message = error.get("message") if isinstance(error, dict) else str(error)
-        raise ApiError(f"接口返回 error：{message}")
+        blocked = envelope.get("candidates") or []
+        raise ApiError(f"接口返回 error：{message}", raw_response=raw,
+                       finish_reason=(blocked[0] or {}).get("finishReason") if blocked else None)
 
     candidates = envelope.get("candidates") or []
     if not candidates:
-        raise EmptyResponseError("candidates 为空（直连但无候选，常见于走代理或额度问题）")
+        raise EmptyResponseError("candidates 为空（直连但无候选，常见于走代理或额度问题）",
+                                 raw_response=raw)
 
     texts = []
     for candidate in candidates:
@@ -523,11 +563,14 @@ def _parse_response(raw: str):
 
     finish_reason = (candidates[0] or {}).get("finishReason")
     if finish_reason in ("SAFETY", "RECITATION"):
-        raise ApiError(f"候选被 {finish_reason} 截断，正文不可用")
+        raise ApiError(f"候选被 {finish_reason} 截断，正文不可用", raw_response=raw,
+                       finish_reason=finish_reason)
     if not text:
-        raise EmptyResponseError(f"正文长度为 0（finishReason={finish_reason}）")
+        raise EmptyResponseError(f"正文长度为 0（finishReason={finish_reason}）",
+                                 raw_response=raw, finish_reason=finish_reason)
     if len(text) < 300 and any(marker in text for marker in OFFLINE_MARKERS):
-        raise ApiError(f"正文疑似模型下线通知：{text[:120]!r}")
+        raise ApiError(f"正文疑似模型下线通知：{text[:120]!r}", raw_response=raw,
+                       finish_reason=finish_reason)
 
     usage = envelope.get("usageMetadata") or {}
     return text, usage
@@ -556,8 +599,12 @@ def call_model(prompt: str, video_path: Path, api_key: str, timeout: float = DEF
     attempts = 1 + len(BACKOFF_SECONDS)
     started = time.monotonic()
     last_error = "未知失败"
+    # 最后一次尝试的证据（云端原文 / 原始响应 / finishReason）：重试用尽时挂到抛出的
+    # ApiError 上，主链路据此写「拆解错误.json」。只留痕，不参与任何判定。
+    last_raw, last_finish, last_cloud = "", None, ""
 
     for attempt in range(1, attempts + 1):
+        last_raw, last_finish, last_cloud = "", None, ""
         try:
             print(f"[调用] 第 {attempt}/{attempts} 次 直连 {MODEL_LABEL}", flush=True)
             raw = _post_generate_content(opener, api_key, payload, timeout)
@@ -567,22 +614,30 @@ def call_model(prompt: str, video_path: Path, api_key: str, timeout: float = DEF
             return text, usage, elapsed
         except EmptyResponseError as exc:
             last_error = f"空响应：{redact(str(exc), api_key)}"
+            last_cloud = str(exc)
+            last_raw, last_finish = exc.raw_response, exc.finish_reason
         except urllib.error.HTTPError as exc:
             body = ""
             try:
-                body = exc.read().decode("utf-8", errors="replace")[:300]
+                body = exc.read().decode("utf-8", errors="replace")
             except Exception:
                 body = ""
-            last_error = f"HTTP {exc.code} {exc.reason}" + (f" / {body}" if body else "")
+            last_error = f"HTTP {exc.code} {exc.reason}" + (f" / {body[:300]}" if body else "")
             last_error = redact(last_error, api_key)
+            last_cloud = _http_cloud_message(exc, body)
+            last_raw, last_finish = body, None
         except urllib.error.URLError as exc:
             last_error = redact(f"URLError：{exc.reason}", api_key)
         except (ssl.SSLError, OSError) as exc:
             last_error = redact(f"{type(exc).__name__}：{exc}", api_key)
         except ApiError as exc:
             last_error = redact(str(exc), api_key)
+            last_cloud = exc.cloud_message
+            last_raw, last_finish = exc.raw_response, exc.finish_reason
         except Exception as exc:                       # 兜底：绝不把异常当结果
             last_error = redact(f"{type(exc).__name__}：{exc}", api_key)
+
+        last_cloud = last_cloud or last_error          # 取不到云端原文就退回失败描述
 
         print(f"[失败] 第 {attempt} 次：{last_error}", file=sys.stderr, flush=True)
         if attempt <= len(BACKOFF_SECONDS):
@@ -590,7 +645,42 @@ def call_model(prompt: str, video_path: Path, api_key: str, timeout: float = DEF
             print(f"[退避] {delay}s 后重试", file=sys.stderr, flush=True)
             time.sleep(delay)
 
-    raise ApiError(f"{attempts} 次尝试全部失败，最后一次：{last_error}")
+    raise ApiError(f"{attempts} 次尝试全部失败，最后一次：{last_error}",
+                   raw_response=last_raw, finish_reason=last_finish,
+                   cloud_message=last_cloud or last_error)
+
+
+def clear_api_error(outdir: Path) -> None:
+    """清掉上一次失败留下的证据：这一次成功了就不该有「拆解错误.json」。"""
+    try:
+        (Path(outdir) / ERROR_ARTIFACT_NAME).unlink(missing_ok=True)
+    except OSError:                                    # 删不掉不算失败，不拖垮主流程
+        pass
+
+
+def write_api_error(outdir: Path, exc: ApiError, api_key: str = "") -> Path | None:
+    """ApiError 失败时把云端原文落盘：`analysis/<dir>/拆解错误.json`。
+
+    与 call_vlm.py 写 vision_error.json 同型——证据要能事后追查，不能只留在 stderr。
+    schema 已冻结（键名被 discuss.py 读取，不许改名）：
+        error_type / message（完整不截断）/ finish_reason / raw_response（原始响应前 500 字）
+    写盘失败只告警，绝不掩盖原本的退出码 3（stderr 与退出码仍由调用方照旧处理）。
+    """
+    payload = {
+        "error_type": "ApiError",
+        "message": redact(exc.cloud_message, api_key),
+        "finish_reason": exc.finish_reason,
+        "raw_response": redact(exc.raw_response, api_key)[:RAW_RESPONSE_LIMIT],
+    }
+    path = Path(outdir) / ERROR_ARTIFACT_NAME
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+                        encoding="utf-8")
+    except OSError as exc_write:
+        print(f"ERROR 写不了 {ERROR_ARTIFACT_NAME}：{exc_write}", file=sys.stderr)
+        return None
+    return path
 
 
 # ---------------------------------------------------------------- 十层切段与校验
@@ -1728,6 +1818,7 @@ def run_extract(video_path: Path, video_id: str, outdir: Path, timeout: float, i
     if _progress is not None:
         _progress.write_progress(outdir, "大拆解·准备中")
     inject_problem = ""
+    clear_api_error(outdir)                # 上一轮的失败证据不带进这一轮（成功就不该有）
     try:
         if _progress is not None:
             _progress.write_progress(outdir, "大拆解·已提交远程模型，等待返回")
@@ -1748,9 +1839,11 @@ def run_extract(video_path: Path, video_id: str, outdir: Path, timeout: float, i
                 if _progress is not None:
                     _progress.write_progress(outdir, "大拆解·模型已返回，校验与落盘中")
             except ApiError as exc2:
+                write_api_error(outdir, exc2, api_key)
                 print(f"ERROR API 失败：{redact(str(exc2), api_key)}", file=sys.stderr)
                 return 3
         else:
+            write_api_error(outdir, exc, api_key)
             print(f"ERROR API 失败：{redact(str(exc), api_key)}", file=sys.stderr)
             return 3
 
