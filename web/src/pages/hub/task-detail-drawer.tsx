@@ -77,6 +77,8 @@ import {
     type HubTaskDetail,
     type HubTaskSummary,
 } from "./hub-api";
+// AT-16 B9：解除阻断后的换配置直达条（判定=起态门 + dispatch=cleared，动作=既有撤销批准链）
+import { GenClearedBar, hubClearedDirect } from "./gen-cleared";
 import { lapianClockTexts, lapianStageName, useLapianClock } from "./lapian-clock";
 import { HubStateTag, SubmitResultLine } from "./hub-status";
 import { TaskDeleteButton } from "./task-delete-confirm";
@@ -2504,6 +2506,20 @@ function GenSettingsSection({ detail, busy, act }: { detail: HubTaskDetail; busy
         dispatchPhase: genDispatchPhase(detail),
     });
 
+    /**
+     * AT-16 B9 / D10：解除阻断（dispatch.phase=cleared）后的换配置直达。
+     * 只读同一份事实，判定复用上面的起态门（hubClearedDirect 内部先跑 hubReworkGate）——
+     * cleared 态在起态门里本来就是 allowed，缺的只是「让所有者看得见 + 一键」，不是新状态。
+     */
+    const clearedDirect = hubClearedDirect({
+        state,
+        submit: detail.submit ?? null,
+        cloudTaskId: detail.cloud_task_id || "",
+        activeSubmit: detail.active_submit,
+        submitUnknown: Boolean(detail.submit_unknown),
+        dispatchPhase: genDispatchPhase(detail),
+    });
+
     const update = (patch: Partial<GenDraft>) => {
         setDraft((prev) => {
             const next = { ...(prev as GenDraft), ...patch };
@@ -2731,9 +2747,11 @@ function GenSettingsSection({ detail, busy, act }: { detail: HubTaskDetail; busy
                     <h2 className="text-sm font-semibold">生成设置</h2>
                     <span className="text-xs text-stone-500 dark:text-stone-400">
                         {readOnly
-                            ? reworkGate.mode === "unknown" || reworkGate.mode === "blocked"
-                                ? "已随批准固化（只读）——结果待核对，先别撤销"
-                                : "已随批准固化（快照 v2）；要改先撤销批准"
+                            ? clearedDirect.visible
+                                ? "已随批准固化（只读）——上次的阻断已解除：原配置可重交，换配置先撤销批准"
+                                : reworkGate.mode === "unknown" || reworkGate.mode === "blocked"
+                                  ? "已随批准固化（只读）——结果待核对，先别撤销"
+                                  : "已随批准固化（快照 v2）；要改先撤销批准"
                             : "与会话画布同源；批准时固化本次配置"}
                     </span>
                 </div>
@@ -2742,6 +2760,11 @@ function GenSettingsSection({ detail, busy, act }: { detail: HubTaskDetail; busy
                         ? `已提交的配置由服务端快照固化；本地草稿口径：${genDraftSummary(draft, channel)}`
                         : "改任一有效字段（渠道身份 / 模型 / 模式 / 参数）＝快照失效，需重新批准；只换 key 不失效。"}
                 </div>
+
+                {/* AT-16 B9 / D10 直达条：解除阻断（cleared）后把「换模型 / 渠道」这条路摆到最上面 ——
+                    判定只读起态门，一键接既有撤销批准链（revoke → 回 awaiting_approval → 配置解锁 →
+                    改完走同一条「批准出片」）；非 cleared 态这个组件返回 null。 */}
+                <GenClearedBar direct={clearedDirect} busy={busy} onRevoke={revoke} />
 
                 {/* AT-16 B5b ④ 无本地草稿边界：草稿丢了就说清手上这份是什么，不假装读到快照 */}
                 {draftOrigin !== "draft" ? (
