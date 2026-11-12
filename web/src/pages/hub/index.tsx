@@ -170,7 +170,13 @@ function HubTableView() {
             const data = await forceFinishHubTask(task.local_id);
             setForceTarget("");
             patchState(task.local_id, data.state || "failed");
-            message.success(data.already ? `任务 ${task.local_id} 已是失败状态` : `已强制结束：${task.local_id} 置为失败（产物全保留，可重试或删除）`);
+            // 回执三分：远程那半句由后端算（还在跑/预计还需/结果作废），原样透出并留在行内
+            const remoteNote = String(data.remote?.message || "");
+            message.success(
+                (data.already ? `任务 ${task.local_id} 已是失败状态` : `已强制结束：${task.local_id} 置为失败（产物全保留，可重试或删除）`)
+                + (remoteNote ? `；${remoteNote}` : ""),
+            );
+            if (remoteNote) setRowError(task.local_id, remoteNote);
         } catch (forceError) {
             // 行内留痕：409「任务当前不是运行态…」/400「需二次确认…」都原样透出，不吞、不白屏
             const text = errorText(forceError);

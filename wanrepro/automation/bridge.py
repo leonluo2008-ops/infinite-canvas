@@ -68,8 +68,10 @@ def _request(method: str, path: str, *, body: bytes | None = None,
         raise BridgeError(f"bridge {method} {path} → 响应不是 JSON: {raw[:200]}") from None
 
 
-def get(path: str) -> Any:
-    return _request("GET", path)
+def get(path: str, timeout: int = 120) -> Any:
+    """GET 一个面。timeout 可调：hub 读「拆解槽真相」这类只读诊断面用短超时（1–3s）——
+    桥半死不活时不许把界面轮询拖成两分钟。"""
+    return _request("GET", path, timeout=timeout)
 
 
 def get_bytes(path: str, timeout: int = 600) -> bytes:

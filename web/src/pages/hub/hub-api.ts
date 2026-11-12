@@ -80,6 +80,28 @@ export type HubLostRun = {
 export type HubFailedView = { reason: string; at: string; evidence: Record<string, unknown> | null };
 
 /**
+ * `remote`：强制终止后的「远程半边」（后端 hub_api._remote_view 一处生产，文案源在
+ * automation/remote_wait.py）。三条产品语义就落在这几个键上：
+ *  · 本地已终止 ≠ 远程已停：`running` 为真时，已提交到聚鑫的拆解**还在跑**，`cancellable` 恒为 false
+ *    （平台事实：提交后无法取消）；
+ *  · 要再提交同一条任务，只能等它返回、拆解槽释放（`eta_seconds` 是「预计还需」，启发式估计）；
+ *  · 结果返回后按作废丢弃，不覆盖 failed——`message` 就是这句话，界面**不自造**。
+ * 旧 bridge 缺这个键 → null：不显示、也不当成「没有远程在跑」（未知就说未知）。
+ */
+export type HubRemoteWait = {
+    submitted: boolean;
+    running: boolean;
+    cancellable: boolean;
+    task_id: string;
+    job?: string;
+    elapsed_seconds: number | null;
+    eta_seconds: number | null;
+    checked_at: string;
+    source: string;
+    message: string;
+};
+
+/**
  * 拆解双锚（AT-16 B4a 透传合同）：
  * - started_at 拆解启动锚（job 开始时刻，重拆按新 job 重置）
  * - stage_at   当前阶段开始锚（阶段变化即重置）
@@ -302,7 +324,33 @@ export type HubTaskDetail = HubTaskSummary & {
     active_submit?: boolean;
     /** 疑似孤儿三步判定结果（服务端 diagnose，只判定不动状态）。 */
     submit_lost?: HubSubmitLost | null;
+    /** 远程半边（强制终止后）：远程还在跑吗、预计还需多久、结果按作废丢弃。缺 → null。 */
+    remote?: HubRemoteWait | null;
 };
+
+/**
+ * `remote` 归一：缺/畸形 → null（不造「空闲」）。数值只认有限数，字符串一律转文本——
+ * 读层不许因为后端多一个字段就白屏（与 normalizeFailedView 同一条纪律）。
+ */
+function normalizeRemote(value: unknown): HubRemoteWait | null {
+    if (!value || typeof value !== "object") return null;
+    const raw = value as Record<string, unknown>;
+    const message = contractText(raw.message);
+    if (!message) return null;                 // 没有那句话 = 后端没给结论，前端不编
+    const num = (v: unknown) => (typeof v === "number" && Number.isFinite(v) ? v : null);
+    return {
+        submitted: Boolean(raw.submitted),
+        running: Boolean(raw.running),
+        cancellable: Boolean(raw.cancellable),
+        task_id: contractText(raw.task_id),
+        job: contractText(raw.job),
+        elapsed_seconds: num(raw.elapsed_seconds),
+        eta_seconds: num(raw.eta_seconds),
+        checked_at: contractText(raw.checked_at),
+        source: contractText(raw.source),
+        message,
+    };
+}
 
 /** 提交意图标记（AT-13 §2.3；兼容早期扁平字符串写法）。 */
 export type HubDispatch = { phase?: string; at?: string; note?: string; job?: string; carrier?: string };
@@ -361,7 +409,11 @@ async function request<T>(url: string, init?: RequestInit): Promise<T> {
     }
     if (!response.ok) {
         const detail = data ? String(data.error || data.message || "") : "";
-        throw new Error(detail || text.slice(0, 200) || `请求失败（HTTP ${response.status}）`);
+        const error = new Error(detail || text.slice(0, 200) || `请求失败（HTTP ${response.status}）`);
+        // 错误体里的结构化自述（retry_after_seconds / remote / slot）挂到 error 上：
+        // 「重试暂缓」这类拒绝要能驱动按钮态与倒计时，而不是只剩一句文案。
+        (error as Error & { data?: JsonRecord }).data = data || undefined;
+        throw error;
     }
     if (data?.error) throw new Error(String(data.error));
     return (data || {}) as T;
@@ -427,6 +479,8 @@ export async function getHubTask(localId: string): Promise<HubTaskDetail> {
         activity: normalizeActivity(task.activity),
         lost_run: normalizeLostRun(task.lost_run),
         failed: normalizeFailedView(task.failed),
+        // 远程半边：缺 → null（旧 bridge 不知道「远程还在不在跑」时，界面不假装知道）
+        remote: normalizeRemote(task.remote),
     };
 }
 
@@ -1012,8 +1066,8 @@ export async function retryHubTask(localId: string): Promise<{ state?: string; j
 export async function forceFinishHubTask(
     localId: string,
     reason = "人工强制结束（所有者操作）",
-): Promise<{ ok?: boolean; local_id?: string; state?: string; state_was?: string; changed?: boolean; already?: boolean; reason?: string; kept?: Record<string, boolean> }> {
-    return request<{ ok?: boolean; local_id?: string; state?: string; state_was?: string; changed?: boolean; already?: boolean; reason?: string; kept?: Record<string, boolean> }>(
+): Promise<{ ok?: boolean; local_id?: string; state?: string; state_was?: string; changed?: boolean; already?: boolean; reason?: string; remote?: HubRemoteWait | null; kept?: Record<string, boolean> }> {
+    return request<{ ok?: boolean; local_id?: string; state?: string; state_was?: string; changed?: boolean; already?: boolean; reason?: string; remote?: HubRemoteWait | null; kept?: Record<string, boolean> }>(
         `/api/hub/task/${encodeURIComponent(localId)}/force-finish`,
         {
             method: "POST",

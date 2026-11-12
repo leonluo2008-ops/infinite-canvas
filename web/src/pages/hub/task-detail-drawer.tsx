@@ -84,7 +84,7 @@ import {
 import { GenClearedBar, hubClearedDirect } from "./gen-cleared";
 import { lapianClockTexts, lapianStageName, useLapianClock } from "./lapian-clock";
 import { HubStateTag, SubmitResultLine, forceFinishGuard } from "./hub-status";
-import { CloudFailurePanel, FORCE_FINISH_CONFIRM_TITLE, ForceFinishButton, ForceFinishConfirmBody } from "./task-card";
+import { CloudFailurePanel, FORCE_FINISH_CONFIRM_TITLE, ForceFinishButton, ForceFinishConfirmBody, RemoteWaitLine } from "./task-card";
 import { TaskDeleteButton } from "./task-delete-confirm";
 
 /** 九宫格粗标配色（同帧多目标分色，AT-9 层1）。 */
@@ -343,6 +343,12 @@ export function TaskDetailDrawer({
                                 <div className="mt-2">
                                     <SubmitResultLine submit={submitView} />
                                 </div>
+                                {/* 远程半边：强制终止后本地已停、远程可能还在跑——详情页必须说清（含预计剩余） */}
+                                {detail?.remote?.message ? (
+                                    <div className="mt-2">
+                                        <RemoteWaitLine remote={detail.remote} />
+                                    </div>
+                                ) : null}
                                 <div className="mt-2 whitespace-pre-wrap break-words text-sm leading-6 text-stone-700 dark:text-stone-200">
                                     <span className="mr-1 font-medium text-stone-500 dark:text-stone-400">改造意图：</span>
                                     {summary.intent || "（未填写意图）"}

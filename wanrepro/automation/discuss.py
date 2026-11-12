@@ -17,7 +17,7 @@ import sys
 import time
 from pathlib import Path
 
-from . import bridge, config, state
+from . import bridge, config, remote_wait, state
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 sys.stderr.reconfigure(encoding="utf-8", errors="replace")
@@ -52,6 +52,20 @@ def _env_seconds(name: str, default: float) -> float:
 
 class DiscussError(RuntimeError):
     pass
+
+
+class SlotBusy(DiscussError):
+    """拆解槽（远程一侧的排他位）被占、等到上限仍未拿到——**环境级**，不是远程判失败。
+
+    语义为什么单独成一类：`start_and_wait` 的 409 排队不是「这一轮拆解失败」，而是
+    「压根没提交上去」。若和任务级失败混在一起，run_discuss 会把它写成 failed，文案里那句
+    「本任务没有被远程判失败」与磁盘状态互相打脸。run_discuss 对它只透传不落 failed，
+    执行体按环境级退出码退场（任务保留 discussing，稍后重试即续）。
+
+    消息一律由 `automation/remote_wait.py` 生成（唯一文案源）：「在等谁的远程返回、
+    已等多久、预计还需多久、为什么只能等」——不再给用户刷「第 N 次失败」的计数。
+    """
+    slot: dict | None = None
 
 
 # AT-15 R2：门禁轮次进拆解日志。R1 的透出链是 mark_stage → 进度.json → job 轮询逐阶段记日志，
@@ -416,6 +430,13 @@ def start_and_wait(task: dict, on_stage=None, on_heartbeat=None,
         except Exception:  # noqa: BLE001 —— 心跳失败不拖垮拆解主链
             pass
 
+    # 409 = 拆解槽被占（排队语义，不是失败）。文案走 remote_wait 唯一源：
+    # 说清「在等谁的远程返回 / 已等了多久 / 预计还需多久」，不再给用户刷「第 N 次失败」。
+    # 日志节奏：首次必写一行，之后每 60s 追一行（与等待心跳同频）——5s 一次会把日志刷成计数墙。
+    bridge_id = str(task.get("bridge_id") or "")
+    busy_waited = 0.0
+    last_slot: dict | None = None
+    emit_every = max(1, int(round(60 / float(BUSY_RETRY_INTERVAL))))
     for attempt in range(BUSY_RETRY_MAX):
         try:
             out = bridge.post_json("/api/lapian/run",
@@ -425,14 +446,23 @@ def start_and_wait(task: dict, on_stage=None, on_heartbeat=None,
                 raise DiscussError(f"lapian/run 未回 job: {json.dumps(out, ensure_ascii=False)[:200]}")
             break
         except bridge.BridgeError as e:
-            if "HTTP 409" in str(e):
-                _emit(f"拆解槽忙，排队重试（{attempt + 1}/{BUSY_RETRY_MAX}，{BUSY_RETRY_INTERVAL}s 后）")
-                print(f"  [排队] 桥忙（{BUSY_RETRY_INTERVAL}s 后重试 {attempt + 1}/{BUSY_RETRY_MAX}）")
+            if e.status == 409 or "HTTP 409" in str(e):
+                payload = e.payload or {}
+                slot = payload.get("slot") if isinstance(payload.get("slot"), dict) else {}
+                last_slot = slot or None
+                line = remote_wait.busy_line(slot, bridge_id=bridge_id, waited=busy_waited,
+                                             task_busy=str(payload.get("task_id") or ""))
+                if attempt % emit_every == 0:
+                    _emit(line)
+                print(f"  [排队] {line}（第 {attempt + 1}/{BUSY_RETRY_MAX} 次探测，"
+                      f"{BUSY_RETRY_INTERVAL}s 后复查）")
                 time.sleep(BUSY_RETRY_INTERVAL)
+                busy_waited += BUSY_RETRY_INTERVAL
                 continue
             raise
     else:
-        raise DiscussError(f"桥持续忙 {BUSY_RETRY_MAX} 次，放弃（任务未失败，重跑本命令续）")
+        raise SlotBusy(remote_wait.busy_exhausted_reason(last_slot, bridge_id=bridge_id,
+                                                         waited=busy_waited))
     _emit(f"已提交拆解（job={job}），远程模型通常 5–15 分钟，慢时更久，不用重开")
 
     waited = 0
@@ -548,6 +578,13 @@ def run_discuss(task_dir: Path, *, verbose: bool = True, on_stage=None, on_heart
         # 环境级：状态留在 discussing，重跑即续（不判 failed）
         if verbose:
             print(f"[环境故障] {task['local_id']}: {e} —— 状态保留 discussing，重跑续")
+        raise
+    except SlotBusy as e:
+        # 槽占用等到上限 = 本轮**没提交上去**（环境级，不是远程判失败）：不写 failed，
+        # 状态留在 discussing，稍后再点重试即续。与「远程返回了但失败」（下一支 → failed）
+        # 严格两分——「本任务没有被远程判失败」这句话必须与磁盘上的状态一致。
+        if verbose:
+            print(f"[排队超时] {task['local_id']}: {e} —— 状态保留 discussing，稍后重试续")
         raise
     except DiscussError as e:
         # 任务级失败：唯一写入口落盘——桥侧原文优先，缺失才用冻结文案兜底；

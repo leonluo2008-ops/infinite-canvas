@@ -113,6 +113,15 @@ def run(local_id: str, run_id: str) -> int:
         beat("终态：awaiting_assets（等置换）")
         outcome, code = "done", EXIT_OK
         return EXIT_OK
+    except discuss.SlotBusy as exc:
+        # 槽占用等到上限 = **本轮没提交上去**（环境级，不是远程判失败）：状态保留 discussing，
+        # 稍后再点重试即续。文案已在 discuss 侧按 remote_wait 唯一源生成（在等谁的远程返回、
+        # 预计还需多久），这里只负责如实退场，不许把它写成 failed。
+        message = str(exc) or "拆解槽一直被占用，本次未提交"
+        emit(f"终态：本轮未提交（{message}）——状态保留，稍后再点重试", terminal=True)
+        beat(f"终态：本轮未提交（{message}）")
+        tail, outcome, code, source = message, "env_error", EXIT_ENV, "slot_busy"
+        return EXIT_ENV
     except discuss.DiscussError as exc:
         # 任务级失败：discuss 已把 failed 写进任务.json（唯一写盘核 state.write_failed）。
         emit(f"终态：失败（{exc}）", terminal=True)

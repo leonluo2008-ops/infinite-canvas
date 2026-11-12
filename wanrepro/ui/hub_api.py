@@ -32,7 +32,8 @@ _PKG_ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from automation import cards, config as auto_config, discuss, frames, generate, ingest, local_assets, replace, selfcheck, state, submit_view  # noqa: E402
+from automation import bridge, cards, config as auto_config, discuss, frames, generate  # noqa: E402
+from automation import ingest, local_assets, remote_wait, replace, selfcheck, state, submit_view  # noqa: E402
 
 # 任务目录根的**唯一来源** = automation.config.PROJECTS_DIR（认 WANREPRO_AUTO_DIR）。
 # 禁止在这里另写一个 ROOT/"automation"/"projects"：硬编码会让「设 env 起隔离实例」变成
@@ -137,6 +138,16 @@ class HubError(RuntimeError):
     """工作台业务错误——server 层转 4xx JSON，message 面向员工。status=HTTP 状态码。"""
 
     status = 409
+
+    def __init__(self, message: str = "", *, status: int | None = None,
+                 extra: dict | None = None) -> None:
+        super().__init__(message)
+        # extra 随错误体一起回给界面（与 ApiError 同一形状）：重试拒绝带
+        # retry_after_seconds / slot 自述，界面就能给「预计还需 X 分钟」的倒计时引导，
+        # 而不是只显示一句「忙」。类属性 status 仍是默认值，逐条可覆盖。
+        if status is not None:
+            self.status = status
+        self.extra = dict(extra or {})
 
 
 class HubInputError(HubError):
@@ -565,6 +576,8 @@ def get_task(local_id: str) -> dict:
         "dispatch": task.get("dispatch") or None,
         "cloud_task_id": task.get("cloud_task_id") or "",
         "active_submit": _active_submit(local_id),
+        # 远程半边（强制终止后）：还在跑吗、预计还需多久、结果会按作废丢弃——读面唯一出口
+        "remote": _remote_view(task, task_dir),
         "submit_lost": generate.diagnose(task_dir, task,
                                          active_submit=_active_submit(local_id)),
     })
@@ -1046,6 +1059,158 @@ def _retry_guard(local_id: str, task_dir: Path) -> tuple[tuple[str, dict] | None
     return blocking, basis, ignored
 
 
+# ---------------------------------------------------------------- 远程半边（拆解槽真相）
+#
+# 现场（auto-0067，2026-11-12）：强制结束一个已提交远程拆解的任务后，本地 failed，但远程
+# 拆解无法取消、仍在跑，第一轮的等待循环还占着桥端拆解槽；此时点重试 → 新 run 起得来，
+# 一提交就撞 409 排队，界面反复刷「第 N 次失败」，用户看不到「在等什么、还要等多久」。
+#
+# 修法不是改阈值，而是把**事实**接出来：桥端 /api/lapian/slot 说「槽被谁占、跑了多久」，
+# 这里翻成人话（automation/remote_wait.py 唯一文案源），并落到两处出口：
+#   · 强制结束回执 + 详情页 remote 读面（本地已终止 ≠ 远程已停，三分说清）；
+#   · 重试入口前置引导（方案 a：明确禁止 + 预计时间），不让用户点进无限排队。
+
+REMOTE_SLOT_CACHE_SECONDS = 2.0   # 卡片挂载会逐卡读详情：2s 内复用同一份槽真相，别把桥打成反射壁
+REMOTE_SLOT_TIMEOUT = 3           # 桥半死不活时不许把界面轮询拖成两分钟
+
+_slot_cache: dict = {"at": 0.0, "data": None}
+
+
+def _slot_now(*, fresh: bool = False) -> dict:
+    """桥端拆解槽真相（GET /api/lapian/slot）——**事实**，不是估算。
+
+    返回 {"ok": True, "busy": bool, "holder": {...}|None, ...}；桥连不上 →
+    {"ok": False, "why": "..."}。未知一律如实说未知：绝不把「查不到」当成「空闲」或「忙」。
+    """
+    now = time.time()
+    cached = _slot_cache.get("data")
+    if (not fresh and isinstance(cached, dict)
+            and now - float(_slot_cache.get("at") or 0.0) < REMOTE_SLOT_CACHE_SECONDS):
+        return dict(cached)
+    try:
+        data = bridge.get("/api/lapian/slot", timeout=REMOTE_SLOT_TIMEOUT)
+        if not isinstance(data, dict):
+            raise bridge.BridgeError("slot 面返回的不是对象")
+        out = {"ok": True, **data}
+    except bridge.BridgeError as exc:
+        out = {"ok": False, "why": str(exc)}
+    _slot_cache.update({"at": now, "data": out})
+    return dict(out)
+
+
+def _remote_submitted(task: dict) -> bool:
+    """该任务是否提交过远程拆解——只认既有持久证据（last_job / remote_wait 快照 / 阶段文本），不猜。"""
+    if str(task.get("last_job") or "").strip():
+        return True
+    if isinstance(task.get("remote_wait"), dict) and task.get("remote_wait"):
+        return True
+    return bool(_stage_text(task.get(LAPIAN_STAGE)))
+
+
+def _remote_after_finish(task_dir: Path, task: dict) -> dict:
+    """强制结束回执的远程半边：查槽真相 → 三分人话 → 落盘快照（详情页刷新后说同一句话）。
+
+    快照写进 任务.json `remote_wait`：**只读面用它决定要不要去问桥**——没被人工终止过的任务
+    永远不会平白多出一次桥查询。写失败不拖垮强制结束（文件侧 failed 已经落定）。
+    """
+    bridge_id = str(task.get("bridge_id") or "")
+    slot = _slot_now(fresh=True)
+    slot_ok = bool(slot.get("ok"))
+    view = remote_wait.force_finish_remote(
+        slot if slot_ok else None, bridge_id=bridge_id,
+        submitted=_remote_submitted(task),
+        bridge_error="" if slot_ok else str(slot.get("why") or "桥没有响应"))
+    snap = {"task_id": view.get("task_id") or bridge_id, "job": view.get("job") or "",
+            "running": bool(view.get("running")), "elapsed_seconds": view.get("elapsed_seconds"),
+            "eta_seconds": view.get("eta_seconds"), "source": view.get("source") or "",
+            "checked_at": _now()}
+    try:
+        # 与 state._write_failed 同一把**进程间**文件锁：快照写盘和执行体的读-改-写必须互斥，
+        # 否则毫秒级窗口里可能把执行体刚写的字段覆盖回去（读面不该制造这类竞态）。
+        with state._file_lock(task_dir):
+            fresh = state.load(task_dir)
+            fresh["remote_wait"] = snap
+            state.save(task_dir, fresh)
+    except (OSError, state.StateError):
+        pass
+    return view
+
+
+def _remote_view(task: dict, task_dir: Path) -> dict:
+    """读面 remote：强制终止后的「远程半边」——还在跑吗、预计还需多久、结果会怎样。
+
+    只在「任务已被人工终止、且当时远程在途（有 remote_wait 快照）」时给实质内容；
+    其余态返回 submitted 壳、不查桥（列表/详情轮询都读这里，别为常态付一次网络往返）。
+    快照会被活口纠正：槽已释放 → 明说「已不在跑；若已返回，结果按作废丢弃」。
+    """
+    snap = task.get("remote_wait") if isinstance(task.get("remote_wait"), dict) else {}
+    bridge_id = str(task.get("bridge_id") or "")
+    submitted = _remote_submitted(task)
+    empty = {"submitted": submitted, "running": False, "cancellable": False,
+             "task_id": bridge_id, "job": "", "elapsed_seconds": None, "eta_seconds": None,
+             "checked_at": "", "source": "", "message": ""}
+    if str(task.get("state") or "") != "failed" or not bridge_id or not snap:
+        return empty
+    slot = _slot_now()
+    if not slot.get("ok"):
+        return {**empty, "task_id": str(snap.get("task_id") or bridge_id),
+                "elapsed_seconds": snap.get("elapsed_seconds"),
+                "eta_seconds": snap.get("eta_seconds"),
+                "checked_at": str(snap.get("checked_at") or ""), "source": "snapshot",
+                "message": "远程拆解状态暂时读不到（" + str(slot.get("why") or "桥没有响应") +
+                           "）——若它仍在跑，结果返回后会按作废丢弃，不会覆盖这次失败"}
+    if slot.get("busy") and remote_wait.is_same_task(slot, bridge_id):
+        holder = remote_wait.holder_of(slot)
+        elapsed = holder.get("elapsed_seconds")
+        return {**empty, "submitted": True, "running": True, "cancellable": False,
+                "task_id": holder.get("task_id") or bridge_id, "job": holder.get("job") or "",
+                "elapsed_seconds": elapsed, "eta_seconds": remote_wait.eta_seconds(elapsed),
+                "checked_at": str(slot.get("checked_at") or _now()), "source": "bridge_live",
+                "message": remote_wait.busy_line(slot, bridge_id=bridge_id) +
+                           "；本次失败状态不会被它覆盖"}
+    return {**empty, "checked_at": str(slot.get("checked_at") or _now()), "source": "bridge_live",
+            "message": remote_wait.remote_idle_message(submitted=submitted)}
+
+
+def _remote_retry_block(task: dict) -> tuple[str, dict] | None:
+    """重试入口前置引导（方案 a：明确禁止 + 说清还要等多久）→ (人话, 结构化自述) 或 None。
+
+    只在「本任务上一轮远程拆解还占着槽」时拦：那种情况下放行也只能撞 409 排队，
+    界面就变成无限失败计数（auto-0067 的现场形态）。
+    两条放行前提，缺一不可地写在前面：
+      · **产物优先**：产物已齐时重试根本不需要槽（run_discuss 直接迁 awaiting_assets），绝不拦；
+      · **槽未知不当忙**：桥连不上/读不到持有者 → 放行，让既有链路自己说结果（未知不许当忙碌用）。
+    别的任务占槽不在这里拦：那种等待是真排队，交给 discuss 的排队循环说人话（同一文案源）。
+    """
+    bridge_id = str(task.get("bridge_id") or "")
+    if not bridge_id:
+        return None
+    try:
+        probe = state.probe_bridge_products(bridge_id) or {}
+        if probe.get("has_disc") and probe.get("has_check") and probe.get("has_prompt"):
+            return None
+    except Exception:                     # noqa: BLE001 —— 产物探测失败不阻断重试（既有链会如实报）
+        pass
+    slot = _slot_now(fresh=True)
+    if not slot.get("ok") or not slot.get("busy"):
+        return None
+    holder = remote_wait.holder_of(slot)
+    if holder.get("task_id") != bridge_id:
+        return None
+    eta = remote_wait.eta_seconds(holder.get("elapsed_seconds"))
+    message = ("重试暂缓：" + remote_wait.busy_line(slot, bridge_id=bridge_id)
+               + "。本次没有提交任何远程任务")
+    return message, {
+        "slot": slot,
+        "retry_after_seconds": eta,
+        "remote": {"submitted": True, "running": True, "cancellable": False,
+                   "task_id": holder.get("task_id") or bridge_id,
+                   "job": holder.get("job") or "",
+                   "elapsed_seconds": holder.get("elapsed_seconds"),
+                   "eta_seconds": eta},
+    }
+
+
 def start_retry(local_id: str) -> dict:
     """POST /api/hub/task/{id}/retry —— failed 态续跑入口（§四：重试/环境级故障重跑即续）。
 
@@ -1080,6 +1245,12 @@ def start_retry(local_id: str) -> dict:
                 f"命中依据：{basis}{exempt}")
         if task["state"] != "failed":
             raise HubError(f"重试需 failed 状态，当前 {task['state']}（只有失败任务可重试）")
+        # 已提交到远程的拆解无法取消：上一轮还在跑时先拦下并说清「预计还需多久」，
+        # 不让用户点进「撞 409 排队 → 刷失败计数」的死循环（auto-0067 现场）。
+        block = _remote_retry_block(task)
+        if block is not None:
+            message, extra = block
+            raise HubError(message, extra=extra)
         previous_reason = str(task.get("failed_reason") or "")
         job = _spawn_discuss(task_dir, "人工重试：failed → discussing（重跑即续，产物优先）")
     return {"state": "discussing", "job_id": job.get("job_id"), "heartbeat_reset": True,
@@ -1969,11 +2140,13 @@ def force_finish(local_id: str, *, confirm=None, confirm_name=None, reason: str 
             # （auto-0055 的现场形态）。只清内存，不写 history、不动 failed_at、不覆盖原原因。
             finished = _finish_running_jobs(local_id, note=note)
             heartbeat = _close_heartbeat(task_dir)      # 心跳侧车同样终态化（幂等）
+            remote = _remote_after_finish(task_dir, task)   # 远程半边：仍在跑吗、还需多久
             return {"ok": True, "local_id": local_id, "state": "failed", "state_was": "failed",
                     "changed": False, "already": True,
                     "reason": str(task.get("failed_reason") or ""),
                     "jobs_force_finished": finished,
                     "heartbeat_closed": bool(heartbeat),
+                    "remote": remote,
                     "kept": _kept_view(task_dir, task)}
         if st not in FORCE_FINISH_STATES:
             raise HubError(f"任务当前不是运行态（{st}），无需强制结束")
@@ -1988,10 +2161,12 @@ def force_finish(local_id: str, *, confirm=None, confirm_name=None, reason: str 
         finished = _finish_running_jobs(local_id, note=note)
         heartbeat = _close_heartbeat(task_dir)      # 第三半：心跳侧车终态化（清 last_beat_at）
         task = state.load(task_dir)
+        remote = _remote_after_finish(task_dir, task)   # 第四半（只读 + 快照）：远程仍在跑/无法取消
     return {"ok": True, "local_id": local_id, "state": "failed", "state_was": st,
             "changed": True, "already": False, "reason": note,
             "jobs_force_finished": finished,
             "heartbeat_closed": bool(heartbeat),
+            "remote": remote,
             "kept": _kept_view(task_dir, task)}
 
 

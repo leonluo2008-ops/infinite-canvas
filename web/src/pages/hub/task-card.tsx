@@ -3,7 +3,7 @@ import { App, Button, Image as AntdImage, Input, Modal, Progress, Tag } from "an
 import { useCallback, useEffect, useRef, useState, type DragEvent } from "react";
 import { Streamdown } from "streamdown";
 
-import { approveHubTask, confirmHubReplace, errorText, forceFinishHubTask, getHubTask, hubOutputUrl, postHubAsset, renderHubTask, retryHubTask, submitHubTask, uploadHubAssets, uploadHubImage, type HubActivity, type HubAssetCard, type HubFailedView, type HubHeartbeat, type HubLostRun, type HubPairLine, type HubRenderPreview, type HubTaskDetail, type HubTaskSummary } from "./hub-api";
+import { approveHubTask, confirmHubReplace, errorText, forceFinishHubTask, getHubTask, hubOutputUrl, postHubAsset, renderHubTask, retryHubTask, submitHubTask, uploadHubAssets, uploadHubImage, type HubActivity, type HubAssetCard, type HubFailedView, type HubHeartbeat, type HubLostRun, type HubPairLine, type HubRemoteWait, type HubRenderPreview, type HubTaskDetail, type HubTaskSummary } from "./hub-api";
 import { forceFinishGuard } from "./hub-status";
 import { TaskDeleteButton } from "./task-delete-confirm";
 
@@ -32,6 +32,12 @@ const DOWNLOAD_LINK_CLASS = "inline-flex h-8 items-center gap-1.5 rounded-md bg-
 export const FORCE_FINISH_CONFIRM_TITLE = "强制结束这个任务？";
 export const FORCE_FINISH_CONFIRM_SCOPE = "只把状态置为「失败」：任务目录、拆解产物、参考视频全部保留，不删除任何文件，也不杀进程。";
 export const FORCE_FINISH_CONFIRM_SIDE_EFFECT = "如果它其实还活着，进程会继续跑完，但状态仍是失败——之后可点「重试」续跑，或「删除」清掉。";
+/**
+ * 远程语义（所有者 2026-11-12 裁定，必须出现在终止动作的确认与回执里）：
+ * 已经提交到远程的拆解**无法取消**，会继续跑到返回；结果按作废丢弃；再提交同一条任务
+ * 必须等它返回。少这一句，用户就会以为「强制结束 = 远程也停了」。
+ */
+export const FORCE_FINISH_CONFIRM_REMOTE = "已经提交到远程（聚鑫）的拆解无法取消，会继续跑到返回；返回的结果按作废丢弃，不会覆盖这次失败。要再提交同一条任务，得等它返回后再点重试。";
 
 /** 失败原因兜底（与既有文案一致，改它会让「没拿到原因」和「拿到了空原因」长得一样）。 */
 export const FAILED_REASON_FALLBACK = "任务失败，错误原文未返回。";
@@ -146,8 +152,35 @@ export function ForceFinishConfirmBody({ task }: { task: HubTaskSummary }) {
         <div className="space-y-2 text-xs" data-hub-force-confirm={task.local_id}>
             <div className="break-words text-stone-600 dark:text-stone-300">{FORCE_FINISH_CONFIRM_SCOPE}</div>
             <div className="break-words text-stone-600 dark:text-stone-300">{FORCE_FINISH_CONFIRM_SIDE_EFFECT}</div>
+            <div className="break-words text-amber-700 dark:text-amber-300">{FORCE_FINISH_CONFIRM_REMOTE}</div>
             <div className="text-stone-500 dark:text-stone-400">
                 任务号 <span className="font-mono">{task.local_id}</span> · 当前状态 {task.state || "未知"}
+            </div>
+        </div>
+    );
+}
+
+/**
+ * 远程半边（强制终止后）：本地已终止 ≠ 远程已停。
+ *
+ * 只渲染后端 `remote.message`——那句话（还在跑 / 预计还需 / 结果按作废丢弃）的唯一文案源是
+ * automation/remote_wait.py，界面三处出口（强制结束回执、卡片、抽屉）说同一句，不自造第二套。
+ * `running` 只决定配色（在跑=琥珀，已释放=灰），不参与措辞。
+ */
+export function RemoteWaitLine({ remote, compact = false }: { remote?: HubRemoteWait | null; compact?: boolean }) {
+    if (!remote || !remote.message) return null;
+    const running = Boolean(remote.running);
+    const tone = running
+        ? "border-amber-200 bg-amber-50 text-amber-800 dark:border-amber-900 dark:bg-amber-950/20 dark:text-amber-200"
+        : "border-stone-200 bg-stone-50 text-stone-600 dark:border-stone-700 dark:bg-stone-800/40 dark:text-stone-300";
+    return (
+        <div
+            className={`rounded-md border px-2.5 py-1.5 text-xs ${tone}`}
+            data-hub-remote-wait={running ? "running" : "released"}
+        >
+            <div className="flex items-start gap-1.5">
+                <CircleAlert className="mt-0.5 size-3.5 shrink-0" />
+                <span className={`min-w-0 flex-1 break-words ${compact ? "line-clamp-3" : ""}`}>{remote.message}</span>
             </div>
         </div>
     );
@@ -551,6 +584,11 @@ export function TaskCard({ task, onStateChange, onRefresh }: { task: HubTaskSumm
     };
 
     const retry = async () => {
+        // 远程还在跑：按钮已禁用，这里再兜一层（真机双击/键盘回车也不会打出无意义的排队请求）
+        if (detail?.remote?.running) {
+            setActionError(`重试暂缓：${detail.remote.message}`);
+            return;
+        }
         setBusy("retry");
         setActionError("");
         try {
@@ -582,7 +620,14 @@ export function TaskCard({ task, onStateChange, onRefresh }: { task: HubTaskSumm
             const data = await forceFinishHubTask(task.local_id);
             setForceOpen(false);
             onStateChange(task.local_id, data.state || "failed");
-            message.success(data.already ? `任务 ${task.local_id} 已是失败状态` : `已强制结束：${task.local_id} 置为失败（产物全保留，可重试或删除）`);
+            // 回执三分：本地已终止 / 远程无法取消仍在跑（后端算好预计剩余）/ 结果返回后作废丢弃。
+            // 后半句原样来自 data.remote.message（唯一文案源），前端不另写一套。
+            const remoteNote = String(data.remote?.message || "");
+            message.success(
+                (data.already ? `任务 ${task.local_id} 已是失败状态` : `已强制结束：${task.local_id} 置为失败（产物全保留，可重试或删除）`)
+                + (remoteNote ? `；${remoteNote}` : ""),
+            );
+            if (remoteNote) setActionError("");
             void loadDetail();
         } catch (error) {
             // 行内留痕：409「任务当前不是运行态…」/400「需二次确认…」都原样透出，不吞、不白屏
@@ -785,11 +830,22 @@ export function TaskCard({ task, onStateChange, onRefresh }: { task: HubTaskSumm
                 <div className="space-y-2">
                     {/* AT-18 §4.6：原因只认后端 failed.reason，老任务回落既有 error，都没有才兜底 */}
                     <FailedReasonLine failed={task.failed || detail?.failed} fallbackError={detail?.error || ""} />
+                    {/* 远程半边：已终止的 run 若远程还在跑，这里说清「无法取消、还需等多久、结果作废」 */}
+                    <RemoteWaitLine remote={detail?.remote} compact />
                     <div className="flex flex-wrap items-center justify-between gap-2">
                         <span className="text-xs text-stone-500 dark:text-stone-400">重试=重新拆解（已有产物优先复用）；删除=写墓碑防任务号复用，不可恢复。</span>
                         <div className="flex items-center gap-1.5">
-                            <Button danger size="small" icon={<RefreshCw className="size-3.5" />} loading={busy === "retry"} data-hub-retry={task.local_id} onClick={() => void retry()}>
-                                重试
+                            <Button
+                                danger
+                                size="small"
+                                icon={<RefreshCw className="size-3.5" />}
+                                loading={busy === "retry"}
+                                disabled={Boolean(detail?.remote?.running)}
+                                title={detail?.remote?.running ? "上一轮远程拆解仍在跑（无法取消），返回后拆解槽自动释放，再点重试" : undefined}
+                                data-hub-retry={task.local_id}
+                                onClick={() => void retry()}
+                            >
+                                {detail?.remote?.running ? "等远程返回后重试" : "重试"}
                             </Button>
                             {/* 删除走既有二键确认件（同承接、同墓碑说明），成功即刷新列表；拒绝原因同时进 toast 与行内 */}
                             <TaskDeleteButton task={task} size="small" onDeleted={() => onRefresh()} onError={(text) => setActionError(`删除失败：${text}`)} />

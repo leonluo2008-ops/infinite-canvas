@@ -33,6 +33,7 @@ import subprocess
 import sys
 import threading
 import time
+from datetime import datetime
 import traceback
 import unicodedata
 import urllib.error
@@ -2162,7 +2163,9 @@ class Handler(BaseHTTPRequestHandler):
                            err.status)
         except hub_api.HubError as e:      # 工作台业务错（状态不对/文件缺失）→ 4xx，原文给员工看
             # AT-13 §2.2：配置不合法（HubInputError）→ 400，不是状态冲突 409
-            self.send_json({"error": str(e)}, getattr(e, "status", 409))
+            extra = getattr(e, "extra", None)
+            self.send_json({"error": str(e), **(extra if isinstance(extra, dict) else {})},
+                           getattr(e, "status", 409))
         except subprocess.TimeoutExpired:
             self.send_json({"error": "子进程超时"}, 500)
         except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
@@ -2208,6 +2211,10 @@ class Handler(BaseHTTPRequestHandler):
         m = re.fullmatch(r"/api/hub/task/([^/]+)", path)
         if m:
             self.send_json({"task": hub_api.get_task(urllib.parse.unquote(m.group(1)))})
+            return
+        if path == "/api/lapian/slot":
+            # 拆解槽真相（只读）：hub 侧用它把「槽忙」翻成人话（在等谁的远程返回、预计还需多久）
+            self.send_json(lapian_slot_view())
             return
         m = re.fullmatch(r"/api/hub/file/([^/]+)", path)
         if m:
@@ -3549,12 +3556,53 @@ def analyze_argv(rel: str, task_id: str, intent: str,
     return ["analyze.py", rel, "--id", task_id, "--yes", "--intent", intent] + list(extra_args or [])
 
 
+def lapian_slot_view() -> dict:
+    """拆解槽真相（只读诊断面）：谁在占、占了多久、跑到哪个阶段。
+
+    为什么必须把这个面暴露出来：拆解槽（ANALYZE_BUSY）是**桥进程内的锁**，hub 那侧看不见
+    「槽被谁占着」。强制结束一个已提交远程拆解的任务后，重试只能反复撞 409，界面给用户刷
+    「第 N 次失败」——事实（上一个 run 的远程拆解还在跑、还剩多久）本来就查得到，只是没出口。
+    本面只读、零副作用；锁被占但查不到 job 记录（acquire 与记录落盘之间、或记录被 TTL 清掉）
+    时如实报 busy=true + holder=None，绝不猜一个任务号填上。
+    """
+    busy = bool(ANALYZE_BUSY.locked())
+    holder = None
+    with JOBS_LOCK:
+        running = [(jid, dict(rec)) for jid, rec in JOBS.items()
+                   if str(rec.get("status") or "") == "running"]
+    if busy and running:
+        # 同一时刻只有一个 job 能持有 ANALYZE_BUSY → 最早启动的那条就是持有者
+        running.sort(key=lambda kv: float(kv[1].get("started") or 0))
+        jid, rec = running[0]
+        started = float(rec.get("started") or 0)
+        tid = str(rec.get("task_id") or "")
+        stage_rec = read_progress(tid) or {}
+        holder = {
+            "job": jid,
+            "task_id": tid,
+            "started_at": datetime.fromtimestamp(started).astimezone().isoformat(timespec="seconds")
+                          if started else "",
+            "elapsed_seconds": round(time.time() - started, 1) if started else None,
+            "stage": str(stage_rec.get("stage") or ""),
+        }
+    return {
+        "busy": busy,
+        "holder": holder,
+        # 诊断用：哪些任务 id 记在 ANALYZING（同一任务重拆也会 409，文案要指向它）
+        "analyzing": sorted(ANALYZING),
+        "checked_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+    }
+
+
 def start_analyze_job(video: str, intent: str = "", requested_task_id: str = "",
                       extra_args: list[str] | None = None,
                       extra_env: dict | None = None) -> dict:
     """提交拆解任务，立刻返回 job id；真正的 analyze.py 在后台线程里跑。"""
     if not ANALYZE_BUSY.acquire(blocking=False):
-        raise ApiError(409, "已经有一个拆解在跑，等它跑完（约 1–3 分钟）再点")
+        # 409 语义写死：**排队**，不是失败。extra.slot 把「谁在占、跑了多久」交给调用方，
+        # 调用方（automation/discuss.py 的排队循环 / hub 重试入口）据此说人话，而不是刷计数。
+        raise ApiError(409, "已经有一个拆解在跑，等它跑完（约 1–3 分钟）再点",
+                       extra={"slot": lapian_slot_view()})
     now = time.time()
     job_id = secrets.token_hex(8)
     with JOBS_LOCK:
@@ -3625,7 +3673,8 @@ def analyze_video(video: str, intent: str = "", requested_task_id: str = "",
     task_path.mkdir(parents=True, exist_ok=True)
     with WRITE_LOCK:
         if task_id in ANALYZING:
-            raise ApiError(409, f"{task_id} 正在拆解，等它跑完（约 30–60 秒）")
+            raise ApiError(409, f"{task_id} 正在拆解，等它跑完（约 30–60 秒）",
+                           extra={"slot": lapian_slot_view(), "task_id": task_id})
         write_text(task_path / "意图.txt", intent)
         ANALYZING.add(task_id)
     started = time.time()
