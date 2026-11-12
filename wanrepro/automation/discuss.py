@@ -11,11 +11,10 @@
 """
 import argparse
 import json
+import os
 import re
 import sys
-import threading
 import time
-from datetime import datetime, timezone
 from pathlib import Path
 
 from . import bridge, config, state
@@ -38,7 +37,9 @@ class DiscussError(RuntimeError):
 # 但轮询粒度（3s）追不上门禁尾段的快速阶段变化（实测「投影」「门禁第1轮」整段被跳过），
 # 门禁轮次在拆解日志里丢线。这里在 job done 终态补账一次：读 analysis/reverse/<bridge>/门禁.json
 # （与自检面板/selfcheck.load_gate_item 同一真源，红线 25 同源不另判）追一行门禁终态，确定性落日志。
-_ANALYSIS_ROOT = Path(__file__).resolve().parents[1] / "analysis" / "reverse"
+_ANALYSIS_ROOT = Path(os.environ.get("WANREPRO_ANALYSIS_ROOT") or "").expanduser() \
+    if (os.environ.get("WANREPRO_ANALYSIS_ROOT") or "").strip() \
+    else Path(__file__).resolve().parents[1] / "analysis" / "reverse"
 
 
 def _gate_summary_line(bridge_id: str) -> str:
@@ -172,19 +173,6 @@ def _fmt_wait(seconds: float) -> str:
 
 _BRIDGE_EXIT_RE = re.compile(r"analyze\.py 退出 (\d+)")
 _PROGRESS_EXIT_RE = re.compile(r"退出码 (\d+)")
-_FAIL_LOCK = threading.RLock()      # 同进程内多执行体（hub 每任务一线程）串行化失败回写
-
-
-def _now_iso() -> str:
-    """与 state._now() 同格式（本地时区带偏移、秒精度）——失败原因与 history 同一口径。"""
-    return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
-
-
-def _is_fallback_reason(text: str) -> bool:
-    """是否 AT-18 冻结文案（= 兜底句，不是错误原文）。"""
-    t = str(text or "").strip()
-    return bool(t) and (t == state.FAKE_RUN_REASON_FALLBACK
-                        or t in set(state.FAKE_RUN_REASONS.values()))
 
 
 def _task_failure(message: str, *, bridge_error: str | None = None,
@@ -250,53 +238,25 @@ def _fail_task(task_dir: Path, reason: str, *, source: str = "discuss",
 
     · 原文优先：有原文写原文；原文缺失（reason 为空）才用 AT-18 冻结文案兜底，
       本模块**不新造**第二套用户可见文案；
-    · 幂等：已是 failed 且原因相同 → 不动盘（不写 history、不刷新 failed_at）——
-      同一次失败被重复触发不会产生第二次状态迁移；
-    · 原文升级：先前已按兜底句判死、随后拿到原文 → 只改 failed_reason（+证据来源），
-      不写 history、不刷新 failed_at（「兜底句只在原文缺失时用」由此保证）。
+    · 写盘委托 `state.write_failed`（AT-19 §4.3 唯一写盘核）：进程间文件锁 + run_id 栅栏 +
+      起态准入都在那里，本函数只管「取哪一句原文」；
+    · 幂等：已是 failed 且原因相同 → 不动盘（不写 history、不刷新 failed_at）——同一次失败
+      被重复触发不会产生第二次状态迁移；先按兜底句判死、随后拿到原文 → 只升级原因。
     """
     task_dir = Path(task_dir)
-    with _FAIL_LOCK:
-        task = state.load(task_dir)
-        cur = str(task.get("state") or "")
-        text = str(reason or "").strip()
-        fallback = not text
-        if fallback:
-            text = state.fake_run_reason(cur or "discussing")
-        now = _now_iso()
-
-        if cur == "failed":
-            old = str(task.get("failed_reason") or "")
-            if old == text:
-                return {"changed": False, "already": True, "reason": old}
-            if _is_fallback_reason(old) and not _is_fallback_reason(text):
-                evidence = task.get("failed_evidence")
-                evidence = dict(evidence) if isinstance(evidence, dict) else {}
-                evidence.update({"trigger": str(source or "bridge_exit"),
-                                 "decided_at": now,
-                                 "exit_code": exit_code if exit_code is not None
-                                 else evidence.get("exit_code")})
-                evidence["reason_upgraded_from"] = old
-                task["failed_reason"] = text
-                task["failed_evidence"] = evidence
-                state.save(task_dir, task)
-                return {"changed": True, "upgraded": True, "reason": text, "was": old}
-            # 已有真实原因（不是兜底句）：先到的原文为准，后续重复触发一律不动盘
-            return {"changed": False, "already": True, "reason": old}
-
-        # 写盘前重读一次（与 state.fail_orphan_task 同纪律）：判定窗口内已被看门狗/别处
-        # 降级 → 本次不再迁移，改走「已 failed」分支（幂等或原文升级），保证只一条 failed 迁移。
-        if str(state.load(task_dir).get("state") or "") == "failed":
-            return _fail_task(task_dir, reason, source=source, exit_code=exit_code)
-
-        state.transition(task_dir, "failed", note=text,
-                         extra={"failed_reason": text,
-                                "failed_at": now,
-                                "failed_evidence": {"trigger": str(source or "discuss"),
-                                                    "decided_at": now,
-                                                    "exit_code": exit_code,
-                                                    "fallback_text": fallback}})
-        return {"changed": True, "already": False, "reason": text}
+    task = state.load(task_dir)
+    cur = str(task.get("state") or "")
+    text = str(reason or "").strip()
+    fallback = not text
+    if fallback:
+        text = state.fake_run_reason(cur or "discussing")
+    res = state.write_failed(task_dir, reason=text, source=str(source or "discuss"),
+                             exit_code=exit_code,
+                             run_id=os.environ.get("WANREPRO_EXEC_RUN_ID", ""),
+                             probe={"fallback_text": fallback})
+    out = dict(res or {})
+    out["reason"] = str(out.get("reason") or text)
+    return out
 
 
 def start_and_wait(task: dict, on_stage=None, on_heartbeat=None,

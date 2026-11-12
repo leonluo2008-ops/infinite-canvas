@@ -27,6 +27,8 @@ import hashlib
 import json
 import os
 import threading
+import time
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -379,9 +381,26 @@ ACTIVITY_SOURCES = ("心跳", "状态迁移", "阶段锚", "任务目录产物",
 HEARTBEAT_FILE = "心跳.json"
 _HEARTBEAT_SCHEMA = 1
 _ARTIFACT_DEPTH = 2                # 产物清单浅扫：不递归超过 2 层
-_ARTIFACT_EXCLUDE = (_TASK_FILE, HEARTBEAT_FILE, "拆解日志.txt")   # §1.3：digest 不许自证自变
-_ACTIVITY_EXCLUDE = (_TASK_FILE, HEARTBEAT_FILE)                   # 活动证据：日志 mtime 仍算
-_ANALYSIS_REVERSE = Path(__file__).resolve().parents[1] / "analysis" / "reverse"
+
+# ---- AT-19 契约文件（方案 v2 §1.3）------------------------------------------------
+EXEC_EXIT_FILE = "执行体退出码.json"      # 执行体收尾写；spawn 失败时父进程代写（outcome=spawn_failed）
+CHILD_LOG_FILE = "拆解子进程日志.txt"     # 子进程 stdout/stderr 合流（追加式）
+TASK_LOCK_FILE = ".任务.lock"             # 进程间文件锁载体（X1）
+EXEC_GRACE_SECONDS = 60                   # 只保护「执行体还没接管」（E3）；E1/E2 不看宽限
+EXEC_PID_REUSE_TOLERANCE = 2              # PID 复用判据：OS creation time 差 > 2s 视为复用
+EXEC_RUN_ID_KEY = "exec_run_id"           # 任务.json 上的 run 令牌（X2 所有权栅栏）
+
+_ARTIFACT_EXCLUDE = (_TASK_FILE, HEARTBEAT_FILE, "拆解日志.txt",          # §1.3：digest 不许自证自变
+                     EXEC_EXIT_FILE, EXEC_EXIT_FILE + ".tmp",
+                     HEARTBEAT_FILE + ".tmp", CHILD_LOG_FILE, TASK_LOCK_FILE)
+# 活动证据六源：心跳 / 状态迁移 / 阶段锚 / 任务目录产物 / 拆解产物 / 起跑锚。
+# 退出码文件是「死亡证据」不是活动；锁文件每次读写都改 mtime；子进程日志逐行增长——
+# 三者都不许顶替 last_activity_at（否则死证被自己的残留文件盖掉）。
+_ACTIVITY_EXCLUDE = (_TASK_FILE, HEARTBEAT_FILE, EXEC_EXIT_FILE, EXEC_EXIT_FILE + ".tmp",
+                     HEARTBEAT_FILE + ".tmp", CHILD_LOG_FILE, TASK_LOCK_FILE)
+_ANALYSIS_REVERSE = (Path(os.environ["WANREPRO_ANALYSIS_ROOT"]).expanduser()
+                     if (os.environ.get("WANREPRO_ANALYSIS_ROOT") or "").strip()
+                     else Path(__file__).resolve().parents[1] / "analysis" / "reverse")
 
 _ORPHAN_LOCK = threading.Lock()    # 只保护 fail_orphan_task 的判定-写盘临界区；transition() 不变
 
@@ -398,9 +417,15 @@ def heartbeat_path(task_dir: Path) -> Path:
 
 
 def _heartbeat_blank() -> dict:
+    """心跳全空结构（缺文件 / 坏 JSON / 从未跑起 的唯一可识别形态）。
+
+    AT-19 扩 4 键：exec（child|thread|""）/ pid / pid_created_at（OS creation time）/ exit_code。
+    读侧是**逐键白名单拷贝**，新增字段不进这里就等于没写（审计 X8：静默失效）。
+    """
     return {"schema": _HEARTBEAT_SCHEMA, "run_id": "", "started_at": "", "last_beat_at": "",
             "beat_count": 0, "phase": "", "artifact_count": 0, "artifact_digest": "",
-            "ended_at": "", "outcome": ""}
+            "ended_at": "", "outcome": "",
+            "exec": "", "pid": 0, "pid_created_at": "", "exit_code": None}
 
 
 def heartbeat_read(task_dir: Path) -> dict:
@@ -417,15 +442,29 @@ def heartbeat_read(task_dir: Path) -> dict:
     if not isinstance(raw, dict):
         return out
     for key in ("run_id", "started_at", "last_beat_at", "phase", "artifact_digest",
-                "ended_at", "outcome"):
+                "ended_at", "outcome", "exec", "pid_created_at"):
         value = raw.get(key)
         out[key] = "" if value is None else str(value)
-    for key in ("schema", "beat_count", "artifact_count"):
+    for key in ("schema", "beat_count", "artifact_count", "pid"):
         try:
             out[key] = int(raw.get(key) or 0)
         except (TypeError, ValueError):
             out[key] = 0
+    code = raw.get("exit_code")
+    try:
+        out["exit_code"] = None if code is None else int(code)
+    except (TypeError, ValueError):
+        out["exit_code"] = None
     return out
+
+
+def _fence_ok(data: dict, expected_run_id: str) -> bool:
+    """逐写栅栏（方案 v2 §1.4 第二道）：给了期望 run 就必须逐字节匹配。
+
+    不匹配 = 本次 run 已被接管（force_finish + retry / 人工重试），本次写入一律放弃。
+    """
+    return not expected_run_id or str((data or {}).get("run_id") or "") == str(expected_run_id)
+
 
 
 def _heartbeat_write(task_dir: Path, data: dict) -> dict:
@@ -436,45 +475,79 @@ def _heartbeat_write(task_dir: Path, data: dict) -> dict:
     return data
 
 
-def heartbeat_begin(task_dir: Path, *, run_id: str, phase: str = "") -> dict:
-    """一次 run 起手：整体覆盖写心跳（旧 run_id 作废）。**必须在起线程之前调用**。
+def heartbeat_begin(task_dir: Path, *, run_id: str, phase: str = "", exec: str = "") -> dict:
+    """一次 run 起手：整体覆盖写心跳（旧 run_id 作废）。**必须在 Popen 之前调用**。
 
-    这样「线程根本没起来」（Thread.start() 失败 / 进程在起手后崩 / 桥连不上就退出）
-    也有一份带 started_at 的心跳，判定窗口从发起时刻起算，而不是等线程内部第一次写。
+    这样「执行体根本没起来」（启动失败 / 进程在起手后崩 / 桥连不上就退出）
+    也有一份带 started_at 的心跳，判定窗口从发起时刻起算，而不是等执行体内部第一次写。
     last_beat_at 保持空串 = 本次 run 从未收到心跳（初值可被识别，不许伪造一次心跳）。
+    exec（AT-19）：child=独立子进程，thread=旧进程内线程，""=旧任务/未知。
     """
     task_dir = Path(task_dir)
     data = _heartbeat_blank()
     data["run_id"] = str(run_id or "")
     data["started_at"] = _now()
     data["phase"] = str(phase or "")
+    data["exec"] = str(exec or "")
     data["artifact_count"], data["artifact_digest"] = _artifact_fingerprint(task_dir)
     return _heartbeat_write(task_dir, data)
 
 
-def heartbeat_beat(task_dir: Path, *, phase: str | None = None) -> dict:
-    """一次心跳：只写心跳文件的 last_beat_at/beat_count/artifact_*（+ phase 变化时同步）。
+def heartbeat_attach(task_dir: Path, *, run_id: str, pid: int,
+                     pid_created_at: str = "") -> dict:
+    """父进程在 Popen 成功后写 pid + OS creation time（T0+，父的最后一笔心跳写入）。
 
-    **绝不碰 任务.json**（AT-16 B4b 合同：等待期心跳借道阶段回调会把阶段计时清零）。
+    单写者合同：父只写 T0（begin）与 T0+（attach），此后 beat/finish 全归子进程。
     """
     task_dir = Path(task_dir)
     data = heartbeat_read(task_dir)
+    if not _fence_ok(data, run_id):
+        return {}                      # 已被接管：不写
+    data["schema"] = _HEARTBEAT_SCHEMA
+    data["pid"] = int(pid or 0)
+    data["pid_created_at"] = str(pid_created_at or "")
+    data["exec"] = "child"
+    return _heartbeat_write(task_dir, data)
+
+
+def heartbeat_beat(task_dir: Path, *, phase: str | None = None,
+                   expected_run_id: str = "", pid: int | None = None) -> dict:
+    """一次心跳：只写心跳文件的 last_beat_at/beat_count/artifact_*（+ phase 变化时同步）。
+
+    **绝不碰 任务.json**（AT-16 B4b 合同：等待期心跳借道阶段回调会把阶段计时清零）。
+    expected_run_id（AT-19 X2）：给了就逐写校验；不匹配 → 放弃写入并返回 {}（不抛，
+    心跳失败不拖垮拆解）。
+    """
+    task_dir = Path(task_dir)
+    data = heartbeat_read(task_dir)
+    if not _fence_ok(data, expected_run_id):
+        return {}
     data["schema"] = _HEARTBEAT_SCHEMA
     if not data["started_at"]:
         data["started_at"] = _now()          # 没有起手写（旧任务/异常路径）也不许伪造历史
     data["last_beat_at"] = _now()
     data["beat_count"] = int(data.get("beat_count") or 0) + 1
+    if pid is not None:
+        data["pid"] = int(pid or 0)
     if phase is not None and str(phase) != "":
         data["phase"] = str(phase)
     data["artifact_count"], data["artifact_digest"] = _artifact_fingerprint(task_dir)
     return _heartbeat_write(task_dir, data)
 
 
-def heartbeat_finish(task_dir: Path, *, outcome: str) -> dict:
-    """一次 run 收尾：写 ended_at + outcome（仅诊断，不参与判定）。"""
+def heartbeat_finish(task_dir: Path, *, outcome: str, expected_run_id: str = "",
+                     exit_code: int | None = None) -> dict:
+    """一次 run 收尾：写 ended_at + outcome + exit_code（诊断位，不参与判定）。
+
+    expected_run_id 不匹配 → 放弃（旧执行体不许给新 run 的心跳盖终态）。
+    """
     data = heartbeat_read(task_dir)
+    if not _fence_ok(data, expected_run_id):
+        return {}
     data["ended_at"] = _now()
     data["outcome"] = str(outcome or "")
+    if exit_code is not None:
+        data["exit_code"] = int(exit_code)
     return _heartbeat_write(Path(task_dir), data)
 
 
@@ -704,25 +777,25 @@ def judge_lost_run(task: dict, probe: dict, *, now=None,
 # ---------------------------------------------------------------- 受控降级（唯一写入口）
 
 def fail_orphan_task(task_dir: Path, *, reason: str, probe: dict | None = None,
-                     trigger: str = "auto_scan") -> dict:
-    """运行态 → failed 的唯一受控入口（方案 §3.3；T1/T2 两条显式边）。
+                     trigger: str = "auto_scan", run_id: str = "",
+                     exec_view: dict | None = None) -> dict:
+    """运行态 → failed 的唯一受控入口（方案 §3.3；T1/T2 两条显式边 + AT-19 exec_dead 边）。
 
     返回 {"changed": bool, "state": "failed", "state_was": str, "reason": str, "at": iso}
     · 已是 failed → changed=False / already=True，**不写 history、不刷新 failed_at**（幂等）；
     · 状态不在运行态 → StateError("任务当前不是运行态（<state>）")；
-    · trigger="auto_scan" 时在写盘前**重新过一遍守卫**（G1 运行态 / G2 静默 ≥900s /
+    · trigger="auto_scan"：写盘前**重新过一遍守卫**（G1 运行态 / G2 静默 ≥900s /
       G3 无在途证据 / G4 调用方传入的 held_job），未过即拒降级——守卫不只在扫描器里；
+    · trigger="exec_dead"（AT-19）：写盘前重过 `judge_exec_dead`（E1/E2/E2b/E3 死证），
+      未握死证即拒降级——这是「执行体不存在→立即降级」的入口，与 900s 静默判定分离；
     · 只写 5 个键：state / history(追加一条) / failed_reason / failed_at / failed_evidence；
     · **绝不**：删文件、清 pending_replace、清 approval、动产物、动 lapian_*。
-
-    为什么不用 transition()：它的 failed 边是「任意态可进」，会把判定窗口内**并发推进**
-    到 awaiting_assets 的任务也判死。这里写盘形态与 transition() 完全一致（history 同形状
-    + 一次 save），但在写盘前重读校验起态未变；起态变了 → 放弃本轮（changed=False）。
     """
     task_dir = Path(task_dir)
+    reason_code = ""
     with _ORPHAN_LOCK:
         task = load(task_dir)
-        state_was = task["state"]
+        state_was = str(task["state"])
         if state_was == "failed":
             return {"changed": False, "already": True, "state": "failed",
                     "state_was": "failed",
@@ -731,15 +804,408 @@ def fail_orphan_task(task_dir: Path, *, reason: str, probe: dict | None = None,
         if state_was not in RUNNING_STATES_MACHINE:
             raise StateError(f"任务当前不是运行态（{state_was}）")
         reason = str(reason or "").strip() or fake_run_reason(state_was)
+        probe = dict(probe) if isinstance(probe, dict) else {}
         if trigger == "auto_scan":
-            snapshot = probe if isinstance(probe, dict) else activity_snapshot(task_dir, task)
-            lost, reason_code = judge_lost_run(task, snapshot,
-                                               held_job=bool(snapshot.get("held_job")))
+            snapshot = probe or activity_snapshot(task_dir, task)
+            lost, code = judge_lost_run(task, snapshot,
+                                        held_job=bool(snapshot.get("held_job")))
             if not lost:
-                raise StateError(f"未达假运行判定（{reason_code or 'unknown'}），拒绝降级")
+                raise StateError(f"未达假运行判定（{code or 'unknown'}），拒绝降级")
             probe = snapshot
+        elif trigger == "exec_dead":
+            view = exec_view if isinstance(exec_view, dict) else exec_snapshot(task_dir, task)
+            dead, code = judge_exec_dead(task, view)
+            if not dead:
+                raise StateError(f"未达执行体死证（{code or 'unknown'}），拒绝降级")
+            reason_code = str(code or "")
+            probe = {**probe, "exec": view}
+        return _write_failed(task_dir, reason=reason, probe=probe, trigger=trigger,
+                             run_id=run_id, expected_from=state_was,
+                             reason_code=reason_code)
+
+
+# ============================================================================
+# AT-19：执行体进程化 —— 进度与死证层（退出码回写 / PID 判死 / 启动即对账的证据面）
+#
+# 方案 v2（kanban 附件 方案v2-AT-19-…-20261112.md）§1.3 / §2 / §4.3。本段只做三件事：
+#   · 证据：`执行体退出码.json`（子进程收尾唯一写点，原子替换）+ PID 存活/creation time
+#            （Windows GetProcessTimes / POSIX /proc/<pid>/stat 第 22 字段）——死证只认磁盘。
+#   · 判定：`judge_exec_dead(task, exec_view)` 纯函数，E1/E2/E2b/E3 四条死证，900s 静默
+#            判定（judge_lost_run）**零改动**、仍作兜底。
+#   · 写盘：`_write_failed` 是 discuss 链 failed 5 键的**唯一构造点**，进程间文件锁 +
+#            run_id 栅栏 + 起态准入；`fail_orphan_task` 只是它前面的守卫壳。
+#
+# 冻结值一个不动：900/60/300/900/30、FAKE_RUN_REASONS、墓碑合同、generating 不自动降级。
+# ============================================================================
+
+_LOCK_RETRY_SECONDS = 0.05
+_LOCK_TIMEOUT_SECONDS = 5.0
+
+
+@contextmanager
+def _file_lock(task_dir: Path):
+    """任务级**进程间**互斥（X1）：`<任务根>/.locks/<任务号>.lock` 上一个字节的独占锁。
+
+    为什么必须跨进程：AT-19 把执行体搬出 server 进程后，「子进程整份 save」与「server
+    对账写 failed」是真并发。进程内 threading.Lock 挡不住，`_write_task` 的「写盘前重读」
+    也只能把窗口缩到 load→save 的毫秒级。锁只在 read-modify-write 区间持有（毫秒级），
+    不做长事务、不覆盖 transition()。
+
+    锁文件放在**任务目录之外**（同级 .locks/）：任务目录要被「只写 5 键、文件集合不变」的
+    冻结合同与产物指纹/活动六源检视，锁文件在里面会同时污染这三处。
+    """
+    task_dir = Path(task_dir)
+    lock_dir = task_dir.parent / ".locks"
+    lock_path = lock_dir / f"{task_dir.name}.lock"
+    fd = None
+    deadline = time.monotonic() + _LOCK_TIMEOUT_SECONDS
+    try:
+        try:
+            lock_dir.mkdir(parents=True, exist_ok=True)
+            fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o644)
+        except OSError:
+            yield                          # 锁文件都建不了（目录被删/无权限）：退化为无锁，绝不阻塞调用方
+            return
+        while True:
+            try:
+                if os.name == "nt":
+                    import msvcrt
+                    msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    raise StateError(f"任务文件锁等待超时（{_LOCK_TIMEOUT_SECONDS}s）：{lock_path}")
+                time.sleep(_LOCK_RETRY_SECONDS)
+        yield
+    finally:
+        if fd is not None:
+            try:
+                if os.name == "nt":
+                    import msvcrt
+                    os.lseek(fd, 0, os.SEEK_SET)
+                    msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
+# ---------------------------------------------------------------- 退出码契约文件
+
+def exec_path(task_dir: Path) -> Path:
+    return Path(task_dir) / EXEC_EXIT_FILE
+
+
+def _exec_blank() -> dict:
+    return {"schema": 1, "run_id": "", "pid": 0, "exit_code": None, "outcome": "",
+            "error_tail": "", "reason_source": "", "at": "", "exists": False}
+
+
+def exec_read(task_dir: Path) -> dict:
+    """读 执行体退出码.json（纯读，不抛）。exists=False = 本次 run 没写退出码（被强杀/还在跑）。"""
+    out = _exec_blank()
+    try:
+        raw = json.loads(exec_path(task_dir).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return out
+    if not isinstance(raw, dict):
+        return out
+    out["exists"] = True
+    for key in ("run_id", "outcome", "error_tail", "reason_source", "at"):
+        value = raw.get(key)
+        out[key] = "" if value is None else str(value)
+    for key in ("pid",):
+        try:
+            out[key] = int(raw.get(key) or 0)
+        except (TypeError, ValueError):
+            out[key] = 0
+    code = raw.get("exit_code")
+    try:
+        out["exit_code"] = None if code is None else int(code)
+    except (TypeError, ValueError):
+        out["exit_code"] = None
+    return out
+
+
+def exec_write(task_dir: Path, *, run_id: str, pid: int = 0, exit_code: int | None = None,
+               outcome: str = "", error_tail: str = "", reason_source: str = "") -> dict:
+    """执行体退出前**一次**原子写（tmp + replace）。
+
+    栅栏：已有退出码且 run_id 不是本次 run → 不覆盖（旧执行体不许盖新 run 的死证）。
+    唯一由父代写的例外：spawn 失败（outcome="spawn_failed"，父用同一 run_id 写）。
+    """
+    task_dir = Path(task_dir)
+    current = exec_read(task_dir)
+    if current.get("exists") and str(current.get("run_id") or "") not in ("", str(run_id)):
+        return current
+    payload = {"schema": 1, "run_id": str(run_id or ""), "pid": int(pid or 0),
+               "exit_code": None if exit_code is None else int(exit_code),
+               "outcome": str(outcome or ""),
+               "error_tail": str(error_tail or "")[:2000],
+               "reason_source": str(reason_source or ""), "at": _now()}
+    target = exec_path(task_dir)
+    tmp = target.with_name(EXEC_EXIT_FILE + ".tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    tmp.replace(target)
+    payload["exists"] = True
+    return payload
+
+
+def stamp_exec_run(task_dir: Path, run_id: str) -> dict:
+    """把本次 run 令牌写进 任务.json（X2 所有权栅栏的锚）。持进程间锁，读-改-写。"""
+    task_dir = Path(task_dir)
+    with _file_lock(task_dir):
+        task = load(task_dir)
+        task[EXEC_RUN_ID_KEY] = str(run_id or "")
+        save(task_dir, task)
+        return task
+
+
+# ---------------------------------------------------------------- PID 探测（活/creation time）
+
+def _win_open(pid: int):
+    import ctypes
+    from ctypes import wintypes
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.OpenProcess.restype = wintypes.HANDLE
+    k32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    # QUERY_LIMITED_INFORMATION(0x1000) | SYNCHRONIZE(0x00100000)
+    return k32, k32.OpenProcess(0x1000 | 0x00100000, False, int(pid))
+
+
+def pid_alive(pid: int) -> bool | None:
+    """PID 是否活着。None = 探测失败（权限/平台不支持）——判定层按保守处理，不许当死证。"""
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return None
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+        try:
+            k32, handle = _win_open(pid)
+        except OSError:
+            return None
+        if not handle:
+            err = ctypes.get_last_error()
+            return None if err == 5 else False      # 5=拒绝访问 → 存在但探不动
+        try:
+            code = wintypes.DWORD()
+            if not k32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                return None
+            return code.value == 259                # STILL_ACTIVE
+        finally:
+            k32.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)                              # POSIX：信号 0 = 只探存在
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return None
+    return True
+
+
+def pid_created_at(pid: int) -> str:
+    """进程 OS creation time（ISO，毫秒精度）。取不到 → ""（判定层退化为 exec_unknown）。"""
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return ""
+    if pid <= 0:
+        return ""
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+        try:
+            k32, handle = _win_open(pid)
+        except OSError:
+            return ""
+        if not handle:
+            return ""
+        try:
+            created = wintypes.FILETIME()
+            exited = wintypes.FILETIME()
+            kernel = wintypes.FILETIME()
+            user = wintypes.FILETIME()
+            if not k32.GetProcessTimes(handle, ctypes.byref(created), ctypes.byref(exited),
+                                       ctypes.byref(kernel), ctypes.byref(user)):
+                return ""
+            ticks = (created.dwHighDateTime << 32) | created.dwLowDateTime
+            epoch = ticks / 10_000_000 - 11644473600      # FILETIME(1601) → Unix epoch
+            return (datetime.fromtimestamp(epoch, tz=timezone.utc).astimezone()
+                    .isoformat(timespec="milliseconds"))
+        finally:
+            k32.CloseHandle(handle)
+    # POSIX：/proc/<pid>/stat 第 22 字段 starttime（clock tick）→ 秒
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8", errors="replace")
+        fields = stat[stat.rfind(")") + 2:].split()
+        start_ticks = int(fields[19])
+        btime = 0
+        for line in Path("/proc/stat").read_text(encoding="utf-8", errors="replace").splitlines():
+            if line.startswith("btime "):
+                btime = int(line.split()[1])
+                break
+        if not btime:
+            return ""
+        epoch = btime + start_ticks / os.sysconf("SC_CLK_TCK")
+        return (datetime.fromtimestamp(epoch, tz=timezone.utc).astimezone()
+                .isoformat(timespec="milliseconds"))
+    except (OSError, ValueError, IndexError):
+        return ""
+
+
+# ---------------------------------------------------------------- 执行体快照 + 死证判定
+
+def exec_snapshot(task_dir: Path, task: dict | None = None) -> dict:
+    """执行体证据快照（纯读，不写盘）：心跳 4 新键 + 退出码文件 + PID 实时探活。
+
+    判定只吃这份快照——**不读 HUB_JOBS**（server 重启后内存态为空，进程化后内存态
+    更是另一个进程的，永远不可信）。
+    """
+    task_dir = Path(task_dir)
+    task = _task_or_load(task_dir, task)
+    hb = heartbeat_read(task_dir)
+    ex = exec_read(task_dir)
+    pid = int(hb.get("pid") or 0)
+    alive = pid_alive(pid) if pid > 0 else None
+    actual_created = pid_created_at(pid) if (pid > 0 and alive) else ""
+    return {
+        "heartbeat_run_id": str(hb.get("run_id") or ""),
+        "heartbeat_at": str(hb.get("last_beat_at") or ""),
+        "started_at": str(hb.get("started_at") or ""),
+        "beat_count": int(hb.get("beat_count") or 0),
+        "exec": str(hb.get("exec") or ""),
+        "pid": pid,
+        "pid_created_at": str(hb.get("pid_created_at") or ""),
+        "pid_alive": alive,
+        "pid_actual_created_at": actual_created,
+        "exit_exists": bool(ex.get("exists")),
+        "exit_run_id": str(ex.get("run_id") or ""),
+        "exit_code": ex.get("exit_code"),
+        "exit_outcome": str(ex.get("outcome") or ""),
+        "exit_error_tail": str(ex.get("error_tail") or ""),
+        "exit_at": str(ex.get("at") or ""),
+        "task_exec_run_id": str((task or {}).get(EXEC_RUN_ID_KEY) or ""),
+        "scanned_at": _now(),
+    }
+
+
+def judge_exec_dead(task: dict, view: dict, *, now=None) -> tuple[bool, str]:
+    """执行体死证判定（纯函数）。返回 (是否已死, 原因码)。
+
+    判定顺序（方案 v2 §2，冻结）：
+      1 not_running            状态不在运行态
+      2 manual_only_state      generating 永不自动降级（冻结）
+      3 exec_no_evidence       心跳缺失 / exec 非 child（旧任务）→ 退回 900s 静默判定
+      4 exec_stale_run         心跳 run ≠ 任务 exec_run_id（旧执行体，已被接管）
+      5 exec_exit_written      E1：退出码回写且非 0（outcome=env_error 除外，环境级留 discussing）
+      6 exec_pid_gone          E2：pid>0 且已死
+      7 exec_pid_reused        E2b：pid 活着但 OS creation time 与登记的差 > 2s（PID 复用）
+      8 exec_grace / exec_never_attached   E3：child 但从未接管；60s 宽限**只在这里**
+      9/10/11 exec_unknown / exec_alive   其余保守（退回 900s）
+
+    宽限口径（X3）：E1/E2/E2b 不看 60s——执行体已握死证就立即降级。
+    心跳超时**不作**独立死证（Q1 默认裁定）：心跳只让扫描走到 E2/E3。
+    """
+    task = task or {}
+    view = view or {}
+    state_name = str(task.get("state") or "")
+    if state_name not in RUNNING_STATES_MACHINE:
+        return False, "not_running"
+    if state_name == "generating":
+        return False, "manual_only_state"
+    run_id = str(view.get("heartbeat_run_id") or "")
+    if not run_id or str(view.get("exec") or "") != "child":
+        return False, "exec_no_evidence"
+    owner = str(view.get("task_exec_run_id") or "")
+    if owner and owner != run_id:
+        return False, "exec_stale_run"
+    exit_code = view.get("exit_code")
+    exit_run = str(view.get("exit_run_id") or "")
+    outcome = str(view.get("exit_outcome") or "")
+    if view.get("exit_exists") and exit_run == run_id and isinstance(exit_code, int):
+        if outcome == "env_error":
+            return False, "exec_env_error"        # 环境级故障：状态留 discussing，重跑即续
+        if exit_code != 0:
+            return True, "exec_exit_written"      # E1：正常退出但非 0（或 spawn 失败）
+    pid = int(view.get("pid") or 0)
+    alive = view.get("pid_alive")
+    if pid > 0 and alive is False:
+        return True, "exec_pid_gone"              # E2
+    if pid > 0 and alive is True:
+        registered = _parse_iso(view.get("pid_created_at"))
+        actual = _parse_iso(view.get("pid_actual_created_at"))
+        if registered and actual:
+            if abs((actual - registered).total_seconds()) > EXEC_PID_REUSE_TOLERANCE:
+                return True, "exec_pid_reused"    # E2b
+        return False, "exec_alive"                # 在跑但不动 → 900s
+    if pid == 0 and int(view.get("beat_count") or 0) == 0:
+        started = _parse_iso(view.get("started_at"))
+        now_dt = _parse_iso(now) or datetime.now(timezone.utc).astimezone()
+        if started is not None and (now_dt - started).total_seconds() < EXEC_GRACE_SECONDS:
+            return False, "exec_grace"            # E3 宽限：只保护「还没来得及接管」
+        return True, "exec_never_attached"        # E3
+    if pid == 0 and int(view.get("beat_count") or 0) > 0:
+        return False, "exec_unknown"              # 自相矛盾：不动手，退回 900s
+    return False, "exec_unknown"                  # 探测失败：保守
+
+
+# ---------------------------------------------------------------- 唯一写盘核
+
+def _write_failed(task_dir: Path, *, reason: str, probe: dict, trigger: str,
+                  run_id: str = "", expected_from: str = "",
+                  reason_code: str = "") -> dict:
+    """discuss 链 failed 5 键的**唯一构造点**（X1 锁 + X2 栅栏 + X4 准入，全在这里收口）。
+
+    · 进程间文件锁包住 load→判定→save；
+    · 起态准入：`expected_from` 已给且重读后变了 → changed=False（并发推进不误杀）；
+    · run 栅栏：给了 run_id 且任务 exec_run_id 不匹配 → 放弃（旧执行体不许写盘）；
+    · 已 failed：只允许「兜底句 → 原文」单向升级（不写 history、不刷 failed_at）。
+    """
+    task_dir = Path(task_dir)
+    at = _now()
+    with _file_lock(task_dir):
+        task = load(task_dir)
+        cur = str(task.get("state") or "")
+        if cur == "failed":
+            old = str(task.get("failed_reason") or "")
+            if old == str(reason or ""):
+                return {"changed": False, "already": True, "state": "failed",
+                        "state_was": "failed", "reason": old, "at": str(task.get("failed_at") or "")}
+            if _is_fallback_text(old) and not _is_fallback_text(reason):
+                evidence = task.get("failed_evidence")
+                evidence = dict(evidence) if isinstance(evidence, dict) else {}
+                evidence["reason_upgraded_from"] = old
+                evidence["reason_source"] = str((probe or {}).get("reason_source") or "")
+                task["failed_reason"] = str(reason)
+                task["failed_evidence"] = evidence
+                save(task_dir, task)
+                return {"changed": True, "upgraded": True, "state": "failed",
+                        "state_was": "failed", "reason": str(reason), "was": old, "at": at}
+            return {"changed": False, "already": True, "state": "failed",
+                    "state_was": "failed", "reason": old,
+                    "at": str(task.get("failed_at") or "")}
+        if expected_from and cur != expected_from:
+            return {"changed": False, "already": False, "state": cur,
+                    "state_was": expected_from, "reason": str(reason), "at": at}
+        if cur not in RUNNING_STATES_MACHINE:
+            raise StateError(f"起态 {cur} 不在允许集合，拒绝改判 failed")
+        if run_id and str(task.get(EXEC_RUN_ID_KEY) or "") != str(run_id):
+            raise StateError(f"run 已作废（{run_id}），拒绝写盘")
         probe = probe or {}
-        at = _now()
         evidence = {
             "trigger": str(trigger or "auto_scan"),
             "silence_seconds": int(probe.get("silence_seconds") or 0),
@@ -750,19 +1216,53 @@ def fail_orphan_task(task_dir: Path, *, reason: str, probe: dict | None = None,
             "run_id": str(probe.get("heartbeat_run_id") or ""),
             "decided_at": at,
         }
-        fresh = load(task_dir)
-        if fresh.get("state") != state_was:
-            return {"changed": False, "already": fresh.get("state") == "failed",
-                    "state": str(fresh.get("state") or ""), "state_was": state_was,
-                    "reason": str(reason or ""), "at": at}
+        if reason_code:
+            evidence["reason_code"] = str(reason_code)
+        for extra_key in ("exit_code", "fallback_text", "reason_source"):
+            if extra_key in probe:
+                evidence[extra_key] = probe[extra_key]
+        view = probe.get("exec")
+        if isinstance(view, dict):
+            # 可判定证据（卡面要求）：PID / 心跳 / 退出码三件一并落进 failed_evidence
+            evidence["exec"] = {
+                "pid": int(view.get("pid") or 0),
+                "pid_alive": view.get("pid_alive"),
+                "pid_created_at": str(view.get("pid_created_at") or ""),
+                "beat_count": int(view.get("beat_count") or 0),
+                "heartbeat_at": str(view.get("heartbeat_at") or ""),
+                "exit_code": view.get("exit_code"),
+                "exit_outcome": str(view.get("exit_outcome") or ""),
+                "exit_at": str(view.get("exit_at") or ""),
+            }
         task["state"] = "failed"
-        task.setdefault("history", []).append({"at": at, "from": state_was,
+        task.setdefault("history", []).append({"at": at, "from": cur,
                                               "to": "failed", "note": str(reason)})
         task["failed_reason"] = str(reason)
         task["failed_at"] = at
         task["failed_evidence"] = evidence
         save(task_dir, task)
-        return {"changed": True, "already": False, "state": "failed",
-                "state_was": state_was, "reason": str(reason), "at": at,
-                "evidence": evidence}
+        return {"changed": True, "already": False, "state": "failed", "state_was": cur,
+                "reason": str(reason), "at": at, "evidence": evidence}
+
+
+def _is_fallback_text(text: str) -> bool:
+    """是否 AT-18 冻结兜底文案（与 discuss._is_fallback_reason 同一口径，唯一来源在此）。"""
+    t = str(text or "").strip()
+    return bool(t) and (t == FAKE_RUN_REASON_FALLBACK or t in set(FAKE_RUN_REASONS.values()))
+
+
+def write_failed(task_dir: Path, *, reason: str, source: str = "discuss",
+                 exit_code: int | None = None, trigger: str = "",
+                 run_id: str = "", probe: dict | None = None) -> dict:
+    """discuss 执行体报告任务级失败时的公共入口（`_write_failed` 的薄包装）。
+
+    与 `fail_orphan_task` 共用同一个写盘核：这就是「同一次失败只允许一次状态迁移」的实现
+    形态——谁先拿到文件锁谁写，后来者只会走「已 failed」分支（幂等或兜底句→原文升级）。
+    """
+    probe = dict(probe or {})
+    probe.setdefault("reason_source", str(source or ""))
+    if exit_code is not None:
+        probe.setdefault("exit_code", exit_code)
+    return _write_failed(task_dir, reason=reason, probe=probe,
+                         trigger=str(trigger or source or "discuss"), run_id=run_id)
 

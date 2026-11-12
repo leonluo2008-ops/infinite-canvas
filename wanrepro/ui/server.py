@@ -3702,6 +3702,14 @@ def main(argv: list[str] | None = None) -> int:
     watchdog_started = hub_api.start_lost_run_watchdog() if watchdog_on else False
     print(f"     假运行态对账：{'每 300s 自动扫描' if watchdog_started else '已关闭（手动 scan 入口仍可用）'}",
           flush=True)
+    # AT-19 §3：启动即对账——bind + [OK] 之后立刻后台跑**一次** apply 扫描（不等 watchdog 首跑
+    # 的 30s）。可关：WANREPRO_BOOT_RECONCILE=0（只影响这一条，watchdog 另有开关）。
+    boot_on = (os.environ.get("WANREPRO_BOOT_RECONCILE", "1") or "").strip() != "0"
+    if boot_on:
+        hub_api.startup_reconcile_async()
+        print("     启动即对账：已触发（结果行随扫描完成打印）", flush=True)
+    else:
+        print("     启动即对账：已关闭（WANREPRO_BOOT_RECONCILE=0）", flush=True)
     if not args.no_browser and WEB_DIST_ROOT is not None:
         threading.Timer(0.8, lambda: webbrowser.open(url)).start()  # 整合包才开页；开发机画布在 vite :3000
     try:
@@ -3710,6 +3718,14 @@ def main(argv: list[str] | None = None) -> int:
         print("\n[ui] 已停", flush=True)
     finally:
         hub_api.stop_lost_run_watchdog()
+        # AT-19 §1.5 停服语义：Ctrl+C **不杀执行体**（执行体与 server 解耦正是目标本身），
+        # 但必须可见——重启后启动对账会按磁盘证据接管其状态。
+        alive = [rec for rec in hub_api.HUB_JOBS.values()
+                 if rec.get("mode") == "process" and rec.get("status") == "running"
+                 and rec.get("pid")]
+        for rec in alive[:5]:
+            print(f"[ui] 拆解执行体仍在后台运行（pid={rec.get('pid')} kind={rec.get('kind')} "
+                  f"job={rec.get('local_id')}），重启后启动对账会接管其状态", flush=True)
         httpd.server_close()
     return 0
 

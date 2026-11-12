@@ -14,6 +14,7 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -25,6 +26,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+# 包根（**不受运行期 ROOT 改动影响**）：子进程 cwd 必须指向真包根，否则隔离探针把 ROOT
+# 改成临时根后，`python -m automation.discuss_runner` 在临时根下找不到模块（实测 exit 1）。
+_PKG_ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
@@ -38,6 +42,16 @@ TASKS_DIR = auto_config.PROJECTS_DIR
 VIDEO_FILE = "成片.mp4"
 UPLOADS_DIR = ROOT / "uploads"
 TOMBSTONES = TASKS_DIR / ".tombstones.json"     # 删除墓碑（数据合同 B0）
+
+
+def _analysis_reverse() -> Path:
+    """拆解产物根（画布链与 hub 链的同一真源）：`WANREPRO_ANALYSIS_ROOT` 优先，否则 ROOT/analysis/reverse。
+
+    为什么可注入：AT-19 把执行体搬成独立子进程，隔离探针/自托管要能把**父与子**一起指向
+    临时根；只 patch 父进程模块属性对子进程无效，所以这一条走环境变量（_spawn_process 透传）。
+    """
+    env = (os.environ.get("WANREPRO_ANALYSIS_ROOT") or "").strip()
+    return Path(env).expanduser() if env else ROOT / "analysis" / "reverse"
 
 # 提交互斥：同一时刻只允许一个生成在跑（付费红线；桥端兜底，automation 内部还有并发闸）
 HUB_JOBS: dict[str, dict] = {}
@@ -83,17 +97,26 @@ def task_lock(local_id: str):
         lock.release()
 
 
-def _write_task(task_dir: Path, mutate):
+def _write_task(task_dir: Path, mutate, expected_run_id: str = ""):
     """任务文件「读-改-写」短持改写（AT-13 §2.7：后台进度/阶段回写不覆盖别人刚写的状态）。
 
     mutate(task) 返回 False = 不改（不落盘）；其余返回值忽略。返回改写后的任务 dict。
+
+    AT-19 两处加固：
+      · 进程间文件锁（state._file_lock）：执行体是独立子进程后，「子进程整份 save」与
+        「server 对账写 failed」是真并发，进程内线程锁挡不住（X1）；
+      · run_id 栅栏（X2）：给了 expected_run_id 且任务 exec_run_id 已换成新 run →
+        **放弃写入**并返回现盘任务，旧执行体不许把已推进的状态写回去。
     """
     with task_lock(task_dir.name):
-        task = state.load(task_dir)
-        if mutate(task) is False:
+        with state._file_lock(task_dir):
+            task = state.load(task_dir)
+            if expected_run_id and str(task.get(state.EXEC_RUN_ID_KEY) or "") != str(expected_run_id):
+                return task                       # 已被接管：放弃本次写入
+            if mutate(task) is False:
+                return task
+            state.save(task_dir, task)
             return task
-        state.save(task_dir, task)
-        return task
 
 
 class HubError(RuntimeError):
@@ -141,7 +164,7 @@ def _replaced_count(bridge_id: str) -> str:
     """已换数=已传图行数/必换行数（数据合同：实时计算，不落盘）；清单还没有（未拆解）→ 空串。"""
     if not bridge_id:
         return ""
-    path = ROOT / "analysis" / "reverse" / bridge_id / "待确认清单.md"
+    path = _analysis_reverse() / bridge_id / "待确认清单.md"
     if not path.is_file():
         return ""
     rows = replace.parse_rows(path.read_text(encoding="utf-8-sig", errors="replace"))
@@ -197,28 +220,32 @@ LOST_RUN_WATCHDOG_SECONDS = 300                  # 冻结值（方案 §5.2）�
 WATCHDOG_FIRST_DELAY_SECONDS = 30                # 冻结值（方案 §5.2）：进程起来后首跑延迟
 
 
-def _heart(task_dir: Path):
+def _heart(task_dir: Path, expected_run_id: str = ""):
     """心跳写入回调（60s / 每次阶段文案变化）——**唯一实现委托 state.heartbeat_beat**。
 
     为什么不在 hub 侧另写一份：心跳文件是单写者合同（方案 §1.2），两处实现写同一个文件必然
-    字段口径漂移（digest 算法/字段形状）。状态机侧已提供 begin/beat/finish 三件，hub 只负责
-    「什么时候调」。AT-16 B4b 合同不变：心跳**只**写侧车，绝不碰 lapian_*。
+    字段口径漂移（digest 算法/字段形状）。状态机侧已提供 begin/attach/beat/finish 四件，
+    hub 只负责「什么时候调」。AT-16 B4b 合同不变：心跳**只**写侧车，绝不碰 lapian_*。
+    AT-19：expected_run_id 逐写栅栏——执行体搬到子进程后，旧 run 的心跳不许污染新 run。
     """
     task_dir = Path(task_dir)
 
     def beat(msg: str = "") -> dict:
         try:
-            return state.heartbeat_beat(task_dir, phase=_stage_text(msg) or None)
+            return state.heartbeat_beat(task_dir, phase=_stage_text(msg) or None,
+                                        expected_run_id=expected_run_id)
         except OSError:
             return {}                    # 心跳写失败不拖垮拆解（日志行仍在）
 
     return beat
 
 
-def _heartbeat_end(task_dir: Path, outcome: str) -> None:
-    """run 收尾：只打 ended_at / outcome 两个诊断位（不参与判定）。"""
+def _heartbeat_end(task_dir: Path, outcome: str, expected_run_id: str = "",
+                   exit_code: int | None = None) -> None:
+    """run 收尾：只打 ended_at / outcome / exit_code 三个诊断位（不参与判定）。"""
     try:
-        state.heartbeat_finish(Path(task_dir), outcome=outcome)
+        state.heartbeat_finish(Path(task_dir), outcome=outcome,
+                               expected_run_id=expected_run_id, exit_code=exit_code)
     except OSError:
         pass
 
@@ -412,7 +439,7 @@ def _suggestions(raw: str, checklist_md: str, disc_md: str) -> list[dict]:
 
 
 def _checklist_path(bridge_id: str) -> Path:
-    return ROOT / "analysis" / "reverse" / bridge_id / "待确认清单.md"
+    return _analysis_reverse() / bridge_id / "待确认清单.md"
 
 
 def _prompt_path(task_dir: Path, task: dict) -> Path:
@@ -447,7 +474,7 @@ def get_task(local_id: str) -> dict:
     d = _summary(task, task_dir)
     bridge_id = str(task.get("bridge_id") or "")
     decisions = replace.load_row_decisions(bridge_id) if bridge_id else {}
-    summary_md = _read(ROOT / "analysis" / "reverse" / str(task.get("bridge_id")) / "拆解.md")
+    summary_md = _read(_analysis_reverse() / str(task.get("bridge_id")) / "拆解.md")
     checklist_md = _read(_checklist_path(str(task.get("bridge_id"))))
     mode = _audio_mode(task)                 # AT-17 B2c：三态（任务.json 优先，老任务只读现推）
     d.update({
@@ -469,7 +496,7 @@ def get_task(local_id: str) -> dict:
         "已移除行": sorted(n for n, value in decisions.items() if value == "dismissed"),
         # AT-9 B1 建议合同：意图建议结构化透出（复用 intent.py 解析，缺/坏/行号不匹配 → 待核对）
         "suggestions": _suggestions(
-            _read(ROOT / "analysis" / "reverse" / str(task.get("bridge_id") or "") / SUGGESTION_NAME),
+            _read(_analysis_reverse() / str(task.get("bridge_id") or "") / SUGGESTION_NAME),
             checklist_md, summary_md),
         # AT-17 B2c：音频三态透出（B3 前端读的唯一出口）——四个平铺键，键名恒以 audio_mode
         # 开头，不另起「音频三态」别名（B0 附注 4：全链一套命名）。
@@ -531,7 +558,7 @@ def _spawn(job_kind: str, target, *args, heartbeat_dir: Path | None = None) -> d
                         "local_id": _job_local_id(args[0]) if args else None}
     if heartbeat_dir is not None:
         try:
-            state.heartbeat_begin(heartbeat_dir, run_id=job_id, phase=job_kind)
+            state.heartbeat_begin(heartbeat_dir, run_id=job_id, phase=job_kind, exec="thread")
         except Exception as exc:  # noqa: BLE001 —— 锚写失败照实报，但不挡真正的工作
             print(f"[hub] 心跳起手写失败（{job_kind}/{job_id}）：{exc}", file=sys.stderr)
 
@@ -554,10 +581,118 @@ def _job_local_id(value) -> str:
     return Path(value).name if isinstance(value, Path) else str(value)
 
 
+# ---------------------------------------------------------------- 执行体子进程派发（AT-19）
+
 DISCUSS_LOG = "拆解日志.txt"
 
+# DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP（Windows）/ start_new_session（POSIX）：
+# 执行体必须活过 server 的 Ctrl+C 与重启——「重启即接管」的前提正是「停服不打断执行体」。
+if os.name == "nt":
+    _DETACH_FLAGS = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+    _DETACH_SESSION = False
+else:
+    _DETACH_FLAGS = 0
+    _DETACH_SESSION = True
 
-def _stage_recorder(task_dir: Path):
+
+def _discuss_argv(run_id: str, local_id: str) -> list[str]:
+    """执行体命令行：同解释器 + 包内模块入口（不引外部执行器、不复制回调实现）。"""
+    return [sys.executable, "-m", "automation.discuss_runner", local_id, "--run-id", run_id]
+
+
+def _spawn_failed(task_dir: Path, *, kind: str, local_id: str, run_id: str,
+                  message: str) -> dict:
+    """Popen 之前的失败（日志打不开/启动异常）：父代写一条 spawn_failed 死证，不重写心跳起手。"""
+    try:
+        state.exec_write(task_dir, run_id=run_id, pid=0, exit_code=-1,
+                         outcome="spawn_failed", error_tail=message,
+                         reason_source="spawn")
+        state.heartbeat_finish(task_dir, outcome="spawn_failed", expected_run_id=run_id,
+                               exit_code=-1)
+    except OSError:
+        pass
+    HUB_JOBS[run_id] = {"status": "failed", "kind": kind, "started": _now(),
+                        "local_id": local_id, "mode": "process", "pid": None,
+                        "error": message, "ended": _now()}
+    print(f"[hub] 执行体启动失败（{local_id}）：{message}", file=sys.stderr)
+    return {"job_id": run_id, "mode": "process", "pid": None, "error": message}
+
+
+def _reap(proc, job_id: str, local_id: str) -> None:
+    """父进程唯一的后台动作：等子进程退出并回写 job 记录（不持有执行体、不写任务状态）。
+
+    没有它 `/api/hub/job/<id>` 会永久 running（v1 只 poll + 关句柄的老问题）。
+    """
+    try:
+        code = proc.wait()
+    except Exception as exc:  # noqa: BLE001
+        code = None
+        rec = HUB_JOBS.get(job_id) or {}
+        rec.update({"error": f"等待执行体失败：{type(exc).__name__}: {exc}"})
+        HUB_JOBS[job_id] = rec
+    rec = HUB_JOBS.get(job_id) or {}
+    rec.update({"status": "done" if code == 0 else "failed", "exit_code": code,
+                "ended": _now(), "pid": proc.pid, "local_id": local_id,
+                "kind": rec.get("kind", "hub-discuss"), "mode": "process"})
+    if code not in (0, None):
+        rec.setdefault("error", f"执行体退出码 {code}（详见 {state.CHILD_LOG_FILE}）")
+    HUB_JOBS[job_id] = rec
+
+
+def _spawn_process(task_dir: Path, *, kind: str, argv_builder) -> dict:
+    """起一个**独立子进程**当执行体，父进程只负责派发与读取（AT-19 §1.2）。
+
+    写序写死（任何一步失败都留得下可判定痕迹）：
+      T0  heartbeat_begin(exec="child") + 任务.json.exec_run_id=run_id   ← Popen 之前
+      T0+ Popen（DETACHED / start_new_session）→ pid_created_at → heartbeat_attach
+      之后 父进程**不再写心跳**，beat/finish/退出码全归子进程（单写者合同）
+    """
+    job_id = uuid.uuid4().hex[:12]
+    local_id = task_dir.name
+    try:
+        state.heartbeat_begin(task_dir, run_id=job_id, phase=kind, exec="child")
+        state.stamp_exec_run(task_dir, job_id)
+    except Exception as exc:  # noqa: BLE001 —— 锚写失败不挡真正的工作，但要如实留痕
+        print(f"[hub] 心跳起手/令牌写失败（{kind}/{job_id}）：{exc}", file=sys.stderr)
+    HUB_JOBS[job_id] = {"status": "running", "kind": kind, "started": _now(),
+                        "local_id": local_id, "mode": "process", "pid": None}
+    argv = argv_builder(job_id)
+    env = {**os.environ,
+           "PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1", "PYTHONUNBUFFERED": "1",
+           "WANREPRO_EXEC_RUN_ID": job_id,
+           "WANREPRO_AUTO_DIR": str(TASKS_DIR),          # 子进程与父同一任务根（隔离也一致）
+           "WANREPRO_BRIDGE": str(auto_config.BRIDGE_BASE),      # 父进程的**生效值**（可被运行期改）
+           "WANREPRO_ANALYSIS_ROOT": str(_analysis_reverse())}   # 拆解产物根（父与子同源）
+    log_path = task_dir / state.CHILD_LOG_FILE
+    try:
+        log = log_path.open("ab")
+    except OSError as exc:
+        return _spawn_failed(task_dir, kind=kind, local_id=local_id, run_id=job_id,
+                             message=f"日志打不开：{exc}")
+    try:
+        proc = subprocess.Popen(argv, cwd=str(_PKG_ROOT), stdin=subprocess.DEVNULL,
+                                stdout=log, stderr=subprocess.STDOUT, env=env,
+                                creationflags=_DETACH_FLAGS,
+                                start_new_session=_DETACH_SESSION, close_fds=True)
+    except OSError as exc:
+        log.close()
+        return _spawn_failed(task_dir, kind=kind, local_id=local_id, run_id=job_id,
+                             message=f"Popen 失败：{exc}")
+    finally:
+        try:
+            log.close()                      # 子进程已持有自己的副本，父侧句柄不泄漏
+        except OSError:
+            pass
+    created = state.pid_created_at(proc.pid)          # OS creation time（X5：不许子进程自报）
+    state.heartbeat_attach(task_dir, run_id=job_id, pid=proc.pid,
+                           pid_created_at=created)
+    HUB_JOBS[job_id]["pid"] = proc.pid
+    threading.Thread(target=_reap, args=(proc, job_id, local_id), daemon=True,
+                     name=f"hub-reap-{job_id}").start()
+    return {"job_id": job_id, "mode": "process", "pid": proc.pid, "run_id": job_id}
+
+
+def _stage_recorder(task_dir: Path, expected_run_id: str = ""):
     """拆解阶段记录器：每次 stage 变化 → 追加 拆解日志.txt + 回写任务.json 双锚。
 
     AT-16 B4a 双锚合同的**唯一写侧**：
@@ -586,7 +721,7 @@ def _stage_recorder(task_dir: Path):
                 if terminal:
                     t[LAPIAN_ENDED] = at
 
-            _write_task(task_dir, mutate)
+            _write_task(task_dir, mutate, expected_run_id=expected_run_id)
         except Exception:  # noqa: BLE001 —— 状态回写失败不拖垮拆解
             pass
 
@@ -660,7 +795,7 @@ def _audio_mode(task: dict) -> dict:
     side: dict = {}
     if bridge_id:
         try:
-            side = _intent_mod().read_audio_mode(ROOT / "analysis" / "reverse" / bridge_id)
+            side = _intent_mod().read_audio_mode(_analysis_reverse() / bridge_id)
         except Exception:  # noqa: BLE001 —— 读侧坏文件不改判
             side = {}
     if value:
@@ -704,7 +839,7 @@ def set_audio_mode(local_id: str, mode: str) -> dict:
         task["audio_mode_待核对"] = False
         state.save(task_dir, task)
         bridge_id = str(task.get("bridge_id") or "")
-        outdir = ROOT / "analysis" / "reverse" / bridge_id if bridge_id else None
+        outdir = _analysis_reverse() / bridge_id if bridge_id else None
         if outdir is not None and outdir.is_dir():
             # 画布链读的就是这份旁路文件（画布链没有 approve，落盘即生效）
             intent.save_audio_mode(outdir, value, "确认流界面改选（hub）")
@@ -720,61 +855,20 @@ def set_audio_mode(local_id: str, mode: str) -> dict:
 
 
 def _spawn_discuss(task_dir: Path, first_line: str) -> dict:
-    """拆解后台执行体（发起拆解与 failed 重试共用；重跑即续语义全在 discuss.run_discuss）。
+    """拆解执行体（发起拆解与 failed 重试共用；重跑即续语义全在 discuss.run_discuss）。
 
-    AT-18 §1.4 写序：重置双锚 → 起手写心跳（_spawn 内，起线程前）→ emit 首行 → 起线程。
-    线程内：每次阶段变化 → 日志行 + lapian_* + 心跳 phase；每次 60s 心跳 → 日志行 + 心跳；
-    finally → 心跳 ended_at/outcome（诊断位，不参与判定）。
+    AT-19：执行体是**独立子进程**（automation/discuss_runner.py），不再是 server 进程内的
+    daemon 线程——server 停服/重启都不打断拆解，重启后启动对账按磁盘证据接管。
+    写序：重置双锚 → emit 首行（父） → T0 心跳起手 + exec_run_id → Popen → attach pid。
+    子进程内：每次阶段变化 → 日志行 + lapian_* + 心跳 phase；每次 60s 心跳 → 日志行 + 心跳；
+    收尾 → 退出码文件 + 心跳 ended_at/outcome（父进程不再写这两处）。
     """
     _reset_lapian_anchors(task_dir)
     emit = _stage_recorder(task_dir)
-    heartbeat = _log_only(task_dir)      # 心跳：只追加日志行，不碰 lapian_stage / 阶段锚
-    beat = _heart(task_dir)              # 心跳侧车写者（AT-18）：只写 心跳.json
-
-    def stage(msg: str, *, terminal: bool = False) -> None:
-        emit(msg, terminal=terminal)
-        beat(msg)
-
-    def on_beat(msg: str) -> None:
-        heartbeat(msg)                   # AT-16 B4b：等待心跳只进日志
-        beat(msg)                        # AT-18：同时刷新侧车（含产物锚）
-
     emit(first_line)
-
-    def _run(td: Path):
-        # 注意：旧写法是 `return discuss.run_discuss(...)` + else 收尾——Python 里 try 内 return
-        # 会**跳过 else**，成功终态行从来没落过（B4a 实测：成功任务 ended_at 恒空、进度无终态文案）。
-        # 改成先取结果、再收尾 emit 终态，成功/失败都留终态行与停表锚。
-        outcome = "failed"
-        try:
-            try:
-                result = discuss.run_discuss(td, verbose=False, on_stage=stage,
-                                             on_heartbeat=on_beat)
-            except discuss.DiscussError as e:
-                emit(f"终态：失败（{e}）", terminal=True)
-                beat(f"终态：失败（{e}）")
-                raise
-            except Exception as e:  # noqa: BLE001
-                # 环境级故障（桥连不上/超时）状态保留 discussing——心跳 outcome 如实记 env_error
-                outcome = "env_error"
-                emit(f"终态：环境故障（{e}）——状态保留，重跑续", terminal=True)
-                beat(f"终态：环境故障（{e}）——状态保留，重跑续")
-                raise
-            # AT-17 B2c：拆解完成即落音频三态（默认值；已有值不覆盖）——走 _write_task 短持锁，
-            # 与阶段回写同一把锁，防 read-modify-save 把它冲掉。
-            mode = _persist_audio_mode(td)
-            if mode.get("audio_mode"):
-                emit(f"音频三态：{mode['audio_mode']}（{mode.get('依据') or '已有值'}）")
-            else:
-                emit(f"音频三态：未落盘（{mode.get('why') or '读不到拆解'}）")
-            emit("终态：awaiting_assets（等置换）", terminal=True)
-            beat("终态：awaiting_assets（等置换）")
-            outcome = "done"
-            return result
-        finally:
-            _heartbeat_end(td, outcome)
-
-    return _spawn("hub-discuss", _run, task_dir, heartbeat_dir=task_dir)
+    local_id = task_dir.name
+    return _spawn_process(task_dir, kind="hub-discuss",
+                          argv_builder=lambda run_id: _discuss_argv(run_id, local_id))
 
 
 def start_discuss(local_id: str) -> dict:
@@ -903,9 +997,12 @@ def _tombstones_load() -> list[dict]:
         return []
 
 
-def _tombstones_append(local_id: str) -> None:
+def _tombstones_append(local_id: str, run_id: str = "") -> None:
     items = _tombstones_load()
-    items.append({"id": local_id, "时间": _now()})
+    entry = {"id": local_id, "时间": _now()}
+    if run_id:
+        entry["run_id"] = str(run_id)          # AT-19 X7：墓碑登记 run，活执行体据此自行退场
+    items.append(entry)
     tmp = TOMBSTONES.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(items, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     tmp.replace(TOMBSTONES)
@@ -980,11 +1077,16 @@ def delete_task(local_id: str, *, confirm_name: str | None = None) -> dict:
                        f"\"{local_id}\"（或完整任务名「{task_name}」）")
     bridge_id = str(task.get("bridge_id") or "")
     video_name = str((task.get("ingestion") or {}).get("video_name") or "")
+    # AT-19 X7：failed-but-alive——任务已判 failed 但执行体还活着（900s 兜底降级后的窗口）。
+    # 删除优先（用户意图），不杀进程：墓碑记 run_id，活执行体下一次写盘会被栅栏拒绝并自行退场。
+    exec_view = state.exec_snapshot(task_dir, task)
+    executor_alive = bool(exec_view.get("pid_alive"))
+    dead_run_id = str(exec_view.get("heartbeat_run_id") or "")
     with task_lock(local_id):
         shutil.rmtree(task_dir)
         removed_analysis = False
         if bridge_id and not _bridge_still_referenced(bridge_id, exclude=local_id):
-            target = ROOT / "analysis" / "reverse" / bridge_id
+            target = _analysis_reverse() / bridge_id
             if target.is_dir():
                 shutil.rmtree(target)
                 removed_analysis = True
@@ -995,11 +1097,14 @@ def delete_task(local_id: str, *, confirm_name: str | None = None) -> dict:
             if f.is_file() and not _uploads_video_shared(video_name, exclude=local_id):
                 f.unlink()
                 removed_upload = True
-        _tombstones_append(local_id)
+        _tombstones_append(local_id, run_id=dead_run_id)
     return {"ok": True, "deleted": local_id, "state_was": st,
             "analysis_dir_removed": removed_analysis,
             "uploads_video_removed": removed_upload,
             "tombstone": True,
+            # AT-19 §6.1（X7）：删除时执行体仍活 → 如实告知（不杀进程、不删用户意图）
+            "executor_alive": executor_alive,
+            "executor_run_id": dead_run_id,
             # AT-18 §4.4：本次放行时被判定为僵尸、未参与阻断的 JOB 记录（可追溯）
             "ignored_stale_jobs": ignored_stale_jobs}
 
@@ -1017,15 +1122,18 @@ def _kept_view(task_dir: Path, task: dict) -> dict:
     video = str((task.get("ingestion") or {}).get("video_name") or "")
     return {
         "task_dir": Path(task_dir).is_dir(),
-        "analysis_dir": bool(bridge_id) and (ROOT / "analysis" / "reverse" / bridge_id).is_dir(),
+        "analysis_dir": bool(bridge_id) and (_analysis_reverse() / bridge_id).is_dir(),
         "uploads_video": bool(video) and (UPLOADS_DIR / video).is_file(),
     }
 
 
 def scan_lost_runs(*, apply: bool = False) -> dict:
-    """POST /api/hub/maintenance/scan-lost-runs —— 假运行态对账扫描（方案 §4.1）。
+    """POST /api/hub/maintenance/scan-lost-runs —— 假运行态对账扫描（方案 §4.1 + AT-19 §3）。
 
-    触发者：① 后台 watchdog（apply=True，周期 300s）；② 手动/脚本（默认 dry-run）。
+    触发者：① 后台 watchdog（apply=True，周期 300s）；② 启动即对账（apply=True，单次）；
+    ③ 手动/脚本（默认 dry-run）。
+    判定顺序（AT-19）：先看**执行体死证**（E1 退出码非 0 / E2 PID 判死 / E2b PID 复用 /
+    E3 从未接管），握死证即降级、不等 900s；没死证才退回 AT-18 的 900s 静默判定。
     集合语义（冻结）：scanned = 本次检查的运行态任务数；lost[] = 本次判定为假运行的任务
     （apply=False 时 changed 恒 false）；skipped[] = 检查过但不降级的（带 reason_code）；
     已降级的任务下一轮进 skipped{not_running}——这就是幂等的可观测形态。
@@ -1036,50 +1144,73 @@ def scan_lost_runs(*, apply: bool = False) -> dict:
     skipped: list[dict] = []
     errors: list[dict] = []
     scanned = 0
+    applied = 0
+    exec_unknown = 0
     for mf in sorted(Path(TASKS_DIR).glob("auto-*/任务.json")):
         local_id = mf.parent.name
         try:
             task = state.load(mf.parent)
             st = str(task.get("state") or "")
-            probe = dict(state.activity_snapshot(mf.parent, task) or {})
             if st not in state.RUNNING_STATES_MACHINE:
                 skipped.append({"local_id": local_id, "state": st, "reason_code": "not_running"})
                 continue
             scanned += 1
+            probe = dict(state.activity_snapshot(mf.parent, task) or {})
             probe["held_job"] = _held_job(local_id, probe)
-            is_lost, code = state.judge_lost_run(task, probe)
-            if st == "generating":
-                # 方案 §3.2 G3：generating **永不自动降级**（有云端在途必须续查，判死可能重复
-                # 付费提交；没有在途证据的也只走出人工兜底口 force-finish）。这里只报不写。
-                skipped.append({"local_id": local_id, "state": st,
-                                "reason_code": str(code or "manual_only")})
-                continue
-            if not is_lost:
-                skipped.append({"local_id": local_id, "state": st,
-                                "reason_code": str(code or "silence_below_threshold")})
-                continue
-            reason = str(state.FAKE_RUN_REASONS.get(st, ""))
+            view = state.exec_snapshot(mf.parent, task)
+            probe["exec"] = view
+            dead, dead_code = state.judge_exec_dead(task, view)
+            if not dead and dead_code in ("exec_unknown", "exec_no_evidence"):
+                exec_unknown += 1
+            if dead:
+                trigger, reason_code = "exec_dead", str(dead_code or "")
+            else:
+                is_lost, code = state.judge_lost_run(task, probe)
+                if st == "generating":
+                    # 方案 §3.2 G3：generating **永不自动降级**（有云端在途必须续查，判死可能重复
+                    # 付费提交；没有在途证据的也只走出人工兜底口 force-finish）。这里只报不写。
+                    skipped.append({"local_id": local_id, "state": st,
+                                    "reason_code": str(code or "manual_only")})
+                    continue
+                if not is_lost:
+                    skipped.append({"local_id": local_id, "state": st,
+                                    "reason_code": str(code or dead_code or "silence_below_threshold")})
+                    continue
+                trigger, reason_code = "auto_scan", str(code or "silence_over_threshold")
+            reason = str(state.FAKE_RUN_REASONS.get(st, "")) or state.fake_run_reason(st)
             item = {
                 "local_id": local_id,
                 "state": st,
+                "trigger": trigger,
+                "reason_code": reason_code,
                 "silence_seconds": int(probe.get("silence_seconds") or 0),
                 "last_activity_at": str(probe.get("last_activity_at") or ""),
                 "last_activity_source": str(probe.get("source") or ""),
                 "heartbeat_at": str(probe.get("heartbeat_at") or ""),
                 "reason": reason,
+                "exec": {key: view.get(key) for key in
+                         ("pid", "pid_alive", "heartbeat_at", "beat_count", "exit_code",
+                          "exit_outcome", "exit_at")},
                 "changed": False,
             }
             if apply:
                 with task_lock(local_id):
-                    res = state.fail_orphan_task(mf.parent, reason=reason, probe=probe,
-                                                 trigger="auto_scan") or {}
-                item["changed"] = bool(res.get("changed"))
+                    try:
+                        res = state.fail_orphan_task(
+                            mf.parent, reason=reason, probe=probe,
+                            trigger=trigger,
+                            exec_view=view if trigger == "exec_dead" else None) or {}
+                        item["changed"] = bool(res.get("changed"))
+                        applied += 1 if item["changed"] else 0
+                    except state.StateError as exc:
+                        # 并发已变（别人先降级/状态被推进）：按本轮未迁移如实回执，不重试、不覆盖
+                        item["skipped_reason"] = str(exc)
             lost.append(item)
         except Exception as exc:  # noqa: BLE001 —— 单条坏任务进 errors，其余照扫（§4.1）
             errors.append({"local_id": local_id, "error": f"{type(exc).__name__}: {exc}"})
-    return {"ok": True, "applied": apply,
+    return {"ok": True, "applied": apply, "applied_count": applied,
             "threshold_seconds": int(state.FAKE_RUN_SILENCE_SECONDS),
-            "checked_at": checked_at, "scanned": scanned,
+            "checked_at": checked_at, "scanned": scanned, "exec_unknown": exec_unknown,
             "lost": lost, "skipped": skipped, "errors": errors}
 
 
@@ -1126,17 +1257,72 @@ def force_finish(local_id: str, *, confirm=None, confirm_name=None, reason: str 
 # 后台对账看门狗（方案 §5.2：唯一新增设施，生命周期写死）
 _WATCHDOG_STOP = threading.Event()
 _WATCHDOG_THREAD: threading.Thread | None = None
+_RECONCILE_LOCK = threading.Lock()      # 启动对账 与 周期 watchdog 共用（同一时刻只允许一轮 apply）
+_BOOT_RECONCILE: dict = {}
+
+
+def _print_reconcile_line(slot: dict) -> None:
+    """完成摘要行：state / scanned / lost / exec_unknown / errors，一并打出来（F2 可见性）。"""
+    result = slot.get("result") or {}
+    print(f"     启动对账：{slot.get('state', '-')} scanned={result.get('scanned', '-')} "
+          f"lost={len(result.get('lost') or [])} "
+          f"exec_unknown={result.get('exec_unknown', '-')} "
+          f"errors={len(result.get('errors') or [])}"
+          + (f"（{slot['error']}）" if slot.get("error") else ""), flush=True)
+
+
+def startup_reconcile_async() -> dict:
+    """启动即对账（AT-19 §3）：server bind + [OK] 之后立刻后台跑**一次** apply 扫描。
+
+    为什么要独立于 watchdog：watchdog 首跑延迟 30s、周期 300s，等于「重启后最长 5 分钟
+    仍是僵尸 running 态」。启动对账把「server 重启前就死了的执行体」在 5 秒内落成 failed。
+    与 watchdog 共用 `_RECONCILE_LOCK`：谁先拿到谁扫，另一个跳过本轮（不排队、不重复迁移）。
+    幂等仍由 `fail_orphan_task`（文件锁 + 起态重读 + 已 failed 即 changed=False）保证。
+    """
+    slot = {"started_at": _now(), "state": "running", "result": None, "error": ""}
+    _BOOT_RECONCILE.clear()
+    _BOOT_RECONCILE.update(slot)
+
+    def _run() -> None:
+        try:
+            if not _RECONCILE_LOCK.acquire(blocking=False):
+                slot.update(state="skipped", error="另一轮对账在跑，交回 watchdog")
+                _print_reconcile_line(slot)
+                return
+            try:
+                slot["result"] = scan_lost_runs(apply=True)
+            finally:
+                _RECONCILE_LOCK.release()
+            slot["state"] = "done"
+        except Exception as exc:                     # noqa: BLE001 —— 绝不静默
+            slot.update(state="error", error=f"{type(exc).__name__}: {exc}")
+            print(f"[boot-reconcile][WARN] {slot['error']}", file=sys.stderr)
+        _BOOT_RECONCILE.update(slot)
+        _print_reconcile_line(slot)
+
+    threading.Thread(target=_run, daemon=True, name="hub-boot-reconcile").start()
+    return slot
+
+
+def boot_reconcile_view() -> dict:
+    """启动对账当前/最终状态（探针与排障读面）。"""
+    return dict(_BOOT_RECONCILE)
 
 
 def _watchdog_loop() -> None:
     if _WATCHDOG_STOP.wait(WATCHDOG_FIRST_DELAY_SECONDS):
         return
     while not _WATCHDOG_STOP.is_set():
-        try:
-            scan_lost_runs(apply=True)
-        except Exception as exc:  # noqa: BLE001 —— 单轮失败只写 stderr，绝不影响 HTTP 服务
-            print(f"[watchdog] 对账扫描失败：{type(exc).__name__}: {exc}"
-                  "——本轮跳过，不影响服务", file=sys.stderr)
+        if not _RECONCILE_LOCK.acquire(blocking=False):
+            print("[watchdog] 另一轮对账在跑，本轮跳过", file=sys.stderr)   # D7：真接锁
+        else:
+            try:
+                scan_lost_runs(apply=True)
+            except Exception as exc:  # noqa: BLE001 —— 单轮失败只写 stderr，绝不影响 HTTP 服务
+                print(f"[watchdog] 对账扫描失败：{type(exc).__name__}: {exc}"
+                      "——本轮跳过，不影响服务", file=sys.stderr)
+            finally:
+                _RECONCILE_LOCK.release()
         if _WATCHDOG_STOP.wait(LOST_RUN_WATCHDOG_SECONDS):
             return
 
