@@ -264,7 +264,15 @@ def main() -> int:
           (hub_api.HUB_JOBS.get("j1") or {}).get("status") == "force_finished",
           f"{hub_api.HUB_JOBS}")
     verdict, resp = retry(local)
-    check("[5b] 强制结束后立刻重试 → 放行（A 清退 + B 豁免协同）", verdict == "ok", f"{verdict} {resp}")
+    check("[5b] 强制结束后立刻重试 → 放行（A 清退 + B 豁免协同）", verdict == "ok",
+          "诊断：若 HUB_JOBS 里该 local_id 仍有 status=running → force_finish 未清残留（方案 A）；"
+          f"若记录已非 running 仍被拒 → 守卫误判（方案 B）。HUB_JOBS={hub_api.HUB_JOBS} err={resp.get('error')}")
+    check("[5b] 回执落 discussing，且放行即真派发重试 run（状态机 failed→discussing 由 run_discuss 执行）",
+          resp.get("state") == "discussing" and SPAWNED and SPAWNED[-1][0] == local
+          and "人工重试" in SPAWNED[-1][1],
+          f"resp={resp} spawned={SPAWNED[-2:]}")
+    check("[5b] 没有出现「任务已有拆解任务在跑」式拒绝", "拆解任务在跑" not in str(resp.get("error") or ""),
+          str(resp.get("error")))
     check("[5b] 放行回执里能看到被豁免的那条 force_finished",
           any("force_finished" in s for s in resp.get("ignored_stale_jobs") or []),
           f"{resp.get('ignored_stale_jobs')}")
