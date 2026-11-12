@@ -110,8 +110,11 @@ class StubBridge:
         with self.lock:
             self.posts.append((path, payload))
         time.sleep(STUB_DELAY)                       # 在途窗口：请求已发出、回执未到
+        # AT-16 B11：带「渠道创建端点 4xx 原文」的响应已归 rejected（见 probe_at16_b11），
+        # 本夹具故意只用**不带 4xx 标记**的真未知（网关错 / 无任务 id），继续锁
+        # 「在途窗口 → unknown」这条迁移，不与 B11 的新语义打架。
         err = bridge.BridgeError('bridge POST /api/sdgf/video/run → HTTP 502: '
-                                 '{"error": "渠道响应 HTTP 403：video_request_failed"}')
+                                 '{"error": "上游网关 502（bad gateway，未返回任务 id）"}')
         err.status = 502
         raise err
 

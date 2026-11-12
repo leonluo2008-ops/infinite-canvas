@@ -28,7 +28,7 @@ import urllib.request
 from contextlib import nullcontext
 from pathlib import Path
 
-from . import bridge, config, local_assets, replace, state
+from . import bridge, config, local_assets, replace, state, submit_view
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 sys.stderr.reconfigure(encoding="utf-8", errors="replace")
@@ -312,6 +312,26 @@ def release_unknown(task_dir: Path, *, note: str = "人工核对渠道无单后�
              "note": safe_error(f"{note}{detail}", "", 300)})
         state.save(task_dir, task)
         return task
+
+
+def heal_create_reject_block(task_dir: Path, *, guard=None) -> dict:
+    """AT-16 B11：创建阶段渠道 4xx 的历史误判自愈（命中即清阻断，未命中零写盘）。
+
+    旧版 sdgf_http 把渠道任何 HTTPError 都包成 502，于是 auto-0043 现场那条
+    「403 fail_to_fetch_task / video_request_failed（渠道明确说任务没建成）」被落成
+    submit_unknown + dispatch=dispatched，把一个「改配置直接重提」逼成「先核对控制台 +
+    解除阻断」。判定与展示同源（submit_view.create_reject_evidence：原文有创建端点 4xx 标记、
+    无云端 taskId/gen_job、阻断标记还在）——三件套同时成立才动，其余一律不动。
+    动法则复用人工路径的 release_unknown（清阻断 + dispatch=cleared + 记 history）。
+    """
+    with (guard or nullcontext)():
+        task = state.load(task_dir)
+        code = submit_view.create_reject_evidence(task)
+        if not code:
+            return task
+        return release_unknown(
+            task_dir, guard=guard,
+            note=f"创建阶段渠道 HTTP {code} 明确未建单（历史误判自动解除，无需人工核对）")
 
 
 def wan_record(carrier: str) -> dict:
@@ -764,6 +784,10 @@ def do_submit(task_dir: Path, verbose: bool = True,
     """
     guard = write_guard or nullcontext
     task = state.load(task_dir)
+    # AT-16 B11：旧版把「创建阶段渠道 4xx（明确未建单）」误标成 submit_unknown；
+    # 判定与展示同源（submit_view），命中就先按人工路径解除（记 history），
+    # 否则下面两道阻断守卫会把「改配置后直接重提」堵死。
+    task = heal_create_reject_block(task_dir, guard=guard)
     st = task["state"]
     if st not in ("approved", "generating"):
         raise GenError(f"submit 需 approved（先审批），当前 {st}")
@@ -848,8 +872,11 @@ def do_submit(task_dir: Path, verbose: bool = True,
                         secret=secret,
                         extra={"asset_host": tried} if tried else None)   # 失败路径也落图源自述
             raise GenError(msg) from None
-        if status in (400, 409):                 # 前置拒绝：服务端在校验/并发闸就挡下了
-            msg = safe_error(f"渠道前置拒绝（HTTP {status}）：{e}", secret)
+        if isinstance(status, int) and 400 <= status < 500:
+            # AT-16 B11：创建阶段 4xx = 渠道/服务端明确拒绝（任务没建成，可改后直接重提）。
+            # 400/409 是老的两条（预检/并发闸），403/422… 是 B11 起从渠道原码透传上来的
+            # （原文标记 渠道创建端点明确拒绝 HTTP 4xx）——一律受控回退，绝不标「未知收单」。
+            msg = safe_error(f"创建请求被明确拒绝（HTTP {status}）：{e}", secret)
             _pre_reject(task_dir, guard, msg, note=f"前置拒绝（HTTP {status}）：受控回退重批",
                         secret=secret)
             raise GenError(msg) from None

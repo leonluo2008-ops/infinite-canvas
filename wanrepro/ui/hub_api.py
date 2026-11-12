@@ -1278,7 +1278,12 @@ def start_submit(local_id: str, key: str | None = None) -> dict:
                                       api_key=api_key)
 
     with task_lock(local_id):
-        task = state.load(task_dir)
+        # AT-16 B11：创建阶段渠道 4xx（明确未建单）曾被旧版误标成 submit_unknown/dispatch，
+        # 判定与展示同源（submit_view.create_reject_evidence）；命中先按人工路径解除，
+        # 否则下面会以「先核对 + 解除阻断」挡住一次本该「改配置直接重提」的提交。
+        # **提交线程在跑时不动**（active 优先，别在途清盘）。
+        task = (state.load(task_dir) if _active_submit(local_id)
+                else generate.heal_create_reject_block(task_dir, guard=lambda: task_lock(local_id)))
         st = task["state"]
         # AT-13 §2.3：阻断判定收口到 _submit_block_kind（revoke_approval 同源共用），
         # 判定顺序固定 active → dispatch → unknown，报错文案与旧三段 raise 逐字一致。
@@ -1315,7 +1320,10 @@ def revoke_approval(local_id: str, *, note: str = "撤销批准（改配置后�
     """
     task_dir = _task_dir(local_id)
     with task_lock(local_id):
-        task = state.load(task_dir)
+        # AT-16 B11：同一处误标自愈（创建阶段渠道 4xx 已明确未建单 → 不是「未知收单」，
+        # 撤销批准/改配置这条路不该被它挡住）。提交线程在跑时不动（active 优先）。
+        task = (state.load(task_dir) if _active_submit(local_id)
+                else generate.heal_create_reject_block(task_dir, guard=lambda: task_lock(local_id)))
         if task["state"] != "approved":
             raise HubError(f"撤销批准需 approved（当前 {task['state']}）——只有已批准的任务能撤销")
         kind = _submit_block_kind(task, local_id)
