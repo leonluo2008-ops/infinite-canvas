@@ -1402,6 +1402,7 @@ def scan_lost_runs(*, apply: bool = False) -> dict:
 
 FORCE_FINISH_JOB_STATUS = "force_finished"   # 内存 job 终态（文件侧终态仍是 failed，两者不混用）
 FORCE_FINISH_FINISHED_BY = "owner_manual"    # 无身份体系：confirm=true + confirm_name=任务号 是唯一的「所有者手动」显式证据
+FORCE_FINISH_HEARTBEAT_OUTCOME = "manual_force_finish"   # 心跳侧车终态 outcome（与内存 job 的 finish_reason 同词）
 
 
 def _finish_running_jobs(local_id: str, *, note: str) -> list[str]:
@@ -1434,14 +1435,32 @@ def _finish_running_jobs(local_id: str, *, note: str) -> list[str]:
     return finished
 
 
+def _close_heartbeat(task_dir: Path) -> dict:
+    """人工强制结束的**心跳半边**：把侧车写成终态，让任何守卫都读不到「还在打」。
+
+    为什么文件、内存两半之外还要这第三半：`HUB_JOBS` 是内存态，server 一重启就清空；
+    而守卫的第二个证据源是心跳侧车（`_job_alive` 的 900s 口径、`_held_job`、看门狗的活动锚）。
+    只置内存终态，重启后残留心跳仍是新鲜的「活证据」；只置文件 failed、心跳照旧新鲜，
+    则任务看起来「已判死但还在跑」（auto-0055/0058 的现场形态）。
+    实现委托 `state.heartbeat_close`（清 last_beat_at，保留 run_id/pid 诊断位与 closed_beat_at 留痕）。
+    无侧车（从未跑起/旧任务）→ {}，不凭空造文件；重复调用幂等。
+    """
+    try:
+        return state.heartbeat_close(Path(task_dir), outcome=FORCE_FINISH_HEARTBEAT_OUTCOME)
+    except OSError:
+        return {}                    # 侧车写失败不拖垮强制结束（文件侧已落 failed，仍可重试）
+
+
 def force_finish(local_id: str, *, confirm=None, confirm_name=None, reason: str = "") -> dict:
     """POST /api/hub/task/{id}/force-finish —— 所有者人工兜底口（方案 §4.2，覆盖阈值误判）。
 
     二次确认是「这是所有者手动操作」的唯一显式证据（身份仍走既有 gate()，不新造体系）：
     confirm 必须是布尔 true（字符串 "true" 不算），confirm_name 必须等于路径里的任务号。
-    语义写死：置 failed + 写人工原因 + **内存 job 记录当场置终态**，**不删任何东西、不杀进程**
-    （本接口不持有进程句柄）。文件与内存两半在同一把 task_lock 内完成（单写者原子）——
-    只落文件不清内存，残留 running 记录会把「人工结束 → 重试」永久挡住（见 _finish_running_jobs）。
+    语义写死：置 failed + 写人工原因 + **内存 job 记录当场置终态 + 心跳侧车终态化**，**不删任何
+    东西、不杀进程**（本接口不持有进程句柄）。文件 / 内存 / 心跳三半在同一把 task_lock 内
+    完成（单写者原子）——只落文件不清内存，残留 running 记录会把「人工结束 → 重试」永久挡住
+    （见 _finish_running_jobs）；只落文件不关心跳，侧车会一直是「还在打」的活证据
+    （见 _close_heartbeat：清 last_beat_at，保留 run_id/pid 诊断位）。
     幂等：已是 failed → 200 already=true（不写 history、不刷新 failed_at、不覆盖原原因，
     但内存里残存的 running 记录照样清掉——所有者这一步仍是「我说它死了」）。
     """
@@ -1462,10 +1481,12 @@ def force_finish(local_id: str, *, confirm=None, confirm_name=None, reason: str 
             # 内存半边同样要闭环：看门狗/并发可能已把文件置 failed，而 job 记录仍挂着 running
             # （auto-0055 的现场形态）。只清内存，不写 history、不动 failed_at、不覆盖原原因。
             finished = _finish_running_jobs(local_id, note=note)
+            heartbeat = _close_heartbeat(task_dir)      # 心跳侧车同样终态化（幂等）
             return {"ok": True, "local_id": local_id, "state": "failed", "state_was": "failed",
                     "changed": False, "already": True,
                     "reason": str(task.get("failed_reason") or ""),
                     "jobs_force_finished": finished,
+                    "heartbeat_closed": bool(heartbeat),
                     "kept": _kept_view(task_dir, task)}
         if st not in FORCE_FINISH_STATES:
             raise HubError(f"任务当前不是运行态（{st}），无需强制结束")
@@ -1478,10 +1499,12 @@ def force_finish(local_id: str, *, confirm=None, confirm_name=None, reason: str 
         # 顺序写死：文件先落 failed，再让内存 job 死。反过来的话「内存已终态、文件还是 running」
         # 的窗口里任务看起来无人管；且失败分支抛错时不该留下已被判死的 job 记录。
         finished = _finish_running_jobs(local_id, note=note)
+        heartbeat = _close_heartbeat(task_dir)      # 第三半：心跳侧车终态化（清 last_beat_at）
         task = state.load(task_dir)
     return {"ok": True, "local_id": local_id, "state": "failed", "state_was": st,
             "changed": True, "already": False, "reason": note,
             "jobs_force_finished": finished,
+            "heartbeat_closed": bool(heartbeat),
             "kept": _kept_view(task_dir, task)}
 
 

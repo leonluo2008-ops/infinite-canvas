@@ -421,10 +421,12 @@ def _heartbeat_blank() -> dict:
 
     AT-19 扩 4 键：exec（child|thread|""）/ pid / pid_created_at（OS creation time）/ exit_code。
     读侧是**逐键白名单拷贝**，新增字段不进这里就等于没写（审计 X8：静默失效）。
+    closed_beat_at：外力终态化（heartbeat_close）前的最后一次真实心跳时刻——last_beat_at 被
+    清空后仍可追「它到底打到哪一刻」，不进白名单就等于没写。
     """
     return {"schema": _HEARTBEAT_SCHEMA, "run_id": "", "started_at": "", "last_beat_at": "",
             "beat_count": 0, "phase": "", "artifact_count": 0, "artifact_digest": "",
-            "ended_at": "", "outcome": "",
+            "ended_at": "", "outcome": "", "closed_beat_at": "",
             "exec": "", "pid": 0, "pid_created_at": "", "exit_code": None}
 
 
@@ -442,7 +444,7 @@ def heartbeat_read(task_dir: Path) -> dict:
     if not isinstance(raw, dict):
         return out
     for key in ("run_id", "started_at", "last_beat_at", "phase", "artifact_digest",
-                "ended_at", "outcome", "exec", "pid_created_at"):
+                "ended_at", "outcome", "closed_beat_at", "exec", "pid_created_at"):
         value = raw.get(key)
         out[key] = "" if value is None else str(value)
     for key in ("schema", "beat_count", "artifact_count", "pid"):
@@ -549,6 +551,37 @@ def heartbeat_finish(task_dir: Path, *, outcome: str, expected_run_id: str = "",
     if exit_code is not None:
         data["exit_code"] = int(exit_code)
     return _heartbeat_write(Path(task_dir), data)
+
+
+def heartbeat_close(task_dir: Path, *, outcome: str) -> dict:
+    """外力终态化心跳（人工强制结束用）：`last_beat_at` 清空 + ended_at/outcome 落笔。
+
+    与 heartbeat_finish 的分工写死：
+      · finish 是**执行体自己**的收尾——只补诊断位，`last_beat_at` 保留（那是真实的最后心跳，
+        活动锚还要用它算静默）；
+      · close 是**外力宣告死亡**（所有者点「强制结束」、看门狗强制降级）——执行体不在了，
+        那个心跳时刻不能再被任何守卫当成「它还在打」。清空 `last_beat_at` 才是终态：
+        `heartbeat_read` 于是不再产出新鲜心跳，`_job_alive`/`_job_blocks_retry`/held_job
+        一律读不到活证据；最后一次真实心跳时刻另存 `closed_beat_at` 供追溯（白名单已扩）。
+
+    三条硬约束：
+      · **不动 run_id**：它是执行体写盘栅栏与删除墓碑的对账锚（活执行体下一次写盘仍要被拒），
+        清掉等于把 X7「failed-but-alive」窗口的栅栏拆了；
+      · **不动 pid / exec**：诊断位（删除时 executor_alive 如实报）仍要能看；
+      · 幂等：已 close 过再调只刷新 ended_at/outcome，closed_beat_at 保留最早那份证据。
+    没有心跳侧车（从未跑起 / 旧任务）→ 什么都不写，返回 {}（不凭空造文件）。
+    """
+    task_dir = Path(task_dir)
+    if not heartbeat_path(task_dir).is_file():
+        return {}
+    data = heartbeat_read(task_dir)
+    previous = str(data.get("last_beat_at") or "")
+    if not str(data.get("closed_beat_at") or ""):
+        data["closed_beat_at"] = previous
+    data["last_beat_at"] = ""
+    data["ended_at"] = _now()
+    data["outcome"] = str(outcome or "")
+    return _heartbeat_write(task_dir, data)
 
 
 # ---------------------------------------------------------------- 产物清单与指纹（锚）
