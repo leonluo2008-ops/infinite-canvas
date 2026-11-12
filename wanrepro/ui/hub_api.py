@@ -181,11 +181,138 @@ def _lapian_anchors(task: dict) -> dict:
     }
 
 
+# ------------------------------------------------ 心跳侧车 / 活动锚 / 假运行态读面（AT-18）
+#
+# 为什么是独立文件 `<任务目录>/心跳.json`，而不是往 任务.json 里加字段：
+#   state.transition() 是 load → 改 → save，**全程不持 task_lock**，且跨进程 CLI/runner
+#   也在调它（线程锁管不到别的进程）。60s 一次的心跳若与状态机共用同一份 任务.json，
+#   两边必然互相覆盖——最坏情况是心跳把已经迁移到的 awaiting_assets 盖回 discussing。
+#   所以：任务.json 只有一个写族（状态机 + 短持锁的阶段回写），心跳单写者、原子替换，
+#   两者**在读时合并**（_summary / get_task 的 heartbeat/activity 字段）。
+# 方案冻结值见 §1.2/§2.1；阈值常量旁不许偷改，要改必须回方案评审。
+
+HEARTBEAT_SECONDS = discuss.HEARTBEAT_INTERVAL   # 60 —— 冻结值（方案 §2.1）：改动必须回方案评审
+STALE_JOB_SECONDS = 900                          # 冻结值（方案 §2.1）：僵尸 JOB 判据
+LOST_RUN_WATCHDOG_SECONDS = 300                  # 冻结值（方案 §5.2）：后台对账周期
+WATCHDOG_FIRST_DELAY_SECONDS = 30                # 冻结值（方案 §5.2）：进程起来后首跑延迟
+
+
+def _heart(task_dir: Path):
+    """心跳写入回调（60s / 每次阶段文案变化）——**唯一实现委托 state.heartbeat_beat**。
+
+    为什么不在 hub 侧另写一份：心跳文件是单写者合同（方案 §1.2），两处实现写同一个文件必然
+    字段口径漂移（digest 算法/字段形状）。状态机侧已提供 begin/beat/finish 三件，hub 只负责
+    「什么时候调」。AT-16 B4b 合同不变：心跳**只**写侧车，绝不碰 lapian_*。
+    """
+    task_dir = Path(task_dir)
+
+    def beat(msg: str = "") -> dict:
+        try:
+            return state.heartbeat_beat(task_dir, phase=_stage_text(msg) or None)
+        except OSError:
+            return {}                    # 心跳写失败不拖垮拆解（日志行仍在）
+
+    return beat
+
+
+def _heartbeat_end(task_dir: Path, outcome: str) -> None:
+    """run 收尾：只打 ended_at / outcome 两个诊断位（不参与判定）。"""
+    try:
+        state.heartbeat_finish(Path(task_dir), outcome=outcome)
+    except OSError:
+        pass
+
+
+def _parse_iso(value) -> float | None:
+    try:
+        return datetime.fromisoformat(str(value)).timestamp()
+    except (TypeError, ValueError):
+        return None
+
+
+def _heartbeat_view(task_dir: Path) -> dict:
+    """读面 heartbeat 四字段（§4.5 冻结字段名）：at / age_seconds / phase / count。
+
+    旧任务没有 心跳.json → state.heartbeat_read 回全空结构（at="" / count=0 / age=None），
+    前端据此显示「活动时间不可用」，绝不当成「刚刚活过」。
+    """
+    data = state.heartbeat_read(task_dir)
+    at = str(data.get("last_beat_at") or "")
+    started = _parse_iso(at)
+    return {
+        "at": at,
+        "age_seconds": int(time.time() - started) if started is not None else None,
+        "phase": _stage_text(data.get("phase")),
+        "count": int(data.get("beat_count") or 0),
+    }
+
+
+def _job_running_records(local_id: str) -> list[tuple[str, dict]]:
+    return [(job_id, rec) for job_id, rec in list(HUB_JOBS.items())
+            if rec.get("local_id") == local_id and rec.get("status") == "running"]
+
+
+def _job_alive(rec: dict, *, heartbeat_at: str = "") -> bool:
+    """单条 HUB_JOBS 记录是否「活」（方案 §3.2 G4 / §4.4 阻断闭包）：
+
+    只认「status=running ∧（启动不足 60s ∨ 心跳距今 ≤ 900s）」。其余一切记录
+    （failed/done 残留、无心跳、心跳过期、Thread.start() 失败留下的孤儿）都不阻断、
+    也不进判定——只登记进 ignored_stale_jobs，可追溯。
+    """
+    if rec.get("status") != "running":
+        return False
+    started = _parse_iso(rec.get("started"))
+    if started is not None and time.time() - started <= HEARTBEAT_SECONDS:
+        return True
+    beat = _parse_iso(heartbeat_at)
+    return beat is not None and time.time() - beat <= STALE_JOB_SECONDS
+
+
+def _held_job(local_id: str, probe: dict | None = None) -> bool:
+    """该任务是否被本进程一条「活 job」扣着（judge_lost_run 的 held_job 入参来源）。"""
+    heartbeat_at = str((probe or {}).get("heartbeat_at") or "")
+    if not heartbeat_at:
+        task_dir = Path(TASKS_DIR) / local_id
+        heartbeat_at = str(state.heartbeat_read(task_dir).get("last_beat_at") or "")
+    return any(_job_alive(rec, heartbeat_at=heartbeat_at)
+               for _, rec in _job_running_records(local_id))
+
+
+def _lost_run_view(task: dict, probe: dict) -> dict:
+    """读面 lost_run：suspect = 「静默已过阈值但本轮还没降级」（给前端提前红字）。"""
+    threshold = int(state.FAKE_RUN_SILENCE_SECONDS)
+    silence = int(probe.get("silence_seconds") or 0)
+    st = str(task.get("state") or "")
+    if st not in state.RUNNING_STATES_MACHINE:
+        return {"suspect": False, "silence_seconds": silence, "threshold_seconds": threshold,
+                "reason_code": "not_running", "reason": ""}
+    probe = {**probe, "held_job": _held_job(str(task.get("local_id") or ""), probe)}
+    is_lost, code = state.judge_lost_run(task, probe)
+    return {"suspect": bool(is_lost or silence >= threshold),
+            "silence_seconds": silence,
+            "threshold_seconds": threshold,
+            "reason_code": str(code or ""),
+            "reason": str(state.FAKE_RUN_REASONS.get(st, "")) if is_lost else ""}
+
+
+def _failed_view(task: dict) -> dict:
+    """读面 failed：仅 state==failed 时非空；旧任务（无 failed_reason）给空值，前端回落 error。"""
+    if str(task.get("state") or "") != "failed":
+        return {"reason": "", "at": "", "evidence": {}}
+    return {
+        "reason": str(task.get("failed_reason") or ""),
+        "at": str(task.get("failed_at") or ""),
+        "evidence": task.get("failed_evidence") or {},
+    }
+
+
 def _summary(task: dict, task_dir: Path) -> dict:
     out = (task_dir / VIDEO_FILE).is_file()
     # AT-9 B1 表格摘要三字段（数据合同）：任务名/阶段/已换数——列表页不拉详情
     task_name = f"{task['local_id']}·{(task.get('ingestion') or {}).get('video_name', '')}"
     stage = _stage_text(task.get(LAPIAN_STAGE)) if task["state"] == "discussing" else ""
+    # AT-18 §4.5：心跳 / 活动锚 / 假运行 / 失败原因——列表与详情同源（一份 probe 算两用）
+    probe = state.activity_snapshot(task_dir, task)
     return {
         "local_id": task["local_id"],
         "bridge_id": task.get("bridge_id"),
@@ -206,6 +333,13 @@ def _summary(task: dict, task_dir: Path) -> dict:
         # 判定源全是既有持久事实（active_submit/dispatch.phase/submit_unknown/gen_error/
         # state/cloud id），本层不新造状态、不另起端点。
         "submit": submit_view.build(task, active_submit=_active_submit(task["local_id"])),
+        # AT-18 §4.5 读面四键（冻结字段名；缺文件/旧任务给空值，不报错）
+        "heartbeat": _heartbeat_view(task_dir),
+        "activity": {"last_activity_at": str(probe.get("last_activity_at") or ""),
+                     "source": str(probe.get("source") or ""),
+                     "silence_seconds": int(probe.get("silence_seconds") or 0)},
+        "lost_run": _lost_run_view(task, probe),
+        "failed": _failed_view(task),
     }
 
 
@@ -383,15 +517,23 @@ def do_ingest(video_path: Path, intent: str) -> dict:
         raise HubError(str(e)) from None
 
 
-def _spawn(job_kind: str, target, *args) -> dict:
+def _spawn(job_kind: str, target, *args, heartbeat_dir: Path | None = None) -> dict:
     """统一异步：后台线程跑 target，HUB_JOBS 记状态，错误原文进 job。
 
     AT-13 §2.8：job 记录是**可 GET 的落账面**（/api/hub/job/<id>）——错误文本与 traceback
     必须脱敏后再存，traceback 不许裸存（R1 实证裸 traceback 会把 key 原样带出去）。
+
+    heartbeat_dir（AT-18 §1.4 ③）：非 None 时**在起线程之前**写一份带 started_at 的心跳，
+    这样「线程根本没起来」也留得下起跑锚（auto-0052 形态的可判定前提）。
     """
     job_id = uuid.uuid4().hex[:12]
     HUB_JOBS[job_id] = {"status": "running", "kind": job_kind, "started": _now(),
                         "local_id": _job_local_id(args[0]) if args else None}
+    if heartbeat_dir is not None:
+        try:
+            state.heartbeat_begin(heartbeat_dir, run_id=job_id, phase=job_kind)
+        except Exception as exc:  # noqa: BLE001 —— 锚写失败照实报，但不挡真正的工作
+            print(f"[hub] 心跳起手写失败（{job_kind}/{job_id}）：{exc}", file=sys.stderr)
 
     def wrap():
         try:
@@ -578,36 +720,61 @@ def set_audio_mode(local_id: str, mode: str) -> dict:
 
 
 def _spawn_discuss(task_dir: Path, first_line: str) -> dict:
-    """拆解后台执行体（发起拆解与 failed 重试共用；重跑即续语义全在 discuss.run_discuss）。"""
+    """拆解后台执行体（发起拆解与 failed 重试共用；重跑即续语义全在 discuss.run_discuss）。
+
+    AT-18 §1.4 写序：重置双锚 → 起手写心跳（_spawn 内，起线程前）→ emit 首行 → 起线程。
+    线程内：每次阶段变化 → 日志行 + lapian_* + 心跳 phase；每次 60s 心跳 → 日志行 + 心跳；
+    finally → 心跳 ended_at/outcome（诊断位，不参与判定）。
+    """
     _reset_lapian_anchors(task_dir)
     emit = _stage_recorder(task_dir)
     heartbeat = _log_only(task_dir)      # 心跳：只追加日志行，不碰 lapian_stage / 阶段锚
+    beat = _heart(task_dir)              # 心跳侧车写者（AT-18）：只写 心跳.json
+
+    def stage(msg: str, *, terminal: bool = False) -> None:
+        emit(msg, terminal=terminal)
+        beat(msg)
+
+    def on_beat(msg: str) -> None:
+        heartbeat(msg)                   # AT-16 B4b：等待心跳只进日志
+        beat(msg)                        # AT-18：同时刷新侧车（含产物锚）
+
     emit(first_line)
 
     def _run(td: Path):
         # 注意：旧写法是 `return discuss.run_discuss(...)` + else 收尾——Python 里 try 内 return
         # 会**跳过 else**，成功终态行从来没落过（B4a 实测：成功任务 ended_at 恒空、进度无终态文案）。
         # 改成先取结果、再收尾 emit 终态，成功/失败都留终态行与停表锚。
+        outcome = "failed"
         try:
-            result = discuss.run_discuss(td, verbose=False, on_stage=emit,
-                                         on_heartbeat=heartbeat)
-        except discuss.DiscussError as e:
-            emit(f"终态：失败（{e}）", terminal=True)
-            raise
-        except Exception as e:  # noqa: BLE001
-            emit(f"终态：环境故障（{e}）——状态保留，重跑续", terminal=True)
-            raise
-        # AT-17 B2c：拆解完成即落音频三态（默认值；已有值不覆盖）——走 _write_task 短持锁，
-        # 与阶段回写同一把锁，防 read-modify-save 把它冲掉。
-        mode = _persist_audio_mode(td)
-        if mode.get("audio_mode"):
-            emit(f"音频三态：{mode['audio_mode']}（{mode.get('依据') or '已有值'}）")
-        else:
-            emit(f"音频三态：未落盘（{mode.get('why') or '读不到拆解'}）")
-        emit("终态：awaiting_assets（等置换）", terminal=True)
-        return result
+            try:
+                result = discuss.run_discuss(td, verbose=False, on_stage=stage,
+                                             on_heartbeat=on_beat)
+            except discuss.DiscussError as e:
+                emit(f"终态：失败（{e}）", terminal=True)
+                beat(f"终态：失败（{e}）")
+                raise
+            except Exception as e:  # noqa: BLE001
+                # 环境级故障（桥连不上/超时）状态保留 discussing——心跳 outcome 如实记 env_error
+                outcome = "env_error"
+                emit(f"终态：环境故障（{e}）——状态保留，重跑续", terminal=True)
+                beat(f"终态：环境故障（{e}）——状态保留，重跑续")
+                raise
+            # AT-17 B2c：拆解完成即落音频三态（默认值；已有值不覆盖）——走 _write_task 短持锁，
+            # 与阶段回写同一把锁，防 read-modify-save 把它冲掉。
+            mode = _persist_audio_mode(td)
+            if mode.get("audio_mode"):
+                emit(f"音频三态：{mode['audio_mode']}（{mode.get('依据') or '已有值'}）")
+            else:
+                emit(f"音频三态：未落盘（{mode.get('why') or '读不到拆解'}）")
+            emit("终态：awaiting_assets（等置换）", terminal=True)
+            beat("终态：awaiting_assets（等置换）")
+            outcome = "done"
+            return result
+        finally:
+            _heartbeat_end(td, outcome)
 
-    return _spawn("hub-discuss", _run, task_dir)
+    return _spawn("hub-discuss", _run, task_dir, heartbeat_dir=task_dir)
 
 
 def start_discuss(local_id: str) -> dict:
@@ -621,12 +788,28 @@ def start_retry(local_id: str) -> dict:
     复用既有重跑即续语义：discuss.run_discuss 对 failed 先做 failed→discussing（状态机
     唯一合法出口），随后产物优先——拆解产物齐就不重跑模型直接落 awaiting_assets，
     未齐才真重发拆解。非 failed → 409（HubError 由 server 层转 409）。
+
+    AT-18 §4.3 补两处合同：
+      · **活跃 job 守卫**（T6 ②）——该任务已有在跑 job 时 409，绝不起第二个线程
+        （这是「同一时刻只有一个 run、心跳侧车恒等于当前 run」的事实前提）；
+      · 重试即**重建心跳锚**（heartbeat_begin 整体覆盖，旧 run_id 作废），
+        旧失败原因不删——state.transition 把它写进 history，另以 previous_reason 回显。
     """
     task_dir = _task_dir(local_id)
-    task = state.load(task_dir)
-    if task["state"] != "failed":
-        raise HubError(f"重试需 failed 状态，当前 {task['state']}（只有失败任务可重试）")
-    return _spawn_discuss(task_dir, "人工重试：failed → discussing（重跑即续，产物优先）")
+    with task_lock(local_id):
+        task = state.load(task_dir)
+        # 守卫顺序写死：**先看在跑 job，再看状态**。否则「重试后立刻再点」只会撞到
+        # 「当前 discussing，只有失败任务可重试」这句状态文案，双写防护形同虚设
+        # （方案 §4.3 A15 要的就是这一句「已有拆解任务在跑」）。
+        active = _job_running_records(local_id)
+        if active:
+            raise HubError(f"任务已有拆解任务在跑（{active[0][1].get('kind')}），重试拒绝")
+        if task["state"] != "failed":
+            raise HubError(f"重试需 failed 状态，当前 {task['state']}（只有失败任务可重试）")
+        previous_reason = str(task.get("failed_reason") or "")
+        job = _spawn_discuss(task_dir, "人工重试：failed → discussing（重跑即续，产物优先）")
+    return {"state": "discussing", "job_id": job.get("job_id"), "heartbeat_reset": True,
+            "previous_reason": previous_reason}
 
 
 def do_assets(local_id: str, image_paths: list[Path]) -> dict:
@@ -663,7 +846,7 @@ def do_confirm(local_id: str, empty_confirm: bool = False,
             raise HubError(str(e)) from None
     # 确认后由后端触发渲染（AT-9 §五「确认后立即关闭 Drawer，渲染照常推进（后端触发）」）：
     # rendering 态下后台跑 do_render → awaiting_approval + 自检；失败如实落 failed（可重试/删除）。
-    job = _spawn("hub-render", _render_and_advance, task_dir)
+    job = _spawn("hub-render", _render_and_advance, task_dir, heartbeat_dir=task_dir)
     return {"state": st, "全沿用": bool(empty_confirm), "job_id": job.get("job_id")}
 
 
@@ -672,9 +855,17 @@ def _render_and_advance(task_dir: Path) -> dict:
 
     渲染失败 → 任务级失败如实落 failed（带原文），绝不把任务吊死在 rendering
     （RUNNING_STATES 不可删不可重试，吊死即死锁）。
+    AT-18 §1.4：这条链同样写心跳侧车（起手由 _spawn 写、收尾打 ended_at/outcome），
+    只用于「前端展示最近活动 + 僵尸 JOB 判据」；自动降级另走扫描（rendering 在自动通道内）。
     """
+    beat = _heart(task_dir)
+    outcome = "failed"
     try:
-        return do_render(task_dir.name)
+        beat("渲染中")
+        result = do_render(task_dir.name)
+        outcome = "done"
+        beat("渲染完成")
+        return result
     except Exception as e:  # noqa: BLE001
         try:
             if state.load(task_dir)["state"] == "rendering":
@@ -682,6 +873,8 @@ def _render_and_advance(task_dir: Path) -> dict:
         except Exception:  # noqa: BLE001 —— 状态回写失败不吞掉原异常
             pass
         raise
+    finally:
+        _heartbeat_end(task_dir, outcome)
 
 
 def do_rollback(local_id: str) -> dict:
@@ -760,11 +953,22 @@ def delete_task(local_id: str, *, confirm_name: str | None = None) -> dict:
     task_dir = _task_dir(local_id)
     task = state.load(task_dir)
     st = task["state"]
-    running_job = next((rec for rec in HUB_JOBS.values()
-                        if rec.get("local_id") == local_id and rec.get("status") == "running"),
-                       None)
-    if running_job:
-        raise HubError(f"任务有排队/运行中的 job（{running_job.get('kind')}），删除拒绝")
+    # AT-18 §4.4 JOB 阻断闭包（冻结）：只有「同一 local_id ∧ status=running ∧ 心跳新鲜
+    # （last_beat_at ≤ 900s，或记录启动不足 60s）」的记录才阻断删除；其余一切记录
+    # （failed/done 残留、无心跳、心跳超 900s、Thread.start() 失败留下的孤儿）一律不阻断，
+    # 逐个登记进 ignored_stale_jobs（<kind>:<job_id>）——僵尸记录不许把任务永久锁死。
+    heartbeat_at = str(state.heartbeat_read(task_dir).get("last_beat_at") or "")
+    blocking = None
+    ignored_stale_jobs: list[str] = []
+    for job_id, rec in list(HUB_JOBS.items()):
+        if rec.get("local_id") != local_id:
+            continue
+        if _job_alive(rec, heartbeat_at=heartbeat_at):
+            blocking = rec
+            continue
+        ignored_stale_jobs.append(f"{rec.get('kind')}:{job_id}")
+    if blocking:
+        raise HubError(f"任务有排队/运行中的 job（{blocking.get('kind')}），删除拒绝")
     if st in RUNNING_STATES:
         raise HubError(f"任务运行中（{st}），删除拒绝（等跑完或失败后再删）")
     if st not in DELETABLE_STATES + TEARDOWN_IDLE_STATES:
@@ -795,7 +999,164 @@ def delete_task(local_id: str, *, confirm_name: str | None = None) -> dict:
     return {"ok": True, "deleted": local_id, "state_was": st,
             "analysis_dir_removed": removed_analysis,
             "uploads_video_removed": removed_upload,
-            "tombstone": True}
+            "tombstone": True,
+            # AT-18 §4.4：本次放行时被判定为僵尸、未参与阻断的 JOB 记录（可追溯）
+            "ignored_stale_jobs": ignored_stale_jobs}
+
+
+# ------------------------------------------------------------ 对账扫描 / 强制结束 / 看门狗（AT-18）
+
+FORCE_FINISH_STATES = ("discussing", "rendering", "generating")   # 方案 §4.2：人工兜底口的可作用态
+FORCE_FINISH_DEFAULT_REASON = "人工强制结束（所有者操作）"
+FORCE_FINISH_REASON_MAX = 200
+
+
+def _kept_view(task_dir: Path, task: dict) -> dict:
+    """强制结束「什么都没删」的可验证回执：任务目录 / 拆解产物 / 参考视频三处都还在。"""
+    bridge_id = str(task.get("bridge_id") or "")
+    video = str((task.get("ingestion") or {}).get("video_name") or "")
+    return {
+        "task_dir": Path(task_dir).is_dir(),
+        "analysis_dir": bool(bridge_id) and (ROOT / "analysis" / "reverse" / bridge_id).is_dir(),
+        "uploads_video": bool(video) and (UPLOADS_DIR / video).is_file(),
+    }
+
+
+def scan_lost_runs(*, apply: bool = False) -> dict:
+    """POST /api/hub/maintenance/scan-lost-runs —— 假运行态对账扫描（方案 §4.1）。
+
+    触发者：① 后台 watchdog（apply=True，周期 300s）；② 手动/脚本（默认 dry-run）。
+    集合语义（冻结）：scanned = 本次检查的运行态任务数；lost[] = 本次判定为假运行的任务
+    （apply=False 时 changed 恒 false）；skipped[] = 检查过但不降级的（带 reason_code）；
+    已降级的任务下一轮进 skipped{not_running}——这就是幂等的可观测形态。
+    """
+    apply = bool(apply)
+    checked_at = _now()
+    lost: list[dict] = []
+    skipped: list[dict] = []
+    errors: list[dict] = []
+    scanned = 0
+    for mf in sorted(Path(TASKS_DIR).glob("auto-*/任务.json")):
+        local_id = mf.parent.name
+        try:
+            task = state.load(mf.parent)
+            st = str(task.get("state") or "")
+            probe = dict(state.activity_snapshot(mf.parent, task) or {})
+            if st not in state.RUNNING_STATES_MACHINE:
+                skipped.append({"local_id": local_id, "state": st, "reason_code": "not_running"})
+                continue
+            scanned += 1
+            probe["held_job"] = _held_job(local_id, probe)
+            is_lost, code = state.judge_lost_run(task, probe)
+            if st == "generating":
+                # 方案 §3.2 G3：generating **永不自动降级**（有云端在途必须续查，判死可能重复
+                # 付费提交；没有在途证据的也只走出人工兜底口 force-finish）。这里只报不写。
+                skipped.append({"local_id": local_id, "state": st,
+                                "reason_code": str(code or "manual_only")})
+                continue
+            if not is_lost:
+                skipped.append({"local_id": local_id, "state": st,
+                                "reason_code": str(code or "silence_below_threshold")})
+                continue
+            reason = str(state.FAKE_RUN_REASONS.get(st, ""))
+            item = {
+                "local_id": local_id,
+                "state": st,
+                "silence_seconds": int(probe.get("silence_seconds") or 0),
+                "last_activity_at": str(probe.get("last_activity_at") or ""),
+                "last_activity_source": str(probe.get("source") or ""),
+                "heartbeat_at": str(probe.get("heartbeat_at") or ""),
+                "reason": reason,
+                "changed": False,
+            }
+            if apply:
+                with task_lock(local_id):
+                    res = state.fail_orphan_task(mf.parent, reason=reason, probe=probe,
+                                                 trigger="auto_scan") or {}
+                item["changed"] = bool(res.get("changed"))
+            lost.append(item)
+        except Exception as exc:  # noqa: BLE001 —— 单条坏任务进 errors，其余照扫（§4.1）
+            errors.append({"local_id": local_id, "error": f"{type(exc).__name__}: {exc}"})
+    return {"ok": True, "applied": apply,
+            "threshold_seconds": int(state.FAKE_RUN_SILENCE_SECONDS),
+            "checked_at": checked_at, "scanned": scanned,
+            "lost": lost, "skipped": skipped, "errors": errors}
+
+
+def force_finish(local_id: str, *, confirm=None, confirm_name=None, reason: str = "") -> dict:
+    """POST /api/hub/task/{id}/force-finish —— 所有者人工兜底口（方案 §4.2，覆盖阈值误判）。
+
+    二次确认是「这是所有者手动操作」的唯一显式证据（身份仍走既有 gate()，不新造体系）：
+    confirm 必须是布尔 true（字符串 "true" 不算），confirm_name 必须等于路径里的任务号。
+    语义写死：置 failed + 写人工原因，**不删任何东西、不杀进程**（本接口不持有进程句柄）。
+    幂等：已是 failed → 200 already=true（不写 history、不刷新 failed_at、不覆盖原原因）。
+    """
+    if confirm is not True:
+        raise HubInputError("强制结束需二次确认：请求体带 confirm=true"
+                            "（并把任务号填进 confirm_name）")
+    if str(confirm_name or "") != local_id:
+        raise HubInputError(f'强制结束需二次确认：confirm_name 必须是 "{local_id}"'
+                            f'（当前 "{confirm_name or ""}"）')
+    note = str(reason or "").strip() or FORCE_FINISH_DEFAULT_REASON
+    if len(note) > FORCE_FINISH_REASON_MAX:
+        raise HubInputError(f"reason 最长 {FORCE_FINISH_REASON_MAX} 字（当前 {len(note)} 字）")
+    task_dir = _task_dir(local_id)            # 不存在 → 409（既有 _task_dir 口径）
+    with task_lock(local_id):
+        task = state.load(task_dir)
+        st = str(task.get("state") or "")
+        if st == "failed":
+            return {"ok": True, "local_id": local_id, "state": "failed", "state_was": "failed",
+                    "changed": False, "already": True,
+                    "reason": str(task.get("failed_reason") or ""),
+                    "kept": _kept_view(task_dir, task)}
+        if st not in FORCE_FINISH_STATES:
+            raise HubError(f"任务当前不是运行态（{st}），无需强制结束")
+        probe = dict(state.activity_snapshot(task_dir, task) or {})
+        probe["held_job"] = _held_job(local_id, probe)
+        try:
+            state.fail_orphan_task(task_dir, reason=note, probe=probe, trigger="manual_force")
+        except state.StateError as exc:     # 并发下状态已变 → 按业务错 409 透出原文
+            raise HubError(str(exc)) from None
+        task = state.load(task_dir)
+    return {"ok": True, "local_id": local_id, "state": "failed", "state_was": st,
+            "changed": True, "already": False, "reason": note,
+            "kept": _kept_view(task_dir, task)}
+
+
+# 后台对账看门狗（方案 §5.2：唯一新增设施，生命周期写死）
+_WATCHDOG_STOP = threading.Event()
+_WATCHDOG_THREAD: threading.Thread | None = None
+
+
+def _watchdog_loop() -> None:
+    if _WATCHDOG_STOP.wait(WATCHDOG_FIRST_DELAY_SECONDS):
+        return
+    while not _WATCHDOG_STOP.is_set():
+        try:
+            scan_lost_runs(apply=True)
+        except Exception as exc:  # noqa: BLE001 —— 单轮失败只写 stderr，绝不影响 HTTP 服务
+            print(f"[watchdog] 对账扫描失败：{type(exc).__name__}: {exc}"
+                  "——本轮跳过，不影响服务", file=sys.stderr)
+        if _WATCHDOG_STOP.wait(LOST_RUN_WATCHDOG_SECONDS):
+            return
+
+
+def start_lost_run_watchdog() -> bool:
+    """起后台对账线程（daemon）；已在跑 → False，不重复起。"""
+    global _WATCHDOG_THREAD
+    if _WATCHDOG_THREAD is not None and _WATCHDOG_THREAD.is_alive():
+        return False
+    _WATCHDOG_STOP.clear()
+    _WATCHDOG_THREAD = threading.Thread(target=_watchdog_loop, daemon=True,
+                                        name="hub-lost-run-watchdog")
+    _WATCHDOG_THREAD.start()
+    return True
+
+
+def stop_lost_run_watchdog() -> None:
+    """置停止事件（不强制 join、不打断正在执行的 fail_orphan_task——单次耗时 < 10ms）。"""
+    _WATCHDOG_STOP.set()
+
 
 
 def _bridge_of(task_dir: Path) -> str:
@@ -1380,15 +1741,25 @@ def start_submit(local_id: str, key: str | None = None) -> dict:
     task_dir = _task_dir(local_id)
 
     def _run(td: Path, frozen_cfg: dict, api_key: str | None):
+        beat = _heart(td)                    # AT-18：生成链心跳（起手由 _spawn 写）
+
         def _progress(pct, waited):  # noqa: ANN001 —— generate 回调签名
             if pct is None:
                 return
             _write_task(td, lambda t: t.__setitem__("gen_progress", int(pct)))
-        with _SUBMIT_LOCK:
-            return generate.do_submit(td, verbose=False, on_progress=_progress,
-                                      frozen=frozen_cfg,
-                                      write_guard=lambda: task_lock(td.name),
-                                      api_key=api_key)
+            beat(f"生成进度 {int(pct)}%")     # 进度回写点 = 心跳点（方案 §1.4）
+
+        outcome = "failed"
+        try:
+            with _SUBMIT_LOCK:
+                result = generate.do_submit(td, verbose=False, on_progress=_progress,
+                                            frozen=frozen_cfg,
+                                            write_guard=lambda: task_lock(td.name),
+                                            api_key=api_key)
+            outcome = "done"
+            return result
+        finally:
+            _heartbeat_end(td, outcome)
 
     with task_lock(local_id):
         # AT-16 B11：创建阶段渠道 4xx（明确未建单）曾被旧版误标成 submit_unknown/dispatch，
@@ -1415,7 +1786,7 @@ def start_submit(local_id: str, key: str | None = None) -> dict:
         # 冻结副本=已批准快照的输入；批准后若被改，do_submit 的快照比对会作废本次提交
         frozen = {"gen_params": dict(task.get("gen_params") or {}),
                   "gen_channel": dict(task.get("gen_channel") or {})}
-        job = _spawn("hub-submit", _run, task_dir, frozen, key or "")
+        job = _spawn("hub-submit", _run, task_dir, frozen, key or "", heartbeat_dir=task_dir)
     return job
 
 

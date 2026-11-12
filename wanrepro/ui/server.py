@@ -2387,6 +2387,12 @@ class Handler(BaseHTTPRequestHandler):
 
     def route_post(self, path: str) -> None:
         # ---- 自动化工作台（hub）：建任务/拆解/置换/确认/渲染/批准/提交 ----
+        if path == "/api/hub/maintenance/scan-lost-runs":
+            # AT-18 §4.1：假运行态对账扫描（手动/定时同一入口）。默认 dry-run 只返回清单；
+            # apply=true 才真的降级（幂等：已 failed 的下一轮进 skipped{not_running}）。
+            payload = self.read_json()
+            self.send_json(hub_api.scan_lost_runs(apply=payload.get("apply") is True))
+            return
         if path == "/api/hub/ingest":
             self.do_hub_ingest()
             return
@@ -2476,6 +2482,17 @@ class Handler(BaseHTTPRequestHandler):
                 note=str(payload.get("note") or "撤销批准（改配置后重批）")))
             return
         # ---- AT-9 B2：任务级 REST（确认组 / 回退 / 删除，路径参数非模板变量） ----
+        m = re.fullmatch(r"/api/hub/task/([^/]+)/force-finish", path)
+        if m:
+            # AT-18 §4.2：所有者人工兜底口（覆盖阈值误判）。二次确认参数缺/类型不对 → 400；
+            # 状态不是运行态 → 409；已 failed → 200 幂等（不二次写 history）。
+            payload = self.read_json()
+            self.send_json(hub_api.force_finish(
+                urllib.parse.unquote(m.group(1)),
+                confirm=payload.get("confirm"),
+                confirm_name=payload.get("confirm_name"),
+                reason=str(payload.get("reason") or "")))
+            return
         m = re.fullmatch(r"/api/hub/task/([^/]+)/delete", path)
         if m:
             payload = self.read_json()
@@ -3657,6 +3674,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--port", type=int, default=8776)
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--no-browser", action="store_true", help="不自动开浏览器")
+    ap.add_argument("--no-watchdog", action="store_true",
+                    help="不启后台假运行态对账扫描（AT-18；等价 WANREPRO_WATCHDOG=0，探针/调试用）")
     args = ap.parse_args(argv)
 
     ffmpeg_src = bundle_ffmpeg_source()
@@ -3676,6 +3695,13 @@ def main(argv: list[str] | None = None) -> int:
     print(f"[OK] {url}  （Ctrl+C 停）", flush=True)
     print(f"     仓库：{ROOT}", flush=True)
     print(f"     ffmpeg: {ffmpeg_src}", flush=True)
+    # AT-18 §5.2：后台对账看门狗（首个 30s 后首跑，之后每 300s）。可关：--no-watchdog 或
+    # WANREPRO_WATCHDOG=0（隔离探针必须带上，免自动降级干扰夹具）。
+    watchdog_on = (not args.no_watchdog
+                   and (os.environ.get("WANREPRO_WATCHDOG", "1") or "").strip() != "0")
+    watchdog_started = hub_api.start_lost_run_watchdog() if watchdog_on else False
+    print(f"     假运行态对账：{'每 300s 自动扫描' if watchdog_started else '已关闭（手动 scan 入口仍可用）'}",
+          flush=True)
     if not args.no_browser and WEB_DIST_ROOT is not None:
         threading.Timer(0.8, lambda: webbrowser.open(url)).start()  # 整合包才开页；开发机画布在 vite :3000
     try:
@@ -3683,6 +3709,7 @@ def main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         print("\n[ui] 已停", flush=True)
     finally:
+        hub_api.stop_lost_run_watchdog()
         httpd.server_close()
     return 0
 
