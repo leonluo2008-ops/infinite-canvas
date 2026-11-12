@@ -495,6 +495,11 @@ def build_assets(task_id: str) -> list[dict]:
 
 DIALOGUE_NAME = "台词改写.md"
 RECEIPT_NAME = "渲染回执.json"
+# AT-17 B2c 音频三态：文件名 / 字段名 / 枚举值（与 pipeline/reverse/intent.py 一套，
+# 改一处必须同改——探针 probe_at17_b2c 交叉断言两边字面一致）
+AUDIO_MODE_NAME = "audio_mode.json"
+AUDIO_MODE_FIELD = "audio_mode"
+AUDIO_MODE_VALUES = ("沿用原片", "按新主体调整", "不要")
 TIME_CODE_RE = re.compile(r"\d{1,2}:\d{2}(?:\.\d+)?\s*[-–—~～]\s*\d{1,2}:\d{2}(?:\.\d+)?")
 QUOTE_CHARS = "\"'“”‘’「」『』"
 
@@ -542,6 +547,29 @@ def intent_receipt(task_id: str) -> dict | None:
     return data if isinstance(data, dict) else None
 
 
+def task_audio_mode(task_id: str) -> dict | None:
+    """`audio_mode.json` → {audio_mode, 依据, 待核对}；文件不在/坏了/值不在枚举内 → None。
+
+    AT-17 B2c：三态默认值由意图阶段（analyze.stage_intent / intent.build）按拆解八 声音
+    结构化字段推导后落盘，这里只读，不推导、不补值。字段名与枚举值全链一套
+    （audio_mode / 沿用原片·按新主体调整·不要）。
+    """
+    path = task_dir(task_id) / AUDIO_MODE_NAME
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(read_text(path) or "{}")
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    value = str(data.get(AUDIO_MODE_FIELD) or "").strip()
+    if value not in AUDIO_MODE_VALUES:
+        return None
+    return {"audio_mode": value, "依据": str(data.get("依据") or ""),
+            "待核对": bool(data.get("待核对"))}
+
+
 def task_payload(task_id: str) -> dict:
     prompt_text, template = latest_prompt(task_id)
     src = video_file(task_id, strict=False)
@@ -564,6 +592,8 @@ def task_payload(task_id: str) -> dict:
         # 意图回执（C-3）：页面看「原句 → 中文」，复制正文只给成品。文件不在就是 null。
         "dialogueMap": dialogue_map(task_id),
         "intentReceipt": intent_receipt(task_id),
+        # AT-17 B2c：音频三态（画布链节点状态只读面）——B3 界面接入前先透出，字段名同 hub 侧。
+        "audio_mode": task_audio_mode(task_id),
     }
 
 

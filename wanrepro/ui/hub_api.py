@@ -126,9 +126,11 @@ def _intent_mod():
 
     建议合同（AT-9 B1）：意图建议的结构化解析**复用 intent.py 规范解析**（parse_suggestions
     三节校验/全半角竖线/行号与镜次校验都有），禁新写解析器。
+    AT-17 B2c：音频三态推导（intent.audio_mode）也走这份加载——模块位置是仓库事实，
+    按 `__file__` 定位（不随 ROOT 数据根替换而变，探针替换数据根时才不会加载失败）。
     """
     import importlib.util
-    path = ROOT / "pipeline" / "reverse" / "intent.py"
+    path = Path(__file__).resolve().parents[1] / "pipeline" / "reverse" / "intent.py"
     spec = importlib.util.spec_from_file_location("wanrepro_reverse_intent", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -313,6 +315,7 @@ def get_task(local_id: str) -> dict:
     decisions = replace.load_row_decisions(bridge_id) if bridge_id else {}
     summary_md = _read(ROOT / "analysis" / "reverse" / str(task.get("bridge_id")) / "拆解.md")
     checklist_md = _read(_checklist_path(str(task.get("bridge_id"))))
+    mode = _audio_mode(task)                 # AT-17 B2c：三态（任务.json 优先，老任务只读现推）
     d.update({
         "summary_md": summary_md,
         "checklist_md": checklist_md,
@@ -334,6 +337,12 @@ def get_task(local_id: str) -> dict:
         "suggestions": _suggestions(
             _read(ROOT / "analysis" / "reverse" / str(task.get("bridge_id") or "") / SUGGESTION_NAME),
             checklist_md, summary_md),
+        # AT-17 B2c：音频三态透出（B3 前端读的唯一出口）——四个平铺键，键名恒以 audio_mode
+        # 开头，不另起「音频三态」别名（B0 附注 4：全链一套命名）。
+        "audio_mode": mode["audio_mode"],
+        "audio_mode_依据": mode["依据"],
+        "audio_mode_待核对": mode["待核对"],
+        "audio_mode_来源": mode["来源"],
         "error": (task.get("history") or [{}])[-1].get("note", "")
         if task["state"] == "failed" else "",
         "gen": task.get("gen") or {},
@@ -477,6 +486,50 @@ def _reset_lapian_anchors(task_dir: Path) -> None:
         pass
 
 
+AUDIO_MODE_FIELD = "audio_mode"
+
+
+def _persist_audio_mode(task_dir: Path) -> dict:
+    """拆解完成即落 audio_mode（AT-17 B2c，hub 链落盘面）：任务.json 字段 + 画布链旁路文件。
+
+    唯一的写实现=discuss.persist_audio_mode（推导走 intent.audio_mode，纯字符串零模型调用）；
+    这里只负责持任务锁调用它，防与阶段回写互相覆盖。已有值不覆盖——B3 界面上改选过的值，
+    重跑拆解也留得住。失败只返回 why，不阻断拆解。
+    """
+    try:
+        with task_lock(task_dir.name):
+            return discuss.persist_audio_mode(task_dir)
+    except Exception as exc:  # noqa: BLE001 —— 附加值落盘失败不许把拆解判死
+        return {"why": f"三态落盘失败（{type(exc).__name__}：{exc}）"}
+
+
+def _audio_mode(task: dict) -> dict:
+    """三态透出（AT-17 B2c，B3 前端读）：任务.json 字段优先，老任务按拆解只读现推。
+
+    读路径**不回写**（不在读路径上迁移数据）：老任务（本批之前拆解完的）没这个字段，
+    就按同一份推导现算一份透出，值一样；下次重跑拆解会正式落盘。
+    返回 {audio_mode, 依据, 待核对, 来源}；连拆解都没有 → 值为空串、待核对 False。
+    """
+    value = str(task.get(AUDIO_MODE_FIELD) or "").strip()
+    bridge_id = str(task.get("bridge_id") or "")
+    side: dict = {}
+    if bridge_id:
+        try:
+            side = _intent_mod().read_audio_mode(ROOT / "analysis" / "reverse" / bridge_id)
+        except Exception:  # noqa: BLE001 —— 读侧坏文件不改判
+            side = {}
+    if value:
+        same = side.get(AUDIO_MODE_FIELD) == value
+        return {"audio_mode": value, "依据": side.get("依据", "") if same else "",
+                "待核对": bool(side.get("待核对")) if same else False, "来源": "任务.json"}
+    if side.get(AUDIO_MODE_FIELD):
+        return {**side, "来源": "audio_mode.json（任务.json 未落）"}
+    info = discuss.derive_audio_mode(bridge_id)
+    if info.get(AUDIO_MODE_FIELD):
+        return {**info, "来源": "拆解现推（未落盘）"}
+    return {"audio_mode": "", "依据": "", "待核对": False, "来源": ""}
+
+
 def _spawn_discuss(task_dir: Path, first_line: str) -> dict:
     """拆解后台执行体（发起拆解与 failed 重试共用；重跑即续语义全在 discuss.run_discuss）。"""
     _reset_lapian_anchors(task_dir)
@@ -497,6 +550,13 @@ def _spawn_discuss(task_dir: Path, first_line: str) -> dict:
         except Exception as e:  # noqa: BLE001
             emit(f"终态：环境故障（{e}）——状态保留，重跑续", terminal=True)
             raise
+        # AT-17 B2c：拆解完成即落音频三态（默认值；已有值不覆盖）——走 _write_task 短持锁，
+        # 与阶段回写同一把锁，防 read-modify-save 把它冲掉。
+        mode = _persist_audio_mode(td)
+        if mode.get("audio_mode"):
+            emit(f"音频三态：{mode['audio_mode']}（{mode.get('依据') or '已有值'}）")
+        else:
+            emit(f"音频三态：未落盘（{mode.get('why') or '读不到拆解'}）")
         emit("终态：awaiting_assets（等置换）", terminal=True)
         return result
 

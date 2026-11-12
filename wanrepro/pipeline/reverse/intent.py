@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import json
 import os
 import re
 import ssl
@@ -36,6 +37,17 @@ DIALOGUE_LINE_MARK = "台词："
 NEW_SCHEMA_MARKS = ("BGM.情绪", "BGM.节奏", "音效点：", DIALOGUE_LINE_MARK)
 # 「没人说话」的写法：不是语种（v2.6 起拆解会明写 `人声语言：无`）
 NO_SPEECH_VALUES = ("无", "无台词", "无对白", "不适用")
+# AT-17 B2c：音频三态（B0② 合同）。字段名/枚举值全链一套，禁止混用（B0 附注 4）——
+# 字段恒为 `audio_mode`，值只许这三个中文词；落盘走 `audio_mode.json` 旁路文件，
+# 严禁写进三档建议正文（ITEM_RE 只认 `行号|理由|镜次` 行，归一化会丢弃别的行）。
+AUDIO_MODE_FIELD = "audio_mode"
+AUDIO_MODE_FILE = "audio_mode.json"
+AUDIO_MODE_KEEP = "沿用原片"
+AUDIO_MODE_ADJUST = "按新主体调整"
+AUDIO_MODE_MUTE = "不要"
+AUDIO_MODE_VALUES = (AUDIO_MODE_KEEP, AUDIO_MODE_ADJUST, AUDIO_MODE_MUTE)
+NO_BGM_MARKS = ("无bgm", "没有bgm")       # 归一后小写比对：`无BGM` 系列 / `没有BGM`
+AUDIO_JSON_NAME = "audio.json"
 ITEM_RE = re.compile(
     r"^\s*[-*+•]?\s*(?P<row>\d{1,4})\s*[|｜]\s*理由\s*[：:]\s*"
     r"(?P<reason>.*?)\s*[|｜]\s*镜次\s*[：:]\s*(?P<shots>.*?)\s*$"
@@ -504,6 +516,96 @@ def rewrite_dialogue(text: str, table) -> tuple[str, int, list[str]]:
     return new_text, hits, misses
 
 
+# ---------------------------------------------------------------- 音频三态（AT-17 B2c）
+# 三态作用域=BGM+音效点（B0②；台词走既有改写链）。默认值不是模型给的，而是**按 B1
+# 已落盘的结构化字段推导**（BGM.情绪 != 无BGM 优先，B0 附注 2）——纯字符串，零模型调用。
+#
+# 落盘形态（双链同一份推导、各落各的盘）：
+#   · 画布链：任务目录 `audio_mode.json` 旁路文件（不进三档建议正文，ITEM_RE 归一化丢不掉它）；
+#   · hub 链：任务.json 字段 `audio_mode`（discuss 拆解完成时写；见 automation/discuss.py）。
+# 删除建议文件（空意图/重跑）≠ 删这一份：两者是各自独立的文件/字段。
+
+
+def _no_bgm(value: str) -> bool:
+    """`无BGM` 系列的写法归一（`无 BGM` / `无BGM（仅环境音）` 都算）；只认字面，不猜语义。"""
+    flat = re.sub(r"\s+", "", value).lower()
+    return flat.startswith(NO_BGM_MARKS[0]) or flat == NO_BGM_MARKS[1]
+
+
+def audio_json(outdir: Path | str) -> dict:
+    """任务目录下的 `audio.json`（老链 analyze_audio 产物）；没有/坏了 → {}，不猜。"""
+    path = Path(outdir) / AUDIO_JSON_NAME
+    try:
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def audio_mode(disc_text: str, audio_meta: dict | None = None) -> dict:
+    """按 B0② 默认规则推导音频三态。返回 {audio_mode, 依据, 待核对}。
+
+    规则（优先级写死，B0 附注 2）：
+      1. 拆解标了无音轨（头部 `音轨: 无` 或八层正文只剩「无音轨」）→ `不要`；
+      2. 结构化 `BGM.情绪` 有值且不是 `无BGM` → `按新主体调整`（有 BGM 片）；
+      3. 结构化 `BGM.情绪` = `无BGM` → `沿用原片`（无 BGM 片）；
+      4. 结构化字段缺失（v2.5 老产物/模型漏写）→ 用 `audio.json` 的 `music_likely` 兜底；
+      5. `music_likely` 也读不到 → `沿用原片` + `待核对=True`：**不把「不知道」写成「无BGM」**
+         （附注 2：不得猜成无 BGM，留给人核对）。沿用原片=不动原片音频，是唯一零风险的缺省。
+    """
+    ext = _extract_mod()
+    body = ext.sound_body(disc_text)
+    plain = body.replace("**", "").strip()
+    info = {"audio_mode": AUDIO_MODE_KEEP, "依据": "", "待核对": False}
+    if ext.audio_track_flag(disc_text) is False or plain == ext.NO_AUDIO_TEXT:
+        info.update({"audio_mode": AUDIO_MODE_MUTE, "依据": "拆解标记无音轨"})
+        return info
+    parsed = ext.parse_sound_layer(body)
+    mood = str(parsed["bgm"].get("BGM.情绪") or "").strip()
+    if mood and not _no_bgm(mood):
+        info.update({"audio_mode": AUDIO_MODE_ADJUST, "依据": f"BGM.情绪={mood}"})
+        return info
+    if mood:
+        info.update({"audio_mode": AUDIO_MODE_KEEP, "依据": "BGM.情绪=无BGM"})
+        return info
+    music = (audio_meta or {}).get("music_likely") if isinstance(audio_meta, dict) else None
+    if music is True:
+        info.update({"audio_mode": AUDIO_MODE_ADJUST,
+                     "依据": "八 声音无结构化 BGM 字段，按 audio.json music_likely=true 兜底"})
+        return info
+    if music is False:
+        info.update({"audio_mode": AUDIO_MODE_KEEP,
+                     "依据": "八 声音无结构化 BGM 字段，按 audio.json music_likely=false 兜底"})
+        return info
+    info.update({"依据": "八 声音无结构化 BGM 字段、audio.json 也读不到——不猜无BGM，请人工核对",
+                 "待核对": True})
+    return info
+
+
+def read_audio_mode(outdir: Path | str) -> dict:
+    """读回 `audio_mode.json`；缺失/坏了/值不在枚举内 → {}（读侧不猜、不补）。"""
+    path = Path(outdir) / AUDIO_MODE_FILE
+    try:
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    value = str(data.get(AUDIO_MODE_FIELD) or "").strip()
+    if value not in AUDIO_MODE_VALUES:
+        return {}
+    return {"audio_mode": value, "依据": str(data.get("依据") or ""),
+            "待核对": bool(data.get("待核对"))}
+
+
+def write_audio_mode(outdir: Path | str, disc_text: str):
+    """推导并落 `audio_mode.json`。返回 (路径, {audio_mode, 依据, 待核对})。"""
+    info = audio_mode(disc_text, audio_json(outdir))
+    target = Path(outdir) / AUDIO_MODE_FILE
+    _write_utf8(target, json.dumps(info, ensure_ascii=False, indent=2) + "\n")
+    return target, info
+
+
 def build(disc_text: str, checklist_text: str, intent_text: str,
           outdir: Path | str | None = None) -> str:
     """根据九层、清单行索引和用户意图生成规范化三档建议文本。
@@ -514,6 +616,8 @@ def build(disc_text: str, checklist_text: str, intent_text: str,
     if not intent_text.strip():
         if outdir is not None:
             write_dialogue(outdir, [])
+            # AT-17 B2c：空意图也要落 audio_mode 默认值（无建议 ≠ 无三态）
+            write_audio_mode(outdir, disc_text)
         return ""
     base_prompt = _read_prompt()
     prompt = (
@@ -564,6 +668,15 @@ def build(disc_text: str, checklist_text: str, intent_text: str,
             else:
                 print(f"[台词改写] 本节标记「{dialogue_stats.get('mark', '')}」，不落文件",
                       flush=True)
+        # AT-17 B2c：三态默认值同一轮落盘（与建议/台词各写各的文件，互不覆盖）
+        try:
+            mode_path, mode_info = write_audio_mode(outdir, disc_text)
+        except OSError as exc:
+            print(f"WARN 音频三态：{Path(outdir) / AUDIO_MODE_FILE} 没写成（{exc}）",
+                  file=sys.stderr)
+        else:
+            print(f"[写出] {mode_path}（{mode_info['audio_mode']}｜{mode_info['依据']}）",
+                  flush=True)
     return normalized
 
 
@@ -614,7 +727,11 @@ def main(argv=None) -> int:
         if not intent.strip():
             filled = apply_suggestions(Path(args.checklist), "")
             write_dialogue(target.parent, [])
-            print(f"[意图建议] 意图为空，已删除旧建议文件：{target}；清空建议列 {filled} 行", file=sys.stderr)
+            # AT-17 B2c：空意图也落三态默认值（删建议文件 ≠ 删 audio_mode）
+            mode_path, mode_info = write_audio_mode(target.parent, disc)
+            print(f"[意图建议] 意图为空，已删除旧建议文件：{target}；清空建议列 {filled} 行",
+                  file=sys.stderr)
+            print(f"[音频三态] {mode_path}（{mode_info['audio_mode']}）", file=sys.stderr)
             return 0
         normalized = build(disc, checklist, intent, outdir=target.parent)
         _write_utf8(target, normalized)

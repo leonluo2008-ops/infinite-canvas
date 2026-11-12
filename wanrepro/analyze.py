@@ -517,7 +517,11 @@ def stage_intent(disc: Path, checklist: Path, outdir: Path, intent: str) -> tupl
             suggestion.unlink(missing_ok=True)
             intent_mod.write_dialogue(outdir, [])
             filled = intent_mod.apply_suggestions(checklist, "")
+            # AT-17 B2c：空意图也落三态默认值（删建议文件 ≠ 删 audio_mode）
+            mode_path, mode_info = intent_mod.write_audio_mode(
+                outdir, disc.read_text(encoding="utf-8"))
             print(f"[意图建议] 意图为空，已删除旧建议文件并清空建议列（{filled} 行）")
+            print(f"[音频三态] {mode_path}（{mode_info['audio_mode']}｜{mode_info['依据']}）")
             return EXIT_OK, "清理"
         disc_text = disc.read_text(encoding="utf-8")
         checklist_text = checklist.read_text(encoding="utf-8")

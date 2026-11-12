@@ -72,6 +72,77 @@ def _products_ready(bridge_id: str) -> bool:
     return bool(p and p["has_disc"] and p["has_check"] and p["has_prompt"])
 
 
+# ---------------------------------------------------------------- 音频三态落盘（AT-17 B2c）
+# 三态默认值的推导只有一份实现：pipeline/reverse/intent.py 的 audio_mode()（纯字符串、
+# 零模型调用，来源=B1 已落盘的结构化字段）。这里只负责「拆解完成时把同一份值落到两处」：
+#   · 任务目录 `audio_mode.json`（画布链节点状态，intent.write_audio_mode）
+#   · 任务.json 字段 `audio_mode`（hub 链落盘面）
+# 两条链同源同值，不许各推一套。
+
+_intent_module = None
+
+
+def _intent_mod():
+    """按路径加载 pipeline/reverse/intent.py（它不是包；顶层无网络调用）。"""
+    global _intent_module
+    if _intent_module is None:
+        import importlib.util
+        path = Path(__file__).resolve().parents[1] / "pipeline" / "reverse" / "intent.py"
+        spec = importlib.util.spec_from_file_location("wanrepro_reverse_intent_for_discuss", path)
+        if spec is None or spec.loader is None:
+            raise DiscussError(f"导不进 {path}")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _intent_module = module
+    return _intent_module
+
+
+def derive_audio_mode(bridge_id: str) -> dict:
+    """按拆解推导三态：{audio_mode, 依据, 待核对}；读不到/推导失败 → {}（禁编值）。"""
+    bridge_id = str(bridge_id or "").strip()
+    if not bridge_id:
+        return {}
+    outdir = _ANALYSIS_ROOT / bridge_id
+    try:
+        disc_text = (outdir / "拆解.md").read_text(encoding="utf-8-sig")
+    except OSError:
+        return {}
+    try:
+        intent = _intent_mod()
+        return intent.audio_mode(disc_text, intent.audio_json(outdir))
+    except Exception:  # noqa: BLE001 —— 推导是附加值，不许把拆解判死
+        return {}
+
+
+AUDIO_MODE_FIELD = "audio_mode"
+
+
+def persist_audio_mode(task_dir: Path) -> dict:
+    """拆解完成即落三态：画布链旁路 `audio_mode.json` + hub 链 任务.json 字段（同一份推导）。
+
+    已存在不覆盖：B3 界面上改选的值，重跑拆解也留得住。返回 {ok, audio_mode?, 依据?, why?}。
+    """
+    task = state.load(task_dir)
+    current = str(task.get(AUDIO_MODE_FIELD) or "").strip()
+    if current:
+        return {"ok": True, "audio_mode": current, "why": "已有，未覆盖"}
+    bridge_id = str(task.get("bridge_id") or "").strip()
+    outdir = _ANALYSIS_ROOT / bridge_id
+    try:
+        disc_text = (outdir / "拆解.md").read_text(encoding="utf-8-sig")
+    except OSError:
+        return {"ok": False, "why": f"读不到 {outdir / '拆解.md'}——不写、不猜值"}
+    try:
+        intent = _intent_mod()
+        _path, info = intent.write_audio_mode(outdir, disc_text)
+    except Exception as exc:  # noqa: BLE001 —— 附加值落盘失败不许把拆解判死
+        return {"ok": False, "why": f"三态落盘失败（{type(exc).__name__}：{exc}）"}
+    task[AUDIO_MODE_FIELD] = info[AUDIO_MODE_FIELD]
+    state.save(task_dir, task)
+    return {"ok": True, "audio_mode": info[AUDIO_MODE_FIELD], "依据": info.get("依据", ""),
+            "待核对": bool(info.get("待核对"))}
+
+
 def _fmt_wait(seconds: float) -> str:
     """等待时长人话：65 →「1分5秒」，7 →「7秒」（心跳行与阶段行同一口径）。"""
     total = max(0, int(seconds))
@@ -254,6 +325,10 @@ def main(argv: list[str] | None = None) -> int:
     config.ensure_dirs()
     try:
         run_discuss(_resolve(args.local_id))
+        # AT-17 B2c：拆解完成即落三态（CLI 侧；hub 侧在 hub_api._spawn_discuss 里持锁写）
+        info = persist_audio_mode(_resolve(args.local_id))
+        print(("[音频三态] " + str(info.get("audio_mode"))) if info.get("ok")
+              else f"[音频三态] 未落盘：{info.get('why')}")
         return 0
     except (DiscussError, bridge.BridgeError, state.StateError) as e:
         print(f"[FAIL] {e}", file=sys.stderr)
