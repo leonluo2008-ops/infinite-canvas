@@ -22,7 +22,9 @@
   [6] 直写 提示词.md（D3-②）：正文落盘 + `prompt_edited_at` 留痕 + approval_snapshot 按新正文重算 +
       状态不变（仍需重新批准）；同文重复提交 = unchanged（不写不重算）；过短 → 400；
       非 awaiting_approval → 409 人话；
-  [7] 真实目录只读：真实 projects / analysis/reverse / uploads 一条都没少、夹具号没落进真实目录；
+  [7] 前端联动：`node web/scripts/probe-at21-b0.mjs` 全绿（派生/手改起态门与后端状态表同序、
+      归一化只搬真值、请求形状、详情页反查入口与「复用为新版本」/「手改正文」真渲染）；
+  [8] 真实目录只读：真实 projects / analysis/reverse / uploads 一条都没少、夹具号没落进真实目录；
       临时根删净。
 
 隔离手法：`--isolated` 下 `WANREPRO_AUTO_DIR` + `WANREPRO_ANALYSIS_ROOT` 指向临时根（在 import
@@ -35,6 +37,7 @@ import hashlib
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -465,6 +468,32 @@ def prompt_write_phase() -> bool:
     return ok
 
 
+# ── [7] 前端联动（起态门/归一化/请求形状/真渲染）───────────────────────────
+WEB = ROOT.parent / "web"
+
+
+def frontend_phase() -> bool:
+    """前端探针（`web/scripts/probe-at21-b0.mjs`）：起态门与详情页反查入口的接线 + 真渲染。"""
+    print("[7] 前端联动：node scripts/probe-at21-b0.mjs（起态门/归一化/请求形状/真渲染）")
+    script = WEB / "scripts" / "probe-at21-b0.mjs"
+    if not script.is_file():
+        print("      注：本工作副本没有 web/scripts/probe-at21-b0.mjs——前端相位**未覆盖**（如实记，不算 PASS）")
+        RESULTS.append(("[7] 前端相位（缺 web 脚本未覆盖）", False))
+        return False
+    states_path = TMP_ROOT / "states.json"
+    states_path.write_text(json.dumps(sorted(state.STATES), ensure_ascii=False), encoding="utf-8")
+    proc = subprocess.run(["node", "scripts/probe-at21-b0.mjs", "--states", str(states_path)],
+                          cwd=str(WEB), capture_output=True, text=True, encoding="utf-8",
+                          errors="replace", timeout=900)
+    fails = "\n".join(line for line in (proc.stdout or "").splitlines() if "FAIL" in line)
+    ok = check("[7] 前端探针全绿（起态门/归一化/请求形状/真渲染）", proc.returncode == 0,
+               fails[-800:] or (proc.stderr or "")[-400:])
+    for line in (proc.stdout or "").splitlines():
+        if line.strip().startswith("[PASS]"):
+            print(f"     {line.strip()}")
+    return ok
+
+
 # ── 入口 ────────────────────────────────────────────────────────────────
 def main() -> int:
     print(f"[probe-at21-b0] 隔离根 {TMP_ROOT}")
@@ -478,6 +507,7 @@ def main() -> int:
             ok &= render_scope_phase(ctx)
             ok &= delete_source_phase()
             ok &= prompt_write_phase()
+            ok &= frontend_phase()
     finally:
         shutil.rmtree(TMP_ROOT, ignore_errors=True)
 
@@ -485,13 +515,13 @@ def main() -> int:
              "uploads": snapshot(REAL_UPLOADS)}
     for name in ("projects", "analysis", "uploads"):
         lost = sorted(BEFORE[name] - after[name])
-        ok &= check(f"[7] 真实 {name} 没有条目消失（不删真实数据）", not lost, f"丢了 {lost}")
+        ok &= check(f"[8] 真实 {name} 没有条目消失（不删真实数据）", not lost, f"丢了 {lost}")
         mine = sorted(x for x in (after[name] - BEFORE[name]) if x in FIXTURES)
-        ok &= check(f"[7] 夹具号没落进真实 {name}", not mine, f"落进真实目录：{mine}")
+        ok &= check(f"[8] 夹具号没落进真实 {name}", not mine, f"落进真实目录：{mine}")
         extra = sorted((after[name] - BEFORE[name]) - set(mine))
         if extra:
             print(f"      注：{name} 跑期间另有新增 {extra[:6]}（非本探针产物：同仓并发痕迹）")
-    ok &= check("[7] 临时根已删净", not TMP_ROOT.exists(), str(TMP_ROOT))
+    ok &= check("[8] 临时根已删净", not TMP_ROOT.exists(), str(TMP_ROOT))
 
     passed = sum(1 for _, good in RESULTS if good)
     total = len(RESULTS)

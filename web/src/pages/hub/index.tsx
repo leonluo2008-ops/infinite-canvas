@@ -369,6 +369,12 @@ function HubTableView() {
                     onStateChange={patchState}
                     onRefresh={() => void load()}
                     onDeleted={handleDeleted}
+                    onOpenTask={(localId) => setOpenId(localId)}
+                    onForked={async (newId) => {
+                        // 先刷新列表再切 id：openTask 由 tasks 里查，列表还没这条就切过去会白屏
+                        await load(true);
+                        setOpenId(newId);
+                    }}
                 />
             ) : null}
         </div>

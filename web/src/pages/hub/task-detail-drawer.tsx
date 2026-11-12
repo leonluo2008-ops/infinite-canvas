@@ -48,12 +48,15 @@ import {
     deleteHubSelfcheckWhitelist,
     errorText,
     forceFinishHubTask,
+    forkHubTask,
     getHubTask,
     groupHubRows,
     hubAssetDisplayUrl,
     hubAssetRefView,
     hubDescEditGate,
+    hubForkGate,
     hubOutputUrl,
+    hubPromptEditGate,
     hubQuickAction,
     hubQuickChannels,
     hubQuickPhaseText,
@@ -70,6 +73,7 @@ import {
     revokeHubTask,
     rollbackHubTask,
     runHubQuickAction,
+    saveHubPrompt,
     setHubAudioMode,
     startLapianRun,
     submitHubTask,
@@ -78,6 +82,8 @@ import {
     type HubAssetCard,
     type HubAssetWriteResult,
     type HubCardGroup,
+    type HubDerivedVersion,
+    type HubForkResult,
     type HubQuickAction,
     type HubQuickPhase,
     type HubReworkGate,
@@ -125,6 +131,8 @@ export function TaskDetailDrawer({
     onStateChange,
     onRefresh,
     onDeleted,
+    onOpenTask,
+    onForked,
 }: {
     task: HubTaskSummary | null;
     open: boolean;
@@ -133,6 +141,10 @@ export function TaskDetailDrawer({
     onRefresh: () => void;
     /** 删除成功（AT-16 B6：确认在 TaskDeleteButton 内二键完成，父级只收结果）。 */
     onDeleted: (localId: string) => void;
+    /** AT-21 B0：跳到另一条任务（来源任务 / 派生版本）——父级切 openId。 */
+    onOpenTask?: (localId: string) => void;
+    /** AT-21 B0：派生成功（父级刷新列表后再打开新任务，避免「列表里还没有这条」白屏）。 */
+    onForked?: (newId: string, out: HubForkResult) => void;
 }) {
     const { message } = App.useApp();
     const [detail, setDetail] = useState<HubTaskDetail | null>(null);
@@ -434,6 +446,9 @@ export function TaskDetailDrawer({
 
                     {/* ⑤ 审批/生成/成片段（§四各状态动作） */}
                     {detail ? <OutcomeSection detail={detail} busy={busy} act={act} /> : null}
+
+                    {/* ⑥ 版本关系（AT-21 B0：反查来源/派生版本 + 「复用为新版本」唯一入口） */}
+                    {detail ? <VersionSection detail={detail} onOpenTask={onOpenTask} onForked={onForked} /> : null}
 
                     {!detail && !loadError ? (
                         <div className="flex min-h-[200px] flex-col items-center justify-center gap-2 text-sm text-stone-500 dark:text-stone-400">
@@ -2206,8 +2221,11 @@ export function PromptSection({
     onWritten?: () => void;
 }) {
     const prompt = detail.prompt_md || "";
+    const { message } = App.useApp();
     const [collapsed, setCollapsed] = useState(false);          // 正文默认展开（折叠改成可选收起）
     const [editingRow, setEditingRow] = useState<number | null>(null);
+    /** AT-21 B0 D3-②：手改提示词正文（直写 提示词.md；awaiting_approval 才可编辑）。 */
+    const [editingPrompt, setEditingPrompt] = useState(false);
     // AT-15 R2：拆解门禁条目从自检束里拆出来单独渲染（绿Tag=绿项数摘要；FAIL/WARN 红条=缺项+重拆轮次）。
     const gateItem = detail.自检?.find((item) => item.项 === GATE_ITEM_NAME) ?? null;
     const checkItems = detail.自检?.filter((item) => item.项 !== GATE_ITEM_NAME) ?? null;
@@ -2218,6 +2236,8 @@ export function PromptSection({
         return map;
     }, [detail.asset_cards]);
     const descGate = useMemo(() => hubDescEditGate(detail.state || ""), [detail.state]);
+    // AT-21 B0：手改正文起态门（与后端 PROMPT_EDIT_REFUSALS 同序；不可改时按钮置灰 + tooltip 给出口）
+    const promptGate = useMemo(() => hubPromptEditGate(detail.state || ""), [detail.state]);
     const saveDesc = useCallback(
         async (n: number, next: string, expect: string) =>
             postHubAsset(localId, { n, desc: next, expect_desc: expect }),
@@ -2265,10 +2285,33 @@ export function PromptSection({
                     提示词
                 </h2>
                 {prompt ? (
+                    <Tooltip title={promptGate.enabled
+                        ? "手改提示词正文：保存即直写 提示词.md、重算审批快照、自检与音频门禁一起重跑（改完必须重新批准）"
+                        : promptGate.reason}>
+                        <span className="ml-auto shrink-0">
+                            <Button
+                                size="small"
+                                type="text"
+                                disabled={!promptGate.enabled}
+                                data-hub-prompt-edit
+                                onClick={() => {
+                                    if (editingPrompt) setEditingPrompt(false);
+                                    else {
+                                        setCollapsed(false);
+                                        setEditingPrompt(true);
+                                    }
+                                }}
+                            >
+                                {editingPrompt ? "退出编辑" : "手改正文"}
+                            </Button>
+                        </span>
+                    </Tooltip>
+                ) : null}
+                {prompt ? (
                     <Button
                         size="small"
                         type="text"
-                        className="ml-auto shrink-0"
+                        className={promptGate.enabled ? "shrink-0" : "ml-auto shrink-0"}
                         data-hub-prompt-toggle
                         onClick={() => setCollapsed((value) => !value)}
                     >
@@ -2278,7 +2321,31 @@ export function PromptSection({
             </div>
             {/* 自检/门禁：独立整宽区（块级流，与标题行并列，不嵌进标题行 flex） */}
             <SelfCheckPanel items={checkItems} gateItem={gateItem} />
-            {prompt ? (
+            {prompt && editingPrompt ? (
+                <div className="mt-3" data-hub-prompt-editor>
+                    <HubTextEditor
+                        variant="doc"
+                        value={prompt}
+                        baseline={prompt}
+                        placeholder="提示词正文（整段可直贴出片）"
+                        hint="保存即直写 提示词.md：审批快照按新正文重算，自检与音频门禁一起重跑；改完要重新「批准」才按新正文出片。"
+                        maxLength={20000}
+                        softMax={12000}
+                        saveLabel="保存并重算审批"
+                        onSave={async (next, expect) => saveHubPrompt(localId, next, expect)}
+                        onCancel={() => setEditingPrompt(false)}
+                        onSaved={(result) => {
+                            onWritten?.();
+                            if (result.unchanged) {
+                                message.info("正文没变：没有重写、没有重算（自检还是上一代结论）");
+                                return;
+                            }
+                            message.success(result.说明 || "已保存：审批快照已按新正文重算，请重新批准");
+                            setEditingPrompt(false);
+                        }}
+                    />
+                </div>
+            ) : prompt ? (
                 collapsed ? null : (
                     <div
                         className="agent-streamdown thin-scrollbar mt-3 max-h-96 w-full overflow-auto rounded-md border border-stone-200 px-3 py-2 text-sm dark:border-stone-800"
@@ -3895,6 +3962,145 @@ function GenSettingsSection({ detail, busy, act }: { detail: HubTaskDetail; busy
                 </div>
             </section>
         </>
+    );
+}
+
+/**
+ * AT-21 B0 版本关系区（详情页反查入口 + 「复用为新版本」唯一入口）。
+ *
+ * 三块，全是服务端真值的呈现：
+ *  ① 本任务是派生版本 → 「复用自 <源号>」+ 派生时点 + 一键跳来源任务（来源已删也要能说清）；
+ *  ② 本任务派生出过版本 → 逐条列出（状态/有片），一键跳过去；
+ *  ③ 出片（done）→ 「复用为新版本」：二次确认后派生**新任务**，回执里的新任务号直接打开。
+ *
+ * 写动作只有 fork 一个；不在这里拼业务话术，也不乐观改任何状态（回执说 state=awaiting_assets
+ * 就显示 awaiting_assets——新版本必须所有者重新确认置换与批准）。
+ */
+export function VersionSection({
+    detail,
+    onOpenTask,
+    onForked,
+}: {
+    detail: HubTaskDetail;
+    onOpenTask?: (localId: string) => void;
+    onForked?: (newId: string, out: HubForkResult) => void;
+}) {
+    const { message } = App.useApp();
+    const [ask, setAsk] = useState(false);
+    const [busy, setBusy] = useState(false);
+    const [error, setError] = useState("");
+    const localId = detail.local_id || "";
+    const from = detail.derived_from ?? null;
+    const versions: HubDerivedVersion[] = detail.derived_versions ?? [];
+    const gate = hubForkGate(detail.state || "", { activeSubmit: Boolean(detail.active_submit) });
+    const run = useCallback(async () => {
+        setBusy(true);
+        setError("");
+        try {
+            const out = await forkHubTask(localId);
+            setAsk(false);
+            message.success(out.说明 || `已派生 ${out.local_id}`);
+            onForked?.(out.local_id, out);
+        } catch (err) {
+            const text = errorText(err);
+            setError(text);                 // 原文留在区内（toast 会闪走）
+            setAsk(false);
+        } finally {
+            setBusy(false);
+        }
+    }, [localId, message, onForked]);
+
+    if (!from && versions.length === 0 && !gate.enabled && !error) return null;
+
+    return (
+        <section className="rounded-lg border border-stone-200 bg-card p-4 dark:border-stone-800" data-hub-version-section>
+            <div className="flex min-w-0 flex-wrap items-center gap-2">
+                <h2 className="flex min-w-0 items-center gap-1.5 text-sm font-semibold">
+                    <Type className="size-4" />
+                    版本关系
+                </h2>
+                <Tooltip title={gate.enabled ? "从这一版派生一个新任务：拆解产物共享，清单/资产图各一份，成片与审批不继承" : gate.reason}>
+                    <span className="ml-auto shrink-0">
+                        <Button
+                            size="small"
+                            type="primary"
+                            ghost
+                            disabled={!gate.enabled || busy}
+                            data-hub-fork-entry
+                            onClick={() => setAsk(true)}
+                        >
+                            复用为新版本
+                        </Button>
+                    </span>
+                </Tooltip>
+            </div>
+
+            {from ? (
+                <div className="mt-2 flex min-w-0 flex-wrap items-center gap-2 text-xs text-stone-600 dark:text-stone-300" data-hub-derived-from>
+                    <span>本任务是派生版本：复用自</span>
+                    {onOpenTask ? (
+                        <Button size="small" type="link" className="!px-0" onClick={() => onOpenTask(from.local_id)} data-hub-derived-from-link>
+                            {from.local_id}
+                        </Button>
+                    ) : (
+                        <Tag>{from.local_id}</Tag>
+                    )}
+                    {from.at ? <span className="text-stone-400">{formatTime(from.at)}</span> : null}
+                    {detail.checklist_private ? (
+                        <span className="text-stone-400">清单是它自己的副本（改它不影响来源任务）</span>
+                    ) : null}
+                </div>
+            ) : null}
+
+            {versions.length ? (
+                <div className="mt-2 space-y-1" data-hub-derived-versions>
+                    <div className="text-xs text-stone-500 dark:text-stone-400">由本任务派生出的版本（{versions.length}）</div>
+                    {versions.map((item) => (
+                        <div key={item.local_id} className="flex min-w-0 flex-wrap items-center gap-2 text-xs">
+                            {onOpenTask ? (
+                                <Button size="small" type="link" className="!px-0" onClick={() => onOpenTask(item.local_id)} data-hub-derived-version-link={item.local_id}>
+                                    {item.local_id}
+                                </Button>
+                            ) : (
+                                <Tag>{item.local_id}</Tag>
+                            )}
+                            <span className="text-stone-500 dark:text-stone-400">{item.state || "状态未知"}</span>
+                            {item.has_output ? <Tag color="green">已有成片</Tag> : null}
+                            {item.at ? <span className="text-stone-400">{formatTime(item.at)}</span> : null}
+                        </div>
+                    ))}
+                </div>
+            ) : null}
+
+            {!gate.enabled ? (
+                <div className="mt-2 break-words text-xs text-stone-400" data-hub-fork-gate-reason>{gate.reason}</div>
+            ) : null}
+
+            {error ? (
+                <div className="mt-2 break-words rounded-md border border-red-200 bg-red-50 px-2 py-1 text-xs text-red-700 dark:border-red-900 dark:bg-red-950/30 dark:text-red-300" data-hub-fork-error>
+                    派生失败：{error}
+                </div>
+            ) : null}
+
+            <Modal
+                open={ask}
+                title={`复用为新版本：${localId}`}
+                onCancel={() => (busy ? undefined : setAsk(false))}
+                okText="派生新任务"
+                cancelText="取消"
+                confirmLoading={busy}
+                onOk={() => void run()}
+                destroyOnHidden
+            >
+                <div className="space-y-2 text-sm">
+                    <p>会新建一条任务，这一版（含成片与审批痕迹）原样留在原地。</p>
+                    <p className="text-stone-500 dark:text-stone-400">
+                        新任务里带着同一份拆解产物与源视频，<strong>待确认清单与资产图是它自己的副本</strong>——
+                        改它不会碰到这里。审批、提交、成片一律不继承：它从「待确认置换」起步，出片仍需你亲手批准（一次批准 = 一次扣费）。
+                    </p>
+                </div>
+            </Modal>
+        </section>
     );
 }
 

@@ -56,6 +56,11 @@ export type HubTaskSummary = {
     lost_run?: HubLostRun | null;
     /** 失败原因（`failed_reason`，唯一给用户看的文案源）；仅 state="failed" 时非空。 */
     failed?: HubFailedView | null;
+    // ---- AT-21 B0 版本关系（列表卡片角标读这两个键；老任务/非派生 → null / 0，零渲染）----
+    /** 派生来源（本任务是从哪条任务「复用为新版本」出来的）。 */
+    derived_from?: HubDerivedFrom | null;
+    /** 本任务已经派生出的版本数（服务端一次扫描算全表，不逐任务反扫）。 */
+    derived_count?: number;
 };
 
 /**
@@ -363,6 +368,24 @@ export type HubSelfcheckWhitelistResult = {
     移除?: number;
 };
 
+/** AT-21 B0：派生来源（任务.json `derived_from` 原样透出的形状；非派生任务 → null）。 */
+export type HubDerivedFrom = {
+    local_id: string;
+    bridge_id?: string;
+    at?: string;
+    /** 派生后改动过的维度（派生瞬间为空；由后续版本 UI 按实际编辑填）。 */
+    changed?: string[];
+};
+
+/** AT-21 B0：来源任务看到的派生版本（服务端读侧反查，不落盘 → 老任务天然空）。 */
+export type HubDerivedVersion = {
+    local_id: string;
+    state?: string;
+    at?: string;
+    changed?: string[];
+    has_output?: boolean;
+};
+
 /** 批准前音频门禁结果（AT-17 B2b）：服务端 generate.run_audio_gate 落任务文件、get_task 透出。
  *  verdict=FAIL 时「批准」会被拒（只拒批准，不回滚渲染）；发现=失败原因原文，处理=怎么修。 */
 export type HubAudioGate = {
@@ -427,6 +450,15 @@ export type HubTaskDetail = HubTaskSummary & {
     submit_lost?: HubSubmitLost | null;
     /** 远程半边（强制终止后）：远程还在跑吗、预计还需多久、结果按作废丢弃。缺 → null。 */
     remote?: HubRemoteWait | null;
+    // ---- AT-21 B0 版本关系（详情页反查入口 + 清单作用域自述）----
+    /** 派生来源（本任务是「复用为新版本」出来的）；非派生 → null。 */
+    derived_from?: HubDerivedFrom | null;
+    /** 由本任务派生出的版本（读侧反查，按派生时间倒序；无 → []）。 */
+    derived_versions?: HubDerivedVersion[];
+    /** true = 本任务的 待确认清单/sidecar 在自己任务目录里（派生任务），不是共享那份。 */
+    checklist_private?: boolean;
+    /** 手改提示词正文的最近时点（直写 提示词.md 的留痕）；没改过 → undefined。 */
+    prompt_edited_at?: string;
 };
 
 /**
@@ -543,6 +575,9 @@ export async function listHubTasks(): Promise<HubTaskSummary[]> {
         activity: normalizeActivity(row.activity),
         lost_run: normalizeLostRun(row.lost_run),
         failed: normalizeFailedView(row.failed),
+        // AT-21 B0：派生关系只认服务端真值（缺/畸形 → null / 0，不造「有 0 个版本」的假象）
+        derived_from: normalizeDerivedFrom(row.derived_from),
+        derived_count: Number.isFinite(Number(row.derived_count)) ? Number(row.derived_count) : 0,
     }));
 }
 
@@ -582,7 +617,49 @@ export async function getHubTask(localId: string): Promise<HubTaskDetail> {
         failed: normalizeFailedView(task.failed),
         // 远程半边：缺 → null（旧 bridge 不知道「远程还在不在跑」时，界面不假装知道）
         remote: normalizeRemote(task.remote),
+        // AT-21 B0：版本关系（派生任务挂来源、来源任务看派生版本；缺 → null / []）
+        derived_from: normalizeDerivedFrom(task.derived_from),
+        derived_versions: normalizeDerivedVersions(task.derived_versions),
+        checklist_private: Boolean(task.checklist_private),
+        prompt_edited_at: hubText(task.prompt_edited_at),
     };
+}
+
+/**
+ * 派生来源归一（AT-21 B0）：`local_id` 是唯一必需真值——没有它这条记录什么都指向不了，
+ * 一律 null（界面不显示「派生自（空）」）。其余字段缺 → 空串/空数组。
+ */
+export function normalizeDerivedFrom(value: unknown): HubDerivedFrom | null {
+    if (!value || typeof value !== "object") return null;
+    const raw = value as JsonRecord;
+    const id = contractText(raw.local_id);
+    if (!id) return null;
+    return {
+        local_id: id,
+        bridge_id: contractText(raw.bridge_id),
+        at: contractText(raw.at),
+        changed: Array.isArray(raw.changed) ? raw.changed.map((x) => contractText(x)).filter(Boolean) : [],
+    };
+}
+
+/** 派生版本列表归一（AT-21 B0）：坏条目直接丢（不补假 state），顺序沿用服务端（派生时间倒序）。 */
+export function normalizeDerivedVersions(value: unknown): HubDerivedVersion[] {
+    if (!Array.isArray(value)) return [];
+    const out: HubDerivedVersion[] = [];
+    for (const row of value) {
+        if (!row || typeof row !== "object") continue;
+        const raw = row as JsonRecord;
+        const id = contractText(raw.local_id);
+        if (!id) continue;
+        out.push({
+            local_id: id,
+            state: contractText(raw.state),
+            at: contractText(raw.at),
+            changed: Array.isArray(raw.changed) ? raw.changed.map((x) => contractText(x)).filter(Boolean) : [],
+            has_output: Boolean(raw.has_output),
+        });
+    }
+    return out;
 }
 
 /**
@@ -1441,6 +1518,106 @@ export async function rollbackHubTask(localId: string): Promise<{ state?: string
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({}),
+    });
+}
+
+// ---------------------------------------------------------------- AT-21 B0 派生（复用为新版本）
+
+/**
+ * 「复用为新版本」起态门（唯一口径，与后端 hub_api.fork_task 的状态表同序）。
+ *
+ * 只有 done 能派生（D6：出片之后才有「这一版留着、下一版改文案/换图」的语义）；
+ * 其余状态给出**出口**（该走哪条既有通道），而不是只把按钮置灰。
+ * 纯函数：页面与探针共用，不在页面里复制第二份状态表。
+ */
+export function hubForkGate(state: string, opts?: { activeSubmit?: boolean }): { enabled: boolean; reason: string } {
+    const s = String(state || "");
+    if (opts?.activeSubmit) return { enabled: false, reason: "这条任务还有活跃提交占用——等它收尾再派生" };
+    if (s === "done") return { enabled: true, reason: "" };
+    const reasons: Record<string, string> = {
+        ingested: "还没拆解：先「发起拆解」",
+        ingesting: "视频还在入库：等它进待置换区",
+        discussing: "拆解还没跑完：等出提示词",
+        awaiting_assets: "这一版还没出片：改图/改描述请直接在置换台做（派生会把成片状态丢掉）",
+        rendering: "正在渲染这一版提示词：等它出来",
+        awaiting_approval: "还没批准：这一版继续在置换台/提示词里改（派生只用于已经出片的版本）",
+        approved: "已批准待生成：先撤销批准或让它生成完",
+        generating: "正在生成：等成片出来再派生下一版",
+        failed: "失败态：先「重试」把这一版跑通（或删除后重来）",
+    };
+    return { enabled: false, reason: reasons[s] || `当前状态（${s || "未知"}）不能派生新版本` };
+}
+
+/** 「复用为新版本」的响应（派生是同步建目录，回执里带复制明细）。 */
+export type HubForkResult = {
+    ok?: boolean;
+    local_id: string;
+    bridge_id?: string;
+    state?: string;
+    derived_from?: HubDerivedFrom | null;
+    复制?: { 源视频?: string; 源视频字节?: number; 指纹同抄?: boolean; 资产图?: number; 清单引用重写?: number };
+    说明?: string;
+};
+
+/**
+ * POST /api/hub/task/{id}/fork —— 派生**新任务**（源任务只读）。
+ *
+ * 合同：拆解产物按同一 bridge_id 共享只读；待确认清单/侧车/资产图是派生任务自己的副本；
+ * 审批/提交/生成痕迹一概不继承（新任务从 awaiting_assets 起步，出片仍需所有者亲手批准）。
+ * 不带任何「沿用上次配置」参数——渠道/参数必须在新任务上重新确认。
+ */
+export async function forkHubTask(localId: string): Promise<HubForkResult> {
+    return request<HubForkResult>(`/api/hub/task/${encodeURIComponent(localId)}/fork`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({}),
+    });
+}
+
+/** 手改提示词正文的起态门（与后端 hub_api.PROMPT_EDIT_STATES/REFUSALS 同序）。 */
+export function hubPromptEditGate(state: string): { enabled: boolean; reason: string } {
+    const s = String(state || "");
+    if (s === "awaiting_approval") return { enabled: true, reason: "" };
+    const reasons: Record<string, string> = {
+        ingested: "任务还没开始拆解：先「发起拆解」",
+        ingesting: "视频还在入库：等拆解跑完",
+        discussing: "拆解还没跑完：等提示词第一次渲染出来（待审批）再改正文",
+        awaiting_assets: "提示词还没生成：先确认置换（确认后后台渲染产出正文）",
+        rendering: "正在渲染：等这一版提示词出来",
+        approved: "已批准：先「撤销批准」回到待审批再改（直接改会让审批快照作废）",
+        generating: "正在生成：改正文会和已提交的片子对不上——等成片出来走「复用为新版本」",
+        done: "已完成：这一版的正文是它那次批准的凭证；改文案请「复用为新版本」",
+        failed: "失败态：先「重试」回到可编辑状态",
+    };
+    return { enabled: false, reason: reasons[s] || `当前状态（${s || "未知"}）不能改正文` };
+}
+
+/** 直写提示词正文的响应（D3-②：写正文 + 重算快照 + 自检/门禁重跑，一次请求跑完）。 */
+export type HubPromptSaveResult = {
+    ok?: boolean;
+    task_id?: string;
+    state?: string;
+    unchanged?: boolean;
+    prompt_md?: string;
+    prompt_chars?: number;
+    prompt_edited_at?: string;
+    approval_snapshot?: string;
+    自检?: unknown;
+    audio_gate?: unknown;
+    说明?: string;
+};
+
+/**
+ * POST /api/hub/task/{id}/prompt —— 手改正文（AT-21 D3-② 乙路线：**直写 提示词.md**，无 override 文件）。
+ *
+ * `expectText` = 打开编辑器时的正文（乐观锁）：与盘上现值不等 → 409「别处改过」，不覆盖。
+ * 与现值逐字相同 → untouched（服务端回 unchanged=true，不写不重算不重跑）。
+ */
+export async function saveHubPrompt(localId: string, text: string, expectText?: string): Promise<HubPromptSaveResult> {
+    return request<HubPromptSaveResult>(`/api/hub/task/${encodeURIComponent(localId)}/prompt`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text, expect_text: expectText ?? null }),
     });
 }
 
