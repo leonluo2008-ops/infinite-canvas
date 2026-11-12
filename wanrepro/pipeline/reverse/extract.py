@@ -45,6 +45,7 @@ OUTPUT_NAME = "拆解.md"
 FRAME_FACTS_NAME = "看帧.json"        # pipeline/reverse/frame_facts.py 的产物
 ERROR_ARTIFACT_NAME = "拆解错误.json"  # ApiError 失败时的证据（键名已冻结，discuss.py 读取）
 RAW_RESPONSE_LIMIT = 500               # 「拆解错误.json」里 raw_response 只留前 500 字
+MESSAGE_LIMIT = 2000                   # message 只留前 2000 字（对齐 call_vlm raw_response[:2000] 上限）
 MAX_ID_LEN = 40
 
 
@@ -110,16 +111,19 @@ class PrecheckError(RuntimeError):
 class ApiError(RuntimeError):
     """调用失败或响应无效（重试用尽后退出码 3）。
 
-    消息之外可携带云端原文（cloud_message / raw_response / finish_reason），主链路据此
-    落盘「拆解错误.json」供事后追查；异常类型与 str() 语义不变（调用方照旧 except ApiError）。
+    消息之外可携带云端原文（cloud_message / raw_response / finish_reason）与重试次数
+    （attempts，0=不经 call_model 重试环），主链路据此落盘「拆解错误.json」供事后追查；
+    异常类型与 str() 语义不变（调用方照旧 except ApiError）。
     """
 
     def __init__(self, message: str, *, raw_response: str = "",
-                 finish_reason=None, cloud_message: str | None = None):
+                 finish_reason=None, cloud_message: str | None = None,
+                 attempts: int = 0):
         super().__init__(message)
         self.raw_response = raw_response
         self.finish_reason = finish_reason
         self.cloud_message = message if cloud_message is None else cloud_message
+        self.attempts = attempts
 
 
 class EmptyResponseError(ApiError):
@@ -647,7 +651,7 @@ def call_model(prompt: str, video_path: Path, api_key: str, timeout: float = DEF
 
     raise ApiError(f"{attempts} 次尝试全部失败，最后一次：{last_error}",
                    raw_response=last_raw, finish_reason=last_finish,
-                   cloud_message=last_cloud or last_error)
+                   cloud_message=last_cloud or last_error, attempts=attempts)
 
 
 def clear_api_error(outdir: Path) -> None:
@@ -663,14 +667,17 @@ def write_api_error(outdir: Path, exc: ApiError, api_key: str = "") -> Path | No
 
     与 call_vlm.py 写 vision_error.json 同型——证据要能事后追查，不能只留在 stderr。
     schema 已冻结（键名被 discuss.py 读取，不许改名）：
-        error_type / message（完整不截断）/ finish_reason / raw_response（原始响应前 500 字）
+        error_type / message（前 2000 字：整页 HTML 错误体不许撑爆 failed_reason/evidence，
+        余文看 raw_response）/ finish_reason / raw_response（原始响应前 500 字）/
+        attempts（call_model 重试次数；重试信息原本只活在会被 stderr tail 挤掉的总结行里）
     写盘失败只告警，绝不掩盖原本的退出码 3（stderr 与退出码仍由调用方照旧处理）。
     """
     payload = {
         "error_type": "ApiError",
-        "message": redact(exc.cloud_message, api_key),
+        "message": redact(exc.cloud_message, api_key)[:MESSAGE_LIMIT],
         "finish_reason": exc.finish_reason,
         "raw_response": redact(exc.raw_response, api_key)[:RAW_RESPONSE_LIMIT],
+        "attempts": int(exc.attempts or 0),
     }
     path = Path(outdir) / ERROR_ARTIFACT_NAME
     try:
