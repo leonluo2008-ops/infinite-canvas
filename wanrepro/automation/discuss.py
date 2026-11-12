@@ -29,6 +29,27 @@ BUSY_RETRY_MAX = 60      # 409 排队：最多等 60 次 × 5s = 5 分钟
 BUSY_RETRY_INTERVAL = 5
 
 
+def _env_seconds(name: str, default: float) -> float:
+    """间隔加速位（AT-16 回归探针用）：环境变量覆盖，**不设 = 上面那个常量**。
+
+    为什么必须是环境变量而不是模块属性：AT-19 起执行体跑在独立子进程
+    （automation/discuss_runner.py），探针在自己进程里改 `discuss.POLL_INTERVAL` 到不了
+    真正的执行体——那种加速度在进程化之后恒等于没设。环境变量由 hub_api._spawn_process
+    随 Popen 透传给子进程，父子同值。
+
+    非法值/空串/非正数一律回落默认（生产行为逐字不变；默认值就是常量本身，故
+    「不设环境变量」与进程化之前完全一致）。
+    """
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return float(default)
+    try:
+        val = float(raw)
+    except ValueError:
+        return float(default)
+    return val if val > 0 else float(default)
+
+
 class DiscussError(RuntimeError):
     pass
 
@@ -315,7 +336,11 @@ def start_and_wait(task: dict, on_stage=None, on_heartbeat=None,
 
     waited = 0
     last_stage = ""
-    beat_every = HEARTBEAT_INTERVAL if heartbeat_interval is None else float(heartbeat_interval)
+    # 间隔一律走「env 覆盖 ∨ 模块常量」：默认（无 env）与进程化之前逐字一致；
+    # 显式 heartbeat_interval 参数优先级最高（单元级探针直接传参，不经 env）。
+    poll_interval = _env_seconds("WANREPRO_POLL_INTERVAL", POLL_INTERVAL)
+    beat_every = (_env_seconds("WANREPRO_HEARTBEAT_INTERVAL", HEARTBEAT_INTERVAL)
+                  if heartbeat_interval is None else float(heartbeat_interval))
     t0 = time.monotonic()
     next_beat = beat_every
     while waited < POLL_MAX_SECONDS:
@@ -351,8 +376,8 @@ def start_and_wait(task: dict, on_stage=None, on_heartbeat=None,
         if stage and stage != last_stage:
             last_stage = stage
             _emit(f"{stage}（已 {rec.get('elapsed', waited)}s）")
-        time.sleep(POLL_INTERVAL)
-        waited += POLL_INTERVAL
+        time.sleep(poll_interval)
+        waited += poll_interval
         # 心跳只在**等待期**发：终态分支在上面已 return，所以 done/error 之后不会有心跳补发
         if beat_every > 0:
             elapsed = time.monotonic() - t0

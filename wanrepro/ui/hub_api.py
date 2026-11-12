@@ -662,7 +662,11 @@ def _spawn_process(task_dir: Path, *, kind: str, argv_builder) -> dict:
            "WANREPRO_EXEC_RUN_ID": job_id,
            "WANREPRO_AUTO_DIR": str(TASKS_DIR),          # 子进程与父同一任务根（隔离也一致）
            "WANREPRO_BRIDGE": str(auto_config.BRIDGE_BASE),      # 父进程的**生效值**（可被运行期改）
-           "WANREPRO_ANALYSIS_ROOT": str(_analysis_reverse())}   # 拆解产物根（父与子同源）
+           "WANREPRO_ANALYSIS_ROOT": str(_analysis_reverse()),   # 拆解产物根（父与子同源）
+           # AT-16 回归探针的间隔加速位：**显式**透传（不设 = 空串 = 执行体用默认常量
+           # 3s / 60s）。写在这里是合同可审：加速只能走 env，进程内 monkeypatch 对子进程无效。
+           "WANREPRO_POLL_INTERVAL": os.environ.get("WANREPRO_POLL_INTERVAL", ""),
+           "WANREPRO_HEARTBEAT_INTERVAL": os.environ.get("WANREPRO_HEARTBEAT_INTERVAL", "")}
     log_path = task_dir / state.CHILD_LOG_FILE
     try:
         log = log_path.open("ab")

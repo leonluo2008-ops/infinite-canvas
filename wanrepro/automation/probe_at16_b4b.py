@@ -2,17 +2,27 @@
 # -*- coding: utf-8 -*-
 """AT-16 B4b 探针：拆解**远程等待心跳**（60s 追加日志 + 不改阶段锚 + 绕开 _stage_recorder 覆盖）。
 
-跑法：wanrepro/ 下 `python -m automation.probe_at16_b4b`。
+跑法：wanrepro/ 下 `python automation/probe_at16_b4b.py`。
+慢跑（默认 60s 节奏实测，约 +80s）：`WANPROBE_B4B_SLOW=1 python automation/probe_at16_b4b.py`。
 
 缺陷（同 B4a 的上游）：远程等待段在 UI 上「假冻结」——lapian_stage 与日志一行不动，
 用户以为卡死。B4b 的辅修是**等待心跳**：等待期每 60s 往 拆解日志.txt 追一行
 「本地等待循环仍在运行（总耗时 M分S秒）」。心跳是日志行，不是阶段行。
 
-本探针锁四件事（真路径：hub_api.start_discuss → discuss.run_discuss → start_and_wait
-→ HTTP 慢返回假 bridge；只在探针进程内把 POLL_INTERVAL/HEARTBEAT_INTERVAL 调小加速）：
+**AT-19 之后为什么必须改造**：执行体是独立子进程（automation/discuss_runner.py），旧版
+「只在探针进程内把 POLL_INTERVAL/HEARTBEAT_INTERVAL 调小加速」对真正的执行体恒等于没设
+（进程内补丁打不到子进程），旧版在 42e3c11 上只剩 16/22（探针窗口内等不到第 2 行心跳与 done）。
 
-  [0] 隔离与同源：自起 ui/server.py（临时 WANREPRO_AUTO_DIR + 假 bridge），
-      /api/hub/where 自述 TASKS_DIR == 探针根，不一致拒跑（防误写/误删真实任务）。
+改造后端到端段**不打任何补丁**：hub 起真子进程（POST /api/hub/discuss/<id> →
+_spawn_process → discuss_runner），加速只走环境变量 `WANREPRO_POLL_INTERVAL` /
+`WANREPRO_HEARTBEAT_INTERVAL`（由 _spawn_process 透传；默认值 = 模块常量 3s / 60s，
+不设即生产节奏）。[5][6] 两条是**单元级**断言（直接对 discuss.start_and_wait 验回调
+分离合同，不经进程），保持进程内直调——它们锁的是 discuss 模块自身的合同，不是 hub 链路。
+
+锁的点（原 22 项断言编号与判据逐条保留；末项为本卡新增，证明「执行体确为独立子进程」）：
+
+  [0] 隔离与同源：自起 ui/server.py（临时 WANREPRO_AUTO_DIR + 临时 WANREPRO_ANALYSIS_ROOT
+      + 假 bridge），/api/hub/where 自述 TASKS_DIR == 探针根，不一致拒跑。
   [1] 心跳真的出：等待期 ≥2 行心跳落日志，行内总耗时**严格递增**（M分S秒可解析）。
   [2] 心跳不改阶段/锚：只含心跳行的采样窗口里，lapian_stage 与 lapian_stage_at **逐字不变**
       ——即心跳没走 _stage_recorder（走一次就会把阶段等待计时清零）。
@@ -21,8 +31,11 @@
   [5] 默认 60s：HEARTBEAT_INTERVAL == 60；不传 heartbeat_interval 时短跑不出心跳（不是秒级刷屏）。
   [6] 回调分离（单元级）：on_stage 只收阶段行、on_heartbeat 只收心跳行，互不串门。
   [7] 文案诚实：只说「本地等待循环仍在运行」+ 总耗时 + 5–15 分钟预期；不出现百分比/远程进度暗示。
+  [9] 生产默认 60s 实测（慢跑，env 开关；默认跑法跳过）：不动心跳常量，第二个隔离实例
+      等待 66s 看真心跳恰 1 行。
 
-夹具任务只用 auto-9711..9712（隔离根内，跑完连根删）；真实任务零写入，跑前跑后对账。
+夹具任务只用 auto-9711..9713（隔离根内，跑完连根删）；真实任务零写入，跑前跑后对账
+（automation/projects、analysis/reverse、uploads 三根指纹）。
 """
 from __future__ import annotations
 
@@ -41,26 +54,37 @@ from pathlib import Path
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
+# 单元级段（[5][6]）要验「模块常量默认 60s」：探针进程内必须无 env 加速位，
+# 否则 env 会盖过常量、[5] 的「不传参不出心跳」失真。服务端加速位只在它的 env dict 里给。
+os.environ.pop("WANREPRO_POLL_INTERVAL", None)
+os.environ.pop("WANREPRO_HEARTBEAT_INTERVAL", None)
+
 ROOT = Path(__file__).resolve().parents[1]          # wanrepro/
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "ui"))                 # hub_api.py 在 ui/ 下（与 probe_hub 同法）
 
-from automation import config, probe_guard  # noqa: E402
-
-RESULTS: list[tuple[str, bool]] = []
-TASK_LIVE = "auto-9711"          # 心跳端到端
-TASK_UNIT = "auto-9712"          # 回调分离单元级
-TASK_SLOW = "auto-9713"          # 生产默认 60s 慢跑（env 开关）
+TASK_LIVE = "auto-9711"          # 心跳端到端（真子进程 + env 加速）
+TASK_UNIT = "auto-9712"          # 回调分离单元级（进程内直调 discuss，不经 hub）
+TASK_SLOW = "auto-9713"          # 生产默认 60s 慢跑（WANPROBE_B4B_SLOW=1 时启用）
 DISCUSS_LOG = "拆解日志.txt"
 BRIDGE_ID = "probe-b4b-run"
+UNIT_BRIDGE_ID = "probe-b4b-unit"
+SLOW_BRIDGE_ID = "probe-b4b-slow"
 HEARTBEAT_MARK = "本地等待循环仍在运行"
 HEARTBEAT_RE = re.compile(r"总耗时 (?:(\d+)分)?(\d+)秒")
 
+E2E_POLLS = 25                   # 0.2s × 25 ≈ 5s 等待；心跳 1s → 4 行（1/2/3/4 秒，整秒递增）
+E2E_BEAT = 1.0                   # 端到端心跳间隔（秒；服务端 env 透传给子进程）
+UNIT_POLLS = 12                  # 单元级默认节奏：0.2s × 12 ≈ 2.4s < 60s → 0 行心跳
 
-def check(name: str, cond: bool, detail: str = "") -> bool:
-    RESULTS.append((name, bool(cond)))
-    print(f"  [{'PASS' if cond else 'FAIL'}] {name}" + (f" —— {detail}" if detail and not cond else ""))
-    return bool(cond)
+RESULTS: list[tuple[str, bool]] = []
+
+
+def check(name: str, cond, detail: str = "") -> bool:
+    ok = bool(cond)
+    RESULTS.append((name, ok))
+    print(f"  [{'PASS' if ok else 'FAIL'}] {name}" + (f" —— {detail}" if detail and not ok else ""))
+    return ok
 
 
 def summary() -> int:
@@ -79,20 +103,22 @@ def hb_seconds(line: str) -> int | None:
     return int(m.group(1) or 0) * 60 + int(m.group(2))
 
 
-# ── 假 bridge：慢返回 + 阶段变化 + done 后产物齐 ────────────────────────
+# ── 假 bridge：慢返回 + 阶段变化 + done 后产物齐（按 bridge_id 分账）────────
 class SlowLapianBridge:
     """只实现拆解要用的三个面：lapian/run、job 轮询（慢返回）、tasks（产物标志）。
 
     产物标志**故意**在 done 之前为假：run_discuss 起手会先查产物（产物优先），
     若一开始就齐，它会跳过整个拆解，根本走不到等待循环→心跳就无从验证。
+    每个 POST /api/lapian/run 开一个新 job：该 bridge_id 的轮询计数归零、产物标志回假
+    （真桥语义：新一次拆解开始，has_* 还不存在）。
     """
 
-    def __init__(self, running_polls: int = 12, stage_every: int = 4, final: str = "done") -> None:
-        self.running_polls = running_polls
-        self.stage_every = stage_every
-        self.final = final
-        self.polls = 0
+    def __init__(self, polls_budget: dict[str, int] | None = None) -> None:
         self._lock = threading.Lock()
+        self._jobs: dict[str, dict] = {}     # job_id -> {"bridge_id","polls"}
+        self._done: dict[str, bool] = {}     # bridge_id -> 产物齐?
+        self._budget = dict(polls_budget or {})   # bridge_id -> done 前的轮询次数
+        self._seq = 0
         outer = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -114,45 +140,51 @@ class SlowLapianBridge:
                     self._send(404, {"error": f"stub bridge 不认 {self.path}"})
                     return
                 n = int(self.headers.get("Content-Length") or 0)
-                if n:
-                    self.rfile.read(n)
+                raw = self.rfile.read(n) if n else b""
+                try:
+                    bridge_id = str(json.loads(raw or b"{}").get("id") or "")
+                except (json.JSONDecodeError, ValueError):
+                    bridge_id = ""
                 with outer._lock:
-                    outer.polls = 0
-                self._send(200, {"job": "beefbeef"})
+                    outer._seq += 1
+                    job = f"b4b{outer._seq:04d}"
+                    outer._jobs[job] = {"bridge_id": bridge_id, "polls": 0}
+                    outer._done[bridge_id] = False
+                self._send(200, {"job": job})
 
             def do_GET(self) -> None:         # noqa: N802
                 if self.path == "/api/tasks":
                     with outer._lock:
-                        ready = outer.polls >= outer.running_polls
-                    self._send(200, {"tasks": [{"id": BRIDGE_ID,
-                                                "has_disc": ready, "has_check": ready,
-                                                "has_prompt": ready}]})
+                        rows = [{"id": bid, "has_disc": ok, "has_check": ok, "has_prompt": ok}
+                                for bid, ok in outer._done.items()]
+                    self._send(200, {"tasks": rows})
                     return
                 if self.path.startswith("/api/job/"):
+                    job = self.path.rsplit("/", 1)[-1]
                     with outer._lock:
-                        outer.polls += 1
-                        n = outer.polls
-                    if n >= outer.running_polls:
-                        if outer.final == "error":
-                            self._send(200, {"status": "error", "error": "探针假错误：桥侧拆解失败"})
-                        else:
+                        rec = outer._jobs.get(job)
+                        if rec is None:
+                            self._send(404, {"error": f"stub bridge 不认 job {job}"})
+                            return
+                        rec["polls"] += 1
+                        n = rec["polls"]
+                        bid = rec["bridge_id"]
+                        limit = outer._budget.get(bid, UNIT_POLLS)
+                        if n >= limit:
+                            outer._done[bid] = True
                             self._send(200, {"status": "done", "elapsed": round(n * 0.2, 1),
                                              "result": "probe"})
-                        return
-                    self._send(200, {"status": "running",
-                                     "stage": f"阶段{1 + (n - 1) // outer.stage_every}",
-                                     "elapsed": round(n * 0.2, 1)})
+                            return
+                        stage = f"阶段{1 + (n - 1) // 4}"
+                        self._send(200, {"status": "running", "stage": stage,
+                                         "elapsed": round(n * 0.2, 1)})
                     return
                 self._send(404, {"error": f"stub bridge 不认 {self.path}"})
 
-        self.port = probe_guard.free_port()
-        self.httpd = ThreadingHTTPServer(("127.0.0.1", self.port), Handler)
-        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
-
-    def reset(self) -> None:
-        """把轮询计数归零（产物标志随之回假）：run_discuss 起手先查产物，产物假才真走等待循环。"""
-        with self._lock:
-            self.polls = 0
+        self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.port = int(self.httpd.server_address[1])
+        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True,
+                                       name="probe-b4b-bridge")
 
     @property
     def base(self) -> str:
@@ -163,8 +195,10 @@ class SlowLapianBridge:
         self.httpd.server_close()
 
 
-# ── 夹具 ──────────────────────────────────────────────────────────────
+# ── 夹具与读盘 ────────────────────────────────────────────────────────
 def make_task(local_id: str, bridge_id: str) -> Path:
+    from automation import config
+
     tdir = Path(config.PROJECTS_DIR) / local_id
     shutil.rmtree(tdir, ignore_errors=True)
     (tdir / "inbox").mkdir(parents=True, exist_ok=True)
@@ -195,93 +229,135 @@ def read_log(tdir: Path) -> list[str]:
         return []
 
 
-def wait_job(job_id: str, timeout: float = 40.0) -> dict:
-    import hub_api  # noqa: E402
+def fingerprint(root: Path) -> dict[str, tuple[int, int]]:
+    """目录指纹（相对路径 → (字节数, mtime_ns)）：跑前跑后一致 = 零写入。"""
+    out: dict[str, tuple[int, int]] = {}
+    if not root.is_dir():
+        return out
+    for p in sorted(root.rglob("*")):
+        if p.is_symlink() or not p.is_file():
+            continue
+        try:
+            st = p.stat()
+        except OSError:
+            continue
+        out[str(p.relative_to(root))] = (st.st_size, st.st_mtime_ns)
+    return out
+
+
+def start_server(base_env: dict[str, str]) -> tuple[subprocess.Popen, str, str]:
+    """起一个隔离 ui/server.py → (proc, base, tasks_dir)。起不来/不同源由调用方拒跑。"""
+    from automation import probe_guard
+
+    port = probe_guard.free_port()
+    base = f"http://127.0.0.1:{port}"
+    proc = subprocess.Popen(
+        [sys.executable, str(ROOT / "ui" / "server.py"), "--port", str(port), "--no-browser"],
+        cwd=str(ROOT), env=base_env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, encoding="utf-8", errors="replace")
+    where = None
+    for _ in range(200):
+        if proc.poll() is not None:
+            break
+        code, payload = probe_guard.http_req(base, "/api/hub/where", timeout=5)
+        if code == 200 and isinstance(payload, dict):
+            where = payload
+            break
+        time.sleep(0.3)
+    return proc, base, (where or {}).get("tasks_dir") or ""
+
+
+def wait_job(base: str, job_id: str, timeout: float = 60.0) -> dict:
+    """轮询服务端 /api/hub/job/<id> 到非 running（job 记录由 _reap 回写）。"""
+    from automation import probe_guard
 
     deadline = time.time() + timeout
+    rec = {}
     while time.time() < deadline:
-        rec = hub_api.HUB_JOBS.get(job_id) or {}
-        if rec.get("status") != "running":
+        code, rec = probe_guard.http_req(base, f"/api/hub/job/{job_id}", timeout=10)
+        if code == 200 and isinstance(rec, dict) and rec.get("status") != "running":
             return rec
-        time.sleep(0.05)
-    return hub_api.HUB_JOBS.get(job_id) or {}
+        time.sleep(0.1)
+    return rec if isinstance(rec, dict) else {}
 
 
 def main() -> int:
-    real_root = Path(config.PROJECTS_DIR)
-    real_before = probe_guard.projects_snapshot(real_root)
-    iso_root = Path(tempfile.mkdtemp(prefix="wanprobe-at16b4b-",
-                                    dir=os.environ.get("TMPDIR") or tempfile.gettempdir()))
+    iso_root = Path(tempfile.mkdtemp(prefix="wanprobe-at16b4b-"))
     iso_projects = iso_root / "projects"
+    iso_analysis = iso_root / "analysis" / "reverse"
     iso_projects.mkdir(parents=True, exist_ok=True)
-    stub = SlowLapianBridge()
-    port = probe_guard.free_port()
-    base = f"http://127.0.0.1:{port}"
+    iso_analysis.mkdir(parents=True, exist_ok=True)
 
-    # 读写同源：先补丁 config 再懒加载（hub_api.TASKS_DIR = config.PROJECTS_DIR，import 期求值）
-    config.PROJECTS_DIR = iso_projects
-    old_bridge_base = config.BRIDGE_BASE
-    config.BRIDGE_BASE = stub.base
-    import hub_api  # noqa: E402
-    from automation import bridge as abridge, discuss  # noqa: E402
+    stub = SlowLapianBridge(polls_budget={BRIDGE_ID: E2E_POLLS, SLOW_BRIDGE_ID: 330})
+    stub.thread.start()
+
+    # 隔离根走环境变量（父与子同源）：hub_api.TASKS_DIR / discuss._ANALYSIS_ROOT 都在 import
+    # 期按 env 求值。探针进程内的单元级段（[5][6]）也走这份 env（真 config，不补丁）。
+    os.environ["WANREPRO_AUTO_DIR"] = str(iso_projects)
+    os.environ["WANREPRO_ANALYSIS_ROOT"] = str(iso_analysis)
+    os.environ["WANREPRO_BRIDGE"] = stub.base
+    os.environ["WANREPRO_WATCHDOG"] = "0"
+    os.environ["WANREPRO_BOOT_RECONCILE"] = "0"
+
+    from automation import config, probe_guard  # noqa: E402
+    import hub_api  # noqa: E402  —— 只用于读侧 get_task（与 server 同一份磁盘/同一函数）
+    from automation import discuss  # noqa: E402
+
+    # 真实数据根（只读）：config.PROJECTS_DIR 已被 env 指到隔离根，这里显式取仓内
+    real_projects = ROOT / "automation" / "projects"
+    real_analysis = ROOT / "analysis" / "reverse"
+    real_uploads = ROOT / "uploads"
+    real_before = {name: fingerprint(p) for name, p in
+                   (("projects", real_projects), ("analysis", real_analysis),
+                    ("uploads", real_uploads))}
 
     proc = None
-    keep = (discuss.POLL_INTERVAL, discuss.HEARTBEAT_INTERVAL)
-    real_run = discuss.run_discuss
-    real_bridge_get, real_bridge_post = abridge.get, abridge.post_json
+    slow_proc = None
     try:
-        stub.thread.start()
-        env = dict(os.environ, WANREPRO_AUTO_DIR=str(iso_projects), WANREPRO_BRIDGE=stub.base)
-        proc = subprocess.Popen(
-            [sys.executable, str(ROOT / "ui" / "server.py"), "--port", str(port), "--no-browser"],
-            cwd=str(ROOT), env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, encoding="utf-8", errors="replace")
-        where = None
-        for _ in range(200):
-            if proc.poll() is not None:
-                break
-            code, payload = probe_guard.http_req(base, "/api/hub/where", timeout=5)
-            if code == 200 and isinstance(payload, dict):
-                where = payload
-                break
-            time.sleep(0.3)
+        # 服务端 env：隔离根 + 假桥 + 加速位（执行体子进程由 _spawn_process 透传继承）。
+        # 轮询 0.2s × 25 ≈ 5s 等待；心跳 1s → 4 行（总耗时 1→2→3→4 秒，整秒严格递增）。
+        env = {**os.environ,
+               "WANREPRO_POLL_INTERVAL": "0.2",
+               "WANREPRO_HEARTBEAT_INTERVAL": str(E2E_BEAT)}
+        proc, base, tasks_dir = start_server(env)
         try:
-            probe_guard.assert_same_root(where or {}, iso_projects)
-            check("[0] 隔离实例起来且读写同源（/api/hub/where == 探针根）", where is not None,
-                  f"{base} 无响应" if where is None else str(where)[:120])
-            print(f"     数据根 {where.get('tasks_dir')}")
+            probe_guard.assert_same_root({"tasks_dir": tasks_dir}, iso_projects)
+            check("[0] 隔离实例起来且读写同源（/api/hub/where == 探针根）", bool(tasks_dir),
+                  f"{base} 无响应或没给 tasks_dir")
+            print(f"     数据根 {tasks_dir}")
         except probe_guard.GuardError as err:
             check("[0] 隔离实例起来且读写同源（/api/hub/where == 探针根）", False, str(err))
             print("[probe-at16-b4b] 拒跑：数据根不同源，后续写入/清理一律不执行。")
             return summary()
 
-        # ── [5] 默认间隔 60s（先验常量与默认行为，后面才调小加速）──────────
+        # ── [5] 默认间隔 60s（单元级：直接对模块常量与默认行为）──────────
         print("5) 默认间隔：HEARTBEAT_INTERVAL=60s，不传参时短跑不出心跳（不刷屏）")
         check("[5] HEARTBEAT_INTERVAL == 60（等待期 60s 一行）",
               discuss.HEARTBEAT_INTERVAL == 60, str(discuss.HEARTBEAT_INTERVAL))
-        tdir_unit = make_task(TASK_UNIT, "probe-b4b-unit")
+        tdir_unit = make_task(TASK_UNIT, UNIT_BRIDGE_ID)
         unit_stage, unit_beat = [], []
         keep_poll = discuss.POLL_INTERVAL
         discuss.POLL_INTERVAL = 0.2
         try:
-            discuss.start_and_wait({"bridge_id": "probe-b4b-unit", "intent": ""},
+            discuss.start_and_wait({"bridge_id": UNIT_BRIDGE_ID, "intent": ""},
                                    on_stage=unit_stage.append, on_heartbeat=unit_beat.append)
-        except Exception as err:  # noqa: BLE001 —— 不传 heartbeat_interval：默认 60s，跑完一轮 ≈1.2s
+        except Exception as err:  # noqa: BLE001 —— 不传 heartbeat_interval：默认 60s，跑完 ≈2.4s
             check("[5] 默认间隔下短跑（不传 heartbeat_interval）", False, f"{type(err).__name__}: {err}")
         discuss.POLL_INTERVAL = keep_poll
-        check("[5] 默认 60s 下 ≈1.2s 的等待**不许**出心跳（心跳不是每次轮询都刷）",
+        check("[5] 默认 60s 下 ≈2.4s 的等待**不许**出心跳（心跳不是每次轮询都刷）",
               unit_beat == [], f"{len(unit_beat)} 行: {unit_beat[:2]}")
 
         # ── [6] 回调分离（单元级，直接对 start_and_wait）──────────────────
         print("6) 回调分离：on_stage 只收阶段行、on_heartbeat 只收心跳行，互不串门")
         unit_stage.clear()
         unit_beat.clear()
+        keep_beat = discuss.HEARTBEAT_INTERVAL
         discuss.POLL_INTERVAL, discuss.HEARTBEAT_INTERVAL = 0.2, 0.4
         try:
-            discuss.start_and_wait({"bridge_id": "probe-b4b-unit", "intent": ""},
+            discuss.start_and_wait({"bridge_id": UNIT_BRIDGE_ID, "intent": ""},
                                    on_stage=unit_stage.append, on_heartbeat=unit_beat.append)
         finally:
-            discuss.POLL_INTERVAL, discuss.HEARTBEAT_INTERVAL = keep
+            discuss.POLL_INTERVAL, discuss.HEARTBEAT_INTERVAL = keep_poll, keep_beat
         check("[6] on_heartbeat 收到的每行都是心跳文案（没有阶段行借道）",
               bool(unit_beat) and all(HEARTBEAT_MARK in m for m in unit_beat),
               f"{len(unit_beat)} 行: {unit_beat[:3]}")
@@ -292,16 +368,15 @@ def main() -> int:
               not any("总耗时" in m for m in unit_stage),
               f"{unit_stage[:3]}")
 
-        # ── [1]~[4] 端到端：hub 起拆解，等待期采样 ────────────────────────
-        print("1) 端到端：hub 起拆解（慢 bridge），等待期日志追加心跳且总耗时递增")
+        # ── [1]~[4] 端到端：hub 起真子进程，等待期采样 ────────────────────
+        print("1) 端到端：hub 起拆解（真子进程 + env 加速），等待期日志追加心跳且总耗时递增")
         tdir = make_task(TASK_LIVE, BRIDGE_ID)
-        # 心跳总耗时是**整秒**口径（生产 60s 一行，整秒必然递增）；加速度下若把间隔压到
-        # 亚秒，同秒内会出多行同值，测不出「递增」这条性质。故这里把等待拉长到 ≈5s、
-        # 心跳间隔设 1s：4 行心跳、总耗时 1→2→3→4 秒，性质可证。
-        discuss.POLL_INTERVAL, discuss.HEARTBEAT_INTERVAL = 0.2, 1.0
-        stub.running_polls = 25
-        stub.reset()      # 上游单元跑过同一假 bridge：产物标志必须先回假，否则 run_discuss 走「产物优先」跳过等待
-        started = hub_api.start_discuss(TASK_LIVE)
+        code, job = probe_guard.http_req(base, f"/api/hub/discuss/{TASK_LIVE}", method="POST",
+                                         timeout=20)
+        check("[1] 执行体确为独立子进程（hub 只派发：mode=process 且有 pid；"
+              "旧版此处是进程内补丁执行体）",
+              code == 200 and job.get("mode") == "process" and bool(job.get("pid")),
+              f"{code} {job}")
         samples: list[tuple[list[str], dict]] = []
         deadline = time.time() + 30
         while time.time() < deadline:
@@ -311,7 +386,7 @@ def main() -> int:
             if str(task_now.get("lapian_stage") or "").startswith("终态"):
                 break
             time.sleep(0.03)
-        rec = wait_job(started["job_id"])
+        rec = wait_job(base, job.get("job_id", ""))
         final_log = read_log(tdir)
         task_after = read_task(tdir)
 
@@ -369,7 +444,7 @@ def main() -> int:
         # ── [4] 终态后心跳停止 ───────────────────────────────────────────
         print("4) 终态后：心跳停止、停表锚落值")
         n_before = len(read_log(tdir))
-        time.sleep(1.2)                    # > 3 个心跳周期（0.35s × 3）
+        time.sleep(1.2)                    # > 3 个心跳周期（1.0s × 3 取整窗口余量）
         n_after = len(read_log(tdir))
         check("[4] 终态后 1.2s（3 个心跳周期）日志行数一格不涨 —— 心跳已停",
               n_after == n_before, f"{n_before} → {n_after}")
@@ -392,7 +467,8 @@ def main() -> int:
               bool(beat_lines) and all(HEARTBEAT_MARK in l for l in beat_lines),
               f"{beat_lines[:2]}")
         check("[7] 每行心跳都含总耗时（人话 M分S秒）且带 5–15 分钟预期口径",
-              bool(beat_lines) and all(hb_seconds(l) is not None and "5–15 分钟" in l for l in beat_lines),
+              bool(beat_lines) and all(hb_seconds(l) is not None and "5–15 分钟" in l
+                                       for l in beat_lines),
               f"{beat_lines[:2]}")
         check("[7] 心跳行不含百分比 / 远程进度暗示（% / 进度 / 已完成 / 剩余）",
               bool(beat_lines) and not any(("%" in l or "进度" in l or "已完成" in l or "剩余" in l)
@@ -401,13 +477,14 @@ def main() -> int:
 
         # ── [9] 生产默认 60s 实测（慢跑，env 开关；默认跑法跳过）────────────
         if os.environ.get("WANPROBE_B4B_SLOW") == "1":
-            print("9) 生产默认间隔实测（WANPROBE_B4B_SLOW=1）：**不动**心跳常量，等 66s 看真心跳")
-            tdir_slow = make_task(TASK_SLOW, BRIDGE_ID)
-            discuss.POLL_INTERVAL, discuss.HEARTBEAT_INTERVAL = 0.2, 60
-            stub.running_polls = 330      # 0.2s × 330 = 66s 等待
-            stub.reset()
-            slow_job = hub_api.start_discuss(TASK_SLOW)
-            slow_rec = wait_job(slow_job["job_id"], timeout=180)
+            print("9) 生产默认间隔实测（WANPROBE_B4B_SLOW=1）：第二个隔离实例**不带**心跳 env，"
+                 "等 66s 看真心跳")
+            tdir_slow = make_task(TASK_SLOW, SLOW_BRIDGE_ID)
+            slow_env = {**os.environ, "WANREPRO_POLL_INTERVAL": "0.2"}   # 心跳 env 不给 → 默认 60s
+            slow_proc, slow_base, _ = start_server(slow_env)
+            code, slow_job = probe_guard.http_req(slow_base, f"/api/hub/discuss/{TASK_SLOW}",
+                                                  method="POST", timeout=20)
+            slow_rec = wait_job(slow_base, slow_job.get("job_id", ""), timeout=180)
             slow_beats = [l for l in read_log(tdir_slow) if HEARTBEAT_MARK in l]
             slow_secs = [hb_seconds(l) for l in slow_beats]
             check("[9] 默认 60s：66s 等待里恰 1 行心跳（第 2 次要到 120s，不多发）",
@@ -421,25 +498,30 @@ def main() -> int:
                   bool(slow_task.get("lapian_stage_at")) and bool(slow_task.get("lapian_ended_at")),
                   f"stage_at={slow_task.get('lapian_stage_at')} ended_at={slow_task.get('lapian_ended_at')}")
 
-        # ── 真实任务零写入 ───────────────────────────────────────────────
-        real_after = probe_guard.projects_snapshot(real_root)
-        try:
-            probe_guard.assert_no_loss(real_before, real_after)
-            check("[8] 真实任务零损失/零新增（真实数据根快照对账）", True)
-        except probe_guard.GuardError as err:
-            check("[8] 真实任务零损失/零新增（真实数据根快照对账）", False, str(err))
+        # ── [8] 真实数据根零写入 ────────────────────────────────────────
+        real_after = {name: fingerprint(p) for name, p in
+                      (("projects", real_projects), ("analysis", real_analysis),
+                       ("uploads", real_uploads))}
+        bad = {}
+        for name in real_before:
+            lost = sorted(set(real_before[name]) - set(real_after[name]))
+            added = sorted(set(real_after[name]) - set(real_before[name]))
+            changed = [k for k in real_before[name]
+                       if k in real_after[name]
+                       and real_before[name][k] != real_after[name][k]]
+            if lost or added or changed:
+                bad[name] = {"lost": lost[:5], "added": added[:5], "changed": changed[:5]}
+        check("[8] 真实数据根零写入（automation/projects + analysis/reverse + uploads 指纹一致）",
+              not bad, json.dumps(bad, ensure_ascii=False)[:400])
         return summary()
     finally:
-        discuss.POLL_INTERVAL, discuss.HEARTBEAT_INTERVAL = keep
-        discuss.run_discuss = real_run
-        abridge.get, abridge.post_json = real_bridge_get, real_bridge_post
-        config.BRIDGE_BASE = old_bridge_base
-        if proc is not None and proc.poll() is None:
-            proc.terminate()
-            try:
-                proc.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                proc.kill()
+        for p in (proc, slow_proc):
+            if p is not None and p.poll() is None:
+                p.terminate()
+                try:
+                    p.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    p.kill()
         stub.close()
         shutil.rmtree(iso_root, ignore_errors=True)
 
