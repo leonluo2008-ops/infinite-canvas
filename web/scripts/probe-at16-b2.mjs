@@ -276,22 +276,27 @@ const howEl = elementByMarker(htmlNew, "data-hub-selfcheck-how");
 check("[B] FAIL 项出「怎么处理」（文案=生产者处理指引原文）",
     howEl.includes("怎么处理：") && howEl.includes("重传（覆盖）") && howEl.includes("按原片处理"),
     howEl.slice(0, 260));
-check("[B] 「原因」段落可见（含检查器发现的动态数据）",
-    elementByMarker(htmlNew, "data-hub-selfcheck-reason").includes("提交快照 3 条 ≠ 发图单位 2 个"));
-const findingsEl = elementByMarker(htmlNew, "data-hub-selfcheck-findings");
-check("[B] 发现逐条渲染，行号/图号来自检查器数据（#12 / 图1），不是前端从证据里抠的",
-    findingsEl.includes("#12") && findingsEl.includes("图1") && findingsEl.includes("应为图3"),
-    findingsEl.slice(0, 260));
-check("[B] 原始证据降为可展开的次级信息（不与话术抢位置）",
-    htmlNew.includes("data-hub-selfcheck-raw") && htmlNew.includes(">原始证据<"));
-check("[B] 门禁 FAIL：整宽红条 + 缺项逐条 + 怎么处理（重试）",
+const textOf = (html) => html.replace(/<[^>]*>/g, " ").replace(/\s+/g, " ");
+// AT-22 E2 改判：可见区不再有「原因」段（它与发现/证据 100% 重复，是用户看不懂的主因）
+check("[B] 可见区不再渲染「原因」段（E2 拔掉最大重复源）",
+    elementByMarker(htmlNew, "data-hub-selfcheck-reason") === ""
+    && !textOf(elementByMarker(htmlNew, "data-hub-selfcheck-item")
+        .replace(elementByMarker(htmlNew, "data-hub-selfcheck-fold"), " ")).includes("提交快照 3 条 ≠ 发图单位 2 个"));
+// AT-22 E2 改判：无 v2 槽位（旧/中态载荷）不出「发现逐条」列表——同样内容在折叠区证据里
+check("[B] 旧/中态载荷不出发现列表也不丢信息（同一内容收进折叠区证据）",
+    !htmlNew.includes("data-hub-selfcheck-findings")
+    && elementByMarker(htmlNew, "data-hub-selfcheck-fold").includes("行→图号"));
+const gateDetailEl = elementByMarker(htmlNew, "data-hub-gate-detail");
+const gateVisibleText = textOf(gateDetailEl.replace(elementByMarker(gateDetailEl, "data-hub-selfcheck-fold"), " "));
+check("[B] 门禁 FAIL：整宽红条 + 缺项逐条人话 + 怎么处理（重试）",
     /data-hub-gate-state="fail"/.test(htmlNew)
-    && htmlNew.includes("缺项：D2 分镜表缺片尾覆盖")
-    && htmlNew.includes("data-hub-gate-how") && htmlNew.includes("重试"),
-    elementByMarker(htmlNew, "data-hub-gate-detail").slice(0, 260));
-check("[B] 门禁不再靠拆证据字符串出摘要（证据里的「状态 标红…」原串不出现在页面上）",
-    !htmlNew.includes("状态 标红｜绿项 6/8"),
-    "门禁摘要应来自说明.结论人话");
+    && gateVisibleText.includes("分镜表缺片尾覆盖")
+    && gateVisibleText.includes("怎么处理：") && gateVisibleText.includes("重试"),
+    gateVisibleText.slice(0, 260));
+check("[B] 门禁可见区不摆统计/不拆证据串（「状态 标红｜绿项 6/8」只在折叠区）",
+    !gateVisibleText.includes("状态 标红") && !gateVisibleText.includes("绿项 6/8")
+    && elementByMarker(gateDetailEl, "data-hub-selfcheck-fold").includes("状态 标红"),
+    "门禁摘要应来自说明.结论人话，统计进折叠区");
 
 const htmlAllPass = ssr.renderPrompt({
     local_id: "auto-9702",
@@ -338,11 +343,14 @@ if (realSelfcheck) {
         && html.includes("怎么处理："), JSON.stringify(failRows.map((row) => [row.项, row.说明?.处理?.slice(0, 40)])));
     check("[D] 渲染出的处理指引与生产者原文逐字一致（读层/展示层没有二次加工）",
         failRows.every((row) => html.includes(row.说明.处理)), "逐条对不上");
-    check("[D] 真实产出的动态行号/图号有进页面（发现条目原样落地）",
-        failRows.some((row) => (row.说明.发现 || []).length > 0)
-            ? failRows.some((row) => (row.说明.发现 || []).some((finding) => html.includes(finding.文字)))
-            : true,
-        JSON.stringify(failRows.map((row) => (row.说明.发现 || []).map((f) => f.文字.slice(0, 30)))));
+    // AT-22 E2 改判：检查器原句（含 #N 写法）不再进可见区，改成「行号 + 短名」进可见区、
+// 原句只进折叠区。这条断言跟到最后：动态行号必须在页面上（以人话形态），原句必须可查（折叠区）。
+// v2 载荷（带 词/行称呼）→ 行号必须以「第 N 行」形态进可见区；旧载荷（pre-B2 自检.json，
+// 没有 v2 槽位）不摆卡也不假装有行号——降级路径的断言在 [D] 前两条。
+const v2Findings = failRows.flatMap((row) => row.说明.发现 || []).filter((finding) => finding.词 || finding.行称呼);
+check("[D] 真实产出的动态行号进页面（人话「第 N 行」，原句收折叠区）",
+    v2Findings.every((finding) => typeof finding.行号 === "number" && html.includes(`第 ${finding.行号} 行`)),
+    JSON.stringify(v2Findings.map((f) => [f.行号, f.行称呼])));
 }
 
 const realLegacy = argVal("--legacy");
@@ -352,13 +360,27 @@ if (realLegacy) {
     const items = hubApi.normalizeSelfCheck(rawItems);
     const html = ssr.renderPrompt({ local_id: "auto-0042", prompt_md: PROMPT, 自检: items });
     const legacyRows = items.filter((row) => !row.说明);
-    check("[D] 历史条目一个都没有伪造「说明」",
-        legacyRows.length === items.length && items.every((row) => row.说明 === undefined),
-        JSON.stringify(items.map((row) => [row.项, Boolean(row.说明)])));
-    check("[D] 历史条目降级标记 + 明说没有处理指引（不假装有指引）",
-        html.includes('data-hub-selfcheck-legacy="1"')
-        && html.includes("没有处理指引") && !html.includes("data-hub-selfcheck-how"),
-        html.slice(html.indexOf("data-hub-selfcheck-legacy") - 40, html.indexOf("data-hub-selfcheck-legacy") + 260));
+    if (legacyRows.length === items.length) {
+        // 全 legacy：连 说明 都没有（AT-21 之前的老文件）
+        check("[D] 历史条目一个都没有伪造「说明」",
+            legacyRows.length === items.length && items.every((row) => row.说明 === undefined),
+            JSON.stringify(items.map((row) => [row.项, Boolean(row.说明)])));
+        check("[D] 历史条目降级标记 + 明说没有处理指引（不假装有指引）",
+            html.includes('data-hub-selfcheck-legacy="1"')
+            && html.includes("没有处理指引") && !html.includes("data-hub-selfcheck-how"),
+            html.slice(html.indexOf("data-hub-selfcheck-legacy") - 40, html.indexOf("data-hub-selfcheck-legacy") + 260));
+    } else {
+        // 中态：有 说明（结论人话/处理）但没有 v2 槽位（词/行称呼/片段）——AT-22 B2 之前的真机文件
+        const midReason = rawItems.map((row) => row.说明?.原因).find((text) => text);
+        const foldHtml = elementByMarker(html, "data-hub-selfcheck-fold");
+        const visible = textOf(html.replace(foldHtml, " "));
+        check("[D] 中态历史载荷不摆 v2 卡（没有 v2 槽位就不套新模板）",
+            !html.includes("data-hub-selfcheck-card") && legacyRows.length < items.length,
+            JSON.stringify(items.map((row) => [row.项, Boolean(row.说明)])));
+        check("[D] 中态历史载荷可见区不出「原因：」段（最大重复源已拔，句子仍收折叠区）",
+            !visible.includes("原因：") && (!midReason || foldHtml.includes(midReason.slice(0, 20))),
+            `${visible.indexOf("原因：")} / ${Boolean(midReason)}`);
+    }
     check("[D] 历史条目的原始证据原文完整可读（逐字保留，不截断不加戏）",
         rawItems.filter((row) => row.结论 !== "PASS").every((row) => html.includes(row.证据)),
         rawItems.filter((row) => row.结论 !== "PASS").map((row) => row.证据.slice(0, 40)).join(" / "));

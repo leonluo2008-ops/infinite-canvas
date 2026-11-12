@@ -44,7 +44,9 @@ RESULTS: list[tuple[str, bool]] = []
 TASK_NEW = "auto-9711"
 TASK_LEGACY = "auto-9712"
 BRIDGE = "probe-at16b2"
-REAL_TASK = "auto-0042"                              # 真实历史任务（只读）
+REAL_TASK = "auto-0042"                              # 真实历史任务（只读，真机上已清）
+# AT-22 E2：真实历史样本按候选顺序取第一份现存的（auto-0042 已被清，退到 auto-0066 这类中态载荷）
+LEGACY_CANDIDATES = (REAL_TASK, "auto-0066", "auto-0065", "auto-0067")
 WEB = ROOT.parent / "web"
 DRAWER = WEB / "src" / "pages" / "hub" / "task-detail-drawer.tsx"
 
@@ -194,12 +196,16 @@ def scenario_producer() -> Path:
     order = by["次序对账"]
     check("① 次序对账按污染判 FAIL（自检独立性不破）", order["结论"] == "FAIL", order["证据"][:160])
     order_say = say_of(order)
-    check("① 次序对账人话：结论说清「几处/什么毛病」",
-          "没对上" in order_say.get("结论人话", "") and "提交的图数" in order_say.get("结论人话", ""),
+    # AT-22 E2 改判：结论人话一条说清「什么毛病」，动态数字下沉到 统计（可见区不再摆数字统计串）
+    check("① 次序对账人话：一句说清什么毛病（提交几张 / 要发几张）",
+          "提交" in order_say.get("结论人话", "") and "张图" in order_say.get("结论人话", "")
+          and "原因" not in order_say,
           order_say.get("结论人话", ""))
-    check("① 次序对账原因含检查器发现的动态数字（提交 3 条 vs 发图单位 2 个）",
-          "提交快照" in order_say.get("原因", "") and "发图单位" in order_say.get("原因", ""),
-          order_say.get("原因", "")[:200])
+    check("① 次序对账动态数字进「统计」（检查器原值，不是模板）",
+          isinstance(order_say.get("统计", {}).get("提交张数"), int)
+          and isinstance(order_say.get("统计", {}).get("要发张数"), int)
+          and order_say["统计"]["提交张数"] != order_say["统计"]["要发张数"],
+          json.dumps(order_say.get("统计"), ensure_ascii=False)[:200])
     check("① 次序对账处理指向真实可执行入口（上传区重传/移除）",
           "重传（覆盖）" in order_say.get("处理", "") and "移除" in order_say.get("处理", ""),
           order_say.get("处理", "")[:200])
@@ -210,8 +216,10 @@ def scenario_producer() -> Path:
     lock = by["锁点对账"]
     lock_say = say_of(lock)
     check("① 锁点对账判 FAIL（#12 必换没图也没按原样）", lock["结论"] == "FAIL", lock["证据"][:160])
-    check("① 锁点人话点出 #12（动态行号来自检查器）",
-          "#12" in lock_say.get("结论人话", "") and any(f.get("行号") == 12 for f in lock_say.get("发现", [])),
+    # AT-22 E2 改判：行号一律「第 12 行「短名」」（#N 是禁用写法），行号仍来自检查器
+    check("① 锁点人话点出「第 12 行「标语品牌字」」（动态行号来自检查器）",
+          "第 12 行" in lock_say.get("结论人话", "") and "「" in lock_say.get("结论人话", "")
+          and any(f.get("行号") == 12 for f in lock_say.get("发现", [])),
           json.dumps(lock_say, ensure_ascii=False)[:300])
     check("① 锁点处理指向「知道，按原样」真实勾选入口",
           "知道，按原样" in lock_say.get("处理", ""), lock_say.get("处理", "")[:160])
@@ -223,6 +231,9 @@ def scenario_producer() -> Path:
 
     print("② 反编造：处理/原因里的「…」具名必须对得上真入口/真列名")
     drawer_src = DRAWER.read_text(encoding="utf-8")
+    # AT-22 E2：结论人话里的「」具名可能是拆解条目短名（道具A/标语品牌字这类行称呼），
+    # 短名来自拆解.md 九 资产 条目名——真源同样算「对得上」。
+    breakdown = (ROOT / "analysis" / "reverse" / BRIDGE / "拆解.md").read_text(encoding="utf-8-sig")
     ck_header = (ROOT / "analysis" / "reverse" / BRIDGE / "待确认清单.md").read_text(encoding="utf-8-sig").splitlines()[2]
     columns = [cell.strip() for cell in ck_header.strip("|").split("|")]
     bad: list[str] = []
@@ -232,7 +243,7 @@ def scenario_producer() -> Path:
         for field in ("处理", "原因", "结论人话"):
             for label in quoted(say.get(field, "")):
                 labels.add(label)
-                if label not in drawer_src and label not in columns:
+                if label not in drawer_src and label not in columns and label not in breakdown:
                     bad.append(f"{name}.{field}「{label}」")
     check("② 全部指引具名都能对到详情页文案或清单列名（零编造）", not bad, "、".join(bad[:6]))
     check("② 具名集合非空（真的查到了入口，不是空跑）", len(labels) >= 4, "、".join(sorted(labels)))
@@ -285,26 +296,34 @@ def scenario_producer() -> Path:
     return out
 
 
-def scenario_legacy_real() -> Path:
-    """④ 真实 auto-0042 自检.json 只读：sha256 不变、无说明、证据可读。"""
-    print("④ 历史兼容：真实 auto-0042 只读")
-    real_dir = Path(config.PROJECTS_DIR) / REAL_TASK
-    if not real_dir.is_dir():
-        # 探针把 config 指到隔离根了，真实路径按仓库默认位置单独拼
-        real_dir = ROOT / "automation" / "projects" / REAL_TASK
-    sc = real_dir / selfcheck.SELFCHECK_NAME
-    if not sc.is_file():
-        check("④ 真实任务 auto-0042 自检.json 存在（只读验证对象）", False, str(sc))
-        return sc
+def scenario_legacy_real() -> Path | None:
+    """④ 真实历史 selfcheck.json 只读：sha256 不变、无 v2 槽位、证据可读。
+
+    AT-22 E2：原先固定的 auto-0042 已被真机清掉，改成按候选清单找「现存的第一份」；
+    一份都没有就留 SKIP 痕迹（不许静默当通过）。全 legacy（连 说明 都没有）的渲染断言
+    由 probe_at22_e2 [D] 覆盖，本处只管「真文件不被写、旧载荷特征成立」。
+    """
+    print("④ 历史兼容：真实自检.json 只读")
+    for task in LEGACY_CANDIDATES:
+        real_dir = ROOT / "automation" / "projects" / task
+        sc = real_dir / selfcheck.SELFCHECK_NAME
+        if sc.is_file():
+            break
+    else:
+        print(f"  [SKIP] ④ {LEGACY_CANDIDATES} 都已不存在（真机清理），真实历史只读断言跳过"
+              f"——legacy/中态降级路径由 probe_at22_e2 [D] 覆盖")
+        return None
     before = sha256(sc)
     raw = json.loads(sc.read_text(encoding="utf-8-sig"))
     items = selfcheck.load_selfcheck(real_dir) or []
     rows = [row for row in items if row.get("项") != selfcheck.GATE_ITEM_NAME]
     after = sha256(sc)
-    check("④ auto-0042 自检.json 跑前跑后 sha256 一致（只读增强不改历史文件）",
+    check(f"④ 真实 {sc.parent.name}/自检.json 跑前跑后 sha256 一致（只读增强不改历史文件）",
           before == after, f"{before[:12]} / {after[:12]}")
-    check("④ 历史条目没有「说明」（不伪造处理指引）", all("说明" not in row for row in rows),
-          str([(r.get("项"), "说明" in r) for r in rows]))
+    findings = [f for row in rows for f in (row.get("说明") or {}).get("发现") or []]
+    check("④ 真实历史载荷没有 v2 槽位（词/行称呼/片段 都不存在）",
+          findings and not any(("词" in f) or ("行称呼" in f) or ("片段" in f) for f in findings),
+          json.dumps(findings[:2], ensure_ascii=False)[:200])
     check("④ 历史条目证据原文非空（降级显示可读）",
           all(str(row.get("证据") or "").strip() for row in rows),
           str([len(str(r.get("证据") or "")) for r in rows]))
@@ -314,12 +333,21 @@ def scenario_legacy_real() -> Path:
     return sc
 
 
-def scenario_frontend(selfcheck_json: Path, legacy_json: Path) -> None:
+def scenario_frontend(selfcheck_json: Path, legacy_json: Path | None) -> None:
     print("⑤ 前端联动：node probe-at16-b2（真产出 + 真历史文件）")
-    cmd = ["node", "scripts/probe-at16-b2.mjs", "--selfcheck", str(selfcheck_json), "--legacy", str(legacy_json)]
+    cmd = ["node", "scripts/probe-at16-b2.mjs", "--selfcheck", str(selfcheck_json)]
+    if legacy_json is not None:
+        cmd += ["--legacy", str(legacy_json)]
+    else:
+        print("  [SKIP] ⑤ 真历史文件渲染（④ 无现存样本）——降级渲染由 probe_at22_e2 前端探针 [D] 覆盖")
     proc = subprocess.run(cmd, cwd=str(WEB), capture_output=True, text=True,
                           encoding="utf-8", errors="replace", timeout=900)
     tail = "\n".join([line for line in (proc.stdout or "").splitlines() if "FAIL" in line or "PASS," in line])
+    if proc.returncode != 0:
+        # 失败时把 node 侧全文落到临时目录（不进仓库），否则 tail 只有几行看不出真因
+        dump = Path(os.environ.get("TMPDIR") or tempfile.gettempdir()) / "probe-at16-b2-node.log"
+        dump.write_text((proc.stdout or "") + "\n---STDERR---\n" + (proc.stderr or ""), encoding="utf-8")
+        print(f"     [node 全文] {dump}")
     check("⑤ 前端探针全绿（布局 + 透传 + 历史降级 + 真产出渲染）", proc.returncode == 0, tail[-600:] or (proc.stderr or "")[-400:])
     for line in (proc.stdout or "").splitlines():
         if line.strip().startswith("[PASS]") and ("[D]" in line or "probe-at16-b2" in line):

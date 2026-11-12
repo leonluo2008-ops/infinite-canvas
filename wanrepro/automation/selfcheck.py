@@ -59,29 +59,75 @@ HOW_RECONFIRM = ("点「退回置换」后重新确认置换：发号按清单�
 HOW_ACK = ("点「退回置换」回到待置换区：给这些行传图，或逐行勾上「知道，按原样」（按原片沿用），再确认置换")
 HOW_GROUP = ("在待置换区该组组卡上传区「重传（覆盖）」统一成同一张图（组内行全组联动）；"
              "同号不同 URL 就把多余那张点「清空」按原片沿用，再确认置换")
-HOW_GATE = ("点详情底部「重试」重跑拆解与渲染（门禁按重拆结果重算）；"
-            "重拆轮次用尽仍缺项 → 按缺项补齐素材/意图后重跑")
+HOW_GATE = ("点详情底部「重试」重跑拆解与渲染（自动检查按重跑结果重算）；"
+            "重跑也补不上 → 按上面点到的位置补素材或意图，再重跑一次")
 
 ORDER_KIND_WORD = {
-    "发号": "发号不连续",
-    "正文号": "提示词里的图号和清单对不上",
+    "发号": "图号跳号了",
+    "正文号": "提示词里的 @图片N 和清单对不上",
     "提交条数": "提交的图数和该发的图数不一致",
     "组内多提交": "同一组多提交了一张",
-    "次序错位": "提交次序和行对不上",
+    "次序错位": "提交的顺序和行对不上",
     "提交图不符": "提交的图不属于那一行",
 }
 
 
 def _how_prompt_word(bridge_id: str) -> str:
-    """② 残留在提示词正文里 → 只能改清单「用我的描述」列（描述文字的唯一人改入口）后重渲染。"""
-    return ("点「退回置换」回到待置换区，在清单 analysis/reverse/{b}/{n} 这些行的"
-            "「用我的描述」列改写（删掉原物词），再确认置换重渲染（提示词按清单重出）"
-            ).format(b=bridge_id or "&lt;桥id&gt;", n=replace.LIST_NAME)
+    """② 残留在提示词正文里 → 回资产置换区改这一行的描述（删掉原物词）后重渲染。
+
+    文案口径（AT-22 E2 §6）：只写页面里真有的入口名，不写磁盘路径/清单列名——`analysis/reverse/…`
+    这类路径已按 E2 从可见区剔除（探针 probe_at16_b2 ② 反编造 + probe_at22_e2 禁用词双向把关）。
+    """
+    return ("点「退回置换」回到资产置换区，找到这一行改这一行的描述（删掉原物词），"
+            "再确认置换重渲染（提示词按清单重出）")
 
 
-def _finding(kind: str, text: str, row: int | None = None, no: int | None = None) -> dict:
-    """一条检查器发现：文字=证据原文（与旧格式逐字一致），行号/图号=人话用的动态数字。"""
-    return {"类型": kind, "文字": text, "行号": row, "图号": no}
+# ---------------------------------------------------------------- finding v2（AT-22 E2）
+#
+# 病根（E2 §1.1）：同一条命中句在屏幕上出现 4 次（结论人话 → 原因 → 发现 → 证据），行号/图号
+# 各重复 2-3 遍，且 4 次都是字段值（`#6`／`图1`／`词表`）而不是话。
+#
+# 做法：生产者把**给人看的那一份**结构化，前端只按槽位渲染（红线 25：不解析证据字符串）。
+#   · `文字`／`证据` 内容一个字节都不改 —— 历史探针（probe_at9/at15_r2/at16_b1b）与排障锚点
+#     都挂在它们上面；v2 只是**追加**字段。
+#   · `原文` 与 `文字` 同值（检查器原句），是 v2 的显式键（新探针断言改查它，不再猜）。
+#   · `说明.原因` v2 起不产出 —— `原因=_evidence(problems)` 等于 `发现` 的拼接，最大重复源。
+#   · 无行号的整体问题（如「提交张数不对」）不带 `行号`，位置段由前端按「这次整体」变体渲染。
+#
+# 一个 finding 一个词（与 E4「保留这个词」逐词粒度对齐）；同一句的多条由**渲染层**按
+# `行号+句序` 分组并成一张卡（分组键是结构化字段，前端不解析文字）。
+
+# 项显示名（E2 §2）：契约键 `项` 保持不变（探针/前端识别用），另给一行人能读的名字。
+ITEM_DISPLAY = {
+    "次序对账": "图号与提交次序",
+    "绑图行残留": "提示词里的老词",
+    "锁点对账": "该换的没换",
+    "组绑定一致性": "合并组的图是否一致",
+    "拆解门禁": "拆解产物检查",
+}
+
+# 图号 → 「你传的××图」（E2 §2）：按该图号主行的类别取词；主行类别不在表里 → 「你传的图」。
+KIND_WORD = {"主体": "产品图", "人物": "人物图", "道具": "道具图", "服装": "服装图",
+             "场景": "场景图", "品牌视觉": "品牌图"}
+
+# 透出给前端的 v2 字段（真值才带；None/空串/空列表/空对象不落盘，前端按缺省降级）。
+SHOWN_V2_KEYS = ("行称呼", "类别", "组", "图称呼", "图引用", "词", "句序",
+                 "上下文", "片段", "原文", "人话", "可修")
+
+
+def _finding(kind: str, text: str, row: int | None = None, no: int | None = None, **v2) -> dict:
+    """一条检查器发现：`文字`=证据原文（与旧格式逐字一致），其余是 v2 结构化槽位。
+
+    `原文` 恒等于 `文字`（同一条检查器原句的显式键）；v2 槽位传进来是空值就不落键——
+    前端只看「键在不在」，不猜空字符串是什么意思。
+    """
+    finding: dict = {"类型": kind, "文字": text, "行号": row, "图号": no}
+    if text:
+        finding["原文"] = text
+    for key, value in v2.items():
+        if key in SHOWN_V2_KEYS and value not in (None, "", [], {}):
+            finding[key] = value
+    return finding
 
 
 def _evidence(findings: list[dict]) -> str:
@@ -89,7 +135,7 @@ def _evidence(findings: list[dict]) -> str:
 
 
 def _shown(findings: list[dict]) -> list[dict]:
-    """透出给前端的结构化发现：行号/图号只带真值（None 不出现）。"""
+    """透出给前端的结构化发现：行号/图号只带真值（None 不出现），v2 槽位真值才带。"""
     shown: list[dict] = []
     for f in findings:
         row: dict = {"文字": str(f["文字"])}
@@ -97,20 +143,34 @@ def _shown(findings: list[dict]) -> list[dict]:
             row["行号"] = int(f["行号"])
         if f.get("图号"):
             row["图号"] = int(f["图号"])
+        for key in SHOWN_V2_KEYS:
+            value = f.get(key)
+            if value not in (None, "", [], {}):
+                row[key] = value
         shown.append(row)
     return shown
 
 
-def _say(结论人话: str, 原因: str = "", 处理: str = "", findings: list[dict] | None = None) -> dict:
-    """「说明」对象：结论人话（一行）/原因/怎么处理/结构化发现——前端逐字渲染，不重判。"""
+def _say(结论人话: str, 处理: str = "", findings: list[dict] | None = None,
+         统计: dict | None = None, 清单行: dict | None = None,
+         原句: dict | None = None) -> dict:
+    """「说明」对象：结论人话（一行）/怎么处理/结构化发现/折叠区数据——前端逐字渲染，不重判。
+
+    v2 起**不写 `原因`**（= 发现的拼接，最大重复源，E2 §2）；`统计`／`清单行`／`原句` 只喂折叠区
+    「展开看证据（内部明细）」，可见区一个数字统计都不许出现（E2 硬规则 3）。
+    """
     said: dict = {"结论人话": 结论人话}
-    if 原因:
-        said["原因"] = 原因
     if 处理:
         said["处理"] = 处理
     shown = _shown(findings or [])
     if shown:
         said["发现"] = shown
+    if 统计:
+        said["统计"] = 统计
+    if 清单行:
+        said["清单行"] = 清单行
+    if 原句:
+        said["原句"] = 原句
     return said
 
 
@@ -124,6 +184,219 @@ def _load_render():
     return module
 
 
+# ---------------------------------------------------------------- 位置段素材（v2 槽位数据源）
+
+
+def _short_names(bridge_id: str, rows: list[dict]) -> dict[int, str]:
+    """{清单行号: 人话短名}——与资产置换卡的 `短名` 一字不差（cards.short_names 同源）。
+
+    短名起不出来（拆解.md 缺、侧车坏、旧任务）一律 {}：位置段降级「类别」→「第 N 行」，
+    自检**不许**因为「起不出名字」而报错或漏报（E2 §11 风险表第一行）。
+    """
+    if not bridge_id or not rows:
+        return {}
+    try:
+        from . import cards
+        layers = cards._split(cards._summary_markdown(bridge_id))
+        if not layers:
+            return {}
+        spans, _note = cards.load_spans(bridge_id)
+        twins = {int(no): (payload.get("同实体疑似") or []) for no, payload in spans.items()}
+        positions = {int(no): payload.get("画面位置") for no, payload in spans.items()}
+        names = cards.short_names(rows, layers, twins, positions)
+        return {int(no): str(name) for no, name in names.items() if name}
+    except Exception:                             # noqa: BLE001 —— 短名是锦上添花，不许拖垮自检
+        return {}
+
+
+def _kind_word(kind: str) -> str:
+    for prefix, word in KIND_WORD.items():
+        if kind.startswith(prefix):
+            return word
+    return "图"
+
+
+def _row_labels(rows: list[dict], ents, groups: list[list[int]] | None,
+                names: dict[int, str]) -> dict[int, dict]:
+    """行号 → v2 位置段素材：行称呼 / 类别 / 组 / 图号 / 图称呼 / 图引用。
+
+    「图称呼」按该图号**主行**（同号行号最小者，与发号口径一致）的类别取词；
+    主行类别不认识 → 「你传的图」。图引用 = 该行清单「资产图」首串（原样，local:… 或 https:…）。
+    """
+    cat_of: dict[int, str] = {}
+    for row in rows or []:
+        try:
+            cat_of[int(row["no"])] = str(row.get("cat") or "")
+        except (KeyError, TypeError, ValueError):
+            continue
+    no_of: dict[int, int] = {}
+    ref_of: dict[int, str] = {}
+    for ent in ents or []:
+        try:
+            row_no, no = int(getattr(ent, "row_no", 0) or 0), int(getattr(ent, "no", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        if not row_no:
+            continue
+        if no:
+            no_of[row_no] = no
+        urls = [u.strip() for u in re.split(r"[,，]", str(getattr(ent, "image", "") or "")) if u.strip()]
+        if urls:
+            ref_of.setdefault(row_no, urls[0])
+        if not cat_of.get(row_no):
+            cat_of[row_no] = str(getattr(ent, "kind", "") or "")
+    group_of: dict[int, list[int]] = {}
+    for group in groups or []:
+        members = sorted({int(n) for n in group})
+        for n in members:
+            group_of[n] = members
+    rows_by_no: dict[int, list[int]] = {}
+    for row_no, no in no_of.items():
+        rows_by_no.setdefault(no, []).append(row_no)
+    labels: dict[int, dict] = {}
+    for row_no in sorted(set(cat_of) | set(no_of)):
+        label: dict = {}
+        name = names.get(row_no) or ""
+        if name:
+            label["行称呼"] = name
+        kind = cat_of.get(row_no) or ""
+        if kind:
+            label["类别"] = kind
+        members = group_of.get(row_no)
+        if members and len(members) > 1:
+            label["组"] = members
+        no = no_of.get(row_no)
+        if no:
+            label["图号"] = no
+            main_kind = cat_of.get(min(rows_by_no.get(no) or [row_no]), "")
+            label["图称呼"] = "你传的" + _kind_word(main_kind)
+        ref = ref_of.get(row_no)
+        if ref:
+            label["图引用"] = ref
+        labels[row_no] = label
+    return labels
+
+
+def _v2_of(labels: dict[int, dict], row_no: int | None, **extra) -> dict:
+    """取该行的 v2 槽位（图号另走 `no=` 参数，避免与 _finding 的位置参数撞名）。"""
+    out = {k: v for k, v in (labels.get(row_no) or {}).items() if k != "图号"}
+    out.update({k: v for k, v in extra.items() if v not in (None, "", [], {})})
+    return out
+
+
+def _row_phrase(row_no: int | None, labels: dict[int, dict]) -> str:
+    """「第 6 行「道具B」」；行称呼/类别都缺 → 「第 6 行」；无行号 → 空串（调用方用整体变体）。"""
+    if not row_no:
+        return ""
+    label = labels.get(int(row_no)) or {}
+    name = label.get("行称呼") or label.get("类别") or ""
+    return f"第 {int(row_no)} 行「{name}」" if name else f"第 {int(row_no)} 行"
+
+
+def _rows_phrase(row_nos: list[int], labels: dict[int, dict]) -> str:
+    """「第 1、5、6 行」；这些行短名一致 → 带上「道具B」（不再逐行重复同一个名字）。"""
+    rows = sorted({int(n) for n in row_nos if n})
+    if not rows:
+        return "这次整体"
+    names = {(labels.get(r) or {}).get("行称呼") or (labels.get(r) or {}).get("类别") or "" for r in rows}
+    joined = f"第 {'、'.join(str(r) for r in rows)} 行"
+    if len(names) == 1 and names.pop():
+        return f"{joined}「{(labels.get(rows[0]) or {}).get('行称呼') or (labels.get(rows[0]) or {}).get('类别')}」"
+    return joined
+
+
+# ---------------------------------------------------------------- 切句（命中段/上下文/片段）
+
+
+def _sentence_spans(body: str) -> list[tuple[int, int]]:
+    """正文切句：`。！？；` 与换行都是边界；空白段不进表（句序只在有内容的句子上编号）。"""
+    spans: list[tuple[int, int]] = []
+    start = 0
+    for index, ch in enumerate(body):
+        if ch in "。！？；\n":
+            if body[start:index].strip():
+                spans.append((start, index + 1))
+            start = index + 1
+    if body[start:].strip():
+        spans.append((start, len(body)))
+    return spans
+
+
+def _sentence_at(body: str, spans: list[tuple[int, int]], offset: int) -> tuple[int, str]:
+    """命中偏移 → (句序 1 起, 命中句原文)。偏移落在句间空白 → (0, "")，调用方按无句处理。"""
+    for index, (start, end) in enumerate(spans, 1):
+        if start <= offset < end:
+            return index, body[start:end].strip()
+    return 0, ""
+
+
+def _sentence_block(body: str, spans: list[tuple[int, int]], finding: dict) -> dict:
+    """折叠区「提示词里的原句」：命中句所在整段（前后各带 1 句）+ 句序/行号；无句序 → {}。"""
+    try:
+        index = int(finding.get("句序") or 0)
+    except (TypeError, ValueError):
+        return {}
+    if index <= 0 or index > len(spans):
+        return {}
+    lo, hi = max(0, index - 2), min(len(spans), index + 1)
+    block = {"句序": index, "段": "".join(body[s:e] for s, e in spans[lo:hi]).strip()}
+    if finding.get("行号"):
+        block["行号"] = int(finding["行号"])
+    return block
+
+
+def _segments(sentence: str, words: list[str]) -> list[dict]:
+    """同一句的分段高亮：每段带 `起`/`止`（在 `上下文` 里的字符偏移），前端只按偏移上色。
+
+    重叠词（「下角入」/「角入画」互为子串且同区间）在**数据层不并词**（E4 要逐词保留），
+    渲染层按偏移并集叠高亮即可——所以这里给出区间，而不是拼好的一整串。
+    """
+    ranges: list[tuple[int, int]] = []
+    for word in words:
+        for match in re.finditer(re.escape(word), sentence):
+            ranges.append((match.start(), match.end()))
+    ranges.sort()
+    merged: list[tuple[int, int]] = []
+    for start, end in ranges:
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    out: list[dict] = []
+    pos = 0
+    for start, end in merged:
+        if start > pos:
+            out.append({"文": sentence[pos:start], "起": pos, "止": start, "高亮": False})
+        out.append({"文": sentence[start:end], "起": start, "止": end, "高亮": True})
+        pos = end
+    if pos < len(sentence):
+        out.append({"文": sentence[pos:], "起": pos, "止": len(sentence), "高亮": False})
+    return out
+
+
+def _checklist_lines(ck_path: Path) -> dict[int, str]:
+    """清单行原文（折叠区「这一行的清单原文」块）：首格是行号的表格行，读不出 → {}。"""
+    try:
+        text = Path(ck_path).read_text(encoding="utf-8-sig")
+    except OSError:
+        return {}
+    out: dict[int, str] = {}
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line.startswith("|"):
+            continue
+        cells = [cell.strip() for cell in line.strip("|").split("|")]
+        if cells and cells[0].isdigit():
+            out[int(cells[0])] = line
+    return out
+
+
+def _lines_block(rows_wanted: list[int], lines: dict[int, str]) -> dict:
+    """折叠区「这一行的清单原文」：{行号: 整行 md 原文}（只收真行；读不出就不给这块）。"""
+    out = {str(int(n)): lines[int(n)] for n in sorted({int(n) for n in rows_wanted if n}) if int(n) in lines}
+    return out
+
+
 def run_selfcheck(task_dir: Path) -> list[dict]:
     """渲染完成后调用：三项检查 → 落盘 自检.json → 返回条目（get_task 原样透出）。"""
     try:
@@ -131,8 +404,8 @@ def run_selfcheck(task_dir: Path) -> list[dict]:
     except Exception as e:  # noqa: BLE001 —— 检查器异常也如实落盘（FAIL），不打断渲染主链
         detail = f"自检器异常（渲染主链不受影响）: {e}；{''.join(traceback.format_exc().splitlines()[-2:])}"
         items = [{"项": "自检执行", "结论": FAIL, "证据": detail,
+                  "项显示名": "自检本身",
                   "说明": _say("自检没跑起来（检查器自己异常了）：这次的图没有机械核对过，别当已通过",
-                              原因=detail,
                               处理="点详情底部「重试」重跑拆解与渲染让自检重跑；重复出现就把这条证据发给开发")}]
     path = task_dir / SELFCHECK_NAME
     tmp = path.with_suffix(".json.tmp")
@@ -164,7 +437,29 @@ def load_selfcheck(task_dir: Path) -> list[dict] | None:
     return items
 
 
-# ---------------------------------------------------------------- 拆解门禁汇总（AT-15 R2）
+# 门禁缺项/告警 → 人话（E2 §6 对照表）：只换**已知的两条**检查项说法，其余保留原文去掉代号前缀。
+GATE_WORDS = (
+    (r"^主列表行缺画面位置[：:]\s*第\s*(\d+)\s*行.*?判定\s*(\d+)\s*行\s*/\s*共\s*(\d+)\s*行",
+     "第 {0} 行没标出画面位置（{2} 行里只标了 {1} 行）"),
+    (r"^主列表行缺自身框[：:]\s*第\s*(\d+)\s*行.*", "第 {0} 行的定位框没生成（画面位置没指向代表帧或超出九宫格）"),
+)
+GATE_CODE_PREFIX = re.compile(r"^[A-Z]\d+\s+[^：:]{1,20}[：:]\s*")
+
+
+def _gate_finding(text: str, kind: str) -> dict:
+    """门禁一条缺项/告警 → 一条结构化发现：`人话` 给人看，`原文` 是检查器原句（折叠区用）。"""
+    raw = str(text or "").strip()
+    body = GATE_CODE_PREFIX.sub("", raw)
+    human = ""
+    for pattern, template in GATE_WORDS:
+        match = re.search(pattern, body)
+        if match:
+            human = template.format(*[g or "" for g in match.groups()])
+            break
+    if not human:
+        human = body
+    return _finding(kind, f"{kind}：{raw}", row=None, no=None, 人话=human)
+
 
 GATE_ITEM_NAME = "拆解门禁"          # 前端按 项==GATE_ITEM_NAME 识别并单独渲染红/绿条
 
@@ -183,11 +478,13 @@ def load_gate_item(task_dir: Path) -> dict | None:
 
     结论三态沿用门禁自己的 verdict（PASS/WARN/FAIL）；证据第一行是摘要（状态/绿项数/
     重拆轮次），缺项与告警逐条排在后面——前端只渲染，不解释（红线 25：渲染承接既有自检位）。
+    根走 `replace.analysis_root()`（认 WANREPRO_ANALYSIS_ROOT）：与清单同一真源，隔离探针
+    才不会「读 A 写 B」。
     """
     bridge_id = _gate_bridge_id(task_dir)
     if not bridge_id:
         return None
-    gate_path = ROOT / "analysis" / "reverse" / bridge_id / "门禁.json"
+    gate_path = replace.analysis_root() / bridge_id / "门禁.json"
     if not gate_path.is_file():
         return None
     try:
@@ -195,10 +492,9 @@ def load_gate_item(task_dir: Path) -> dict | None:
     except (OSError, json.JSONDecodeError):
         gate = None
     if not isinstance(gate, dict):
-        return {"项": GATE_ITEM_NAME, "结论": FAIL,
+        return {"项": GATE_ITEM_NAME, "结论": FAIL, "项显示名": ITEM_DISPLAY[GATE_ITEM_NAME],
                 "证据": "门禁.json 读不出（拆解产物门禁留痕损坏）——如实标红，重跑拆解可重建",
                 "说明": _say("拆解产物的门禁留痕读不出来（文件损坏），这次拆解有没有过门禁无据可查",
-                            原因="门禁.json 读不出（拆解产物门禁留痕损坏）",
                             处理=HOW_GATE)}
     result = gate.get("结果") if isinstance(gate.get("结果"), dict) else {}
     verdict = str(result.get("verdict") or "").strip().upper()
@@ -216,18 +512,21 @@ def load_gate_item(task_dir: Path) -> dict | None:
              f"｜缺项 {len(missing)}｜告警 {len(warns)}｜重拆 {rounds}/{limit}"]
     lines += [f"❌ {item}" for item in missing]
     lines += [f"⚠ {item}" for item in warns]
-    # 人话（AT-16 B2）：结论人话/原因/怎么处理与证据同一份数据（状态/绿项/缺项/告警/轮次）。
+    # 人话（AT-16 B2 → AT-22 E2 重构）：结论人话只说「几项没过、下一步点哪」，统计进折叠区；
+    # 缺项/告警逐条人话化（去 `D2 画面位置：` 这类代号开头的写法），检查器原句留在 `原文`。
+    stats = {"通过": passed, "没通过": len(missing), "提醒": len(warns),
+             "已重拆": rounds, "上限": limit, "共检查": total}
+    found = [_gate_finding(item, "缺项") for item in missing] + [_gate_finding(item, "告警") for item in warns]
     if verdict == PASS:
-        说明 = _say(f"拆解产物的机械门禁过了：绿项 {passed}/{total}、无缺项、无告警（重拆 {rounds}/{limit}）",
-                    处理="无需处理")
+        说明 = _say("拆解产物的检查都过了，没有要补的东西", 处理="无需处理", 统计=stats)
     else:
-        verdict_word = "只出了告警" if verdict == WARN else "没通过"
-        说明 = _say(f"拆解产物的机械门禁{verdict_word}：绿项 {passed}/{total}、缺项 {len(missing)}、"
-                    f"告警 {len(warns)}（重拆 {rounds}/{limit}）",
-                    原因="；".join([f"缺项：{x}" for x in missing] + [f"告警：{x}" for x in warns]) or lines[0],
-                    处理=HOW_GATE,
-                    findings=[{"文字": f"缺项：{x}"} for x in missing] + [{"文字": f"告警：{x}"} for x in warns])
-    return {"项": GATE_ITEM_NAME, "结论": verdict, "证据": "\n".join(lines), "说明": 说明}
+        if verdict == WARN:
+            head = f"拆解只出了 {len(warns)} 条提醒，不挡后面的流程"
+        else:
+            head = f"拆解没通过 {len(missing)} 项自动检查，可以先点「重试」重跑拆解"
+        说明 = _say(head, 处理=HOW_GATE, findings=found, 统计=stats)
+    return {"项": GATE_ITEM_NAME, "结论": verdict, "证据": "\n".join(lines),
+            "项显示名": ITEM_DISPLAY[GATE_ITEM_NAME], "说明": 说明}
 
 
 # ---------------------------------------------------------------- 三项
@@ -235,7 +534,7 @@ def load_gate_item(task_dir: Path) -> dict | None:
 def _check_all(task_dir: Path) -> list[dict]:
     task = state.load(task_dir)
     bridge_id = str(task.get("bridge_id") or "")
-    ck_path = ROOT / "analysis" / "reverse" / bridge_id / replace.LIST_NAME
+    ck_path = replace.analysis_root() / bridge_id / replace.LIST_NAME      # 同一真源（认 WANREPRO_ANALYSIS_ROOT）
     if not ck_path.is_file():
         raise FileNotFoundError(f"找不到清单 {ck_path}（自检以清单为行号真源）")
     checklist_md = ck_path.read_text(encoding="utf-8-sig")
@@ -260,11 +559,15 @@ def _check_all(task_dir: Path) -> list[dict]:
     empty_confirm = bool(task.get("empty_confirm"))
 
     body = _prompt_body(prompt)
+    # v2 位置段素材（AT-22 E2）：短名/类别/组/图号/图称呼/图引用 + 清单行原文。
+    # 起不出来一律降级为空（不阻断自检），只影响位置段详细程度。
+    labels = _row_labels(rows, ents, groups, _short_names(bridge_id, rows))
+    lines = _checklist_lines(ck_path)
     return [
-        _check_order(body, ents, row_to_no, submitted, ck_path, groups),
-        _check_residue(body, ents, render, bridge_id),
-        _check_lock(rows, must_rows, submitted, ack_rows, empty_confirm, ko_rows, groups),
-        _check_groups(ents, row_to_no, submitted, groups),
+        _check_order(body, ents, row_to_no, submitted, ck_path, groups, labels, lines),
+        _check_residue(body, ents, render, bridge_id, labels, lines),
+        _check_lock(rows, must_rows, submitted, ack_rows, empty_confirm, ko_rows, groups, labels, lines),
+        _check_groups(ents, row_to_no, submitted, groups, labels, lines),
     ]
 
 
@@ -290,26 +593,37 @@ def _prompt_body(prompt: str) -> str:
 
 def _check_order(body: str, ents, row_to_no: dict[int, int],
                  submitted: list[tuple[int, str]], ck_path: Path,
-                 groups: list[list[int]] | None = None) -> dict:
+                 groups: list[list[int]] | None = None,
+                 labels: dict[int, dict] | None = None,
+                 lines: dict[int, str] | None = None) -> dict:
     """① 次序对账：行号→图号（assign_numbers 同源重算，组内 N 行共用 1 图号——AT-11 B1）
     → 提交次序（确认快照列表序=提交序，确认时已按组去重）。"""
     groups = groups or []
+    labels = labels or {}
+    lines = lines or {}
     refs = sorted({int(n) for n in re.findall(r"@图片(\d+)", body)})
     url_by_row = {int(e.row_no): [u.strip() for u in re.split(r"[,，]", e.image) if u.strip()]
                   for e in ents if e.image}
+    stats = {"要发张数": len(set(row_to_no.values())), "提交张数": len(submitted),
+             "正文图号": refs, "行→图号": {str(k): v for k, v in sorted(row_to_no.items())},
+             "确认组": groups}
     if not row_to_no and not refs and not submitted:
-        return {"项": "次序对账", "结论": PASS, "证据": "全沿用/无图：清单无绑图行、正文无 @图片N、提交快照为空——三方一致",
+        return {"项": "次序对账", "结论": PASS, "项显示名": ITEM_DISPLAY["次序对账"],
+                "证据": "全沿用/无图：清单无绑图行、正文无 @图片N、提交快照为空——三方一致",
                 "说明": _say("全沿用、没换图：清单没有绑图行、正文没有 @图片N、提交快照为空——三方一致",
-                            处理="无需处理")}
+                            处理="无需处理", 统计=stats)}
     problems: list[dict] = []                       # 同一份发现：文字→证据原文，行号/图号→人话
     nums = sorted(set(row_to_no.values()))          # 唯一图号集合（组内多行同号算一个）
     if nums != list(range(1, len(nums) + 1)):
-        problems.append(_finding("发号", f"发号不连续: row→图号={row_to_no}"))
+        problems.append(_finding("发号", f"发号不连续: row→图号={row_to_no}",
+                                 人话="图号没从 1 开始连着排（中间跳号了）"))
     if refs != nums:
-        problems.append(_finding("正文号", f"正文图号 {refs} ≠ 应发号 {nums}"))
+        problems.append(_finding("正文号", f"正文图号 {refs} ≠ 应发号 {nums}",
+                                 人话="提示词里写的 @图片N 和清单该发的图号对不上"))
     if len(submitted) != len(nums):
         problems.append(_finding("提交条数",
-                                 f"提交快照 {len(submitted)} 条 ≠ 发图单位 {len(nums)} 个（组内多行应只提交一条）"))
+                                 f"提交快照 {len(submitted)} 条 ≠ 发图单位 {len(nums)} 个（组内多行应只提交一条）",
+                                 人话=f"该发 {len(nums)} 张，实际提交了 {len(submitted)} 张"))
     else:
         seen_units: set[tuple] = set()
         for i, (no, url) in enumerate(submitted, 1):
@@ -317,21 +631,27 @@ def _check_order(body: str, ents, row_to_no: dict[int, int],
             if unit in seen_units:
                 problems.append(_finding("组内多提交",
                                          f"提交第 {i} 张来自行 {no}，但该行所在单位已有提交（组内多行多提交）",
-                                         row=no, no=i))
+                                         row=no, no=i,
+                                         **_v2_of(labels, no, 人话="这一行所在的组已经交过一张了，这里又交了一张")))
             seen_units.add(unit)
             if row_to_no.get(no) != i:
                 problems.append(_finding("次序错位",
                                          f"提交第 {i} 张来自行 {no}，但发号映射给该行的是图{row_to_no.get(no)}（应为图{i}）",
-                                         row=no, no=row_to_no.get(no)))
+                                         row=no, no=row_to_no.get(no),
+                                         **_v2_of(labels, no,
+                                                  人话=f"这一行该排在第 {row_to_no.get(no)} 张提交，实际排在第 {i} 张")))
             if url and url not in url_by_row.get(no, []):
                 problems.append(_finding("提交图不符",
                                          f"提交第 {i} 张 URL 不在清单第 {no} 行绑图里: {url[:60]}",
-                                         row=no, no=i))
+                                         row=no, no=i,
+                                         **_v2_of(labels, no, 人话="提交的这张图不在这一行的清单绑图里")))
     ev = (f"行→图号={row_to_no}；正文@图片N={refs}；提交次序={[no for no, _ in submitted]}"
           f"（清单 {ck_path.parent.name}）")
     if not problems:
-        return {"项": "次序对账", "结论": PASS, "证据": "三方映射一致：" + ev,
-                "说明": _say("发号、提示词里的 @图片N、提交次序三方对得上，没有错位的图", 处理="无需处理")}
+        return {"项": "次序对账", "结论": PASS, "项显示名": ITEM_DISPLAY["次序对账"],
+                "证据": "三方映射一致：" + ev,
+                "说明": _say("发号、提示词里的 @图片N、提交次序三方对得上，没有错位的图",
+                            处理="无需处理", 统计=stats)}
     kinds = {p["类型"] for p in problems}
     words = list(dict.fromkeys(ORDER_KIND_WORD[k] for k in (p["类型"] for p in problems) if k in ORDER_KIND_WORD))
     how: list[str] = []
@@ -339,12 +659,19 @@ def _check_order(body: str, ents, row_to_no: dict[int, int],
         how.append(HOW_RECONFIRM)
     if kinds & {"提交条数", "组内多提交", "次序错位", "提交图不符"}:
         how.append(HOW_REBIND)
-    return {"项": "次序对账", "结论": FAIL,
+    if kinds == {"提交条数"}:
+        # E2 §7 样例 3：一眼能指出「一张图都没提交」，而不是「对不上：1 处」
+        head = f"你确认置换时提交了 {len(submitted)} 张图，这次要发 {len(nums)} 张"
+        grouped = [n for n in nums if len([r for r, v in row_to_no.items() if v == n]) > 1]
+        if grouped:
+            members = [r for r in row_to_no if row_to_no[r] == grouped[0]]
+            head += f"（{_rows_phrase(members, labels)}合并成一张）"
+    else:
+        head = f"发的图和提交的图没对上：{len(problems)} 处——" + "、".join(words or ["对不上号"])
+    return {"项": "次序对账", "结论": FAIL, "项显示名": ITEM_DISPLAY["次序对账"],
             "证据": _evidence(problems) + "｜" + ev,
-            "说明": _say(f"发的图和提交的图没对上：{len(problems)} 处——" + "、".join(words or ["对不上号"]),
-                        原因=_evidence(problems),
-                        处理="；".join(how) or HOW_RECONFIRM,
-                        findings=problems)}
+            "说明": _say(head, 处理="；".join(how) or HOW_RECONFIRM, findings=problems,
+                        统计=stats, 清单行=_lines_block([p.get("行号") for p in problems], lines))}
 
 
 def _own_label_line(line: str, names: set[str]) -> bool:
@@ -363,7 +690,9 @@ def _own_label_line(line: str, names: set[str]) -> bool:
     return False
 
 
-def _check_residue(body: str, ents, render, bridge_id: str = "") -> dict:
+def _check_residue(body: str, ents, render, bridge_id: str = "",
+                   labels: dict[int, dict] | None = None,
+                   lines: dict[int, str] | None = None) -> dict:
     """② 绑图行残留：已传图行的原物核心词（实体名+特征词）零残留（词表=strip_core_residue 同源）。
 
     词表只收 ≥3 字的组：2 字组（香水/黑色这类品类与颜色词）不是特征词——我们的产品
@@ -373,11 +702,17 @@ def _check_residue(body: str, ents, render, bridge_id: str = "") -> dict:
     不建表），匹配时跳过实体自身标签行——五类源结构的误报由此清零（66 任务实测 19→1，
     剩余 1 条「品类泛化词撞拍摄手法句」靠 E4 用户白名单兜底）。**删词不跳行**：混合名里的
     实物词照旧参与判定，「入画式香水瓶」仍拦。
+
+    AT-22 E2（呈现）：每条命中带 v2 槽位——词/句序/上下文/片段（同句多词在渲染层并成一张卡）、
+    行称呼/图称呼/图引用（位置段与缩略图）、可修（E3 的动作声明）；`文字` 仍是检查器原句，`证据` 不变。
     """
+    labels = labels or {}
+    lines = lines or {}
     bound = [e for e in ents
              if not e.kind.startswith("品牌视觉") and e.no and e.has_asset_image]
     names = {e.name for e in bound if e.name}
     starts = [0] + [m.end() for m in re.finditer(r"\n", body)]
+    sent_spans = _sentence_spans(body)
 
     def line_at(offset: int) -> str:
         idx = bisect_right(starts, offset) - 1
@@ -394,29 +729,43 @@ def _check_residue(body: str, ents, render, bridge_id: str = "") -> dict:
                 if _own_label_line(line_at(m.start()), names):
                     continue                    # 自指标签行不算残留证据，继续找后续真正文位置
                 left = max(0, m.start() - 10)
+                order_no, sentence = _sentence_at(body, sent_spans, m.start())
                 hits.append(_finding("残留",
                                      f"#{e.row_no} 的「{w}」残留于正文: …{body[left:m.end() + 10]}…",
-                                     row=e.row_no, no=e.no))
+                                     row=e.row_no, no=e.no,
+                                     **_v2_of(labels, e.row_no, 词=w, 句序=order_no or None,
+                                              上下文=sentence or None,
+                                              片段=_segments(sentence, [w]) if sentence else None,
+                                              可修={"类型": "改描述"})))
                 break
     ev = f"已传图行词表 {len(scanned)} 行（{'、'.join(scanned) or '无'}），正文 {len(body)} 字"
+    stats = {"词表行数": len(scanned), "正文字数": len(body),
+             "行→图号": {str(e.row_no): int(e.no) for e in bound if e.no}}
     if not hits:
-        return {"项": "绑图行残留", "结论": PASS, "证据": "零残留｜" + ev,
-                "说明": _say("已传图的每一行，原物的名字和特征词都没残留在提示词正文里", 处理="无需处理")}
+        return {"项": "绑图行残留", "结论": PASS, "项显示名": ITEM_DISPLAY["绑图行残留"],
+                "证据": "零残留｜" + ev,
+                "说明": _say("已传图的每一行，原物的名字和特征词都没残留在提示词正文里",
+                            处理="无需处理", 统计=stats)}
     shown = "；".join(str(h["文字"]) for h in hits[:5])
     rows = list(dict.fromkeys(h["行号"] for h in hits if h.get("行号")))
-    return {"项": "绑图行残留", "结论": FAIL,
+    stats["词数"] = len(hits)
+    stats["句数"] = len({(h.get("行号"), h.get("句序")) for h in hits})
+    head = (f"提示词里还留着 {len(hits)} 个要换掉的原物词，都在{_row_phrase(rows[0], labels)}里"
+            if len(rows) == 1 else
+            f"提示词里还留着 {len(hits)} 个要换掉的原物词，分别在{_rows_phrase(rows, labels)}")
+    return {"项": "绑图行残留", "结论": FAIL, "项显示名": ITEM_DISPLAY["绑图行残留"],
             "证据": shown + ("…" if len(hits) > 5 else "") + "｜" + ev,
-            "说明": _say("提示词正文还留着我方要换掉的原物描述词："
-                         f"{len(hits)} 处（涉及行 {'、'.join(f'#{r}' for r in rows) or '未知'}）",
-                        原因=shown + ("…" if len(hits) > 5 else ""),
-                        处理=_how_prompt_word(bridge_id),
-                        findings=hits)}
+            "说明": _say(head, 处理=_how_prompt_word(bridge_id), findings=hits, 统计=stats,
+                        清单行=_lines_block(rows, lines),
+                        原句=_sentence_block(body, sent_spans, hits[0]))}
 
 
 def _check_lock(rows: list[dict], must_rows: list[int],
                 submitted: list[tuple[int, str]], ack_rows: set[int],
                 empty_confirm: bool, ko_rows: set[int] | None = None,
-                groups: list[list[int]] | None = None) -> dict:
+                groups: list[list[int]] | None = None,
+                labels: dict[int, dict] | None = None,
+                lines: dict[int, str] | None = None) -> dict:
     """③ 锁点对账：必换未换集合 == 确认时点『按原样』/『按原片』/empty_confirm 记录（只读快照，不自证）。
 
     AT-11 §四锁点新规则：必换行 ∈ 组且组已传图（整组被那张图换掉）→ 不锁；
@@ -424,6 +773,8 @@ def _check_lock(rows: list[dict], must_rows: list[int],
     """
     ko_rows = ko_rows or set()
     groups = groups or []
+    labels = labels or {}
+    lines = lines or {}
     swapped = {no for no, _ in submitted}
     for group in groups:                        # 组已传图 → 组内所有行视为已换
         if any(no in swapped for no in group):
@@ -435,6 +786,8 @@ def _check_lock(rows: list[dict], must_rows: list[int],
     ghost = sorted((covered & set(must_rows)) - set(unswapped))   # 记录了按原样/按原片但快照里其实换了
     ev = (f"必换={must_rows}；确认快照已传={sorted(swapped)}；未换={unswapped}；"
           f"按原样记录={sorted(ack_rows)}；按原片记录={sorted(ko_rows)}；empty_confirm={empty_confirm}")
+    stats = {"必换行": sorted(must_rows), "已传": sorted(swapped), "未换": unswapped,
+             "按原样记录": sorted(ack_rows), "按原片记录": sorted(ko_rows)}
     problems: list[dict] = []
     if missed:
         problems.append(_finding("锁点缺口",
@@ -443,10 +796,16 @@ def _check_lock(rows: list[dict], must_rows: list[int],
         problems.append(_finding("记录矛盾",
                                  f"行 {ghost} 记了按原样/按原片但确认快照里已传图（记录与快照矛盾）"))
     if not problems:
-        return {"项": "锁点对账", "结论": PASS, "证据": "未换必换行都有确认时点记录｜" + ev,
-                "说明": _say("标了必须换的每一行，要么真换了，要么有『按原样/按原片』的确认记录", 处理="无需处理")}
-    findings = ([_finding("锁点缺口", f"#{n} 标了必须换，但没传图、也没勾按原样", row=n) for n in missed]
-                + [_finding("记录矛盾", f"#{n} 记了按原片/按原样，但提交快照里其实已经传了图", row=n) for n in ghost])
+        return {"项": "锁点对账", "结论": PASS, "项显示名": ITEM_DISPLAY["锁点对账"],
+                "证据": "未换必换行都有确认时点记录｜" + ev,
+                "说明": _say("标了必须换的每一行，要么真换了，要么有「按原样／按原片」的确认记录",
+                            处理="无需处理", 统计=stats)}
+    findings = ([_finding("锁点缺口", f"#{n} 标了必须换，但没传图、也没勾按原样", row=n,
+                          **_v2_of(labels, n, 人话="这一行标了必须换，但没传图、也没勾「按原样」"))
+                 for n in missed]
+                + [_finding("记录矛盾", f"#{n} 记了按原片/按原样，但提交快照里其实已经传了图", row=n,
+                            **_v2_of(labels, n, 人话="这一行记了按原样／按原片，但提交快照里其实已经传了图"))
+                   for n in ghost])
     words = []
     if missed:
         words.append(f"必换行 {'、'.join(f'#{n}' for n in missed)} 没换也没说按原样")
@@ -457,22 +816,30 @@ def _check_lock(rows: list[dict], must_rows: list[int],
         how.append(HOW_ACK)
     if ghost:
         how.append(HOW_RECONFIRM)
-    return {"项": "锁点对账", "结论": FAIL,
+    if missed and not ghost:                       # E2 §7 样例 2：一行说清哪行、什么问题、下一步
+        head = f"{_rows_phrase(missed, labels)}标了必须换，但没传图、也没勾「按原样」"
+    elif ghost:
+        head = f"{_rows_phrase(ghost, labels)}的按原样记录和已传图对不上"
+    else:
+        head = "锁点对不上：" + "；".join(words)
+    return {"项": "锁点对账", "结论": FAIL, "项显示名": ITEM_DISPLAY["锁点对账"],
             "证据": _evidence(problems) + "｜" + ev,
-            "说明": _say("锁点对不上：" + "；".join(words),
-                        原因=_evidence(problems),
-                        处理="；".join(how),
-                        findings=findings)}
+            "说明": _say(head, 处理="；".join(how), findings=findings, 统计=stats,
+                        清单行=_lines_block(missed + ghost, lines))}
 
 
 def _check_groups(ents, row_to_no: dict[int, int],
                   submitted: list[tuple[int, str]],
-                  groups: list[list[int]]) -> dict:
+                  groups: list[list[int]],
+                  labels: dict[int, dict] | None = None,
+                  lines: dict[int, str] | None = None) -> dict:
     """④ 组绑定一致性（AT-11 B1 新增）：组内行图号/URL 必须一致。
 
     同组两 URL → FAIL；同号不同 URL → FAIL。次序对账读新映射后，这里只管「同组绑定
     是否真的归一」：组内 N 行 1 图号 1 URL 才算合并成功。
     """
+    labels = labels or {}
+    lines = lines or {}
     url_by_row: dict[int, list[str]] = {}
     for e in ents:
         urls = [u.strip() for u in re.split(r"[,，]", e.image) if u.strip()]
@@ -483,14 +850,19 @@ def _check_groups(ents, row_to_no: dict[int, int],
         nums = sorted({row_to_no[n] for n in group if row_to_no.get(n)})
         if not nums:
             continue                            # 组内全无图：不占号不提交，合并仍成立（零图分支）
+        members = sorted({int(n) for n in group})
         if len(nums) != 1:
             problems.append(_finding("组多号",
-                                     f"组 {group} 图号不一致: {[{n: row_to_no[n]} for n in group if row_to_no.get(n)]}"))
+                                     f"组 {group} 图号不一致: {[{n: row_to_no[n]} for n in group if row_to_no.get(n)]}",
+                                     row=members[0] if members else None, 组=members,
+                                     人话="这一组几行的图号不一样（本该共用一张图）"))
         urls = sorted({u for n in group for u in url_by_row.get(n, [])})
         if len(urls) > 1:
             problems.append(_finding("组两URL",
                                      f"组 {group} 绑定了 {len(urls)} 个不同 URL（同组两 URL）: "
-                                     + "、".join(u[:40] for u in urls[:3])))
+                                     + "、".join(u[:40] for u in urls[:3]),
+                                     row=members[0] if members else None, 组=members,
+                                     人话="这一组几行绑的不是同一张图（本该全组一张）"))
     num_urls: dict[int, set[str]] = {}
     for no, urls in url_by_row.items():
         num = row_to_no.get(no)
@@ -498,10 +870,13 @@ def _check_groups(ents, row_to_no: dict[int, int],
             num_urls.setdefault(num, set()).update(urls)
     for num in sorted(num_urls):
         if len(num_urls[num]) > 1:
+            rows_with = sorted(r for r, n in row_to_no.items() if n == num)
             problems.append(_finding("同号两URL",
                                      f"图{num} 对应多个 URL（同号不同 URL）: "
                                      + "、".join(sorted(u[:40] for u in num_urls[num])[:3]),
-                                     no=num))
+                                     no=num, row=rows_with[0] if rows_with else None,
+                                     组=rows_with or None,
+                                     人话="同一个图号挂了不同的图"))
     seen: dict[tuple, str] = {}
     for no, url in submitted:
         unit = replace.row_unit(no, groups)
@@ -509,15 +884,19 @@ def _check_groups(ents, row_to_no: dict[int, int],
             problems.append(_finding("提交同组两URL",
                                      f"提交快照里同组两 URL（行 {no} 与行 "
                                      f"{next(n for n, u in submitted if replace.row_unit(n, groups) == unit and u == seen[unit])}）",
-                                     row=no))
+                                     row=no,
+                                     **_v2_of(labels, no, 人话="同一组交上来的两张图不一样")))
         seen.setdefault(unit, url)
     ev = (f"确认组={groups or '无'}；行→图号={row_to_no}；组内 URL 归一后提交 {len(submitted)} 条")
+    stats = {"确认组": groups or [], "行→图号": {str(k): v for k, v in sorted(row_to_no.items())},
+             "提交条数": len(submitted)}
     if not problems:
-        return {"项": "组绑定一致性", "结论": PASS, "证据": "组内行同图号同 URL（无组或全组归一）｜" + ev,
-                "说明": _say("每个组内部都是同一张图、同一个图号（没有组时等于没这条约束）", 处理="无需处理")}
-    return {"项": "组绑定一致性", "结论": FAIL,
+        return {"项": "组绑定一致性", "结论": PASS, "项显示名": ITEM_DISPLAY["组绑定一致性"],
+                "证据": "组内行同图号同 URL（无组或全组归一）｜" + ev,
+                "说明": _say("每个组内部都是同一张图、同一个图号（没有组时等于没这条约束）",
+                            处理="无需处理", 统计=stats)}
+    return {"项": "组绑定一致性", "结论": FAIL, "项显示名": ITEM_DISPLAY["组绑定一致性"],
             "证据": _evidence(problems) + "｜" + ev,
-            "说明": _say(f"合并过的组里对不上：{len(problems)} 处——组内本应只有一张图/一个图号",
-                        原因=_evidence(problems),
-                        处理=HOW_GROUP,
-                        findings=problems)}
+            "说明": _say(f"合并过的组里对不上：{len(problems)} 处——组内本该只有一张图、一个图号",
+                        处理=HOW_GROUP, findings=problems, 统计=stats,
+                        清单行=_lines_block([p.get("行号") for p in problems], lines))}

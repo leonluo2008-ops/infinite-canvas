@@ -75,7 +75,9 @@ import {
     type HubQuickAction,
     type HubQuickPhase,
     type HubReworkGate,
+    type HubSelfCheckFinding,
     type HubSelfCheckItem,
+    type HubSelfCheckSegment,
     type HubSuggestion,
     type HubTaskDetail,
     type HubTaskSummary,
@@ -1190,6 +1192,7 @@ function GroupCard({
             className="mt-3 rounded-lg border-2 border-dashed border-emerald-300 bg-emerald-50/40 p-3 dark:border-emerald-700 dark:bg-emerald-950/20"
             style={{ borderLeft: `4px solid ${color.replace(/0\.30\)$/, "0.85)")}` }}
             data-hub-group-card={group ? group.键 : ""}
+            data-hub-asset-rows={members.join(",")}
         >
             <div className="flex flex-wrap items-center gap-2">
                 <Tag color="success" className="m-0" data-hub-group-badge>
@@ -1429,6 +1432,7 @@ function AssetCardUnit({
             className={`rounded-lg border p-3 dark:border-stone-800 ${checked ? "!border-indigo-500 ring-2 ring-indigo-200 dark:ring-indigo-900" : ""}`}
             style={{ borderLeft: `4px solid ${color.replace(/0\.30\)$/, "0.85)")}` }}
             data-hub-card-row={card.n}
+            data-hub-asset-row={card.n}
             data-hub-merge-selected={checked ? "1" : "0"}
         >
             <header className="flex flex-wrap items-center gap-2">
@@ -2190,10 +2194,335 @@ export function PromptSection({ detail }: { detail: HubTaskDetail }) {
     );
 }
 
-/** 自检面板（AT-9 B5 + AT-16 B2）：独立整宽区域，有异常默认展开。
- *  用户话（结论 + 原因 + 怎么处理 + 发现的行号/图号）全部由自检生产者产出（
- *  automation/selfcheck.py「说明」字段）——前端只渲染，**不解析证据文字重判**（红线 25）。
- *  旧任务没有话术字段（auto-0042 那批）→ 降级显示原始证据，并明说没有处理指引，不改历史文件。 */
+/** 自检面板（AT-9 B5 → AT-16 B2 → AT-22 E2 重构）：独立整宽区域，有异常默认展开。
+ *
+ *  AT-22 E2 的病根是「一条 finding 在屏幕上说 4 遍」（结论人话 → 原因 → 发现 → 证据），
+ *  行号/图号各重复 2-3 遍。重构后的硬规则：
+ *    1. 可见区一条信息只说一次：结论人话（一条 item 一行）→ 每「行+句」一张卡（位置段/命中词/
+ *       上下文高亮）→ 怎么处理；同一句多词由渲染层按结构化 `行号+句序` 并卡；
+ *    2. 行号一律「第 N 行「短名」」、图号一律「图N（你传的××图）」＋缩略图（`#N`／`图M` 不再裸奔）；
+ *    3. 一切统计/键值/路径/检查器原句只进「展开看证据（内部明细）」折叠区；
+ *    4. 话术全部由生产者（automation/selfcheck.py「说明」）产出——这里只按槽位渲染结构化字段，
+ *       **不解析「证据」字符串、不拼业务话术**（红线 25）。旧数据（无 v2 槽位）走降级分支。 */
+const SELFCHECK_STAT_INSIDE = new Set([
+    "词表行数", "正文字数", "要发张数", "提交张数", "必换行", "已传", "未换",
+    "通过", "没通过", "提醒", "已重拆", "上限", "共检查",
+]);
+
+/** 命中窗口半径/上限（E2 §8.1：命中句前后各 ≤12 字，整串 ≤60 字）。 */
+const SELFCHECK_WINDOW_RADIUS = 12;
+const SELFCHECK_WINDOW_LIMIT = 60;
+
+type SelfCheckRun = { 文: string; 高亮: boolean };
+type SelfCheckCard = { key: string; 行号: number | null; findings: HubSelfCheckFinding[] };
+
+/** 按结构化字段分组：同 `行号+句序` = 同一句 → 一张卡（不解析文字）；无行号/无句序各自成卡。 */
+function selfCheckCards(findings: HubSelfCheckFinding[]): SelfCheckCard[] {
+    const cards: SelfCheckCard[] = [];
+    const at = new Map<string, number>();
+    findings.forEach((finding, index) => {
+        const key = finding.行号 !== null && finding.句序 ? `${finding.行号}#${finding.句序}` : `single#${index}`;
+        const hit = at.get(key);
+        if (hit === undefined) {
+            at.set(key, cards.length);
+            cards.push({ key, 行号: finding.行号, findings: [finding] });
+        } else {
+            cards[hit].findings.push(finding);
+        }
+    });
+    return cards.sort((a, b) => (a.行号 ?? 0) - (b.行号 ?? 0));
+}
+
+/** 命中窗口：按 `片段` 的结构化偏移取并集高亮，前后各留 ≤12 字、整串 ≤60 字。
+ *  只做下标运算（slice/区间合并），不对文本做 split/match/replace——前端不许重解析原文。 */
+function selfCheckWindow(text: string, groups: HubSelfCheckSegment[][]): SelfCheckRun[] {
+    const spans: Array<[number, number]> = [];
+    for (const pieces of groups) {
+        for (const piece of pieces) {
+            if (piece.高亮) spans.push([piece.起, piece.止]);
+        }
+    }
+    if (!text) return [];
+    if (!spans.length) return [{ 文: text.slice(0, SELFCHECK_WINDOW_LIMIT), 高亮: false }];
+    spans.sort((a, b) => a[0] - b[0]);
+    const first = Math.min(...spans.map(([from]) => from));
+    const last = Math.max(...spans.map(([, to]) => to));
+    let lo = Math.max(0, first - SELFCHECK_WINDOW_RADIUS);
+    let hi = Math.min(text.length, last + SELFCHECK_WINDOW_RADIUS);
+    if (hi - lo > SELFCHECK_WINDOW_LIMIT) {
+        const center = Math.floor((first + last) / 2);
+        lo = Math.max(0, Math.min(center - Math.floor(SELFCHECK_WINDOW_LIMIT / 2), text.length - SELFCHECK_WINDOW_LIMIT));
+        hi = Math.min(text.length, lo + SELFCHECK_WINDOW_LIMIT);
+    }
+    const runs: SelfCheckRun[] = [];
+    const push = (from: number, to: number, on: boolean) => {
+        if (to <= from) return;
+        const tail = runs[runs.length - 1];
+        if (tail && tail.高亮 === on) tail.文 += text.slice(from, to);
+        else runs.push({ 文: text.slice(from, to), 高亮: on });
+    };
+    let pos = lo;
+    for (const [from, to] of spans) {
+        const start = Math.max(from, lo, pos);
+        const end = Math.min(to, hi);
+        if (end <= start) continue;
+        push(pos, start, false);
+        push(start, end, true);
+        pos = end;
+    }
+    push(pos, hi, false);
+    if (lo > 0) runs.unshift({ 文: "…", 高亮: false });
+    if (hi < text.length) runs.push({ 文: "…", 高亮: false });
+    return runs;
+}
+
+/** 数值/列表 → 折叠区文案（可见区不许出现这些东西）。 */
+function selfCheckStatText(key: string, value: unknown): string {
+    const list = Array.isArray(value) ? (value.length ? value.join("、") : "无") : "";
+    switch (key) {
+        case "词表行数":
+            return `已传图行 ${String(value)} 行`;
+        case "正文字数":
+            return `提示词正文 ${String(value)} 字`;
+        case "要发张数":
+            return `要发 ${String(value)} 张`;
+        case "提交张数":
+            return `提交 ${String(value)} 张`;
+        case "必换行":
+        case "已传":
+        case "未换":
+        case "按原样记录":
+        case "按原片记录":
+            return `${key} ${list}`;
+        case "通过":
+        case "没通过":
+        case "提醒":
+            return `${key} ${String(value)} 项`;
+        case "已重拆":
+            return `已重拆 ${String(value)} 次`;
+        case "上限":
+            return `上限 ${String(value)} 次`;
+        case "共检查":
+            return `共检查 ${String(value)} 项`;
+        default:
+            return `${key} ${list || String(value)}`;
+    }
+}
+
+/** 折叠区一块：标题固定、默认关闭（E2 §4 五块）。 */
+function SelfCheckFoldBlock({ title, lines }: { title: string; lines: string[] }) {
+    if (!lines.length) return null;
+    return (
+        <div className="space-y-0.5" data-hub-fold-block={title}>
+            <div className="text-[11px] font-medium text-stone-500 dark:text-stone-400">{title}</div>
+            {lines.map((line, index) => (
+                <div key={index} className="break-words whitespace-pre-wrap font-mono text-[11px] leading-4 text-stone-500 dark:text-stone-400">
+                    {line}
+                </div>
+            ))}
+        </div>
+    );
+}
+
+/** 「展开看证据（内部明细）」：内部统计 / 机器键值 / 这一行的清单原文 / 提示词里的原句 / 检查器原始输出。 */
+function SelfCheckFold({ item }: { item: HubSelfCheckItem }) {
+    const say = item.说明;
+    const stats = Object.entries(say?.统计 ?? {});
+    const inside = stats.filter(([key]) => SELFCHECK_STAT_INSIDE.has(key))
+        .map(([key, value]) => selfCheckStatText(key, value));
+    const machine = stats.filter(([key]) => !SELFCHECK_STAT_INSIDE.has(key))
+        .map(([key, value]) => `${key} ${Array.isArray(value) ? JSON.stringify(value) : String(value)}`);
+    const 清单行 = Object.entries(say?.清单行 ?? {}).map(([row, line]) => `第 ${row} 行：${line}`);
+    const 原句 = say?.原句 ? [`第 ${say.原句.句序} 段：${say.原句.段}`] : [];
+    return (
+        <details className="w-full min-w-0" data-hub-selfcheck-fold>
+            <summary className="cursor-pointer list-none text-[11px] text-stone-400 [&::-webkit-details-marker]:hidden dark:text-stone-500">
+                展开看证据（内部明细）
+            </summary>
+            <div className="mt-1 space-y-1.5 rounded-md bg-stone-50 p-2 dark:bg-stone-900/40">
+                <SelfCheckFoldBlock title="内部统计" lines={inside} />
+                <SelfCheckFoldBlock title="机器键值" lines={machine} />
+                <SelfCheckFoldBlock title="这一行的清单原文" lines={清单行} />
+                <SelfCheckFoldBlock title="提示词里的原句" lines={原句} />
+                <SelfCheckFoldBlock title="检查器原始输出" lines={item.证据 ? [item.证据] : []} />
+            </div>
+        </details>
+    );
+}
+
+/** 一张 finding 卡：位置段（第 N 行「短名」·共用图·缩略图·定位）→ 命中词 → 上下文高亮 → 动作位。 */
+function SelfCheckCardView({ card }: { card: SelfCheckCard }) {
+    const { message } = App.useApp();
+    const assetStates = useContext(AssetStateContext);
+    const first = card.findings[0];
+    const rowNo = card.行号;
+    const label = first.行称呼 || first.类别 || "";
+    const others = (first.组 ?? []).filter((no) => no !== rowNo);
+    const words = [...new Set(card.findings.map((finding) => finding.词).filter((word): word is string => Boolean(word)))]
+        .sort((a, b) => b.length - a.length);
+    const groups = card.findings.map((finding) => finding.片段 ?? []).filter((pieces) => pieces.length > 0);
+    const context = card.findings.map((finding) => finding.上下文).find((text): text is string => Boolean(text)) ?? "";
+    const runs = context ? selfCheckWindow(context, groups) : [];
+    const 人话 = card.findings.map((finding) => finding.人话).find((text): text is string => Boolean(text)) ?? "";
+    const fixable = card.findings.some((finding) => finding.可修);
+
+    const locate = () => {
+        if (rowNo === null || typeof document === "undefined") return;
+        const single = document.querySelector(`[data-hub-asset-row="${rowNo}"]`) as HTMLElement | null;
+        let target: HTMLElement | null = single;
+        if (!target) {
+            for (const node of Array.from(document.querySelectorAll("[data-hub-asset-rows]"))) {
+                const rows = (node.getAttribute("data-hub-asset-rows") || "").split(",").map((value) => value.trim());
+                if (rows.includes(String(rowNo))) {
+                    target = node as HTMLElement;
+                    break;
+                }
+            }
+        }
+        if (!target) {
+            message.info("先点「退回置换」回到资产置换区，再点这里");
+            return;
+        }
+        target.scrollIntoView({ block: "center" });
+        target.classList.add("ring-2", "ring-indigo-400");
+        window.setTimeout(() => target?.classList.remove("ring-2", "ring-indigo-400"), 2000);
+    };
+
+    const position = rowNo === null
+        ? "这次整体对不上，不是某一行的问题"
+        : `第 ${rowNo} 行${label ? `「${label}」` : ""}`
+            + (first.图号 ? ` · 图${first.图号}（${first.图称呼 || "你传的图"}）` : "")
+            + (others.length && first.图号 ? ` · 这一张也用在第 ${others.join("、")} 行` : "")
+            + (first.图引用 ? "" : "（这行还没绑图）");
+    const state = first.图引用 ? assetStates[first.图引用] : "";
+    const hit = words.length > 1 ? `这句里的${words.map((word) => `『${word}』`).join("")}还在提示词里：`
+        : words.length === 1 ? `『${words[0]}』还在提示词里：` : "";
+
+    return (
+        <article
+            className="w-full min-w-0 space-y-1 rounded-md border border-red-200/70 bg-white/60 p-2 dark:border-red-950 dark:bg-stone-900/30"
+            data-hub-selfcheck-card
+            data-hub-selfcheck-group={card.key}
+            data-hub-selfcheck-row={rowNo ?? ""}
+        >
+            <div className="flex flex-wrap items-start gap-2">
+                {first.图引用 ? (
+                    <UploadedThumb
+                        assetRef={first.图引用}
+                        state={state}
+                        alt={first.图称呼 || "已传的图"}
+                        thumbClass="size-12 rounded border border-stone-200 object-cover dark:border-stone-700"
+                    />
+                ) : null}
+                <div className="min-w-0 flex-1 space-y-0.5">
+                    <div className="break-words text-stone-700 dark:text-stone-200" data-hub-selfcheck-position>{position}</div>
+                    {hit ? <div className="break-words font-medium text-red-700 dark:text-red-300" data-hub-selfcheck-words>{hit}</div> : null}
+                    {人话 ? <div className="break-words text-stone-700 dark:text-stone-200" data-hub-selfcheck-say>{人话}</div> : null}
+                </div>
+                {rowNo !== null ? (
+                    <Button size="small" type="text" className="shrink-0" onClick={locate} data-hub-selfcheck-locator={rowNo}>
+                        去这一行
+                    </Button>
+                ) : null}
+            </div>
+            {runs.length ? (
+                <div className="break-words text-stone-600 dark:text-stone-300" data-hub-selfcheck-context>
+                    {runs.map((run, index) => (
+                        run.高亮 ? (
+                            <mark key={index} className="rounded bg-amber-100 px-0.5 text-stone-800 underline decoration-red-500 decoration-2 underline-offset-2 dark:bg-amber-900/50 dark:text-amber-100">
+                                {run.文}
+                            </mark>
+                        ) : (
+                            <span key={index}>{run.文}</span>
+                        )
+                    ))}
+                </div>
+            ) : null}
+            {fixable || words.length ? (
+                <div className="flex flex-wrap items-center gap-1.5" data-hub-selfcheck-actions>
+                    {fixable ? (
+                        <Tooltip title="行内改描述在 UI 内闭环（E3 落地后可用）">
+                            <Button size="small" disabled data-hub-selfcheck-fix>改这一行的描述</Button>
+                        </Tooltip>
+                    ) : null}
+                    {words.map((word) => (
+                        <Tooltip key={word} title={`这个词是原物的，按我们的产品保留（E4 落地后可用）：${word}`}>
+                            <Button size="small" type="text" disabled data-hub-selfcheck-keep={word}>保留这个词</Button>
+                        </Tooltip>
+                    ))}
+                </div>
+            ) : null}
+        </article>
+    );
+}
+
+/** 一条自检项：项显示名 + 结论人话（各一次）+ finding 卡（同句并卡、最多 3 张）+ 处理 + 折叠区。
+ *  v2 判据：发现里带任何 v2 槽位（词/行称呼/片段/人话）→ 新模板；只有旧字段 → 中间态降级
+ *  （只显结论人话+处理+折叠证据，不渲染「原因」——那是与发现 100% 重复的一句）。 */
+function SelfCheckItemView({ item }: { item: HubSelfCheckItem }) {
+    const say = item.说明;
+    const failed = item.结论 !== "PASS";
+    const cards = say ? selfCheckCards(say.发现 ?? []) : [];
+    const v2 = cards.some((card) => card.findings.some((finding) => finding.词 || finding.行称呼 || finding.片段 || finding.人话));
+    const shown = v2 ? cards.slice(0, 3) : [];
+    const rest = v2 ? cards.slice(3) : [];
+    const restWords = rest.reduce((sum, card) => sum + card.findings.length, 0);
+    const restRows = [...new Set(rest.map((card) => card.行号).filter((no): no is number => no !== null))];
+    return (
+        <div
+            className="w-full text-xs leading-5"
+            data-hub-selfcheck-item
+            data-hub-selfcheck-state={failed ? "fail" : "pass"}
+            data-hub-selfcheck-legacy={say ? "0" : "1"}
+            data-hub-selfcheck-v2={v2 ? "1" : "0"}
+        >
+            <div className="flex flex-wrap items-center gap-1.5">
+                {failed ? <CircleAlert className="size-3.5 shrink-0 text-red-600" /> : <CheckCircle2 className="size-3.5 shrink-0 text-emerald-600" />}
+                <span className="font-medium" data-hub-selfcheck-name>{item.项显示名 || item.项}</span>
+                {failed ? (
+                    <span className="text-[11px] text-stone-400 dark:text-stone-500" data-hub-selfcheck-notblocking>如实显示，不挡提交</span>
+                ) : null}
+            </div>
+            {say ? (
+                <div className="mt-1 space-y-1.5 pl-5">
+                    {say.结论人话 ? (
+                        <div className="break-words text-stone-700 dark:text-stone-200" data-hub-selfcheck-conclusion>
+                            {say.结论人话}
+                        </div>
+                    ) : null}
+                    {shown.map((card) => (
+                        <SelfCheckCardView key={card.key} card={card} />
+                    ))}
+                    {rest.length ? (
+                        <div className="break-words text-stone-500 dark:text-stone-400" data-hub-selfcheck-more>
+                            还有 {restWords} 个词在另外 {restRows.length || rest.length} 行（展开看证据）
+                        </div>
+                    ) : null}
+                    {say.处理 ? (
+                        <div
+                            className={`break-words ${failed ? "text-red-700 dark:text-red-300" : "text-stone-600 dark:text-stone-300"}`}
+                            data-hub-selfcheck-how
+                        >
+                            <span className="font-medium">怎么处理：</span>
+                            {say.处理}
+                        </div>
+                    ) : null}
+                    <SelfCheckFold item={item} />
+                </div>
+            ) : (
+                <div className="mt-1 space-y-0.5 pl-5" data-hub-selfcheck-legacy-note>
+                    <div className="text-stone-500 dark:text-stone-400">
+                        这条任务的检查结果早于「人话说明」上线：只有当时的原始证据，没有处理指引。
+                    </div>
+                    <div className="break-words whitespace-pre-wrap text-stone-500 dark:text-stone-400" data-hub-selfcheck-evidence>
+                        {item.证据}
+                    </div>
+                </div>
+            )}
+        </div>
+    );
+}
+
 function SelfCheckPanel({ items, gateItem }: { items: HubSelfCheckItem[] | null; gateItem: HubSelfCheckItem | null }) {
     const all = items ?? [];
     const failed = all.filter((item) => item.结论 !== "PASS");
@@ -2214,14 +2543,14 @@ function SelfCheckPanel({ items, gateItem }: { items: HubSelfCheckItem[] | null;
                         data-hub-selfcheck-badge
                         data-hub-selfcheck-state={failed.length ? "fail" : "pass"}
                     >
-                        {failed.length ? `自检 ⚠ ${failed.length}/${all.length} 项异常` : `自检 ✓ ${all.length} 项通过`}
+                        {failed.length ? `${failed.length} 项没通过（共 ${all.length} 项）` : `自检 ✓ ${all.length} 项通过`}
                     </Tag>
                 )}
             </div>
             {failed.length ? (
                 <div className="w-full space-y-2.5 rounded-md border border-red-200 bg-red-50/60 p-2.5 dark:border-red-950 dark:bg-red-950/20" data-hub-selfcheck-detail>
                     {failed.map((item) => (
-                        <SelfCheckRow key={item.项} item={item} />
+                        <SelfCheckItemView key={item.项} item={item} />
                     ))}
                     {passed.length ? (
                         <details className="w-full min-w-0" data-hub-selfcheck-passed>
@@ -2230,7 +2559,7 @@ function SelfCheckPanel({ items, gateItem }: { items: HubSelfCheckItem[] | null;
                             </summary>
                             <div className="mt-1.5 space-y-2.5">
                                 {passed.map((item) => (
-                                    <SelfCheckRow key={item.项} item={item} />
+                                    <SelfCheckItemView key={item.项} item={item} />
                                 ))}
                             </div>
                         </details>
@@ -2242,119 +2571,49 @@ function SelfCheckPanel({ items, gateItem }: { items: HubSelfCheckItem[] | null;
     );
 }
 
-/** 一条自检：生产者话术优先（结论人话/原因/怎么处理/发现）；旧结构（无说明）只显原始证据。 */
-function SelfCheckRow({ item }: { item: HubSelfCheckItem }) {
-    const say = item.说明;
-    const failed = item.结论 !== "PASS";
-    return (
-        <div
-            className="w-full text-xs leading-5"
-            data-hub-selfcheck-item
-            data-hub-selfcheck-state={failed ? "fail" : "pass"}
-            data-hub-selfcheck-legacy={say ? "0" : "1"}
-        >
-            <div className="flex flex-wrap items-center gap-1.5">
-                {failed ? <CircleAlert className="size-3.5 shrink-0 text-red-600" /> : <CheckCircle2 className="size-3.5 shrink-0 text-emerald-600" />}
-                <span className="font-medium">{item.项}</span>
-                <Tag color={failed ? "red" : "green"} className="mr-0 px-1 py-0 text-[10px]">
-                    {failed ? "异常" : "通过"}
-                </Tag>
-            </div>
-            {say ? (
-                <div className="mt-1 space-y-0.5 pl-5">
-                    {say.结论人话 ? (
-                        <div className="break-words text-stone-700 dark:text-stone-200" data-hub-selfcheck-conclusion>
-                            {say.结论人话}
-                        </div>
-                    ) : null}
-                    {say.原因 ? (
-                        <div className="break-words whitespace-pre-wrap text-stone-600 dark:text-stone-300" data-hub-selfcheck-reason>
-                            <span className="text-stone-400 dark:text-stone-500">原因：</span>
-                            {say.原因}
-                        </div>
-                    ) : null}
-                    {say.处理 ? (
-                        <div
-                            className={`break-words ${failed ? "text-red-700 dark:text-red-300" : "text-stone-600 dark:text-stone-300"}`}
-                            data-hub-selfcheck-how
-                        >
-                            <span className="font-medium">怎么处理：</span>
-                            {say.处理}
-                        </div>
-                    ) : null}
-                    {say.发现.length ? (
-                        <ul className="space-y-0.5 text-stone-500 dark:text-stone-400" data-hub-selfcheck-findings>
-                            {say.发现.map((finding, index) => (
-                                <li key={index} className="break-words">
-                                    {finding.行号 !== null ? <span className="mr-1 font-mono">#{finding.行号}</span> : null}
-                                    {finding.图号 !== null ? <span className="mr-1 font-mono">图{finding.图号}</span> : null}
-                                    {finding.文字}
-                                </li>
-                            ))}
-                        </ul>
-                    ) : null}
-                    {item.证据 ? (
-                        <details className="w-full min-w-0" data-hub-selfcheck-raw>
-                            <summary className="cursor-pointer list-none text-[11px] text-stone-400 [&::-webkit-details-marker]:hidden dark:text-stone-500">
-                                原始证据
-                            </summary>
-                            <div className="mt-0.5 break-words whitespace-pre-wrap text-stone-500 dark:text-stone-400">{item.证据}</div>
-                        </details>
-                    ) : null}
-                </div>
-            ) : (
-                <div className="mt-1 space-y-0.5 pl-5" data-hub-selfcheck-legacy-note>
-                    <div className="text-stone-500 dark:text-stone-400">
-                        这条任务的检查结果早于「人话说明」上线：只有当时的原始证据，没有处理指引。
-                    </div>
-                    <div className="break-words whitespace-pre-wrap text-stone-500 dark:text-stone-400" data-hub-selfcheck-evidence>
-                        {item.证据}
-                    </div>
-                </div>
-            )}
-        </div>
-    );
-}
-
-/** 拆解门禁（AT-15 R2 数据合同）：PASS → 绿 Tag 带摘要；FAIL/WARN → 整宽红条（缺项/告警逐条 +
- *  重拆轮次 + 怎么处理）。摘要与逐条明细都来自 selfcheck.load_gate_item 的「说明」，
- *  这里只渲染不解释（红线 25：不拆证据字符串重判）。 */
+/** 拆解门禁（AT-15 R2 数据合同 → AT-22 E2 人话化）：PASS → 绿 Tag；FAIL/WARN → 整宽红条。
+ *  可见区只放「项显示名 + 结论人话 + 每条缺项一句人话 + 怎么处理」，统计（绿项/缺项/重拆）与
+ *  检查器原句一律进折叠区——这里只渲染不再解释（红线 25：不拆证据字符串重判）。 */
 function GateBadge({ item }: { item: HubSelfCheckItem }) {
     const say = item.说明;
-    const failed = item.结论 !== "PASS";
-    const summary = say?.结论人话 || "拆解门禁结果";
-    const details = say?.发现.map((finding) => finding.文字) ?? [];
-    if (!failed && item.结论 !== "WARN") {
+    const failed = item.结论 === "FAIL";
+    const warn = item.结论 === "WARN";
+    const name = item.项显示名 || item.项;
+    const summary = say?.结论人话 || "拆解产物的检查";
+    const lines = (say?.发现 ?? []).map((finding) => finding.人话 || finding.文字).filter(Boolean);
+    if (!failed && !warn) {
         return (
             <div className="w-full" data-hub-gate data-hub-gate-state="pass">
                 <Tag color="green" className="m-0">
-                    拆解门禁 ✓ {summary}
+                    {name} ✓ {summary}
                 </Tag>
             </div>
         );
     }
     return (
         <div className="w-full" data-hub-gate data-hub-gate-state={failed ? "fail" : "warn"}>
-            <details className="w-full min-w-0" open>
-                <summary className="flex cursor-pointer list-none flex-wrap items-center gap-1.5 [&::-webkit-details-marker]:hidden">
-                    <Tag color={failed ? "red" : "gold"} className="m-0">
-                        {failed ? `拆解门禁 ✗ ${summary}` : `拆解门禁 ⚠ ${summary}`}
-                    </Tag>
-                </summary>
-                <div className="mt-2 w-full space-y-1 rounded-md border border-red-300 bg-red-50 p-2 dark:border-red-900 dark:bg-red-950" data-hub-gate-detail>
-                    {details.map((line, index) => (
-                        <div key={index} className="break-words whitespace-pre-wrap text-xs leading-5 text-stone-600 dark:text-stone-300">
-                            {line}
-                        </div>
-                    ))}
-                    {say?.处理 ? (
-                        <div className="break-words text-xs leading-5 text-red-700 dark:text-red-300" data-hub-gate-how>
-                            <span className="font-medium">怎么处理：</span>
-                            {say.处理}
-                        </div>
-                    ) : null}
-                </div>
-            </details>
+            <div className="flex flex-wrap items-center gap-1.5">
+                <Tag color={failed ? "red" : "gold"} className="m-0">
+                    {failed ? `${name} ✗` : `${name} ⚠`} {summary}
+                </Tag>
+                {failed ? (
+                    <span className="text-[11px] text-stone-400 dark:text-stone-500" data-hub-gate-notblocking>如实显示，不挡提交</span>
+                ) : null}
+            </div>
+            <div className="mt-2 w-full space-y-1 rounded-md border border-red-300 bg-red-50 p-2 dark:border-red-900 dark:bg-red-950" data-hub-gate-detail>
+                {lines.map((line, index) => (
+                    <div key={index} className="break-words whitespace-pre-wrap text-xs leading-5 text-stone-600 dark:text-stone-300">
+                        {line}
+                    </div>
+                ))}
+                {say?.处理 ? (
+                    <div className="break-words text-xs leading-5 text-red-700 dark:text-red-300" data-hub-gate-how>
+                        <span className="font-medium">怎么处理：</span>
+                        {say.处理}
+                    </div>
+                ) : null}
+                <SelfCheckFold item={item} />
+            </div>
         </div>
     );
 }

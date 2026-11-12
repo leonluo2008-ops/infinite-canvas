@@ -239,25 +239,70 @@ export type HubAssetWriteResult = {
 };
 
 /** 自检结果单条（AT-9 B5 数据合同：projects/<id>/自检.json 每条 {项,结论,证据}；结论 PASS|FAIL）。
- *  AT-16 B2：生产者（automation/selfcheck.py）追加「说明」——结论人话/原因/怎么处理/结构化发现；
- *  前端只渲染它，**不解析「证据」文字重判**（红线 25）。旧任务（如 auto-0042）没有「说明」→ 降级显示。 */
+ *  AT-16 B2：生产者（automation/selfcheck.py）追加「说明」——结论人话/怎么处理/结构化发现；
+ *  AT-22 E2：发现升级 finding v2（行号+行称呼+图号+图称呼+图引用+词+句序+上下文+片段），
+ *  前端**只按槽位渲染，不解析「证据」文字重判**（红线 25）。旧任务（无「说明」或无 v2 字段）→ 降级显示。 */
+export type HubSelfCheckSegment = {
+    /** 段原文（与相邻段拼起来 = `上下文`，一字不改）。 */
+    文: string;
+    /** 段在 `上下文` 里的起/止字符偏移（前端只按下标上色，不猜文字）。 */
+    起: number;
+    止: number;
+    /** 命中段 = true（同一句多词的高亮区间由渲染层取并集）。 */
+    高亮?: boolean;
+};
+
 export type HubSelfCheckFinding = {
     /** 检查器自己发现的行号（没有 → null；前端不猜）。 */
     行号: number | null;
     /** 检查器自己发现的图号（没有 → null）。 */
     图号: number | null;
+    /** 检查器原句（旧字段：证据拼接与历史探针的锚点，逐字不改）。 */
     文字: string;
+    /** v2 显式键：与 `文字` 同值的检查器原句（折叠区「检查器原始输出」与探针断言用它）。 */
+    原文?: string;
+    /** 该行短名（与资产置换卡标题一字不差；缺 → 用 类别 → 「第 N 行」）。 */
+    行称呼?: string;
+    /** 清单「类别」列。 */
+    类别?: string;
+    /** 该行所在确认组（行号集合；无组 → 缺省）。 */
+    组?: number[];
+    /** 「你传的××图」——按该图号主行类别取词；主行缺 → 「你传的图」。 */
+    图称呼?: string;
+    /** 该行已传图原串（local:… 或 https:…，缩略图数据源）。 */
+    图引用?: string;
+    /** 命中词（一个 finding 一个词，与 E4 逐词粒度对齐）。 */
+    词?: string;
+    /** 命中句在正文里的句序（同「行号+句序」= 同一句 → 渲染层并成一张卡）。 */
+    句序?: number;
+    /** 命中句原文（不改字，含 @图片N）。 */
+    上下文?: string;
+    /** 同一句的分段高亮（前端只按下标上色）。 */
+    片段?: HubSelfCheckSegment[];
+    /** 给人看的一句话（非命中类 finding 的正文；命中类由 词/片段 驱动）。 */
+    人话?: string;
+    /** 可修声明（E3 的动作位）：仅残留类 finding 带。 */
+    可修?: { 类型: string };
 };
 
 export type HubSelfCheckExplain = {
     结论人话: string;
-    原因: string;
+    /** v2 起生产者不再产出（= 发现拼接，最大重复源）；旧文件仍带 → 可见区不渲染。 */
+    原因?: string;
     处理: string;
     发现: HubSelfCheckFinding[];
+    /** 折叠区「内部统计」+「机器键值」的数据源（可见区一个统计都不许出现）。 */
+    统计?: Record<string, unknown>;
+    /** 折叠区「这一行的清单原文」：{行号: 整行 md 原文}。 */
+    清单行?: Record<string, string>;
+    /** 折叠区「提示词里的原句」：命中句所在整段（前后各 1 句）。 */
+    原句?: { 句序: number; 段: string; 行号?: number };
 };
 
 export type HubSelfCheckItem = {
     项: string;
+    /** 项显示名（「提示词里的老词」这类人话；缺 → 回落 项）。 */
+    项显示名?: string;
     结论: string;
     证据: string;
     /** AT-16 B2 话术（生产者侧同源）；旧结构缺失 → undefined（读层降级，不改历史文件）。 */
@@ -662,6 +707,8 @@ export function normalizeSelfCheck(value: unknown): HubSelfCheckItem[] | null {
             结论: hubText(item["结论"]) || "FAIL",
             证据: hubText(item["证据"]),
         };
+        const shown = hubText(item["项显示名"]);          // 话术项名（缺 → 展示层回落 项）
+        if (shown) row.项显示名 = shown;
         const 说明 = normalizeSelfCheckExplain(item["说明"]);
         if (说明) row.说明 = 说明;
         return row;
@@ -674,20 +721,98 @@ function selfCheckNo(value: unknown): number | null {
     return Number.isInteger(n) && n > 0 ? n : null;
 }
 
+/** 句序/行偏移归一：0 或正整数才算（片段偏移从 0 起，句序从 1 起，畸形 → null）。 */
+function selfCheckOffset(value: unknown, min: number): number | null {
+    const n = Number(value);
+    return Number.isInteger(n) && n >= min ? n : null;
+}
+
+/** 片段归一：只收「文非空 + 起止是整数 + 止≥起」的段；畸形段直接丢（不猜文字、不补偏移）。 */
+function normalizeSelfCheckSegments(value: unknown): HubSelfCheckSegment[] {
+    if (!Array.isArray(value)) return [];
+    const segments: HubSelfCheckSegment[] = [];
+    for (const raw of value) {
+        if (!raw || typeof raw !== "object") continue;
+        const seg = raw as JsonRecord;
+        const text = hubText(seg["文"]);
+        const from = selfCheckOffset(seg["起"], 0);
+        const to = selfCheckOffset(seg["止"], 0);
+        if (!text || from === null || to === null || to < from) continue;
+        const piece: HubSelfCheckSegment = { 文: text, 起: from, 止: to, 高亮: seg["高亮"] === true };
+        segments.push(piece);
+    }
+    return segments;
+}
+
+/** 组归一：正整数行号集合，升序去重；空/畸形 → undefined（无组）。 */
+function normalizeSelfCheckRows(value: unknown): number[] | undefined {
+    if (!Array.isArray(value)) return undefined;
+    const rows = [...new Set(value.map((item) => selfCheckNo(item)).filter((n): n is number => n !== null))];
+    return rows.length ? rows.sort((a, b) => a - b) : undefined;
+}
+
 /** 说明归一：只搬生产者字段 + 结构化发现；一个真字段都没有 → undefined（=旧结构）。 */
 function normalizeSelfCheckExplain(value: unknown): HubSelfCheckExplain | undefined {
     if (!value || typeof value !== "object") return undefined;
     const raw = value as JsonRecord;
     const 发现: HubSelfCheckFinding[] = (Array.isArray(raw["发现"]) ? raw["发现"] : [])
         .map((entry) => (entry && typeof entry === "object" ? (entry as JsonRecord) : {}))
-        .map((entry) => ({ 行号: selfCheckNo(entry["行号"]), 图号: selfCheckNo(entry["图号"]), 文字: hubText(entry["文字"]) }))
+        .map((entry) => {
+            const finding: HubSelfCheckFinding = {
+                行号: selfCheckNo(entry["行号"]),
+                图号: selfCheckNo(entry["图号"]),
+                文字: hubText(entry["文字"]),
+            };
+            const text = (key: string): string => hubText(entry[key]);
+            // v2 槽位：真值才带（缺 = 前端不渲染该槽位；这里只搬运，不派生、不猜）
+            for (const key of ["行称呼", "类别", "图称呼", "图引用", "词", "上下文", "人话", "原文"] as const) {
+                const value2 = text(key);
+                if (value2) finding[key] = value2;
+            }
+            const rows = normalizeSelfCheckRows(entry["组"]);
+            if (rows) finding.组 = rows;
+            const order = selfCheckOffset(entry["句序"], 1);
+            if (order !== null) finding.句序 = order;
+            const segments = normalizeSelfCheckSegments(entry["片段"]);
+            if (segments.length) finding.片段 = segments;
+            const fixable = entry["可修"];
+            if (fixable && typeof fixable === "object") {
+                const kind = hubText((fixable as JsonRecord)["类型"]);
+                if (kind) finding.可修 = { 类型: kind };
+            }
+            return finding;
+        })
         .filter((entry) => entry.文字 || entry.行号 !== null || entry.图号 !== null);
     const explain: HubSelfCheckExplain = {
         结论人话: hubText(raw["结论人话"]),
-        原因: hubText(raw["原因"]),
         处理: hubText(raw["处理"]),
         发现,
     };
+    const reason = hubText(raw["原因"]);
+    if (reason) explain.原因 = reason;
+    const 统计 = raw["统计"];
+    if (统计 && typeof 统计 === "object" && !Array.isArray(统计)) explain.统计 = 统计 as Record<string, unknown>;
+    const 清单行 = raw["清单行"];
+    if (清单行 && typeof 清单行 === "object" && !Array.isArray(清单行)) {
+        const lines: Record<string, string> = {};
+        for (const [key, line] of Object.entries(清单行 as JsonRecord)) {
+            const text = hubText(line);
+            if (text) lines[key] = text;
+        }
+        if (Object.keys(lines).length) explain.清单行 = lines;
+    }
+    const 原句 = raw["原句"];
+    if (原句 && typeof 原句 === "object") {
+        const block = 原句 as JsonRecord;
+        const seq = selfCheckOffset(block["句序"], 1);
+        const segment = hubText(block["段"]);
+        if (seq !== null && segment) {
+            const out: { 句序: number; 段: string; 行号?: number } = { 句序: seq, 段: segment };
+            const row = selfCheckNo(block["行号"]);
+            if (row !== null) out.行号 = row;
+            explain.原句 = out;
+        }
+    }
     const hasText = explain.结论人话 || explain.原因 || explain.处理 || explain.发现.length;
     return hasText ? explain : undefined;
 }
