@@ -8,6 +8,9 @@
  * 判据（方案 `方案-假运行态判定与出清-20261112.md` §4.5 / §4.6 / §5.1）：
  *  [A] 表格行真渲染（SSR 真代码）：running 行含活动读数 + 强制结束；failed 行含原因 + 重试 + 删除；
  *      done 行两者皆无；ingesting 不造假出口；活动缺失明说「活动时间不可用」。
+ *  [E] 列表行失败原因收口（t_d7254b52）：行内只长后端原文**首行**（line-clamp-2）+ on_disk/missing 徽标，
+ *      同帧云端原文只出现 1 次、［原始响应］JSON 不进单元格；完整原文（含三行附属）只在详情页
+ *      `CloudFailurePanel` 出现（反向断言）。
  *  [B] 表格页接线：取消只关弹层（零请求）、确认才调 force-finish、成功即行内刷 failed、
  *      三条接口错误原文进行内、可见性与文案全部复用 B3 导出件（本页零第二套状态枚举/零文案复制）。
  *  [C] 抽屉：同一条按钮 + 同一段确认文案 + 成功后 onStateChange(localId,"failed") + onRefresh()。
@@ -51,13 +54,16 @@ writeFileSync(
         'import { App } from "antd";',
         'import { HubRowStatusCell, HubRowActions, HubRowFailedReason, LapianStageCell, hubRowQuickAction } from "../../../src/pages/hub/index";',
         'import { DrawerForceFinishEntry, TaskDetailDrawer } from "../../../src/pages/hub/task-detail-drawer";',
-        'import { FORCE_FINISH_CONFIRM_TITLE, FORCE_FINISH_CONFIRM_SCOPE, FORCE_FINISH_CONFIRM_SIDE_EFFECT, ForceFinishConfirmBody, hubFailedReason, FAILED_REASON_FALLBACK } from "../../../src/pages/hub/task-card";',
+        'import { FORCE_FINISH_CONFIRM_TITLE, FORCE_FINISH_CONFIRM_SCOPE, FORCE_FINISH_CONFIRM_SIDE_EFFECT, ForceFinishConfirmBody, hubFailedReason, failedRowSummary, CloudFailurePanel, FAILED_REASON_FALLBACK } from "../../../src/pages/hub/task-card";',
         'import { forceFinishHubTask, retryHubTask } from "../../../src/pages/hub/hub-api";',
         "export { DrawerForceFinishEntry, TaskDetailDrawer, LapianStageCell, hubRowQuickAction };",
         "export { forceFinishHubTask, retryHubTask };",
-        "export { FORCE_FINISH_CONFIRM_TITLE, FORCE_FINISH_CONFIRM_SCOPE, FORCE_FINISH_CONFIRM_SIDE_EFFECT, hubFailedReason, FAILED_REASON_FALLBACK };",
+        "export { FORCE_FINISH_CONFIRM_TITLE, FORCE_FINISH_CONFIRM_SCOPE, FORCE_FINISH_CONFIRM_SIDE_EFFECT, hubFailedReason, failedRowSummary, FAILED_REASON_FALLBACK };",
         "const noop = () => {};",
         "const channels: any[] = [];",
+        "export function renderCloudPanel(failed: any, fallbackError = \"\"): string {",
+        "    return renderToStaticMarkup(<App><CloudFailurePanel failed={failed} fallbackError={fallbackError} /></App>);",
+        "}",
         "export function renderStatus(task: any, actionError = \"\"): string {",
         '    return renderToStaticMarkup(<App><HubRowStatusCell task={task} actionError={actionError} onDismissActionError={noop} /></App>);',
         "}",
@@ -169,7 +175,8 @@ check("[A] running 行操作列：非 failed 不给重试（不造无意义入�
 check("[A] running 行操作列：打开 + 删除两键仍在", /打\s?开/.test(runActions) && runActions.includes('data-hub-delete-trigger="auto-0052"'), runActions.slice(0, 240));
 
 const failStatus = ssr.renderStatus(FAILED);
-check("[A] failed 行状态列：失败原因逐字 = 后端 failed.reason", failStatus.includes("拆解进程失联，可重试或删除") && failStatus.includes('data-hub-failed-reason="backend"'), failStatus.slice(0, 300));
+check("[A] failed 行状态列：后端原文首行逐字透出（data-hub-failed-first-line）+ 来源钩子 backend", failStatus.includes("拆解进程失联，可重试或删除") && failStatus.includes("data-hub-failed-first-line") && failStatus.includes('data-hub-failed-reason="backend"'), failStatus.slice(0, 300));
+check("[A] failed 行状态列：单行 fixture 无换行 → 与后端 failed.reason 逐字相等（不多字不少字）", (failStatus.match(/data-hub-failed-first-line[^>]*>([\s\S]*?)<\/span>/) || [])[1] === "拆解进程失联，可重试或删除", (failStatus.match(/data-hub-failed-first-line[^>]*>([\s\S]*?)<\/span>/) || [])[1]);
 check("[A] failed 行状态列：失败时间在场（三段式第二段）", failStatus.includes("失败时间") && /11-12\s+14:37:11/.test(failStatus), failStatus.slice(0, 300));
 check("[A] failed 行状态列：不渲染活动读数（非运行态不假装活着）", !failStatus.includes("data-hub-activity"), "");
 
@@ -198,6 +205,63 @@ check("[A] 行内错误：可主动关掉（「知道了」按钮在场）", wit
 // 老任务（无 failed.reason）回落详情 error 的顺序仍是三段式（纯函数，B3 交付件未改）
 check("[A] 原因三段式顺序未变：failed.reason → error → 兜底句", ssr.hubFailedReason({ reason: "后端" }, "旧") === "后端" && ssr.hubFailedReason(null, "旧") === "旧" && ssr.hubFailedReason(null, "") === ssr.FAILED_REASON_FALLBACK);
 check("[A] 兜底句逐字未变", ssr.FAILED_REASON_FALLBACK === "任务失败，错误原文未返回。", ssr.FAILED_REASON_FALLBACK);
+
+// ════════════════════════════════════════════════════════════ [E] 列表行失败原因收口（t_d7254b52）
+console.log("1b) 列表行收口：只长云端原文首行 + 落盘徽标；同帧原文 1 次；全文只在详情页");
+
+const CLOUD_MSG = "HTTP 429 Too Many Requests：Current group upstream load is saturated, please try again later (request id: 2026111219311023663367qPhGp1bu)";
+const RAW_JSON = '{"error":{"message":"Current group upstream load is saturated","type":"new_api_error"}}';
+// 真机样本（auto-0055 的 failed_reason 就是这 4 行）：首行云端原文 + 三条诊断附属（末行是 raw JSON）
+const LONG_REASON = [
+    `云端原文：${CLOUD_MSG}`,
+    "［附属］退出码 3｜错误类型 ApiError",
+    "［转述］analyze.py 退出 3：ERROR 拆解失败（下游退出码 3），后面两步不再执行",
+    `［原始响应］${RAW_JSON}`,
+].join("\n");
+const LONG_EVIDENCE = {
+    trigger: "bridge_exit",
+    exit_code: 3,
+    cloud_error: { error_type: "ApiError", message: CLOUD_MSG, finish_reason: null, raw_response: RAW_JSON },
+    cloud_raw: "on_disk",
+};
+const ROW_FAILED = { ...FAILED, failed: { reason: LONG_REASON, at: "2026-11-12T19:31:14+08:00", evidence: LONG_EVIDENCE } };
+const rowLong = ssr.renderStatus(ROW_FAILED);
+const firstLineOf = (html) => (html.match(/data-hub-failed-first-line[^>]*>([\s\S]*?)<\/span>/) || [])[1];
+
+check("[E] 行内首行 = 后端原文第一行（逐字，含「云端原文：」前缀不改写）", firstLineOf(rowLong) === `云端原文：${CLOUD_MSG}`, firstLineOf(rowLong));
+check("[E] 云端原文同帧只出现 1 次（不再被 CloudErrorEvidence 的 message 重复渲染）", countOf(rowLong, CLOUD_MSG) === 1, String(countOf(rowLong, CLOUD_MSG)));
+check("[E] 证据块整体不再进单元格（data-hub-cloud-error 不在行内）", !rowLong.includes("data-hub-cloud-error"), "");
+check("[E] ［原始响应］JSON 不进表格单元格（raw JSON 片段与 new_api_error 都不在）", !rowLong.includes("new_api_error") && !rowLong.includes(RAW_JSON.slice(0, 40)), "");
+check("[E] 视觉上限 2 行：首行容器带 line-clamp-2", /data-hub-failed-first-line/.test(rowLong) && /line-clamp-2/.test(rowLong), "");
+check("[E] 行内不再平铺多行原文（whitespace-pre-wrap 全文字段不在行内）", !rowLong.includes("whitespace-pre-wrap"), "");
+check("[E] 落盘徽标 on_disk 在场且只认 evidence.cloud_raw", rowLong.includes('data-hub-cloud-raw="on_disk"') && rowLong.includes("on_disk 已落盘"), "");
+check("[E] 行内给出口：悬停提示指向详情完整原文（不假装行内就是全部）", /title="[^"]*完整原文见「打开」详情/.test(rowLong), "");
+check("[E] 失败时间不占视觉行：只进 title 悬停提示（详情页正文另有）", /title="失败时间 11-12 19:31:14 · 完整原文见/.test(rowLong) && !rowLong.includes("data-hub-failed-at"), "");
+
+// 反向断言：同一份 failed.reason 送详情页 → 全文 + 三行附属都在（原文只在详情页出现）
+const panelLong = ssr.renderCloudPanel(ROW_FAILED.failed, "");
+check("[E] 反向：全文只在详情页（CloudFailurePanel 主展示区含完整云端原文）", panelLong.includes("data-hub-cloud-failure-main") && panelLong.includes(CLOUD_MSG), "");
+check("[E] 反向：三行附属也只在详情页（行内一行都不许留）", ["［附属］退出码 3", "［转述］analyze.py 退出 3", "［原始响应］"].every((needle) => panelLong.includes(needle)) && !rowLong.includes("［附属］") && !rowLong.includes("［转述］") && !rowLong.includes("［原始响应］"), "");
+check("[E] 反向：原文逐字可拼回（详情页 != 裁剪版；行内首行是它的真前缀）", ssr.hubFailedReason(ROW_FAILED.failed, "").startsWith(firstLineOf(rowLong)) && panelLong.includes("new_api_error") && !rowLong.includes("new_api_error"), "");
+
+// 徽标三态 + 纯函数（缺/坏值不造占位）
+const rowMissing = ssr.renderStatus({ ...ROW_FAILED, failed: { ...ROW_FAILED.failed, evidence: { ...LONG_EVIDENCE, cloud_raw: "missing" } } });
+check("[E] cloud_raw=missing → missing 徽标（只认字面值）", rowMissing.includes('data-hub-cloud-raw="missing"') && rowMissing.includes("missing 未落盘"), "");
+const rowNoRaw = ssr.renderStatus({ ...ROW_FAILED, failed: { ...ROW_FAILED.failed, evidence: { trigger: "auto_scan" } } });
+check("[E] cloud_raw 缺失 → 不渲染徽标（不造假占位）", !rowNoRaw.includes("data-hub-cloud-raw"), "");
+const rowNoEvidence = ssr.renderStatus({ ...ROW_FAILED, failed: { ...ROW_FAILED.failed, evidence: null } });
+check("[E] evidence=null → 仍只长首行（不因缺证据退化成全文/空行）", firstLineOf(rowNoEvidence) === `云端原文：${CLOUD_MSG}`, firstLineOf(rowNoEvidence));
+
+const sum1 = ssr.failedRowSummary(ROW_FAILED.failed, "");
+check("[E] failedRowSummary：firstLine=后端起首行、cloudRaw=on_disk、不含换行", sum1.firstLine === `云端原文：${CLOUD_MSG}` && sum1.cloudRaw === "on_disk" && !sum1.firstLine.includes("\n"), JSON.stringify(sum1));
+const sum2 = ssr.failedRowSummary(null, "DiscussError: bridge timeout\n尾注第二行");
+check("[E] failedRowSummary：老任务回落 error 的首行（尾注第二行不进行内）", sum2.firstLine === "DiscussError: bridge timeout" && sum2.cloudRaw === "", JSON.stringify(sum2));
+const sum3 = ssr.failedRowSummary({ reason: "某原因", at: "", evidence: { cloud_raw: "weird" } }, "");
+check("[E] failedRowSummary：未知 cloud_raw 值 → 空串（不猜 on_disk/missing）", sum3.cloudRaw === "", JSON.stringify(sum3));
+const sum4 = ssr.failedRowSummary(null, "");
+check("[E] failedRowSummary：两者皆空 → 兜底句（与既有文案同一句）", sum4.firstLine === ssr.FAILED_REASON_FALLBACK, JSON.stringify(sum4));
+const rowEmpty = ssr.renderStatus({ ...FAILED, failed: null });
+check("[E] 无 failed.reason 也无 error → 行内兜底句（不空盒）", rowEmpty.includes(ssr.FAILED_REASON_FALLBACK) && rowEmpty.includes("data-hub-failed-row"), rowEmpty.slice(0, 240));
 
 // ════════════════════════════════════════════════════════════ [B] 表格页接线
 console.log("2) 表格页接线：取消零请求、确认才发、成功即刷行内状态、错误原文进「行内」");

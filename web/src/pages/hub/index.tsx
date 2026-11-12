@@ -463,6 +463,9 @@ export function HubRowStatusCell({ task, actionError = "", onDismissActionError 
  * failed 行的失败原因（AT-18 B3b）：`failed.reason` 优先（后端唯一文案源）；
  * 老任务（无 `failed_reason`）回落详情 `error`——表格摘要没有 error 字段，故**只在原因缺失时**
  * 懒拉一次详情补原文（一次 GET，不轮询、不每行常驻拉取），再套 B3 的三段式兜底。
+ *
+ * 表格行走 `compact` 密度（t_d7254b52）：只长后端原文首行 + on_disk/missing 徽标，视觉 ≤2 行。
+ * 完整原文（含［附属］/［转述］/［原始响应］）不在这里——它在详情页 `CloudFailurePanel`。
  */
 export function HubRowFailedReason({ task }: { task: HubTaskSummary }) {
     const missing = !(task.failed?.reason || "").trim();
@@ -482,7 +485,7 @@ export function HubRowFailedReason({ task }: { task: HubTaskSummary }) {
             alive = false;
         };
     }, [missing, task.local_id, task.failed?.at]);
-    return <FailedReasonLine failed={task.failed} fallbackError={detailError} />;
+    return <FailedReasonLine failed={task.failed} fallbackError={detailError} compact />;
 }
 
 /**

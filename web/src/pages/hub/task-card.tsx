@@ -162,6 +162,28 @@ export function hubFailedReason(failed?: HubFailedView | null, fallbackError?: s
 }
 
 /**
+ * 列表行摘要（纯函数，探针直测）：后端原文**首行** + `cloud_raw` 徽标值。
+ *
+ * 为什么只取首行：后端 `discuss._failure_detail` 把「云端原文：{message}」摆在首行，后面
+ * ［附属］/［转述］/［原始响应］是诊断附属（含 raw_response JSON）。表格行是横向比对用的，
+ * 四行原文平铺会把单行撑到 673px（真机实测），所以行内只留首行 + 一个落盘徽标，
+ * 完整原文交给详情页 `CloudFailurePanel`（读同一份 `failed.reason`，逐字不裁剪）。
+ *
+ * 红线：不解析错误语义、不改写文案、**不读 `evidence.cloud_error.message` 二次渲染**
+ * （那正是「云端原文在同一行出现两次」的重复来源）；徽标只认 `cloud_raw` 的字面值，
+ * 其它值不造占位。
+ */
+export type FailedRowSummary = { firstLine: string; cloudRaw: "on_disk" | "missing" | "" };
+
+export function failedRowSummary(failed?: HubFailedView | null, fallbackError = ""): FailedRowSummary {
+    const firstLine = (hubFailedReason(failed, fallbackError).split("\n")[0] || "").trimEnd();
+    const evidence = failed?.evidence;
+    const raw = evidence && typeof evidence === "object" ? evidence.cloud_raw : "";
+    const cloudRaw = raw === "on_disk" ? "on_disk" : raw === "missing" ? "missing" : "";
+    return { firstLine, cloudRaw };
+}
+
+/**
  * 云端原文证据块（直渲 failed_evidence，冻结 schema 原样展示）：
  * · cloud_error.message 主行，error_type / finish_reason / attempts 有值才跟附属行；
  * · cloud_raw 给 on_disk/missing 徽标（discuss.py 落的标记，前端只认值不重判）。
@@ -206,10 +228,48 @@ function CloudErrorEvidence({ evidence }: { evidence: Record<string, unknown> })
     );
 }
 
-export function FailedReasonLine({ failed, fallbackError = "" }: { failed?: HubFailedView | null; fallbackError?: string }) {
+/**
+ * 失败原因行（两种密度）：
+ * · 默认（详情抽屉 / `?legacy=1` 卡片流）：全文 + 云端证据块，原因不折叠；
+ * · `compact`（默认页 `/hub` 表格行）：**只长首行**（视觉最多 2 行，`line-clamp-2`）+ 落盘徽标，
+ *   不再叠 `CloudErrorEvidence` 的 message（同一句云端原文会在同一行出现两次），
+ *   ［原始响应］JSON 也不进表格单元格——完整原文在详情页 `CloudFailurePanel`。
+ */
+export function FailedReasonLine({ failed, fallbackError = "", compact = false }: { failed?: HubFailedView | null; fallbackError?: string; compact?: boolean }) {
     const evidence = failed?.evidence || null;
+    const hook = failed?.reason ? "backend" : fallbackError ? "history" : "empty";
+    if (compact) {
+        const { firstLine, cloudRaw } = failedRowSummary(failed, fallbackError);
+        // 失败时间不进第二行（真机实测：多一行就顶到 120px 上限），改成悬停提示 + 详情页正文
+        const tip = [failed?.at ? `失败时间 ${hubClockText(failed.at)}` : "", "完整原文见「打开」详情"].filter(Boolean).join(" · ");
+        return (
+            <div
+                className="rounded-md border border-red-200 bg-red-50 px-2.5 py-0.5 dark:border-red-950 dark:bg-red-950/20"
+                data-hub-failed-reason={hook}
+                data-hub-failed-row="1"
+                title={tip || undefined}
+            >
+                <div className="flex items-start gap-1.5 text-xs text-red-700 dark:text-red-300">
+                    <CircleAlert className="mt-0.5 size-3.5 shrink-0" />
+                    {firstLine ? (
+                        <span className="line-clamp-2 min-w-0 flex-1 break-words leading-4" data-hub-failed-first-line>{firstLine}</span>
+                    ) : null}
+                    {cloudRaw ? (
+                        <span
+                            className={cloudRaw === "on_disk"
+                                ? "shrink-0 rounded border border-emerald-300 bg-emerald-50 px-1 font-mono text-[10px] leading-4 text-emerald-700 dark:border-emerald-800 dark:bg-emerald-950/40 dark:text-emerald-300"
+                                : "shrink-0 rounded border border-stone-300 bg-stone-100 px-1 font-mono text-[10px] leading-4 text-stone-500 dark:border-stone-600 dark:bg-stone-800/60 dark:text-stone-400"}
+                            data-hub-cloud-raw={cloudRaw}
+                        >
+                            {cloudRaw === "on_disk" ? "on_disk 已落盘" : "missing 未落盘"}
+                        </span>
+                    ) : null}
+                </div>
+            </div>
+        );
+    }
     return (
-        <div className="rounded-md border border-red-200 bg-red-50 p-3 dark:border-red-950 dark:bg-red-950/20" data-hub-failed-reason={failed?.reason ? "backend" : fallbackError ? "history" : "empty"}>
+        <div className="rounded-md border border-red-200 bg-red-50 p-3 dark:border-red-950 dark:bg-red-950/20" data-hub-failed-reason={hook}>
             <div className="flex items-start gap-2 text-sm text-red-700 dark:text-red-300">
                 <CircleAlert className="mt-0.5 size-4 shrink-0" />
                 {/* whitespace-pre-wrap：failed_reason 是多行文本（云端原文主位+附属行），不许折成一长句 */}
