@@ -533,6 +533,50 @@ def _audio_mode(task: dict) -> dict:
     return {"audio_mode": "", "依据": "", "待核对": False, "来源": ""}
 
 
+def set_audio_mode(local_id: str, mode: str) -> dict:
+    """AT-17 B3：确认流里改选音频三态 → 任务.json + 画布旁路同值落盘 → 按新三态重渲染 → 门禁重判。
+
+    为什么一个动作里做三件事（不是三套轮子）：
+      · 落盘是「用户的选择」，两链同一份枚举（intent.AUDIO_MODE_VALUES），hub 落任务字段、
+        画布落 audio_mode.json——B2c 的双链落盘面，写入口也只有这两处；
+      · 重渲染复用 generate.do_render 的那条 bridge GET（fetch_prompt，同一处拼 audio_mode），
+        只是状态不迁移（awaiting_approval 原地换正文）；
+      · 门禁重跑复用的是 approve 前置那同一份 run_audio_gate —— 不另写一套判定。
+    这样「改了三态、红条还在骂旧三态」在数据上不可能：红条读的就是这一次重判结果。
+
+    状态守卫：只有 awaiting_approval（提示词已出、还没批准）能改。approved/generating 要改
+    得先走既有「撤销批准」受控回退（不改状态机）。
+    """
+    value = str(mode or "").strip()
+    intent = _intent_mod()
+    if value not in intent.AUDIO_MODE_VALUES:
+        raise HubInputError(f"audio_mode 只认 {'/'.join(intent.AUDIO_MODE_VALUES)}，收到「{value}」")
+    task_dir = _task_dir(local_id)
+    with task_lock(local_id):
+        task = state.load(task_dir)
+        if task["state"] != "awaiting_approval":
+            raise HubError(f"改三态需 awaiting_approval（提示词已出、还没批准），"
+                           f"当前 {task['state']}——已批准的先用「撤销批准」回退")
+        task[AUDIO_MODE_FIELD] = value
+        task["audio_mode_依据"] = "确认流界面改选"
+        task["audio_mode_待核对"] = False
+        state.save(task_dir, task)
+        bridge_id = str(task.get("bridge_id") or "")
+        outdir = ROOT / "analysis" / "reverse" / bridge_id if bridge_id else None
+        if outdir is not None and outdir.is_dir():
+            # 画布链读的就是这份旁路文件（画布链没有 approve，落盘即生效）
+            intent.save_audio_mode(outdir, value, "确认流界面改选（hub）")
+        try:
+            done = generate.rerender_for_audio_mode(task_dir)
+        except generate.GenError as exc:
+            raise HubError(str(exc)) from None
+    task = state.load(task_dir)
+    return {"ok": True, "task_id": local_id, "state": task["state"], "audio_mode": value,
+            "prompt_chars": done.get("prompt_chars", 0),
+            "prompt_md": _read(_prompt_path(task_dir, task)),
+            "audio_gate": task.get("audio_gate") or None}
+
+
 def _spawn_discuss(task_dir: Path, first_line: str) -> dict:
     """拆解后台执行体（发起拆解与 failed 重试共用；重跑即续语义全在 discuss.run_discuss）。"""
     _reset_lapian_anchors(task_dir)

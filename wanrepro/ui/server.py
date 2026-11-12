@@ -578,6 +578,39 @@ def task_audio_mode(task_id: str) -> dict | None:
             "待核对": bool(data.get("待核对"))}
 
 
+_INTENT_MODULE_CACHE: list = []
+
+
+def _intent_module():
+    """按路径加载 pipeline/reverse/intent.py（与 hub_api._intent_mod 同一做法，进程内缓存一次）。"""
+    if _INTENT_MODULE_CACHE:
+        return _INTENT_MODULE_CACHE[0]
+    import importlib.util
+    path = ROOT / "pipeline" / "reverse" / "intent.py"
+    spec = importlib.util.spec_from_file_location("wanrepro_reverse_intent_for_server", path)
+    if spec is None or spec.loader is None:
+        raise ApiError(500, f"导不进 {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    _INTENT_MODULE_CACHE.append(module)
+    return module
+
+
+def set_task_audio_mode(task_id: str, mode: str, basis: str = "") -> dict:
+    """画布链：界面改选三态 → 落任务目录 `audio_mode.json`（画布链没有 approve，落盘即生效）。
+
+    写实现只有 intent.save_audio_mode 一份（枚举校验也在那里，值域外 → 400 原文给用户）。
+    画布链的提示词是按需渲染的（拉片 → 提示词 / 重渲染），渲染器自己读这份文件，
+    所以这里只落盘、不预生成产物（方案 §4 B3：画布链落盘即可）。
+    """
+    dir_ = task_dir(task_id)                     # 校验 id 与任务存在（404 语义沿用）
+    try:
+        info = _intent_module().save_audio_mode(dir_, mode, basis or "画布拉片弹层改选")
+    except ValueError as exc:
+        raise ApiError(400, str(exc)) from None
+    return {"ok": True, "id": task_id, **info, "来源": AUDIO_MODE_NAME}
+
+
 def task_payload(task_id: str) -> dict:
     prompt_text, template = latest_prompt(task_id)
     src = video_file(task_id, strict=False)
@@ -2426,6 +2459,14 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(hub_api.recover_orphan(urllib.parse.unquote(m.group(1)),
                                                   confirm=payload.get("confirm") is True))
             return
+        m = re.fullmatch(r"/api/hub/task/([^/]+)/audio-mode", path)
+        if m:
+            # AT-17 B3：确认流改选音频三态 → 落盘 + 按新三态重渲染 + 门禁重判（hub_api 一处收口）。
+            # body: {"audio_mode": "沿用原片|按新主体调整|不要"}；枚举外 → 400，状态不对 → 409。
+            payload = self.read_json()
+            self.send_json(hub_api.set_audio_mode(urllib.parse.unquote(m.group(1)),
+                                                  str(payload.get("audio_mode") or "")))
+            return
         m = re.fullmatch(r"/api/hub/task/([^/]+)/revoke", path)
         if m:
             # AT-13 §2.2/§2.4：撤销批准（受控回退 approved→awaiting_approval，不自动重批）
@@ -2543,6 +2584,15 @@ class Handler(BaseHTTPRequestHandler):
         m = re.fullmatch(r"/api/upload/([^/]+)", path)
         if m:
             self.do_upload(urllib.parse.unquote(m.group(1)))
+            return
+        m = re.fullmatch(r"/api/audio-mode/([^/]+)", path)
+        if m:
+            # AT-17 B3（画布链）：拉片弹层改选三态 → 落任务目录 audio_mode.json（画布链无 approve，
+            # 落盘即生效；渲染时 render.py 自己读这份）。body: {"audio_mode": "…"}，枚举外 → 400。
+            payload = self.read_json()
+            self.send_json(set_task_audio_mode(urllib.parse.unquote(m.group(1)),
+                                               str(payload.get("audio_mode") or ""),
+                                               str(payload.get("依据") or "")))
             return
         m = re.fullmatch(r"/api/render/([^/]+)", path)
         if m:

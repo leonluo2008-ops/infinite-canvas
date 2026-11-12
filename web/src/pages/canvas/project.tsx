@@ -40,6 +40,7 @@ import { LapianAssetAttachModal, type LapianAssetAttachImage } from "@/component
 import { LapianPromptTemplateModal } from "@/components/canvas/lapian-prompt-template-modal";
 import { LapianOptionalModal, parseLapianOptional } from "@/components/canvas/lapian-optional-modal";
 import { LapianModelModal } from "@/components/canvas/lapian-model-modal";
+import { AudioModePicker } from "@/components/audio-mode-picker";
 import { InfiniteCanvas } from "@/components/canvas/infinite-canvas";
 import { Minimap } from "@/components/canvas/canvas-mini-map";
 import { CanvasNode } from "@/components/canvas/canvas-node";
@@ -140,6 +141,29 @@ type LapianAssetFrame = { url: string; t: number; width: number; height: number;
 
 const VIDEO_NODE_MAX_WIDTH = 420;
 const VIDEO_NODE_MAX_HEIGHT = 420;
+
+// AT-17 B3：画布链音频三态——读回 / 落盘（hub 链走 /api/hub/task/<id>/audio-mode，各链各的端点）。
+// 画布链没有 approve：落 audio_mode.json 即生效，渲染时 render.py 自己读这份（B2a 的 resolve_audio_mode）。
+type CanvasAudioMode = { audio_mode: string; 依据: string; 待核对: boolean };
+
+async function fetchCanvasAudioMode(taskId: string): Promise<CanvasAudioMode | null> {
+    const data = await fetch(`${LAPIAN_BRIDGE}/api/task/${encodeURIComponent(taskId)}`, { cache: "no-store" }).then((r) => r.json());
+    const row = data?.audio_mode;
+    if (!row || typeof row !== "object") return null;
+    const value = String(row.audio_mode || "").trim();
+    if (!value) return null;
+    return { audio_mode: value, 依据: String(row.依据 || ""), 待核对: Boolean(row.待核对) };
+}
+
+async function saveCanvasAudioMode(taskId: string, mode: string): Promise<CanvasAudioMode> {
+    const data = await fetch(`${LAPIAN_BRIDGE}/api/audio-mode/${encodeURIComponent(taskId)}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ audio_mode: mode }),
+    }).then((r) => r.json());
+    if (!data || data.error) throw new Error(String(data?.error || "落盘失败"));
+    return { audio_mode: String(data.audio_mode || mode), 依据: String(data.依据 || ""), 待核对: Boolean(data.待核对) };
+}
 // Stable empty reference array prevents `... || []` from invalidating CanvasNode's React.memo on every render.
 const EMPTY_REFERENCES: CanvasResourceReference[] = [];
 const CONNECTION_HANDLE_HIT_RADIUS = 40;
@@ -287,6 +311,9 @@ function InfiniteCanvasPage() {
     const [lapianIntent, setLapianIntent] = useState("");
     const [lapianModelNodeId, setLapianModelNodeId] = useState<string | null>(null);  // M6-T7-R：拉片节点「模型」弹窗的目标节点
     const [lapianBusy, setLapianBusy] = useState(false);
+    // AT-17 B3：拉片弹层的音频三态（回显 + 改选落盘；画布链没有 approve，落盘即生效）
+    const [lapianAudioMode, setLapianAudioMode] = useState<CanvasAudioMode | null>(null);
+    const [lapianAudioBusy, setLapianAudioBusy] = useState(false);
     const [lapianError, setLapianError] = useState("");
     const [lapianTemplateNodeId, setLapianTemplateNodeId] = useState<string | null>(null);
     // T6-B5 画布侧：拉片可选段勾选（勾了的段渲染提示词时真进正文）。
@@ -1012,6 +1039,47 @@ function InfiniteCanvasPage() {
     const lapianModelGroupOptions = useMemo(() => lapianModelGroups(effectiveConfig.channels, effectiveConfig.lapianModels), [effectiveConfig.channels, effectiveConfig.lapianModels]);
 
     const lapianPopoverNode = lapianNodeId ? nodes.find((n) => n.id === lapianNodeId) : null;
+    // AT-17 B3：三态回显源 = 这个视频节点**下游**拉片任务的 audio_mode（画布链落在任务目录
+    // audio_mode.json，经 GET /api/task/<id> 读回）。没有下游拉片任务 = 还没拆解 → 控件在场但不可改，
+    // 不猜默认值（B0② 的默认值由拆解八 声音决定，界面不替它先定一个）。
+    const lapianAudioTaskId = useMemo(() => {
+        if (!lapianPopoverNode) return "";
+        const child = nodes.find(
+            (node) => node.type === CanvasNodeType.Lapian
+                && connections.some((c) => c.fromNodeId === lapianPopoverNode.id && c.toNodeId === node.id),
+        );
+        return String(child?.metadata?.taskId || "");
+    }, [lapianPopoverNode, nodes, connections]);
+
+    useEffect(() => {
+        if (!lapianAudioTaskId) {
+            setLapianAudioMode(null);
+            return;
+        }
+        let alive = true;
+        void fetchCanvasAudioMode(lapianAudioTaskId)
+            .then((row) => { if (alive) setLapianAudioMode(row); })
+            .catch(() => { if (alive) setLapianAudioMode(null); });   // 读不到就不装作有值
+        return () => { alive = false; };
+    }, [lapianAudioTaskId]);
+
+    const changeLapianAudioMode = useCallback(
+        async (next: string) => {
+            if (!lapianAudioTaskId || lapianAudioBusy) return;
+            setLapianAudioBusy(true);
+            try {
+                const row = await saveCanvasAudioMode(lapianAudioTaskId, next);
+                setLapianAudioMode(row);
+                message.success(`音频三态已改为「${next}」：已落 audio_mode.json，下次「拉片 → 提示词」按新三态渲染`);
+            } catch (e) {
+                message.error(`改音频三态失败：${(e as Error).message}`);
+            } finally {
+                setLapianAudioBusy(false);
+            }
+        },
+        [lapianAudioTaskId, lapianAudioBusy, message],
+    );
+
     const lapianTemplateNode = lapianTemplateNodeId ? nodes.find((n) => n.id === lapianTemplateNodeId) ?? null : null;
     const lapianOptionalNode = lapianOptionalNodeId ? nodes.find((n) => n.id === lapianOptionalNodeId) ?? null : null;
     const lapianModelNode = lapianModelNodeId ? nodes.find((n) => n.id === lapianModelNodeId) ?? null : null;
@@ -4373,6 +4441,25 @@ function InfiniteCanvasPage() {
                                 onChange={(e) => setLapianIntent(e.target.value)}
                                 data-lapian-intent
                             />
+                            {/* AT-17 B3：音频三态（与 hub 确认流同一个控件）。画布链没有 approve，
+                                改选即落任务目录 audio_mode.json；下次「拉片 → 提示词」按新三态渲染。
+                                还没跑过拉片 = 没有 audio_mode 可回显 → 控件在场但不可改（不猜默认值）。 */}
+                            <div className="mb-3 rounded-xl border border-white/10 bg-stone-950/60 p-2" data-lapian-audio-mode-box>
+                                <AudioModePicker
+                                    tone="canvas"
+                                    value={lapianAudioMode?.audio_mode || ""}
+                                    basis={lapianAudioMode?.依据 || ""}
+                                    pendingCheck={Boolean(lapianAudioMode?.待核对)}
+                                    busy={lapianAudioBusy}
+                                    disabled={!lapianAudioTaskId}
+                                    onChange={(next) => void changeLapianAudioMode(next)}
+                                />
+                                {!lapianAudioTaskId ? (
+                                    <div className="mt-1 text-[11px] leading-4 text-stone-500" data-lapian-audio-mode-hint>
+                                        这个视频还没跑过拉片：三态由拆解「八 声音」自动判定（有 BGM→按新主体调整 / 无 BGM→沿用原片 / 无音轨→不要），跑完再回来改。
+                                    </div>
+                                ) : null}
+                            </div>
                             {lapianError ? <div className="mb-3 rounded-lg border border-red-500/40 bg-red-500/10 p-2 text-xs leading-relaxed text-red-300" data-lapian-error-text>{lapianError}</div> : null}
                             <div className="flex justify-end gap-2">
                                 <button type="button" className="rounded-lg px-3 py-1.5 text-sm text-stone-400 hover:bg-white/5" onClick={() => { setLapianNodeId(null); setLapianPendingPosition(null); }}>取消</button>

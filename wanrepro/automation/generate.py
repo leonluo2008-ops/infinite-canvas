@@ -169,6 +169,19 @@ def parse_set(spec: str) -> dict:
     return out
 
 
+def fetch_prompt(bridge_id: str, audio_mode: str = "") -> str:
+    """bridge 渲染一版默认模板提示词 → 正文（do_render 与三态改选重渲染共用这一处）。
+
+    GET 没有 body，三态只能上 query（附注 11）；空 = 不带，渲染器自己按 audio_mode.json 推导。
+    """
+    url = f"/api/render/{bridge_id}/{DEFAULT_TEMPLATE}"
+    mode = str(audio_mode or "").strip()
+    if mode:
+        url += "?" + urllib.parse.urlencode({"audio_mode": mode})
+    out = bridge.get(url)
+    return out.get("text") or ""
+
+
 def do_render(task_dir: Path, set_spec: str, verbose: bool = True,
               audio_mode: str | None = None) -> dict:
     """rendering → 渲染 → awaiting_approval（回显预演，等人工 approve）。
@@ -182,11 +195,8 @@ def do_render(task_dir: Path, set_spec: str, verbose: bool = True,
         raise GenError(f"render 需 rendering 状态（先完成置换确认），当前 {task['state']}")
     params = {**DEFAULT_PARAMS, **parse_set(set_spec)}
     mode = str(audio_mode if audio_mode is not None else task.get("audio_mode") or "").strip()
-    url = f"/api/render/{task['bridge_id']}/{DEFAULT_TEMPLATE}"
-    if mode:
-        url += "?" + urllib.parse.urlencode({"audio_mode": mode})
-    out = bridge.get(url)
-    prompt = out.get("text") or ""
+    prompt = fetch_prompt(str(task["bridge_id"]), mode)
+
     # 结构性校验（不假设模板格式——红线 14）：非空且够长即视为正文；
     # 模板差异（lumi 带 # 标题头 / seedance-flow 纯正文流）不是合同的一部分
     if len(prompt.strip()) < 200:
@@ -216,6 +226,45 @@ def do_render(task_dir: Path, set_spec: str, verbose: bool = True,
         print(f"  快照 {snap[:16]}…；提示词已落 {PROMPT_FILE}（{len(prompt)} 字）")
         print(f"  批准: py -3 -m automation.generate approve {task['local_id']}")
     return {"params": params, "snapshot": snap, "prompt_chars": len(prompt)}
+
+
+# ------------------------------------------------ 三态改选即重渲染（AT-17 B3，方案 §4 B3）
+
+def rerender_for_audio_mode(task_dir: Path) -> dict:
+    """awaiting_approval 内**原地**按新三态重渲染提示词（不改状态、不碰已批准快照以外的东西）。
+
+    B3 的切换行为：界面改三态 → 任务.json 落新值（调用方写）→ 本函数按新值重渲染 →
+    自检与音频门禁**一起重跑**。重跑门禁是为了「改了三态红条还在骂旧三态」不可能发生：
+    红条读的就是这次重判的结果（get_task.audio_gate）。
+
+    为什么不用 do_render：那个是 rendering 停点专用（会迁移状态到 awaiting_approval）。
+    这里状态不变，只换正文与快照（快照按新正文重算，否则之后的 approve 会因为
+    「输入变了」永远对不上）。
+    """
+    task = state.load(task_dir)
+    if task["state"] != "awaiting_approval":
+        raise GenError(f"三态改选需 awaiting_approval（预演已出、还没批准），当前 {task['state']}")
+    mode = str(task.get("audio_mode") or "").strip()
+    if not mode:
+        raise GenError("任务没有 audio_mode：先把三态落盘（拆解完成/界面改选）再重渲染")
+    prompt = fetch_prompt(str(task["bridge_id"]), mode)
+    if len(prompt.strip()) < 200:
+        raise GenError(f"渲染正文过短（{len(prompt.strip())} 字）不像提示词: {prompt[:120]}")
+    (task_dir / PROMPT_FILE).write_text(prompt, encoding="utf-8")
+
+    task = state.load(task_dir)
+    task["approval_snapshot"] = state.snapshot_for(task, prompt)
+    task.setdefault("audio_mode_history", []).append(
+        {"at": state._now(), "audio_mode": mode,
+         "依据": str(task.get("audio_mode_依据") or ""), "note": "界面改选三态后重渲染"})
+    state.save(task_dir, task)
+
+    # 自检与门禁都属于「这一次的正文」——换了正文必须一起重跑，否则面板停在旧结论上。
+    from . import selfcheck
+    selfcheck.run_selfcheck(task_dir)
+    gate = run_audio_gate(task_dir, state.load(task_dir))
+    return {"audio_mode": mode, "prompt_chars": len(prompt),
+            "snapshot": task["approval_snapshot"], "audio_gate": gate}
 
 
 # ------------------------------------------------ 批准前音频门禁（AT-17 B2b，方案 §4 B2b）

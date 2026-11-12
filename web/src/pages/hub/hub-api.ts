@@ -233,6 +233,17 @@ export type HubTaskDetail = HubTaskSummary & {
     lapian_stage?: string;
     /** 批准前音频门禁结果（AT-17 B2b）；没跑过/老任务 → null（前端不显示，不当成通过）。 */
     audio_gate?: HubAudioGate | null;
+    /**
+     * AT-17 B2c/B3 音频三态（确认流改选控件读的就是这四个平铺键）：
+     *  · audio_mode     当前值（枚举三词之一；空串 = 还没落值，拆解后自动判定）
+     *  · audio_mode_依据 判定依据（如「BGM.情绪=轻快」/「确认流界面改选」）
+     *  · audio_mode_待核对 true = 拆解读不到 BGM 判定，WARN 让人核对（不猜无 BGM）
+     *  · audio_mode_来源 值的来源（任务.json / audio_mode.json / 拆解现推）
+     */
+    audio_mode?: string;
+    audio_mode_依据?: string;
+    audio_mode_待核对?: boolean;
+    audio_mode_来源?: string;
     /** 拆解日志尾 15 行（排查留痕）。 */
     log_tail?: string;
     pair_lines: HubPairLine[];
@@ -371,6 +382,11 @@ export async function getHubTask(localId: string): Promise<HubTaskDetail> {
         // 阶段文案与锚同一条透传口径（异构历史值 → 空串，不出 repr）
         stage: contractText(task.stage),
         lapian_stage: contractText(task.lapian_stage),
+        // AT-17 B3：三态四键归一（旧 bridge 缺 → 空串/false，控件据此不高亮、不假装有值）
+        audio_mode: hubText(task.audio_mode),
+        audio_mode_依据: hubText(task.audio_mode_依据),
+        audio_mode_待核对: Boolean(task.audio_mode_待核对),
+        audio_mode_来源: hubText(task.audio_mode_来源),
     };
 }
 
@@ -822,6 +838,33 @@ export async function submitHubTask(localId: string, key?: string | null): Promi
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ key: String(key || "").trim() }),
+    });
+}
+
+/**
+ * AT-17 B3：确认流改选音频三态（POST /api/hub/task/<id>/audio-mode）。
+ *
+ * 一个动作三层，全在服务端一处收口（hub_api.set_audio_mode）：落盘（任务.json + 画布旁路同值）
+ * → 按新三态重渲染（复用 B2a 的 GET render 链）→ 音频门禁重跑（B2b 同一条判定）。
+ * 返回里带 prompt_md 与 audio_gate，调用方据此立刻换正文、换红条，不必等下一轮轮询。
+ */
+export async function setHubAudioMode(localId: string, audioMode: string): Promise<{
+    ok?: boolean;
+    state?: string;
+    audio_mode?: string;
+    prompt_md?: string;
+    audio_gate?: HubAudioGate | null;
+}> {
+    return request<{
+        ok?: boolean;
+        state?: string;
+        audio_mode?: string;
+        prompt_md?: string;
+        audio_gate?: HubAudioGate | null;
+    }>(`/api/hub/task/${encodeURIComponent(localId)}/audio-mode`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ audio_mode: audioMode }),
     });
 }
 

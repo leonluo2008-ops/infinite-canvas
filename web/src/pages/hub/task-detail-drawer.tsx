@@ -4,6 +4,7 @@ import { createContext, useCallback, useContext, useEffect, useMemo, useRef, use
 import { Streamdown } from "streamdown";
 
 import { ModelPicker } from "@/components/model-picker";
+import { AudioModePicker } from "@/components/audio-mode-picker";
 import { badgeFits, boxRect, containRect, formatSeconds, frameCaption, frameState, layoutLegend, otherBoxCount, ratioFromImage, stageSize } from "@/lib/hub/frame-overlay";
 import {
     buildApproveConfig,
@@ -63,6 +64,7 @@ import {
     revokeHubTask,
     rollbackHubTask,
     runHubQuickAction,
+    setHubAudioMode,
     startLapianRun,
     submitHubTask,
     ungroupHubRows,
@@ -97,7 +99,7 @@ const OVERLAY_COLORS = [
 
 const POST_DECOMPOSE_STATES = ["awaiting_assets", "rendering", "awaiting_approval", "approved", "generating", "done", "failed"];
 
-type BusyKind = "upload" | "confirm" | "empty" | "approve" | "submit" | "retry" | "rollback" | "revoke" | "release" | "group" | "ungroup" | "discuss" | "decision" | "dismiss-batch" | null;
+type BusyKind = "upload" | "confirm" | "empty" | "approve" | "submit" | "retry" | "rollback" | "revoke" | "release" | "group" | "ungroup" | "discuss" | "decision" | "dismiss-batch" | "audio-mode" | null;
 
 /**
  * 任务详情全屏 Drawer（AT-9 §五）：头部 → Agent 建议 → 资产置换 → 提示词 → 审批/生成/成片。
@@ -2436,6 +2438,84 @@ function GenIssueSection({ detail, busy, act }: { detail: HubTaskDetail; busy: B
 }
 
 /**
+ * 音频三态区（AT-17 B3，方案 §4 B3 + 附注 14）：三态控件 + B2c 待核对 WARN + B2b 门禁红条。
+ *
+ * 落点 = 确认流按钮区（原本只有 B2b 红条的那一块），**不开新面板**：三态控件与红条上下相邻，
+ * 改选后门禁结果就在下面一行更新——「改了三态红条还在骂旧三态」在视觉上也无处藏。
+ *
+ * 切换行为（服务端一处收口，前端只发一个 POST）：
+ *   改选 → POST /api/hub/task/<id>/audio-mode → 落盘（任务.json + 画布旁路同值）
+ *   → 按新三态重渲染（B2a 同一条 GET render 链）→ 门禁重判（B2b 同一条判定）
+ *   → act() 回刷 detail：提示词正文（PromptSection）与红条同时换新。
+ * 只有「待批准」态可改：已批准要先「撤销批准」（既有受控回退边），这里如实说明、不放宽。
+ */
+export function AudioModeSection({
+    detail,
+    busy,
+    act,
+}: {
+    detail: HubTaskDetail;
+    busy: BusyKind;
+    act: (kind: Exclude<BusyKind, null>, run: () => Promise<void>, okText?: string) => Promise<void>;
+}) {
+    const mode = detail.audio_mode || "";
+    const editable = detail.state === "awaiting_approval";
+    const gate = detail.audio_gate;
+    return (
+        <div className="mt-3 w-full space-y-2" data-hub-audio-mode-section data-hub-audio-mode={mode}>
+            <AudioModePicker
+                value={mode}
+                basis={detail.audio_mode_依据 || ""}
+                pendingCheck={Boolean(detail.audio_mode_待核对)}
+                busy={busy === "audio-mode"}
+                disabled={!editable || busy !== null}
+                onChange={(next) => {
+                    void act(
+                        "audio-mode",
+                        async () => {
+                            await setHubAudioMode(detail.local_id, next);
+                        },
+                        `音频三态已改为「${next}」：提示词声音段按新三态重渲染，门禁已重判`,
+                    );
+                }}
+            />
+            {!editable ? (
+                <div className="text-[11px] leading-4 text-stone-500 dark:text-stone-400" data-hub-audio-mode-locked>
+                    三态只在「待批准」态可改；已批准的先「撤销批准」回退，再改。
+                </div>
+            ) : null}
+            {editable && gate?.verdict === "FAIL" ? (
+                <div
+                    className="w-full space-y-1 rounded-md border border-red-300 bg-red-50 p-2 dark:border-red-900 dark:bg-red-950"
+                    data-hub-audio-gate="fail"
+                    data-hub-audio-gate-mode={gate.audio_mode || ""}
+                >
+                    <div className="flex flex-wrap items-center gap-1.5">
+                        <Tag color="red" className="m-0">
+                            音频门禁 ✗ 批不了
+                        </Tag>
+                        <span className="text-xs text-stone-600 dark:text-stone-300">
+                            提示词的声音段与任务声明的音频三态不一致（只拒绝批准，渲染产物保持原状）
+                        </span>
+                    </div>
+                    {(gate.发现 ?? []).map((line, index) => (
+                        <div key={index} className="break-words whitespace-pre-wrap text-xs leading-5 text-stone-600 dark:text-stone-300">
+                            {line}
+                        </div>
+                    ))}
+                    {gate.处理 ? (
+                        <div className="break-words text-xs leading-5 text-red-700 dark:text-red-300" data-hub-audio-gate-how>
+                            <span className="font-medium">怎么处理：</span>
+                            {gate.处理}
+                        </div>
+                    ) : null}
+                </div>
+            ) : null}
+        </div>
+    );
+}
+
+/**
  * 生成设置（§2.1/§2.2/§2.10）：
  *  - 渠道 + 模型（复用 ModelPicker(capability=video)）→ 按「渠道+模型引用」存任务草稿（不写全局 videoModel）
  *  - 模型候选＝画布视频模型全集（AT-14 §3.2 档位 a，共享函数 selectableModelsByCapability 派生）；
@@ -3020,36 +3100,8 @@ function GenSettingsSection({ detail, busy, act }: { detail: HubTaskDetail; busy
                     </div>
                 ) : null}
 
-                {/* AT-17 B2b：音频门禁失败原因（同源 GateBadge 红条样式，不新造面板）——
-                    批准会被后端拒（409），这里先把「为什么批不了」摆在按钮上方，防反复点击。
-                    结果来自 get_task.audio_gate（服务端门禁落盘），前端只渲染不重判。 */}
-                {state === "awaiting_approval" && detail.audio_gate?.verdict === "FAIL" ? (
-                    <div
-                        className="mt-3 w-full space-y-1 rounded-md border border-red-300 bg-red-50 p-2 dark:border-red-900 dark:bg-red-950"
-                        data-hub-audio-gate="fail"
-                        data-hub-audio-gate-mode={detail.audio_gate.audio_mode || ""}
-                    >
-                        <div className="flex flex-wrap items-center gap-1.5">
-                            <Tag color="red" className="m-0">
-                                音频门禁 ✗ 批不了
-                            </Tag>
-                            <span className="text-xs text-stone-600 dark:text-stone-300">
-                                提示词的声音段与任务声明的音频三态不一致（只拒绝批准，渲染产物保持原状）
-                            </span>
-                        </div>
-                        {(detail.audio_gate.发现 ?? []).map((line, index) => (
-                            <div key={index} className="break-words whitespace-pre-wrap text-xs leading-5 text-stone-600 dark:text-stone-300">
-                                {line}
-                            </div>
-                        ))}
-                        {detail.audio_gate.处理 ? (
-                            <div className="break-words text-xs leading-5 text-red-700 dark:text-red-300" data-hub-audio-gate-how>
-                                <span className="font-medium">怎么处理：</span>
-                                {detail.audio_gate.处理}
-                            </div>
-                        ) : null}
-                    </div>
-                ) : null}
+                {/* AT-17 B3：音频三态控件（本区，与 B2b 红条同一处）——改选 → 落盘 → 重渲染 → 门禁重判 */}
+                <AudioModeSection detail={detail} busy={busy} act={act} />
 
                 <div className="mt-3 flex flex-wrap items-center justify-end gap-2">
                     {state === "awaiting_approval" ? (

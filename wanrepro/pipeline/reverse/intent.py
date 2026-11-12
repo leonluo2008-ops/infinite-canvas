@@ -606,6 +606,22 @@ def write_audio_mode(outdir: Path | str, disc_text: str):
     return target, info
 
 
+def save_audio_mode(outdir: Path | str, value: str, 依据: str = "") -> dict:
+    """B3：把界面改选的三态**显式**落到 `audio_mode.json`（唯一写实现，推导仍只走 audio_mode()）。
+
+    和 `write_audio_mode()` 的分工：那个按拆解推导（拆解完成时用），这个照人选的值写。
+    值只认 B0② 三个中文词（枚举外直接 ValueError，不静默归一）；`待核对` 归 False——
+    人已亲手选过，不该再挂「请核对」。返回 {audio_mode, 依据, 待核对}。
+    """
+    mode = str(value or "").strip()
+    if mode not in AUDIO_MODE_VALUES:
+        raise ValueError(f"audio_mode 只认 {'/'.join(AUDIO_MODE_VALUES)}，收到「{mode}」")
+    info = {"audio_mode": mode, "依据": str(依据 or "界面改选"), "待核对": False}
+    _write_utf8(Path(outdir) / AUDIO_MODE_FILE,
+                json.dumps(info, ensure_ascii=False, indent=2) + "\n")
+    return info
+
+
 def build(disc_text: str, checklist_text: str, intent_text: str,
           outdir: Path | str | None = None) -> str:
     """根据九层、清单行索引和用户意图生成规范化三档建议文本。
