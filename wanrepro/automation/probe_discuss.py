@@ -22,6 +22,8 @@
     · `_bridge_still_referenced` / `_uploads_video_shared` 在临时根下扫不到真任务，所以只许删
       **本次新建**的 bridge_id / 片名——删除前逐个与跑前快照对账，撞上跑前已存在的名字直接
       拒绝删除并如实 FAIL（uploads/官号参考1.mp4 是真实参考片，删不得）。
+      对账用的是**落地片名**（t_a94ccd30）：[1] 故意撞存量名官号参考1.mp4，桥侧改名落
+      官号参考1-<N>.mp4，任务.json 记落地名——删除合同只删本次那条，正是该修复的端到端回归。
 """
 import os
 import shutil
@@ -195,20 +197,28 @@ def run() -> int:
               f"uploads {len(before['uploads']['files'])} 文件")
 
         print("[1] 真拆：ingest → discuss → awaiting_assets + 三真")
-        # 片名每次唯一：桥侧 place_upload 重名会改名（官号参考1.mp4 → 官号参考1-39.mp4），而任务.json
-        # 记的是 ingest 传进去的片名——重名时删除合同会拿**旧文件**顶锅（uploads/官号参考1.mp4 是
-        # 真实参考片）。素材内容一字不改（幂等键=视频内容 sha），只把 zip 里的叶子名换成唯一名。
-        ref_name = f"probe-discuss-ref1-{int(time.time())}-{os.getpid()}.mp4"
+        # 片名故意撞存量（t_a94ccd30 修复验证）：uploads/官号参考1.mp4 是真实参考片，
+        # 桥侧 place_upload 重名不覆盖 → 本次落地为 官号参考1-<N>.mp4。修复后任务.json
+        # video_name 记**落地名**（删除合同只删本次那条）、原名另存 source_name；
+        # 修复前记原名，删除合同会拿旧文件顶锅（数据事故）。素材内容一字不改（幂等键=视频内容 sha）。
+        ref_name = VIDEO.name
         z = tmp / "t.zip"
         with zipfile.ZipFile(z, "w") as zf:
             zf.write(VIDEO, ref_name)
             zf.writestr("资产-主角.png", PNG_1PX)
             zf.writestr("意图.txt", "自动化探针任务：同款创意")
         r = ingest_one(z)
-        created.append((r["local_id"], r["bridge_id"], r["video_name"]))
-        ok &= check("[1] 上传片名未被重名改名（删除合同删的就是本次那一条）",
-                    r.get("video_name") == ref_name and (Path(hub.UPLOADS_DIR) / ref_name).is_file(),
-                    f"任务记的片名={r.get('video_name')!r} 期望={ref_name!r}")
+        landed = str(r.get("landed_video_name") or "")
+        created.append((r["local_id"], r["bridge_id"], landed))
+        ok &= check("[1] 重名上传被桥改名落地，任务.json 记落地名（删除合同删的就是本次那条）",
+                    r.get("video_name") == ref_name and landed != ref_name
+                    and (Path(hub.UPLOADS_DIR) / landed).is_file(),
+                    f"原名={r.get('video_name')!r} 落地名={landed!r}")
+        st_json = load(config.PROJECTS_DIR / r["local_id"])
+        ok &= check("[1] 任务.json：video_name=落地名、source_name=上传原名",
+                    (st_json.get("ingestion") or {}).get("video_name") == landed
+                    and (st_json.get("ingestion") or {}).get("source_name") == ref_name,
+                    str(st_json.get("ingestion"))[:200])
         tdir = config.PROJECTS_DIR / r["local_id"]
         st = run_discuss(tdir)
         t = load(tdir)
@@ -238,7 +248,8 @@ def run() -> int:
                 zf.write(uniq, uniq.name)      # 每次换新素材 → 新视频 sha → 新任务
                 zf.writestr("意图.txt", "失败路径探针")
             r3 = ingest_one(z3)
-            created.append((r3["local_id"], r3["bridge_id"], r3["video_name"]))
+            created.append((r3["local_id"], r3["bridge_id"],
+                            str(r3.get("landed_video_name") or r3["video_name"])))
             tdir3 = config.PROJECTS_DIR / r3["local_id"]
             # 夹具自检（前置，不放宽任何判据）：若又命中幂等，下面两条断言必然假红，先在这里判死
             ok &= check("独立素材建了新任务（未幂等命中 [1] 的同视频任务）",

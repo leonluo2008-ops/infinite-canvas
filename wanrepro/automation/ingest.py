@@ -117,12 +117,18 @@ def ingest_media(video: Path, intent: str, *, images: list[Path] | None = None,
         d = json.loads((existing / "任务.json").read_text(encoding="utf-8"))
         return {"local_id": d["local_id"], "bridge_id": d.get("bridge_id"),
                 "result": "HIT", "hit_existing": True,
-                "video_name": (d.get("ingestion") or {}).get("video_name", ""),
+                "video_name": _display_name(d),
                 "note": f"同视频已摄取过（{d['local_id']}），未重复建任务"}
     return _create_task(video_name=video.name, video_bytes=video.read_bytes(),
                         intent=intent.strip(), assets=[p.name for p in (images or [])],
                         ignored=[], sha=sha,
                         source=source_note or f"media:{video.name}")
+
+
+def _display_name(d: dict) -> str:
+    """用户可读片名：原名（source_name）优先；修复前的老任务没有 source_name，回落 video_name。"""
+    ing = d.get("ingestion") or {}
+    return str(ing.get("source_name") or ing.get("video_name") or "")
 
 
 def _iter_zips(target: Path) -> list[Path]:
@@ -204,6 +210,10 @@ def _create_task(*, video_name: str, video_bytes: bytes, intent: str, assets: li
     up = bridge.upload_video(inbox / video_name)
     if not bridge.task_exists(up["id"]):
         raise IngestError(f"上传回了 id={up['id']} 但 /api/tasks 里查不到——桥任务未建成")
+    # 桥侧重名不覆盖（server.place_upload：x.mp4 → x-2.mp4），落地名只有它自己知道。
+    # video_name 必须记**落地名**（删除合同按它删 uploads/<video_name>，记原名会拿同名旧片顶锅）；
+    # 原名另存 source_name 供展示（任务名/列表对用户显示原名更贴近）。
+    landed = str(up.get("name") or "").strip() or video_name
 
     task = {
         "local_id": local_id,
@@ -215,13 +225,14 @@ def _create_task(*, video_name: str, video_bytes: bytes, intent: str, assets: li
         "intent": intent,
         "assets": assets,
         "ingestion": {"zip_sha256": sha, "zip_name": source,
-                      "video_name": video_name, "text_name": "",
+                      "video_name": landed, "source_name": video_name, "text_name": "",
                       "ignored": ignored},
     }
     (tdir / "任务.json").write_text(
         json.dumps(task, ensure_ascii=False, indent=2), encoding="utf-8")
     return {"local_id": local_id, "bridge_id": up["id"], "result": "OK",
             "hit_existing": False, "video_name": video_name,
+            "landed_video_name": landed,
             "note": f"视频 {video_name} 已建桥任务 {up['id']}；"
                     f"资产图 {len(assets)} 张待置换；意图 {len(intent)} 字"}
 
@@ -234,7 +245,7 @@ def ingest_one(zip_path: Path, *, dry_run: bool = False) -> dict:
         d = json.loads((existing / "任务.json").read_text(encoding="utf-8"))
         return {"local_id": d["local_id"], "bridge_id": d.get("bridge_id"),
                 "result": "HIT", "hit_existing": True,
-                "video_name": (d.get("ingestion") or {}).get("video_name", ""),
+                "video_name": _display_name(d),
                 "note": f"同 zip 已摄取过（{d['local_id']}），未重复建任务"}
 
     spec = inspect_zip(zip_path)
@@ -250,7 +261,7 @@ def ingest_one(zip_path: Path, *, dry_run: bool = False) -> dict:
         d = json.loads((existing / "任务.json").read_text(encoding="utf-8"))
         return {"local_id": d["local_id"], "bridge_id": d.get("bridge_id"),
                 "result": "HIT", "hit_existing": True,
-                "video_name": (d.get("ingestion") or {}).get("video_name", ""),
+                "video_name": _display_name(d),
                 "note": f"同视频已摄取过（{d['local_id']}），未重复建任务"}
 
     return _create_task(video_name=spec["video_name"], video_bytes=spec["video_bytes"],
