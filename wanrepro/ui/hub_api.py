@@ -41,6 +41,9 @@ from automation import cards, config as auto_config, discuss, frames, generate, 
 TASKS_DIR = auto_config.PROJECTS_DIR
 VIDEO_FILE = "成片.mp4"
 UPLOADS_DIR = ROOT / "uploads"
+# 桥侧上传建目录时写的指纹文件名（ui/server.py::FP_NAME 同名——server 在本模块之上，不可反向
+# import；automation/frames.py 已有同款先例）。老任务兜底反查 uploads 落盘名全靠它的「路径」。
+FP_NAME = ".源视频指纹.json"
 TOMBSTONES = TASKS_DIR / ".tombstones.json"     # 删除墓碑（数据合同 B0）
 
 
@@ -279,20 +282,44 @@ def _job_running_records(local_id: str) -> list[tuple[str, dict]]:
             if rec.get("local_id") == local_id and rec.get("status") == "running"]
 
 
-def _job_alive(rec: dict, *, heartbeat_at: str = "") -> bool:
-    """单条 HUB_JOBS 记录是否「活」（方案 §3.2 G4 / §4.4 阻断闭包）：
+def _job_age_text(rec: dict) -> str:
+    """记录自 started 起的时长人话（"已运行 123s" / "启动时间未知"）——只为拒绝文案可读。"""
+    started = _parse_iso(rec.get("started"))
+    if started is None:
+        return "启动时间未知"
+    return f"已运行 {int(time.time() - started)}s"
 
-    只认「status=running ∧（启动不足 60s ∨ 心跳距今 ≤ 900s）」。其余一切记录
-    （failed/done 残留、无心跳、心跳过期、Thread.start() 失败留下的孤儿）都不阻断、
-    也不进判定——只登记进 ignored_stale_jobs，可追溯。
+
+def _job_blocks_retry(rec: dict, *, heartbeat_at: str = "") -> str:
+    """单条 HUB_JOBS 记录的**统一存活判据**：空串 = 不阻断，非空 = 命中的依据（人话）。
+
+    口径写死（方案 §3.2 G4 / §4.4 阻断闭包）：只认「status=running ∧（启动不足
+    HEARTBEAT_SECONDS ∨ 心跳距今 ≤ STALE_JOB_SECONDS）」。status 非 running 的记录——
+    failed/done 残留、Thread.start() 失败留下的孤儿、以及方案 A 写下的 `force_finished`
+    （人工已结束）——一律不阻断。
+
+    retry 守卫 / 删除合同 / held_job 三处共用本判据（`_job_alive` 就是它的布尔投影），
+    口径只剩一份：任何一侧放宽或收紧，两侧同时生效，不会再有「看门狗认死、重试认活」。
     """
     if rec.get("status") != "running":
-        return False
+        return ""
     started = _parse_iso(rec.get("started"))
     if started is not None and time.time() - started <= HEARTBEAT_SECONDS:
-        return True
+        return f"启动至今 {int(time.time() - started)}s ≤ {HEARTBEAT_SECONDS}s 启动宽限期内"
     beat = _parse_iso(heartbeat_at)
-    return beat is not None and time.time() - beat <= STALE_JOB_SECONDS
+    if beat is not None and time.time() - beat <= STALE_JOB_SECONDS:
+        return f"心跳距今 {int(time.time() - beat)}s ≤ {STALE_JOB_SECONDS}s（执行体仍在打心跳）"
+    return ""
+
+
+def _job_alive(rec: dict, *, heartbeat_at: str = "") -> bool:
+    """单条 HUB_JOBS 记录是否「活」（方案 §3.2 G4 / §4.4 阻断闭包）——`_job_blocks_retry`
+    的布尔投影，判据只此一份。
+
+    其余一切记录（failed/done 残留、无心跳、心跳过期、Thread.start() 失败留下的孤儿）
+    都不阻断、也不进判定——只登记进 ignored_stale_jobs，可追溯。
+    """
+    return bool(_job_blocks_retry(rec, heartbeat_at=heartbeat_at))
 
 
 def _held_job(local_id: str, probe: dict | None = None) -> bool:
@@ -336,7 +363,7 @@ def _failed_view(task: dict) -> dict:
 def _summary(task: dict, task_dir: Path) -> dict:
     out = (task_dir / VIDEO_FILE).is_file()
     # AT-9 B1 表格摘要三字段（数据合同）：任务名/阶段/已换数——列表页不拉详情
-    task_name = f"{task['local_id']}·{(task.get('ingestion') or {}).get('video_name', '')}"
+    task_name = f"{task['local_id']}·{display_video_name(task)}"
     stage = _stage_text(task.get(LAPIAN_STAGE)) if task["state"] == "discussing" else ""
     # AT-18 §4.5：心跳 / 活动锚 / 假运行 / 失败原因——列表与详情同源（一份 probe 算两用）
     probe = state.activity_snapshot(task_dir, task)
@@ -351,7 +378,7 @@ def _summary(task: dict, task_dir: Path) -> dict:
         "state": task["state"],
         "intent": task.get("intent", ""),
         "created_at": task.get("created_at"),
-        "video_name": (task.get("ingestion") or {}).get("video_name", ""),
+        "video_name": display_video_name(task),
         "gen_progress": task.get("gen_progress"),
         "has_pending_replace": bool(task.get("pending_replace")),
         "has_output": out,
@@ -894,6 +921,31 @@ def start_discuss(local_id: str) -> dict:
     return _spawn_discuss(_task_dir(local_id), "拆解启动")
 
 
+def _retry_guard(local_id: str, task_dir: Path) -> tuple[tuple[str, dict] | None, str, list[str]]:
+    """start_retry 第一关守卫的判定：返回 (阻断记录 (job_id, rec) 或 None, 命中依据, 被豁免的陈旧记录)。
+
+    判据与看门狗/删除合同**同一份**（`_job_blocks_retry`）：真活着的 job 才阻断；
+    `force_finished` / `failed` / `done` 残留、心跳超 900s 的僵尸 running 一律只登记
+    不阻断——旧实现只看 status=="running"，强制结束后的残留记录会把重试永久挡死。
+    """
+    heartbeat_at = str(state.heartbeat_read(task_dir).get("last_beat_at") or "")
+    blocking: tuple[str, dict] | None = None
+    basis = ""
+    ignored: list[str] = []
+    for job_id, rec in list(HUB_JOBS.items()):
+        if rec.get("local_id") != local_id:
+            continue
+        why = _job_blocks_retry(rec, heartbeat_at=heartbeat_at)
+        if why:
+            if blocking is None:
+                blocking, basis = (job_id, rec), why
+            continue
+        ignored.append(f"{rec.get('kind')}:{job_id}（status={rec.get('status') or '-'}，"
+                       f"started={rec.get('started') or '-'}，{_job_age_text(rec)}，"
+                       f"未达存活判据，已豁免）")
+    return blocking, basis, ignored
+
+
 def start_retry(local_id: str) -> dict:
     """POST /api/hub/task/{id}/retry —— failed 态续跑入口（§四：重试/环境级故障重跑即续）。
 
@@ -902,26 +954,38 @@ def start_retry(local_id: str) -> dict:
     未齐才真重发拆解。非 failed → 409（HubError 由 server 层转 409）。
 
     AT-18 §4.3 补两处合同：
-      · **活跃 job 守卫**（T6 ②）——该任务已有在跑 job 时 409，绝不起第二个线程
-        （这是「同一时刻只有一个 run、心跳侧车恒等于当前 run」的事实前提）；
+      · **活跃 job 守卫**（T6 ②）——该任务已有**真活着**的 job 时 409，绝不起第二个线程
+        （这是「同一时刻只有一个 run、心跳侧车恒等于当前 run」的事实前提）。存活口径与
+        看门狗/删除合同同一份 `_job_blocks_retry`：心跳新鲜的真 running 才拦，
+        `force_finished`/`failed` 残留与心跳超 900s 的僵尸不拦（否则强制结束后永久不可重试）；
+        拒绝文案带 job_id / status / started 与命中依据，运维可据此定位。
       · 重试即**重建心跳锚**（heartbeat_begin 整体覆盖，旧 run_id 作废），
         旧失败原因不删——state.transition 把它写进 history，另以 previous_reason 回显。
     """
     task_dir = _task_dir(local_id)
+    ignored: list[str] = []
     with task_lock(local_id):
         task = state.load(task_dir)
         # 守卫顺序写死：**先看在跑 job，再看状态**。否则「重试后立刻再点」只会撞到
         # 「当前 discussing，只有失败任务可重试」这句状态文案，双写防护形同虚设
         # （方案 §4.3 A15 要的就是这一句「已有拆解任务在跑」）。
-        active = _job_running_records(local_id)
-        if active:
-            raise HubError(f"任务已有拆解任务在跑（{active[0][1].get('kind')}），重试拒绝")
+        blocking, basis, ignored = _retry_guard(local_id, task_dir)
+        if blocking is not None:
+            job_id, rec = blocking
+            exempt = f"；另有陈旧记录未阻断：{'；'.join(ignored)}" if ignored else ""
+            raise HubError(
+                f"任务已有拆解任务在跑（{rec.get('kind')}），重试拒绝"
+                f"——job={job_id}，status={rec.get('status') or '-'}，"
+                f"started={rec.get('started') or '-'}（{_job_age_text(rec)}），"
+                f"命中依据：{basis}{exempt}")
         if task["state"] != "failed":
             raise HubError(f"重试需 failed 状态，当前 {task['state']}（只有失败任务可重试）")
         previous_reason = str(task.get("failed_reason") or "")
         job = _spawn_discuss(task_dir, "人工重试：failed → discussing（重跑即续，产物优先）")
     return {"state": "discussing", "job_id": job.get("job_id"), "heartbeat_reset": True,
-            "previous_reason": previous_reason}
+            "previous_reason": previous_reason,
+            # 放行时被判定为陈旧、未参与阻断的 JOB 记录（可追溯，与删除合同同名）
+            "ignored_stale_jobs": ignored}
 
 
 def do_assets(local_id: str, image_paths: list[Path]) -> dict:
@@ -1056,6 +1120,92 @@ def _uploads_video_shared(video_name: str, exclude: str) -> bool:
     return False
 
 
+def display_video_name(task: dict) -> str:
+    """用户可读片名：原名（source_name）优先；修复前的老任务没有 source_name，回落 video_name。
+
+    与 automation.ingest._display_name 同一约定（任务名/列表对用户显示上传原名，
+    ingestion.video_name 存的是桥侧落地名，只供删除合同对账 uploads）。
+    """
+    ing = task.get("ingestion") or {}
+    return str(ing.get("source_name") or ing.get("video_name") or "")
+
+
+def _fingerprint_uploads_name(bridge_id: str) -> str:
+    """老任务兜底：analysis/reverse/<bridge_id>/.源视频指纹.json 的「路径」反查 uploads 落盘名。
+
+    修复前的任务.json 只记上传原名、落地名未知；指纹是桥侧建任务时写的（server.write_fingerprint），
+    「路径」= 落盘文件相对 ROOT 的 posix 路径（uploads/<落地名>）。只认 uploads/ 下的单层文件名。
+    """
+    if not bridge_id:
+        return ""
+    fp = _analysis_reverse() / bridge_id / FP_NAME
+    if not fp.is_file():
+        return ""
+    try:
+        meta = json.loads(fp.read_text(encoding="utf-8-sig") or "{}")
+    except (OSError, json.JSONDecodeError):
+        return ""
+    rel = str(meta.get("路径") or "").replace("\\", "/")
+    if not rel.startswith("uploads/"):
+        return ""
+    name = rel[len("uploads/"):]
+    return name if name and "/" not in name and "\\" not in name else ""
+
+
+def _inbox_shas(task_dir: Path) -> set[str]:
+    """本任务 inbox 里所有文件的内容 sha（视频+资产图）——uploads 候选必须与其中之一同内容。"""
+    out: set[str] = set()
+    inbox = Path(task_dir) / "inbox"
+    if not inbox.is_dir():
+        return out
+    for p in sorted(inbox.iterdir()):
+        if not p.is_file():
+            continue
+        try:
+            out.add(ingest._sha256_file(p))
+        except OSError:
+            continue
+    return out
+
+
+def resolve_uploads_video(task_dir: Path, task: dict) -> tuple[str, str, str]:
+    """定位本任务上传的片在 uploads/ 的**落盘文件** → (落盘名, 判定来源, 未定位原因)。
+
+    候选顺序：① ingestion.video_name（修复后 = 桥侧落地名）；② 指纹「路径」反查（老任务兜底）。
+    每个候选必须真实存在**且与任务 inbox 同内容**（sha 相等）——同名不同内容的存量片不许顶锅
+    （修复前按原名直删，撞上重名的旧参考片就是数据事故）。定位不到返回 ("", "", 原因链)，
+    调用方必须如实留痕，不许静默当删成功。
+    """
+    ing = task.get("ingestion") or {}
+    video_name = str(ing.get("video_name") or "")
+    inbox_shas = _inbox_shas(task_dir)
+    candidates: list[tuple[str, str]] = []
+    if video_name:
+        candidates.append((video_name, "video_name"))
+    fp_name = _fingerprint_uploads_name(str(task.get("bridge_id") or ""))
+    if fp_name and fp_name != video_name:
+        candidates.append((fp_name, "fingerprint"))
+    miss: list[str] = []
+    for name, source in candidates:
+        if "/" in name or "\\" in name:
+            miss.append(f"{source}:unsafe_name")
+            continue
+        f = UPLOADS_DIR / name
+        if not f.is_file():
+            miss.append(f"{source}:missing")
+            continue
+        if not inbox_shas:
+            miss.append(f"{source}:no_inbox")     # 收不了内容就删 = 凭名字赌，不做
+            continue
+        try:
+            if ingest._sha256_file(f) in inbox_shas:
+                return name, source, ""
+            miss.append(f"{source}:sha_mismatch")
+        except OSError:
+            miss.append(f"{source}:unreadable")
+    return "", "", ",".join(miss) if miss else "no_candidate"
+
+
 def delete_task(local_id: str, *, confirm_name: str | None = None) -> dict:
     """POST /api/hub/task/{id}/delete —— AT-9 §六删除合同。
 
@@ -1089,12 +1239,16 @@ def delete_task(local_id: str, *, confirm_name: str | None = None) -> dict:
     if st not in DELETABLE_STATES + TEARDOWN_IDLE_STATES:
         raise HubError(f"状态 {st} 不可删除（仅 {DELETABLE_STATES} 免确认；"
                        f"{TEARDOWN_IDLE_STATES} 需任务名确认）")
-    task_name = f"{local_id}·{(task.get('ingestion') or {}).get('video_name', '')}"
+    task_name = f"{local_id}·{display_video_name(task)}"
     if st in TEARDOWN_IDLE_STATES and (confirm_name or "").strip() not in {local_id, task_name}:
         raise HubError(f"拆解过的任务删除需任务名确认：请求体带 confirm_name="
                        f"\"{local_id}\"（或完整任务名「{task_name}」）")
     bridge_id = str(task.get("bridge_id") or "")
-    video_name = str((task.get("ingestion") or {}).get("video_name") or "")
+    # 删除合同认**落盘文件**不认名字：ingestion.video_name 修复后=桥侧落地名；老任务（只记
+    # 上传原名）走指纹「路径」反查。候选还必须与 inbox 同内容（sha 相等），重名的旧参考片
+    # （uploads/官号参考1.mp4 这类真实参考片）绝不顶锅。必须在 rmtree 之前定位——任务目录
+    # 一删 inbox sha 就没了。定位失败照常删任务目录，但 uploads 如实留痕（不假报 removed=true）。
+    uploads_name, uploads_source, uploads_miss = resolve_uploads_video(task_dir, task)
     # AT-19 X7：failed-but-alive——任务已判 failed 但执行体还活着（900s 兜底降级后的窗口）。
     # 删除优先（用户意图），不杀进程：墓碑记 run_id，活执行体下一次写盘会被栅栏拒绝并自行退场。
     exec_view = state.exec_snapshot(task_dir, task)
@@ -1109,16 +1263,24 @@ def delete_task(local_id: str, *, confirm_name: str | None = None) -> dict:
                 shutil.rmtree(target)
                 removed_analysis = True
         removed_upload = False
-        safe_video = video_name and "/" not in video_name and "\\" not in video_name
-        if safe_video:
-            f = UPLOADS_DIR / video_name
-            if f.is_file() and not _uploads_video_shared(video_name, exclude=local_id):
+        uploads_skip = uploads_miss
+        if uploads_name:
+            f = UPLOADS_DIR / uploads_name
+            if not _uploads_video_shared(uploads_name, exclude=local_id):
                 f.unlink()
                 removed_upload = True
+                uploads_skip = ""
+            else:
+                uploads_skip = "shared"          # 同内容还有别的任务在用：留着，如实说
         _tombstones_append(local_id, run_id=dead_run_id)
     return {"ok": True, "deleted": local_id, "state_was": st,
             "analysis_dir_removed": removed_analysis,
             "uploads_video_removed": removed_upload,
+            # 删除对账明细（t_a94ccd30）：删/留的是哪个落盘文件、靠什么判定的、
+            # 没删时为什么——不许静默报 true
+            "uploads_video": uploads_name,
+            "uploads_video_source": uploads_source if uploads_name else "",
+            "uploads_video_skip": uploads_skip,
             "tombstone": True,
             # AT-19 §6.1（X7）：删除时执行体仍活 → 如实告知（不杀进程、不删用户意图）
             "executor_alive": executor_alive,
@@ -1135,13 +1297,19 @@ FORCE_FINISH_REASON_MAX = 200
 
 
 def _kept_view(task_dir: Path, task: dict) -> dict:
-    """强制结束「什么都没删」的可验证回执：任务目录 / 拆解产物 / 参考视频三处都还在。"""
+    """强制结束「什么都没删」的可验证回执：任务目录 / 拆解产物 / 参考视频三处都还在。
+
+    uploads 片走删除合同同一个定位函数（resolve_uploads_video）：落盘名对得上才算还在，
+    老任务（只记上传原名）由指纹兜底反查；定位不到回落 video_name 只做存在性检查。
+    """
     bridge_id = str(task.get("bridge_id") or "")
-    video = str((task.get("ingestion") or {}).get("video_name") or "")
+    name, _source, _miss = resolve_uploads_video(Path(task_dir), task)
+    if not name:
+        name = str((task.get("ingestion") or {}).get("video_name") or "")
     return {
         "task_dir": Path(task_dir).is_dir(),
         "analysis_dir": bool(bridge_id) and (_analysis_reverse() / bridge_id).is_dir(),
-        "uploads_video": bool(video) and (UPLOADS_DIR / video).is_file(),
+        "uploads_video": bool(name) and (UPLOADS_DIR / name).is_file(),
     }
 
 
@@ -1232,13 +1400,50 @@ def scan_lost_runs(*, apply: bool = False) -> dict:
             "lost": lost, "skipped": skipped, "errors": errors}
 
 
+FORCE_FINISH_JOB_STATUS = "force_finished"   # 内存 job 终态（文件侧终态仍是 failed，两者不混用）
+FORCE_FINISH_FINISHED_BY = "owner_manual"    # 无身份体系：confirm=true + confirm_name=任务号 是唯一的「所有者手动」显式证据
+
+
+def _finish_running_jobs(local_id: str, *, note: str) -> list[str]:
+    """人工强制结束的**内存半边**：把 HUB_JOBS 里该任务残存的 running 记录当场置终态。
+
+    为什么必须有这一半：force_finish 只把 任务.json 置 failed，`HUB_JOBS` 的 job 记录仍挂着
+    status="running"；而 `_job_running_records`（重试守卫）与 `_active_submit`（提交闸）都只认
+    这个字面值、且**无心跳豁免**——记录不自消（server 不重启就永远在），于是「人工结束 → 重试」
+    被自己留下的记录永久拒绝。
+
+    合同（调用方必须在 task_lock(local_id) 内调用：与任务.json 写 failed 同一把锁，单写者原子）：
+      · 只改 `status=="running"` 的记录，其余原样留着——重复调用幂等：第二次无可改、不抛异常；
+      · **就地 update**，绝不换 dict 对象：后台线程（_spawn.wrap / _reap）按 job_id 持引用回写，
+        换对象会让它们手持孤本、写回一份没人看的记录；
+      · 不杀进程、不删记录（force_finish 本就不持进程句柄；记录仍可 GET 查，落账面不丢）。
+    终态取值 `force_finished` 天然非活跃：`_job_running_records`/`_active_submit`（只认 running）
+    与 `_job_alive`（非 running 直接 False）都不会把它当存活。
+    """
+    finished: list[str] = []
+    ended = _now()
+    epoch = int(time.time())
+    for job_id, rec in list(HUB_JOBS.items()):
+        if rec.get("local_id") != local_id or rec.get("status") != "running":
+            continue
+        rec.update({"status": FORCE_FINISH_JOB_STATUS, "finished_at": epoch,
+                    "finish_reason": "manual_force_finish",
+                    "finished_by": FORCE_FINISH_FINISHED_BY,
+                    "finish_note": note, "ended": ended})
+        finished.append(job_id)
+    return finished
+
+
 def force_finish(local_id: str, *, confirm=None, confirm_name=None, reason: str = "") -> dict:
     """POST /api/hub/task/{id}/force-finish —— 所有者人工兜底口（方案 §4.2，覆盖阈值误判）。
 
     二次确认是「这是所有者手动操作」的唯一显式证据（身份仍走既有 gate()，不新造体系）：
     confirm 必须是布尔 true（字符串 "true" 不算），confirm_name 必须等于路径里的任务号。
-    语义写死：置 failed + 写人工原因，**不删任何东西、不杀进程**（本接口不持有进程句柄）。
-    幂等：已是 failed → 200 already=true（不写 history、不刷新 failed_at、不覆盖原原因）。
+    语义写死：置 failed + 写人工原因 + **内存 job 记录当场置终态**，**不删任何东西、不杀进程**
+    （本接口不持有进程句柄）。文件与内存两半在同一把 task_lock 内完成（单写者原子）——
+    只落文件不清内存，残留 running 记录会把「人工结束 → 重试」永久挡住（见 _finish_running_jobs）。
+    幂等：已是 failed → 200 already=true（不写 history、不刷新 failed_at、不覆盖原原因，
+    但内存里残存的 running 记录照样清掉——所有者这一步仍是「我说它死了」）。
     """
     if confirm is not True:
         raise HubInputError("强制结束需二次确认：请求体带 confirm=true"
@@ -1254,9 +1459,13 @@ def force_finish(local_id: str, *, confirm=None, confirm_name=None, reason: str 
         task = state.load(task_dir)
         st = str(task.get("state") or "")
         if st == "failed":
+            # 内存半边同样要闭环：看门狗/并发可能已把文件置 failed，而 job 记录仍挂着 running
+            # （auto-0055 的现场形态）。只清内存，不写 history、不动 failed_at、不覆盖原原因。
+            finished = _finish_running_jobs(local_id, note=note)
             return {"ok": True, "local_id": local_id, "state": "failed", "state_was": "failed",
                     "changed": False, "already": True,
                     "reason": str(task.get("failed_reason") or ""),
+                    "jobs_force_finished": finished,
                     "kept": _kept_view(task_dir, task)}
         if st not in FORCE_FINISH_STATES:
             raise HubError(f"任务当前不是运行态（{st}），无需强制结束")
@@ -1266,9 +1475,13 @@ def force_finish(local_id: str, *, confirm=None, confirm_name=None, reason: str 
             state.fail_orphan_task(task_dir, reason=note, probe=probe, trigger="manual_force")
         except state.StateError as exc:     # 并发下状态已变 → 按业务错 409 透出原文
             raise HubError(str(exc)) from None
+        # 顺序写死：文件先落 failed，再让内存 job 死。反过来的话「内存已终态、文件还是 running」
+        # 的窗口里任务看起来无人管；且失败分支抛错时不该留下已被判死的 job 记录。
+        finished = _finish_running_jobs(local_id, note=note)
         task = state.load(task_dir)
     return {"ok": True, "local_id": local_id, "state": "failed", "state_was": st,
             "changed": True, "already": False, "reason": note,
+            "jobs_force_finished": finished,
             "kept": _kept_view(task_dir, task)}
 
 
