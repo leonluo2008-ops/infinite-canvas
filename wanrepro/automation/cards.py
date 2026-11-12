@@ -409,11 +409,17 @@ def frame_boxes(rows: list[dict], spans: dict[int, dict], names: dict[int, str],
 
 
 def build(bridge_id: str, local_id: str) -> list[dict]:
-    """清单 + 侧车 + 帧 → asset_cards[]（按 n 升序；清单不存在 = 还没拆解，返回 []）。"""
+    """清单 + 侧车 + 帧 → asset_cards[]（按 n 升序；清单不存在 = 还没拆解，返回 []）。
+
+    AT-21 B0：清单/组/行决策按**任务作用域**读——fork 任务读自己任务目录里的私有副本（它换过的图、
+    改过的描述、重绑过的组都只在自己那份），其余任务继续读共享 bridge 清单。出现时段/画面位置
+    （`load_spans`）仍按 bridge_id 读共享侧车：那是拆解产物，fork 不复制也不改。
+    """
     if not bridge_id:
         return []
+    scope = replace.private_scope(local_id)
     try:
-        md_path = replace.checklist_path(bridge_id)
+        md_path = replace.checklist_path(bridge_id, scope)
     except replace.ReplaceError:
         return []
     rows = replace.parse_rows(md_path.read_text(encoding="utf-8-sig", errors="replace"))
@@ -425,11 +431,11 @@ def build(bridge_id: str, local_id: str) -> list[dict]:
     twins = {no: (payload.get("同实体疑似") or []) for no, payload in spans.items()}
     positions = {no: payload.get("画面位置") for no, payload in spans.items()}
     # AT-9 B2 确认组（sidecar 顶层『同实体确认』，写端点生产；疑似≠确认，疑似不联动）
-    groups = replace.load_groups(bridge_id)
+    groups = replace.load_groups(bridge_id, scope)
     names = short_names(rows, layers, twins, positions) if layers else {}
     cache = frames.load_cache(bridge_id)
     # ---- AT-10 C1 代表帧：分镜表时段 → 代表镜（位置键典型镜 → 意图建议镜）→ 同镜共享帧
-    video = frames.video_path(bridge_id)
+    video = frames.video_path(bridge_id, local_id)
     total = frames.duration(video) or (_confirm().probe_duration(markdown) or 0.0)
     bounds: dict[int, tuple[float, float]] = {}
     shots_layer = layers.get("七 分镜表", "")
@@ -537,8 +543,8 @@ def build(bridge_id: str, local_id: str) -> list[dict]:
     # 主行=『组元数据』落盘值（无 → 成员最小行，M2 确认窗可改）；代表帧与唯一框**同源自主行**
     # ——组卡只投影主行代表帧+主行自身框；主行无自身框 → 单框=None+单框降级=True（诚实降级，
     # 绝不搬组内其他行的框充数）。镜次并集=成员位置键镜次 ∪ 意图建议镜次（evidence 级）。
-    decisions = replace.load_row_decisions(bridge_id)
-    meta = replace.load_group_meta(bridge_id)
+    decisions = replace.load_row_decisions(bridge_id, scope)
+    meta = replace.load_group_meta(bridge_id, scope)
     by_no_cards = {card["n"]: card for card in cards}
     for card in cards:
         card["组"] = None

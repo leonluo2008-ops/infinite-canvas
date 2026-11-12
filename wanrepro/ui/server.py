@@ -2299,7 +2299,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(render_payload(urllib.parse.unquote(m.group(1)),
                                           urllib.parse.unquote(m.group(2)),
                                           self.query_param("optional"),
-                                          self.query_param("audio_mode")))
+                                          self.query_param("audio_mode"),
+                                          self.query_param("checklist_task")))
             return
         m = re.fullmatch(r"/api/job/([0-9a-f]+)", path)
         if m:
@@ -2547,6 +2548,23 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(hub_api.delete_task(urllib.parse.unquote(m.group(1)),
                                                confirm_name=None if confirm_name is None
                                                else str(confirm_name)))
+            return
+        m = re.fullmatch(r"/api/hub/task/([^/]+)/fork", path)
+        if m:
+            # AT-21 B0：复用为新版本 → 派生**新任务**（源任务只读，产物按 bridge 共享，清单/资产图各一份）。
+            # 只接受无体（或空体）请求：派生不携带任何「沿用上次配置」参数——新版本必须重新批准。
+            self.send_json(hub_api.fork_task(urllib.parse.unquote(m.group(1))))
+            return
+        m = re.fullmatch(r"/api/hub/task/([^/]+)/prompt", path)
+        if m:
+            # AT-21 B0 D3-②：手改正文 → 直写 提示词.md + 重算审批快照 + 自检/音频门禁重跑。
+            # body: {"text": "<全文>", "expect_text": "<打开编辑器时的正文，可选乐观锁>"}
+            payload = self.read_json()
+            self.send_json(hub_api.save_prompt_text(
+                urllib.parse.unquote(m.group(1)),
+                str(payload.get("text") if payload.get("text") is not None else ""),
+                expect_text=None if payload.get("expect_text") is None
+                else str(payload.get("expect_text"))))
             return
         m = re.fullmatch(r"/api/hub/task/([^/]+)/group", path)
         if m:
@@ -3464,12 +3482,18 @@ def lapian_payload(tid: str, spec: str) -> dict:
             "markdown": render_lapian.render_markdown(tid, spec, blocks)}
 
 
-def render_payload(tid: str, spec_name: str, optional: str = "", audio_mode: str = "") -> dict:
+def render_payload(tid: str, spec_name: str, optional: str = "", audio_mode: str = "",
+                   checklist_task: str = "") -> dict:
     """M3 bridge：生成规范 → 提示词正文（走 render.py，产物照常落盘可回看）。
 
     AT-17 B2a：`audio_mode` 是音频三态（沿用原片 / 按新主体调整 / 不要）。GET 没有 body，
     所以走 query 透传；不传就让渲染器自己读任务目录 `audio_mode.json`，老调用方不受影响。
     枚举外的值直接 400——静默丢弃会让调用方以为参数生效了。
+
+    AT-21 B0：`checklist_task` 是**清单作用域**（派生任务号）。非空 = 这次渲染读那个任务自己的
+    私有清单副本（`任务目录/待确认清单.md/.json`），产物也落它自己的任务目录——共享 `analysis/reverse/<id>`
+    里的清单/提示词一概不碰（否则 fork 一渲染就把源任务侧的共享提示词覆盖了）。
+    形状/归属/存在三重校验在 `hub_api.private_list_dir`，这里只转发。
     """
     sys.path.insert(0, str(ROOT / "pipeline" / "reverse"))
     from spec_registry import load_registry
@@ -3481,8 +3505,11 @@ def render_payload(tid: str, spec_name: str, optional: str = "", audio_mode: str
     if meta["类型"] != "生成":
         raise ApiError(400, f"{spec_name} 是{meta['类型']}规范，不是生成规范")
     task_dir(tid)                                    # 校验任务存在（404 语义一致）
+    scoped = hub_api.private_list_dir(tid, checklist_task)   # None = 共享清单（既有行为）
     tpl_stem = Path(meta["正文模板"]).stem
     argv = ["--id", tid, "--template", tpl_stem]
+    if scoped is not None:
+        argv += ["--checklist-dir", str(scoped), "--out-dir", str(scoped)]
     if str(optional or "").strip():                  # bridge 与 handler 同口径：可选段要透传（B5）
         argv += ["--optional", str(optional).strip()]
     mode = str(audio_mode or "").strip()
@@ -3501,7 +3528,8 @@ def render_payload(tid: str, spec_name: str, optional: str = "", audio_mode: str
         raise ApiError(500, f"渲染异常退出（exit={detail or '?'}）——看 bridge 控制台 stderr 原文") from None
     if code != 0:
         raise ApiError(500, f"渲染退出码 {code}")
-    text = (ROOT / "analysis" / "reverse" / tid / f"提示词-{tpl_stem}.md").read_text(encoding="utf-8")
+    out_dir = scoped if scoped is not None else (ROOT / "analysis" / "reverse" / tid)
+    text = (out_dir / f"提示词-{tpl_stem}.md").read_text(encoding="utf-8")
     return {"task": tid, "spec": spec_name, "template": tpl_stem, "text": text}
 
 

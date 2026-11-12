@@ -531,9 +531,13 @@ def load_gate_item(task_dir: Path) -> dict | None:
 def _check_all(task_dir: Path) -> list[dict]:
     task = state.load(task_dir)
     bridge_id = str(task.get("bridge_id") or "")
-    ck_path = replace.analysis_root() / bridge_id / replace.LIST_NAME      # 同一真源（认 WANREPRO_ANALYSIS_ROOT）
-    if not ck_path.is_file():
-        raise FileNotFoundError(f"找不到清单 {ck_path}（自检以清单为行号真源）")
+    # AT-21 B0：清单按任务作用域取——fork 任务读它自己的私有副本（源任务清单永不被 fork 碰）；
+    # 其余任务仍是 `analysis/reverse/<bridge>/待确认清单.md`（同一真源，认 WANREPRO_ANALYSIS_ROOT）。
+    scope = replace.private_scope(str(task.get("local_id") or task_dir.name), task)
+    try:
+        ck_path = replace.checklist_path(bridge_id, scope)
+    except replace.ReplaceError as exc:
+        raise FileNotFoundError(f"{exc}（自检以清单为行号真源）") from None
     checklist_md = ck_path.read_text(encoding="utf-8-sig")
     prompt_path = task_dir / "提示词.md"
     prompt = prompt_path.read_text(encoding="utf-8") if prompt_path.is_file() else ""
@@ -544,8 +548,8 @@ def _check_all(task_dir: Path) -> list[dict]:
     render = _load_render()
     ents = render.parse_checklist(ck_path)
     # AT-11 B1：发号同源重算带组/行决策覆盖（与 render 主入口同一 sidecar 数据源）
-    groups = replace.load_groups(bridge_id)
-    decisions = replace.load_row_decisions(bridge_id)
+    groups = replace.load_groups(bridge_id, scope)
+    decisions = replace.load_row_decisions(bridge_id, scope)
     render.assign_numbers(ents, groups, decisions)
     row_to_no = {int(e.row_no): int(e.no) for e in ents if e.no}
 
@@ -715,22 +719,26 @@ def whitelist_entries(container) -> list[dict]:
     return out
 
 
-def row_word_closure(bridge_id: str) -> dict[int, dict]:
+def row_word_closure(bridge_id: str, list_task: str | None = None) -> dict[int, dict]:
     """每行的残留词表闭包（服务端校验白名单的**同一口径**：render.residue_words，不另写一份）。
 
     返回 {行号: {"类别", "已传图", "不查", "图号", "词": {词键: 词}, "来源": {词键: core|gram}}}。
     写路径的 V1/V3/V4 全查这张表——「词必须在这一行本次的词表里」是防整句/任意词混进来的硬闸。
+    `list_task`（AT-21 B0）：fork 任务传自己（读私有清单副本），其余传 None（读共享清单）。
     """
     out: dict[int, dict] = {}
     if not bridge_id:
         return out
     render = _load_render()
-    ck_path = replace.checklist_path(bridge_id)
+    try:
+        ck_path = replace.checklist_path(bridge_id, list_task)
+    except replace.ReplaceError:
+        return out
     if not ck_path.is_file():
         return out
     ents = render.parse_checklist(ck_path)
-    render.assign_numbers(ents, replace.load_groups(bridge_id),
-                          replace.load_row_decisions(bridge_id))
+    render.assign_numbers(ents, replace.load_groups(bridge_id, list_task),
+                          replace.load_row_decisions(bridge_id, list_task))
     for e in ents:
         core = render.residue_core(e)
         words = render.residue_words(e)

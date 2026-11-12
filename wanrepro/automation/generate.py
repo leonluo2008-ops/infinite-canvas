@@ -169,15 +169,25 @@ def parse_set(spec: str) -> dict:
     return out
 
 
-def fetch_prompt(bridge_id: str, audio_mode: str = "") -> str:
+def fetch_prompt(bridge_id: str, audio_mode: str = "", checklist_task: str = "") -> str:
     """bridge 渲染一版默认模板提示词 → 正文（do_render 与三态改选重渲染共用这一处）。
 
     GET 没有 body，三态只能上 query（附注 11）；空 = 不带，渲染器自己按 audio_mode.json 推导。
+
+    `checklist_task`（AT-21 B0）：非空 = 「清单取自这个任务的任务目录」——fork 任务持私有清单副本，
+    桥侧渲染必须读它（否则 fork 改的描述/换的图进不了正文，私有副本就成了摆设）。
+    桥侧把它解析成 `PROJECTS_DIR/<id>/待确认清单.md`，并拒绝任何非法 id（见 server.render_payload）。
     """
-    url = f"/api/render/{bridge_id}/{DEFAULT_TEMPLATE}"
+    params: dict[str, str] = {}
     mode = str(audio_mode or "").strip()
     if mode:
-        url += "?" + urllib.parse.urlencode({"audio_mode": mode})
+        params["audio_mode"] = mode
+    scope = str(checklist_task or "").strip()
+    if scope:
+        params["checklist_task"] = scope
+    url = f"/api/render/{bridge_id}/{DEFAULT_TEMPLATE}"
+    if params:
+        url += "?" + urllib.parse.urlencode(params)
     out = bridge.get(url)
     return out.get("text") or ""
 
@@ -200,7 +210,11 @@ def do_render(task_dir: Path, set_spec: str, verbose: bool = True,
         raise GenError(f"render 需 rendering 状态（先完成置换确认），当前 {task['state']}")
     params = {**DEFAULT_PARAMS, **parse_set(set_spec)}
     mode = str(audio_mode if audio_mode is not None else task.get("audio_mode") or "").strip()
-    prompt = prompt_text if prompt_text is not None else fetch_prompt(str(task["bridge_id"]), mode)
+    # AT-21 B0：fork 任务的清单在它自己的任务目录里（私有副本）——渲染必须先声明清单作用域，
+    # 否则桥侧会读共享清单，fork 改过的描述/资产图全部进不了正文。
+    scope = replace.private_scope(str(task.get("local_id") or task_dir.name), task) or ""
+    prompt = (prompt_text if prompt_text is not None
+              else fetch_prompt(str(task["bridge_id"]), mode, scope))
 
     # 结构性校验（不假设模板格式——红线 14）：非空且够长即视为正文；
     # 模板差异（lumi 带 # 标题头 / seedance-flow 纯正文流）不是合同的一部分
@@ -257,7 +271,8 @@ def rerender_for_audio_mode(task_dir: Path) -> dict:
     mode = str(task.get("audio_mode") or "").strip()
     if not mode:
         raise GenError("任务没有 audio_mode：先把三态落盘（拆解完成/界面改选）再重渲染")
-    prompt = fetch_prompt(str(task["bridge_id"]), mode)
+    scope = replace.private_scope(str(task.get("local_id") or task_dir.name), task) or ""
+    prompt = fetch_prompt(str(task["bridge_id"]), mode, scope)
     if len(prompt.strip()) < 200:
         raise GenError(f"渲染正文过短（{len(prompt.strip())} 字）不像提示词: {prompt[:120]}")
     (task_dir / PROMPT_FILE).write_text(prompt, encoding="utf-8")
@@ -308,9 +323,13 @@ def _audio_gate_sources(task_dir: Path, task: dict) -> tuple[str, str, Path | No
     三态取值口径 = 任务.json `audio_mode`（hub 链落盘面）> analysis 目录 `audio_mode.json`
     （画布链节点状态）；两处都没有 = 老任务/未落盘。**不按拆解现推**——现推出来的值不是
     「任务声明的三态」，拿它执法等于替用户改主意。
+
+    AT-21 B0：清单来源按任务作用域取——fork 任务的私有副本（任务目录那份）优先，其余任务
+    继续读共享 bridge 清单。拆解正文/三态侧车仍是共享产物（按 bridge_id 只读）。
     """
     bridge = str(task.get("bridge_id") or "").strip()
-    analysis = ROOT / "analysis" / "reverse" / bridge if bridge else None
+    analysis = replace.analysis_root() / bridge if bridge else None
+    scope = replace.private_scope(str(task.get("local_id") or task_dir.name), task)
     mode = str(task.get("audio_mode") or "").strip()
     if not mode and analysis is not None and (analysis / "audio_mode.json").is_file():
         try:
@@ -320,7 +339,10 @@ def _audio_gate_sources(task_dir: Path, task: dict) -> tuple[str, str, Path | No
         mode = str((side or {}).get("audio_mode") or "").strip()
 
     def _first(name: str) -> Path | None:
-        for path in ((analysis / name) if analysis is not None else None, task_dir / name):
+        private = (task_dir / name) if scope else None
+        for path in (private,
+                     (analysis / name) if analysis is not None else None,
+                     task_dir / name):
             if path is not None and path.is_file():
                 return path
         return None
@@ -565,8 +587,14 @@ def diagnose(task_dir: Path, task: dict, *, active_submit: bool = False) -> dict
 # ---------------------------------------------------------------- 提交体装配
 
 def _submit_images(task: dict) -> list[str]:
-    """提交图清单：按图号序、组内去重（与发号映射同一 row_unit 口径；组外同 URL 不合并）。"""
-    groups = replace.load_groups(str(task.get("bridge_id") or ""))
+    """提交图清单：按图号序、组内去重（与发号映射同一 row_unit 口径；组外同 URL 不合并）。
+
+    AT-21 B0：组表按**任务作用域**读——派生任务（fork）的组在它自己的私有 sidecar 里。这里读错
+    作用域会真丢图：fork 把源任务的 [5,6] 解组后分别传了两张图，若按共享组表去重，
+    两张会被并成一张交出去。
+    """
+    scope = replace.private_scope(str(task.get("local_id") or ""), task)
+    groups = replace.load_groups(str(task.get("bridge_id") or ""), scope)
     entries = sorted((f for f in (task.get("assets_confirmed") or []) if isinstance(f, dict)),
                      key=lambda f: int(f.get("no") or 0))
     seen_units: set[tuple] = set()

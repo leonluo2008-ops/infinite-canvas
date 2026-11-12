@@ -32,7 +32,7 @@ _PKG_ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from automation import bridge, cards, config as auto_config, discuss, frames, generate  # noqa: E402
+from automation import bridge, cards, config as auto_config, discuss, fork, frames, generate  # noqa: E402
 from automation import ingest, local_assets, remote_wait, replace, selfcheck, state, submit_view  # noqa: E402
 
 # 任务目录根的**唯一来源** = automation.config.PROJECTS_DIR（认 WANREPRO_AUTO_DIR）。
@@ -185,11 +185,17 @@ def _intent_mod():
     return module
 
 
-def _replaced_count(bridge_id: str) -> str:
-    """已换数=已传图行数/必换行数（数据合同：实时计算，不落盘）；清单还没有（未拆解）→ 空串。"""
+def _replaced_count(bridge_id: str, local_id: str = "") -> str:
+    """已换数=已传图行数/必换行数（数据合同：实时计算，不落盘）；清单还没有（未拆解）→ 空串。
+
+    AT-21 B0：fork 任务的「已换数」按它自己的私有清单副本算（它换了什么只在自己那份里）。
+    """
     if not bridge_id:
         return ""
-    path = _analysis_reverse() / bridge_id / "待确认清单.md"
+    try:
+        path = replace.checklist_path(bridge_id, replace.private_scope(local_id) if local_id else None)
+    except replace.ReplaceError:
+        return ""
     if not path.is_file():
         return ""
     rows = replace.parse_rows(path.read_text(encoding="utf-8-sig", errors="replace"))
@@ -382,7 +388,49 @@ def _failed_view(task: dict) -> dict:
     }
 
 
-def _summary(task: dict, task_dir: Path) -> dict:
+def _derived_from_view(task: dict) -> dict | None:
+    """派生来源（D4 持久化字段）→ 展示用视图；非派生任务/畸形值 → None（老任务零渲染）。"""
+    raw = (task or {}).get("derived_from")
+    if not isinstance(raw, dict):
+        return None
+    src = str(raw.get("local_id") or "").strip()
+    if not src:
+        return None
+    return {"local_id": src,
+            "bridge_id": str(raw.get("bridge_id") or ""),
+            "at": str(raw.get("at") or ""),
+            "changed": [str(x) for x in (raw.get("changed") or []) if str(x).strip()]}
+
+
+def _derived_versions(local_id: str) -> list[dict]:
+    """来源任务 → 派生版本列表（**读侧反查，不落盘**；D4：双向落盘会变两处真源+脏引用）。
+
+    扫 `projects/*/任务.json` 取 `derived_from.local_id == 本任务号`，按派生时间倒序。
+    与 `_bridge_still_referenced` 同一手法（扫任务文件判引用），量级与 list_tasks 一致。
+    """
+    out: list[dict] = []
+    if not TASKS_DIR.is_dir():
+        return out
+    for mf in TASKS_DIR.glob("auto-*/任务.json"):
+        if mf.parent.name == local_id:
+            continue
+        try:
+            other = json.loads(mf.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue                      # 坏任务不挡列表（与 list_tasks 同口径）
+        view = _derived_from_view(other)
+        if view is None or view["local_id"] != local_id:
+            continue
+        out.append({"local_id": str(other.get("local_id") or mf.parent.name),
+                    "state": str(other.get("state") or ""),
+                    "at": view["at"],
+                    "changed": view["changed"],
+                    "has_output": (mf.parent / VIDEO_FILE).is_file()})
+    out.sort(key=lambda item: item.get("at") or "", reverse=True)
+    return out
+
+
+def _summary(task: dict, task_dir: Path, *, derived_count: int | None = None) -> dict:
     out = (task_dir / VIDEO_FILE).is_file()
     # AT-9 B1 表格摘要三字段（数据合同）：任务名/阶段/已换数——列表页不拉详情
     task_name = f"{task['local_id']}·{display_video_name(task)}"
@@ -396,7 +444,7 @@ def _summary(task: dict, task_dir: Path) -> dict:
         "stage": stage,
         # AT-16 B4a：双锚独立透出（列表也要走表，不能只靠详情）。
         "lapian": _lapian_anchors(task),
-        "replaced": _replaced_count(str(task.get("bridge_id") or "")),
+        "replaced": _replaced_count(str(task.get("bridge_id") or ""), task["local_id"]),
         "state": task["state"],
         "intent": task.get("intent", ""),
         "created_at": task.get("created_at"),
@@ -416,6 +464,9 @@ def _summary(task: dict, task_dir: Path) -> dict:
                      "silence_seconds": int(probe.get("silence_seconds") or 0)},
         "lost_run": _lost_run_view(task, probe),
         "failed": _failed_view(task),
+        # ---- AT-21 B0 版本关系（D4）：列表卡片角标读这两个键；老任务 = None / 0（零渲染） ----
+        "derived_from": _derived_from_view(task),
+        "derived_count": int(derived_count or 0),
     }
 
 
@@ -440,9 +491,21 @@ def list_tasks() -> list[dict]:
     out = []
     if not TASKS_DIR.is_dir():
         return out
+    loaded: list[tuple[Path, dict]] = []
     for mf in sorted(TASKS_DIR.glob("auto-*/任务.json")):
         try:
-            out.append(_summary(state.load(mf.parent), mf.parent))
+            loaded.append((mf.parent, state.load(mf.parent)))
+        except Exception:  # noqa: BLE001 —— 单条坏任务不拖垮整个列表
+            continue
+    # 派生版本计数：一次扫描算全表（与 list_tasks 已读的那批任务同源），不逐任务反扫
+    counts: dict[str, int] = {}
+    for _d, task in loaded:
+        view = _derived_from_view(task)
+        if view is not None:
+            counts[view["local_id"]] = counts.get(view["local_id"], 0) + 1
+    for d, task in loaded:
+        try:
+            out.append(_summary(task, d, derived_count=counts.get(str(task.get("local_id") or ""), 0)))
         except Exception:  # noqa: BLE001 —— 单条坏任务不拖垮整个列表
             continue
     return list(reversed(out))  # 新任务在前
@@ -487,8 +550,49 @@ def _suggestions(raw: str, checklist_md: str, disc_md: str) -> list[dict]:
             for row in sorted(rows, key=lambda r: r["no"])]
 
 
-def _checklist_path(bridge_id: str) -> Path:
+def _checklist_path(bridge_id: str, list_task: str | None = None) -> Path:
+    """清单路径（唯一入口）：`list_task` 非空 → 该任务的私有副本；否则共享 bridge 清单。"""
+    if list_task:
+        return replace.checklist_path(bridge_id, list_task)
     return _analysis_reverse() / bridge_id / "待确认清单.md"
+
+
+def _list_scope(local_id: str, task: dict | None = None) -> str | None:
+    """本任务的**清单作用域**（AT-21 B0）：fork → 自己的任务号（读私有副本），其余 → None。
+
+    hub 链所有清单/sidecar 读写都必须经过它——漏一处就等于给 fork 留了一条写源任务清单的路。
+    """
+    return replace.private_scope(local_id, task)
+
+
+def private_list_dir(bridge_id: str, list_task: str | None) -> Path | None:
+    """`checklist_task` 查询参数 → 私有清单所在目录（桥侧渲染用）；空 → None（走共享清单）。
+
+    三重校验，缺一不可：
+      ① 形状：只认 `auto-<数字>`，绝不把调用方字符串直接拼进路径（`../`、绝对路径、UNC 全挡）；
+      ② 归属：该任务的 bridge_id 必须等于请求里的桥 id（否则 A 桥的渲染能读任意任务清单）；
+      ③ 真源：这个任务确实是 fork（清单在它自己目录里），且那份副本真实存在。
+    任一项不过就 4xx 原文回给调用方——静默退回共享清单会让 fork 改了描述却渲染出旧正文。
+    """
+    tid = str(list_task or "").strip()
+    if not tid:
+        return None
+    if not re.fullmatch(r"auto-\d+", tid):
+        raise HubInputError(f"清单作用域只认任务号（形如 auto-0066），收到 {tid!r}")
+    tdir = _task_dir(tid)                                  # 不存在 → 404
+    task = state.load(tdir)
+    if str(task.get("bridge_id") or "") != str(bridge_id or ""):
+        raise HubError(f"任务 {tid} 的拆解产物不在 {bridge_id or '（空）'} 下"
+                       f"（它的 bridge_id={task.get('bridge_id') or '空'}）——拒绝跨桥引用清单",
+                       status=403)
+    scope = _list_scope(tid, task)
+    if not scope:
+        raise HubInputError(f"任务 {tid} 用的是共享清单（不是派生任务），不该带 checklist_task")
+    path = replace.checklist_path(bridge_id, scope)
+    if not path.is_file():
+        raise HubError(f"任务 {tid} 的私有清单副本不在：{path.name}（派生任务必须自带清单）",
+                       status=409)
+    return path.parent
 
 
 def _prompt_path(task_dir: Path, task: dict) -> Path:
@@ -531,9 +635,10 @@ def get_task(local_id: str) -> dict:
     task = state.load(task_dir)
     d = _summary(task, task_dir)
     bridge_id = str(task.get("bridge_id") or "")
-    decisions = replace.load_row_decisions(bridge_id) if bridge_id else {}
+    scope = _list_scope(local_id, task)                  # AT-21 B0：fork 读私有清单副本
+    decisions = replace.load_row_decisions(bridge_id, scope) if bridge_id else {}
     summary_md = _read(_analysis_reverse() / str(task.get("bridge_id")) / "拆解.md")
-    checklist_md = _read(_checklist_path(str(task.get("bridge_id"))))
+    checklist_md = _read(_checklist_path(str(task.get("bridge_id")), scope))
     mode = _audio_mode(task)                 # AT-17 B2c：三态（任务.json 优先，老任务只读现推）
     d.update({
         "summary_md": summary_md,
@@ -568,6 +673,11 @@ def get_task(local_id: str) -> dict:
         # AT-22 E4：误报豁免白名单（任务.json 原样透出；老任务/没豁免 → null，前端视为空）。
         # 详情页「已按你的裁量保留」面板读它，不依赖 自检.json 是否最新。
         "selfcheck_whitelist": task.get(selfcheck.WHITELIST_FIELD) or None,
+        # ---- AT-21 B0 派生关系（D4）：派生任务挂来源（持久化），来源任务看派生版本（读侧反查） ----
+        "derived_from": _derived_from_view(task),
+        "derived_versions": _derived_versions(local_id),
+        # 清单作用域自述（诊断面）：非空 = 这个任务的清单/sidecar 在自己目录里（fork 私有副本）
+        "checklist_private": bool(scope),
         "error": (task.get("history") or [{}])[-1].get("note", "")
         if task["state"] == "failed" else "",
         "gen": task.get("gen") or {},
@@ -1103,7 +1213,8 @@ def set_selfcheck_whitelist(local_id: str, rows: list[int] | None = None, *, wor
                     raise HubInputError(
                         f"词长不合法（{len(key)} 字，要求 {selfcheck.WHITELIST_WORD_MIN}–"
                         f"{selfcheck.WHITELIST_WORD_MAX} 字）：残留词表只收 ≥3 字的词")
-                closure = selfcheck.row_word_closure(str(task.get("bridge_id") or ""))
+                closure = selfcheck.row_word_closure(str(task.get("bridge_id") or ""),
+                                                    _list_scope(local_id, task))
                 if not closure:
                     raise HubError("读不到这次的待确认清单（清单还没生成或已失效）——刷新详情后重试",
                                    status=409)
@@ -2451,41 +2562,42 @@ def _record_pending(task_dir: Path, n: int, *, image_url: str | None,
     state.save(task_dir, {**task, "pending_replace": pending})
 
 
-def _must_rows(bridge: str) -> set[int]:
+def _must_rows(bridge: str, list_task: str | None = None) -> set[int]:
     """清单必换行集合（锁点计算用；清单读不了 → 空集）。"""
     try:
-        md = replace.checklist_path(bridge).read_text(encoding="utf-8-sig")
+        md = replace.checklist_path(bridge, list_task).read_text(encoding="utf-8-sig")
     except (replace.ReplaceError, OSError):
         return set()
     return {int(r["no"]) for r in replace.parse_rows(md) if "必须换" in (r.get("advice") or "")}
 
 
-def _row_has_image(bridge: str, no: int) -> bool:
+def _row_has_image(bridge: str, no: int, list_task: str | None = None) -> bool:
     """清单该行「资产图」列是否非空（真源=清单 md，不是 pending 流水）。"""
     try:
-        md = replace.checklist_path(bridge).read_text(encoding="utf-8-sig")
+        md = replace.checklist_path(bridge, list_task).read_text(encoding="utf-8-sig")
     except (replace.ReplaceError, OSError):
         return False
     row = next((r for r in replace.parse_rows(md) if r["no"] == no), None)
     return bool(row and (row.get("cur_assets") or "").strip())
 
 
-def lock_remaining(bridge: str) -> list[int]:
+def lock_remaining(bridge: str, list_task: str | None = None) -> list[int]:
     """锁点剩余（AT-11 §四）：必换行 −(已传图行 ∪ 组已传图的组成员 ∪ 按原片行)。
 
     必换行 ∈ 组且组已传图 → 整组被那张图换掉，不锁；行有决策（keep_origin / AT-12 dismissed）
     → 按原片，不锁。返回仍锁着的必换行号（前端「锁点剩余」徽标与 set_asset 回显共用此口径）。
+    `list_task`（AT-21 B0）：fork 任务传自己（按私有清单副本算剩余）。
     """
-    must = _must_rows(bridge)
+    must = _must_rows(bridge, list_task)
     if not must:
         return []
-    free: set[int] = set(replace.load_row_decisions(bridge))
-    groups = replace.load_groups(bridge)
+    free: set[int] = set(replace.load_row_decisions(bridge, list_task))
+    groups = replace.load_groups(bridge, list_task)
     for no in sorted(must):
-        if _row_has_image(bridge, no):
+        if _row_has_image(bridge, no, list_task):
             free.add(no)
     for group in groups:
-        if any(_row_has_image(bridge, n) for n in group):
+        if any(_row_has_image(bridge, n, list_task) for n in group):
             free |= set(group)
     return sorted(must - free)
 
@@ -2542,12 +2654,13 @@ def _set_row_desc(local_id: str, task_dir: Path, bridge: str, n: int, *,
         if cur_state not in DESC_EDIT_STATES:
             raise HubError(DESC_EDIT_REFUSALS.get(
                 cur_state, f"当前状态（{cur_state}）不能改描述"), status=409)
+        scope = _list_scope(local_id, task)          # AT-21 B0：fork 写自己的私有清单副本
         # AT-22 B0 锁序（task_lock → CHECKLIST_LOCK 单向）：校验读与写入必须在**同一段锁内**，
         # 否则「读到旧值 → 别的链整文件重写 → 我按旧值写」会把对方的写吃掉（E3 并发探针实测到
         # 一次空读：读到写了一半的清单 → 行号校验判「没有第 1 行」）。RLock 可重入，set_row/set_group_write
         # 内部再拿同一把锁是直通。
         with replace.CHECKLIST_LOCK:
-            md = replace.checklist_path(bridge).read_text(encoding="utf-8-sig")
+            md = replace.checklist_path(bridge, scope).read_text(encoding="utf-8-sig")
             by_no = {r["no"]: r for r in replace.parse_rows(md)}
             if n not in by_no:
                 raise HubError(f"待确认清单里没有第 {n} 行（现有 {sorted(by_no)}）", status=404)
@@ -2556,7 +2669,7 @@ def _set_row_desc(local_id: str, task_dir: Path, bridge: str, n: int, *,
                 raise HubError(
                     f"第 {n} 行刚被别处改过（现为：{current or '空'}）——刷新后按最新值再改；"
                     "若要用你的输入覆盖，再点一次「保存并重渲染」", status=409)
-            members = replace.group_members(bridge, n)
+            members = replace.group_members(bridge, n, scope)
             targets = list(members) if len(members) >= 2 else [n]
             changed = [m for m in targets if _desc_of(by_no.get(m) or {}) != clean]
             if not changed and not rerender:
@@ -2567,7 +2680,7 @@ def _set_row_desc(local_id: str, task_dir: Path, bridge: str, n: int, *,
                 if len(members) >= 2:
                     rows = replace.set_group_write(task_dir, n, desc=clean)["rows"]
                 else:
-                    rows = [replace.set_row(bridge, n, desc=clean)]
+                    rows = [replace.set_row(bridge, n, desc=clean, task_id=scope)]
             except replace.ReplaceError as exc:
                 raise HubError(f"保存失败：{exc}；清单未改", status=500) from None
         echo: dict = {
@@ -2610,8 +2723,9 @@ def _rerender_after_desc(task_dir: Path, bridge: str, *, n: int, reason: str) ->
     """
     task = state.load(task_dir)
     mode = str(task.get("audio_mode") or "").strip()
+    scope = _list_scope(task_dir.name, task) or ""      # AT-21 B0：fork 按私有清单副本重渲染
     try:
-        prompt = generate.fetch_prompt(bridge, mode)
+        prompt = generate.fetch_prompt(bridge, mode, scope)
     except Exception as exc:                     # noqa: BLE001 —— bridge 层异常原文给员工看
         raise HubError(f"描述已保存，但重渲染失败（渲染服务没取回提示词：{exc}）。"
                        "点「再试一次重渲染」即可，描述不用重填",
@@ -2624,7 +2738,7 @@ def _rerender_after_desc(task_dir: Path, bridge: str, *, n: int, reason: str) ->
     except state.StateError as exc:
         raise HubError(str(exc)) from None
     try:
-        confirmed = replace.effective_entries(bridge)
+        confirmed = replace.effective_entries(bridge, scope or None)
         replace.run_replace(task_dir, assets=None, map_spec=None, name_spec=None,
                             confirm=True, verbose=False, empty_confirm=not confirmed)
     except (replace.ReplaceError, state.StateError) as exc:
@@ -2711,25 +2825,26 @@ def set_asset(local_id: str, n: int, *, image_url: str | None = None,
                            f"local:任务号/asset-uploads/文件名：{image_url!r}")
     with task_lock(local_id):
         task = state.load(task_dir)
+        scope = _list_scope(local_id, task)          # AT-21 B0：fork 只动自己的私有清单副本
         if decision is not None:
             # ---- AT-11 §3.2/§3.5：单行降级/恢复（行决策覆盖） ----
             if task["state"] != "awaiting_assets":
                 raise HubError(f"行决策需 awaiting_assets（确认后覆盖表锁定不可改），"
                                f"当前 {task['state']}")
-            members = replace.group_members(bridge, n)
+            members = replace.group_members(bridge, n, scope)
             if len(members) >= 2:
                 raise HubError(f"第 {n} 行在确认组 {members} 里（组=原子单位，"
                                f"不可单行降级，先拆开合并）")
-            decisions = replace.load_row_decisions(bridge)
+            decisions = replace.load_row_decisions(bridge, scope)
             if decision in replace.ORIGIN_DECISIONS:
                 decisions[n] = decision
             else:
                 if decisions.pop(n, None) is None:
                     raise HubError(f"第 {n} 行没有『按原片』决策，无需恢复")
-            saved = replace.save_row_decisions(bridge, decisions)
+            saved = replace.save_row_decisions(bridge, decisions, scope)
             return {"ok": True, "task_id": local_id, "n": n, "决策": decision,
                     "覆盖": {str(k): v for k, v in sorted(saved.items())},
-                    "锁点剩余": lock_remaining(bridge)}
+                    "锁点剩余": lock_remaining(bridge, scope)}
         # ---- m-3：图/清空/命名三支的状态守卫（decision 分支上面另有自己的矩阵）----
         if task["state"] in ASSET_WRITE_LOCKED_STATES:
             where = "生成中" if task["state"] == "generating" else "已批准待生成"
@@ -2737,7 +2852,7 @@ def set_asset(local_id: str, n: int, *, image_url: str | None = None,
                 f"任务{where}，清单已锁定不可改（第 {n} 行原样保留）："
                 f"先在画布撤销批准再改；要换图请走重试或复用为新版本")
         try:
-            members = replace.group_members(bridge, n)
+            members = replace.group_members(bridge, n, scope)
             if len(members) >= 2:
                 out = replace.set_group_write(task_dir, n, image_url=url,
                                               clear=clear, text=text)
@@ -2746,11 +2861,12 @@ def set_asset(local_id: str, n: int, *, image_url: str | None = None,
                                   "已传图": _display_refs(cards.split_urls(r.get("cur_assets") or "")),
                                   "命名": r.get("name") or ""} for r in out["rows"]]}
             if url:
-                row = replace.set_row(bridge, n, image_urls=[url], overwrite=True)
+                row = replace.set_row(bridge, n, image_urls=[url], overwrite=True, task_id=scope)
             elif clear:
-                row = replace.set_row(bridge, n, image_urls=[], overwrite=True)
+                row = replace.set_row(bridge, n, image_urls=[], overwrite=True, task_id=scope)
             else:
-                row = replace.set_row(bridge, n, name=re.sub(r"\s+", " ", str(text)).strip())
+                row = replace.set_row(bridge, n, name=re.sub(r"\s+", " ", str(text)).strip(),
+                                      task_id=scope)
             _record_pending(task_dir, n, image_url=url, clear=clear, text=text,
                             desc=row.get("desc") or "")
         except replace.ReplaceError as e:
@@ -2816,24 +2932,25 @@ def group_rows(local_id: str, rows: list[int], primary: int | None = None,
     if len(rows) < 2:
         raise HubError(f"成组至少要 2 行（收到 {rows}）")
     with task_lock(local_id):
+        scope = _list_scope(local_id)
         try:
-            checklist = replace.checklist_path(bridge).read_text(encoding="utf-8-sig")
+            checklist = replace.checklist_path(bridge, scope).read_text(encoding="utf-8-sig")
         except replace.ReplaceError as e:
             raise HubError(str(e)) from None
         by_no = {r["no"]: r for r in replace.parse_rows(checklist)}
         missing = [n for n in rows if n not in by_no]
         if missing:
             raise HubError(f"行号不在清单里: {missing}（现有 {sorted(by_no)}）")
-        ko = [n for n in rows if n in replace.load_row_decisions(bridge)]
+        ko = [n for n in rows if n in replace.load_row_decisions(bridge, scope)]
         if ko:
             raise HubError(f"行 {ko} 已按原片/已移除（keep_origin/dismissed），先恢复再合并"
                            f"（先降级后合并会留半组替换）")
-        groups = replace.load_groups(bridge)
+        groups = replace.load_groups(bridge, scope)
         for g in groups:
             overlap = sorted(set(rows) & set(g))
             if overlap:
                 raise HubError(f"行 {overlap} 已在组 {g} 里（先解组再成组）")
-        saved = replace.save_groups(bridge, groups + [rows])
+        saved = replace.save_groups(bridge, groups + [rows], scope)
         meta: dict[str, dict] | None = None
         if primary is not None or (name is not None and str(name).strip()):
             if primary is not None:
@@ -2847,11 +2964,11 @@ def group_rows(local_id: str, rows: list[int], primary: int | None = None,
                 primary_no = rows[0]
             clean_name = re.sub(r"\s+", " ", str(name)).strip() if name is not None else ""
             key = replace.group_key(rows)
-            cur = replace.load_group_meta(bridge)
+            cur = replace.load_group_meta(bridge, scope)
             entry = cur.get(key) if isinstance(cur.get(key), dict) else {}
             cur[key] = {"主行": primary_no, "组名": clean_name,
                         **{k: v for k, v in entry.items() if k not in ("主行", "组名")}}
-            meta = replace.save_group_meta(bridge, cur)
+            meta = replace.save_group_meta(bridge, cur, scope)
         out: dict = {"ok": True, "task_id": local_id, "本次": rows, "组": saved}
         if meta is not None:
             out["组元数据"] = meta
@@ -2870,13 +2987,14 @@ def ungroup_rows(local_id: str, rows: list[int]) -> dict:
     if not rows:
         raise HubError("解组要给行号（rows）")
     with task_lock(local_id):
-        groups = replace.load_groups(bridge)
+        scope = _list_scope(local_id)
+        groups = replace.load_groups(bridge, scope)
         loose = [n for n in rows if not any(n in g for g in groups)]
         if loose:
             raise HubError(f"行 {loose} 不在任何确认组里")
         rest = [[n for n in g if n not in rows] for g in groups]
-        saved = replace.save_groups(bridge, rest)
-        meta = replace.sync_group_meta(bridge, saved)
+        saved = replace.save_groups(bridge, rest, scope)
+        meta = replace.sync_group_meta(bridge, saved, scope)
         return {"ok": True, "task_id": local_id, "解组": rows, "组": saved,
                 "组元数据": meta}
 
@@ -3306,6 +3424,133 @@ def output_file(local_id: str) -> Path:
     if not f.is_file():
         raise HubError(f"成片未就绪: {local_id}")
     return f
+
+
+# ---------------------------------------------------------------- AT-21 B0：派生（复用为新版本）
+# 派生是**新建另一个任务**，不是状态迁移：done 保持终态（F2），源任务的字段/产物一字不动。
+# 编号分配 + 建目录必须串行（两个并发 fork 拿到同一个 auto-编号 = 撞车），派生本身是低频动作，
+# 直接用一把全局锁；真正的机制在 automation/fork.py（本函数只做校验、锁与 HTTP 回执）。
+_FORK_LOCK = threading.Lock()
+
+
+def fork_task(local_id: str) -> dict:
+    """POST /api/hub/task/{id}/fork —— 「复用为新版本」：派生新任务，源任务只读。
+
+    合同（卡 t_cc8ea89b 第 1/2/3/6 条 + 裁决 3）：
+      · 私有清单副本：新任务目录里一份 待确认清单.md/.json，`local:` 引用重写指自己的 asset-uploads；
+      · inbox 复制：源视频同 sha 抄进新任务 inbox（删除守卫按 inbox 同 sha 天然覆盖 fork）；
+      · derived_from：记来源任务号 + bridge_id + 时点（详情页反查入口读它）；
+      · 剥离：审批/提交/生成痕迹/产物/运行时一概不继承（fork 出生即 awaiting_assets，零审批痕迹）。
+    派生端点**不**批准、**不**提交、**不**写任何 `gen_*`（付费停点铁律：新版本必须所有者亲手批准）。
+    """
+    task_dir = _task_dir(local_id)
+    with _FORK_LOCK:
+        with task_lock(local_id):
+            source = state.load(task_dir)
+            st = str(source.get("state") or "")
+            if st not in fork.FORKABLE_STATES:
+                raise HubError(
+                    f"只有已出片（done）的任务能复用为新版本，{local_id} 当前是 {st}："
+                    "本版还没出片——要改图/改描述请走既有置换台、退回置换或撤销批准", status=409)
+            if _active_submit(local_id):
+                raise HubError("任务还有活跃提交占用（提交进行中）——等它收尾再派生", status=409)
+            try:
+                out = fork.derive_task(task_dir)
+            except fork.ForkError as exc:
+                raise HubError(str(exc)) from None
+            except state.StateError as exc:            # 受控初始化的守卫（出生态/必备字段/不覆盖）
+                raise HubError(f"派生初始化被状态机拒绝：{exc}", status=500) from None
+    return {"ok": True, "local_id": out["local_id"], "bridge_id": out["bridge_id"],
+            "state": state.FORK_BOOTSTRAP_STATE, "derived_from": out["derived_from"],
+            "复制": {"源视频": out["video"], "源视频字节": out["video_bytes"],
+                     "指纹同抄": out["指纹同抄"], "资产图": out["资产图复制"],
+                     "清单引用重写": out["清单引用重写"]},
+            "说明": (f"已派生 {out['local_id']}（复用自 {local_id}）："
+                     "拆解产物按同一 bridge 共享只读，清单/资产图是它自己的副本；"
+                     "出片仍需你亲自确认置换与批准（一次批准 = 一次扣费）")}
+
+
+# ---------------------------------------------------------------- AT-21 B0：直写提示词正文
+# D3-② 乙路线（裁决 2）：手改**直接写** 任务目录/提示词.md（唯一权威正文），不引入 override 文件。
+# 为什么不需要新造审批防线：do_approve 带 config 时按**当前**正文现算快照，提交也按当前正文校验，
+# 所以「手改 → 批准 → 提交」批的与提的天然一致；批准之后再改会被「审批已作废」挡住。
+PROMPT_EDIT_STATES = ("awaiting_approval",)     # 手改只在「预演已出、还没批准」这个天然安全区
+PROMPT_MIN_CHARS = 200                          # 与 do_render 的「像提示词」下限同一口径
+PROMPT_EDIT_REFUSALS = {
+    "ingested": "任务还没开始拆解：先「发起拆解」",
+    "ingesting": "视频还在入库：等拆解跑完",
+    "discussing": "拆解还没跑完：等提示词第一次渲染出来（待审批）再改正文",
+    "awaiting_assets": "提示词还没生成：先确认置换（确认后后台渲染产出正文），到「待审批」再手改",
+    "rendering": "正在渲染：等这一版提示词出来（待审批）再手改",
+    "approved": "已批准：先点「撤销批准」回到待审批，再改正文（直接改会让审批快照作废）",
+    "generating": "正在生成：改正文会让提示词和已提交的片子对不上——等成片出来再走「复用为新版本」",
+    "done": "已完成：这一版的正文是它那次批准的凭证。要改文案请「复用为新版本」（派生新任务，源任务不动）",
+    "failed": "失败态：先点「重试」回到可编辑状态",
+}
+
+
+def save_prompt_text(local_id: str, text: str, *, expect_text: str | None = None) -> dict:
+    """POST /api/hub/task/{id}/prompt —— 直写 `提示词.md`（AT-21 D3-② 乙 / 裁决 2 / 卡面第 4 条）。
+
+    一次请求里跑完（复刻 `rerender_for_audio_mode` 的已落地骨架，F9）：
+      写正文（tmp + os.replace，结构上不会出现半截正文）→ 重算 approval_snapshot →
+      `prompt_edited_at` 留痕 → 自检重跑 → 音频门禁重跑；**状态不变**（仍是 awaiting_approval）。
+
+    `expect_text`（可选乐观锁）：给了且与盘上现值不同 → 409「别处改过」，不写不跑。
+    与现值逐字相同 → `unchanged=true`，不写不重算不重跑（连点两次只产生一代正文）。
+    自检 FAIL **不阻断**（裁决 1）：结果如实回给前端红条，人工终审由所有者做。
+    """
+    body = str(text if text is not None else "")
+    if not body.strip():
+        raise HubInputError("提示词不能为空：要恢复原样请用「退回置换」让模板重新渲染")
+    if len(body.strip()) < PROMPT_MIN_CHARS:
+        raise HubInputError(f"提示词太短（{len(body.strip())} 字，至少要 {PROMPT_MIN_CHARS} 字）："
+                            "这不像一条能出片的正文——多半是粘贴时丢了内容")
+    task_dir = _task_dir(local_id)
+    with task_lock(local_id):
+        task = state.load(task_dir)
+        st = str(task["state"])
+        if st not in PROMPT_EDIT_STATES:
+            raise HubError(PROMPT_EDIT_REFUSALS.get(st, f"当前状态（{st}）不能改提示词正文"),
+                           status=409)
+        prompt_path = _prompt_path(task_dir, task)
+        current = _read(prompt_path)
+        if not current.strip():
+            raise HubError("这个任务还没有提示词正文（预演没落盘）——先让它渲染出正文再改", status=409)
+        if expect_text is not None and str(expect_text) != current:
+            raise HubError("正文刚被别处改过（你打开编辑器之后有人写入了新版本）——"
+                           "刷新后按最新正文再改；若坚持用你的输入覆盖，再点一次「保存」", status=409)
+        if body == current:
+            return {"ok": True, "task_id": local_id, "state": st, "unchanged": True,
+                    "prompt_md": current, "prompt_chars": len(current),
+                    "prompt_edited_at": str(task.get("prompt_edited_at") or ""),
+                    "approval_snapshot": str(task.get("approval_snapshot") or ""),
+                    "自检": selfcheck.load_selfcheck(task_dir),
+                    "audio_gate": task.get("audio_gate") or None}
+        # ① 正文落盘（与 do_render 同一写法：临时文件 + os.replace，结构上不可能半截）
+        tmp = prompt_path.with_name(prompt_path.name + ".tmp")
+        tmp.write_text(body, encoding="utf-8")
+        tmp.replace(prompt_path)
+        # ② 快照按**新正文**重算（按任务自身版本算；老任务 v1、已升 v2 的按 v2——同源函数，不自证）
+        task["approval_snapshot"] = state.snapshot_for(task, body)
+        # ③ 手改留痕（与 AT-22 E3 改描述共用同一字段语义：最近一次人为改正文）
+        task["prompt_edited_at"] = state._now()
+        task["prompt_edit_reason"] = "手改提示词正文（直写 提示词.md）"
+        state.save(task_dir, task)
+        snapshot = str(task["approval_snapshot"])
+        edited_at = str(task["prompt_edited_at"])
+    # ④ 自检 + 音频门禁**一起重跑**：两者都属于「这一次的正文」，换了正文必须一起重判，
+    #    否则面板停在旧结论上（红条骂的是上一版）。
+    items = selfcheck.run_selfcheck(task_dir)
+    gate = generate.run_audio_gate(task_dir, state.load(task_dir))
+    bad = [x for x in items if str(x.get("结论") or "") != "PASS"]
+    return {"ok": True, "task_id": local_id, "state": PROMPT_EDIT_STATES[0],
+            "unchanged": False, "prompt_md": body, "prompt_chars": len(body),
+            "prompt_edited_at": edited_at, "approval_snapshot": snapshot,
+            "自检": items, "audio_gate": gate,
+            "说明": (f"已保存并重算审批快照（自检 {len(items) - len(bad)}/{len(items)} 项通过"
+                     + ("，自检有未通过项：如实显示，不阻断批准" if bad else "")
+                     + "）；正文改动后必须重新批准才会按新正文出片")}
 
 
 def job_status(job_id: str) -> dict:

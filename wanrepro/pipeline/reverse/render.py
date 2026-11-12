@@ -2588,6 +2588,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--template", required=True, help="templates/<name>.md 的 name，或 .md 文件路径")
     ap.add_argument("--optional", default="", help="要打开的可选段字母，逗号分隔，如 A,B（默认全关）")
     ap.add_argument("--out-dir", default="", help="产物目录（默认写回 --id 目录）")
+    ap.add_argument("--checklist-dir", default="",
+                    help="清单/侧车目录（默认=--id 目录）。派生任务（fork）传自己的任务目录："
+                         "待确认清单.md/.json 是它私有的副本，共享拆解产物照旧读 --id 目录")
     ap.add_argument("--body-mode", default="",
                     help="正文模式：留空=模板 frontmatter `正文模式:`（缺省文档模式）；`流式`=只出一段可直贴正文（无标题/无附注）")
     ap.add_argument("--audio-mode", default="",
@@ -2644,8 +2647,11 @@ def main(argv: list[str] | None = None) -> int:
             print(f"[WARN] 拆解只解析出 {len(order)} 层，模板用到的层都在，继续。", file=sys.stderr)
 
         # 4) 待确认清单（可选）——发号读组/行决策覆盖（AT-11 §3.3/§3.4，同一 sidecar 数据源）
-        checklist_md_path = id_path / "待确认清单.md"
-        groups, ko_decisions = load_merge_overlay(id_path / "待确认清单.json")
+        # AT-21 B0：`--checklist-dir` 指定清单作用域（派生任务读自己任务目录里的私有副本）；
+        # 拆解产物仍全部来自 --id 目录（共享只读），只有清单.md/.json 两件跟着作用域走。
+        clist_dir = Path(args.checklist_dir) if str(args.checklist_dir or "").strip() else id_path
+        checklist_md_path = clist_dir / "待确认清单.md"
+        groups, ko_decisions = load_merge_overlay(clist_dir / "待确认清单.json")
         ents = assign_numbers(parse_checklist(checklist_md_path), groups, ko_decisions)
         if not ents:
             print("[WARN] 没有可用的待确认清单，命名替换跳过（原样用模型看到的描述）。", file=sys.stderr)

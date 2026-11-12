@@ -32,6 +32,10 @@ sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 IMG_EXTS = {".png", ".jpg", ".jpeg", ".webp"}
 LIST_NAME = "待确认清单.md"
+SIDECAR_NAME = "待确认清单.json"          # 清单侧车（同实体确认 / 组元数据 / 行决策覆盖 / 出现时段）
+# fork 私有清单副本标记（AT-21 B0 / 双路审计裁决 3）：任务.json 置 true = 该任务的清单与 sidecar 在
+# **自己任务目录**里，共享的 analysis/reverse/<bridge_id>/ 那份从此与它无关（源任务永不被 fork 触碰）。
+PRIVATE_FIELD = "checklist_private"
 
 
 class ReplaceError(RuntimeError):
@@ -64,7 +68,54 @@ def analysis_root() -> Path:
     return Path(env).expanduser() if env else Path(__file__).resolve().parent.parent / "analysis" / "reverse"
 
 
-def checklist_path(bridge_id: str) -> Path:
+def task_dir_of(local_id: str) -> Path:
+    """任务目录（`config.PROJECTS_DIR` 认 WANREPRO_AUTO_DIR，隔离探针同源）。"""
+    return config.PROJECTS_DIR / str(local_id)
+
+
+def private_scope(local_id: str, task: dict | None = None) -> str | None:
+    """**清单作用域**：返回该任务的私有清单副本所在任务号（= local_id），共享任务 → None。
+
+    AT-21 B0 / 裁决 3 的唯一判定点：fork 任务（任务.json `checklist_private: true`）的清单与 sidecar
+    在自己任务目录里，其余任务继续读写 `analysis/reverse/<bridge_id>/` 那份共享文件。
+
+    为什么按「任务声明 + 文件在场」双条件判，而不是只看文件在不在：
+      · 只按文件在不在 → 私有副本一旦被误删，fork 会**静默回落到共享清单**，于是它后面的每一次改
+        描述/换图都写进源任务的清单里——正是裁决 3 要根除的污染形态；
+      · 所以声明了私有就必须有文件，缺文件直接抛（宁可报错，不许悄悄写源清单）。
+    """
+    lid = str(local_id or "").strip()
+    if not lid:
+        return None
+    data = task
+    if data is None:
+        mf = task_dir_of(lid) / "任务.json"
+        if not mf.is_file():
+            return None                      # 没有任务文件的调用方（画布链/单测夹具）走共享口径
+        try:
+            data = json.loads(mf.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            raise ReplaceError(f"任务 {lid} 的任务文件读不了，无法判定清单作用域") from None
+    if not isinstance(data, dict) or not data.get(PRIVATE_FIELD):
+        return None
+    private_md = task_dir_of(lid) / LIST_NAME
+    if not private_md.is_file():
+        raise ReplaceError(
+            f"任务 {lid} 声明了私有清单副本（{PRIVATE_FIELD}），但 {private_md} 不在——"
+            "不回落共享清单（那会把改动写进源任务）")
+    return lid
+
+
+def checklist_path(bridge_id: str, task_id: str | None = None) -> Path:
+    """清单路径：给了 task_id（= `private_scope()` 的返回值）走**私有副本**，否则共享 bridge 清单。
+
+    私有副本缺失时抛错不回落（见 `private_scope` 的说明）。
+    """
+    if task_id:
+        private = task_dir_of(task_id) / LIST_NAME
+        if not private.is_file():
+            raise ReplaceError(f"任务 {task_id} 的私有清单副本不存在：{private}（不回落共享清单）")
+        return private
     # 桥任务目录 analysis/reverse/<id>/（根可注入，见 analysis_root）
     p = analysis_root() / bridge_id / LIST_NAME
     if not p.is_file():
@@ -192,16 +243,17 @@ def _is_sep_row(cells: list[str]) -> bool:
 
 def set_row(bridge_id: str, no: int, *, image_urls: list[str] | None = None,
             name: str | None = None, overwrite: bool = False,
-            desc: str | None = None) -> dict:
+            desc: str | None = None, task_id: str | None = None) -> dict:
     """定向写清单一行（AT-8 置换台写路径）：资产图列覆盖/清空 + 命名列 +「用我的描述」列。
 
     写路径格式定死（数据合同 v3）：前端先走 uguu 拿 URL，再调这里写 md；不新增 multipart。
     AT-22 B0：读-改-整文件重写**全程持 CHECKLIST_LOCK**（与画布链 `_update_checklist_cell`
     同一把锁）——读在锁内才是关键：锁外读、锁内写照样丢更新。
+    AT-21 B0：`task_id` 给了就写该任务的**私有清单副本**（fork），否则写共享 bridge 清单。
     """
     if image_urls is None and name is None and desc is None:
         raise ReplaceError("没有要写的东西：给 image_urls / name / desc 之一")
-    path = checklist_path(bridge_id)
+    path = checklist_path(bridge_id, task_id)
     with CHECKLIST_LOCK:
         before = path.read_text(encoding="utf-8")
         after = fill_row(before, no, list(image_urls or []), name, overwrite=overwrite,
@@ -222,13 +274,16 @@ def set_row(bridge_id: str, no: int, *, image_urls: list[str] | None = None,
 GROUPS_KEY = "同实体确认"          # sidecar 顶层键：[[1,11],...]（数据合同 B0）
 
 
-def sidecar_path(bridge_id: str) -> Path:
-    return analysis_root() / bridge_id / "待确认清单.json"
+def sidecar_path(bridge_id: str, task_id: str | None = None) -> Path:
+    """清单侧车路径（同 `checklist_path` 的作用域规则：给了 task_id 走私有副本）。"""
+    if task_id:
+        return task_dir_of(task_id) / SIDECAR_NAME
+    return analysis_root() / bridge_id / SIDECAR_NAME
 
 
-def load_groups(bridge_id: str) -> list[list[int]]:
+def load_groups(bridge_id: str, task_id: str | None = None) -> list[list[int]]:
     """sidecar 顶层『同实体确认』→ [[1,11],...]；无 sidecar/无键/坏值 → []（合同：空=无组，行为同现状）。"""
-    path = sidecar_path(bridge_id)
+    path = sidecar_path(bridge_id, task_id)
     if not path.is_file():
         return []
     try:
@@ -244,7 +299,7 @@ def load_groups(bridge_id: str) -> list[list[int]]:
     return out
 
 
-def save_groups(bridge_id: str, groups: list[list[int]]) -> list[list[int]]:
+def save_groups(bridge_id: str, groups: list[list[int]], task_id: str | None = None) -> list[list[int]]:
     """规范后整组写回 sidecar（保留其它键不动）：行去重升序、共员组合并、<2 的组剔除。"""
     merged: list[list[int]] = []
     for group in groups:
@@ -256,7 +311,7 @@ def save_groups(bridge_id: str, groups: list[list[int]]) -> list[list[int]]:
         if len(cur) >= 2:
             merged.append(cur)
     merged.sort()
-    path = sidecar_path(bridge_id)
+    path = sidecar_path(bridge_id, task_id)
     payload: dict = {}
     if path.is_file():
         try:
@@ -272,9 +327,9 @@ def save_groups(bridge_id: str, groups: list[list[int]]) -> list[list[int]]:
     return merged
 
 
-def group_members(bridge_id: str, no: int) -> list[int]:
+def group_members(bridge_id: str, no: int, task_id: str | None = None) -> list[int]:
     """含 no 的确认组（升序）；无组 → []（调用方走单行路径）。"""
-    for group in load_groups(bridge_id):
+    for group in load_groups(bridge_id, task_id):
         if no in group:
             return list(group)
     return []
@@ -294,9 +349,9 @@ def row_unit(no: int, groups: list[list[int]]) -> tuple:
     return ("s", int(no))
 
 
-def load_sidecar_payload(bridge_id: str) -> dict:
+def load_sidecar_payload(bridge_id: str, task_id: str | None = None) -> dict:
     """sidecar 顶层 payload（容错：无文件/坏 JSON/非对象 → {}）。组/决策/元数据读写共用。"""
-    path = sidecar_path(bridge_id)
+    path = sidecar_path(bridge_id, task_id)
     if not path.is_file():
         return {}
     try:
@@ -306,13 +361,13 @@ def load_sidecar_payload(bridge_id: str) -> dict:
     return payload if isinstance(payload, dict) else {}
 
 
-def _save_sidecar_key(bridge_id: str, key: str, value) -> None:
+def _save_sidecar_key(bridge_id: str, key: str, value, task_id: str | None = None) -> None:
     """写 sidecar 单个顶层键，其它键原样保留（原子写，同 save_groups）。"""
-    payload = load_sidecar_payload(bridge_id)
+    payload = load_sidecar_payload(bridge_id, task_id)
     payload[key] = value
-    tmp = sidecar_path(bridge_id).with_suffix(".json.tmp")
+    tmp = sidecar_path(bridge_id, task_id).with_suffix(".json.tmp")
     tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    tmp.replace(sidecar_path(bridge_id))
+    tmp.replace(sidecar_path(bridge_id, task_id))
 
 
 # ---------------------------------------------------------------- 组元数据 + 行决策覆盖（AT-11 §四）
@@ -333,9 +388,9 @@ def is_origin_decision(value: str | None) -> bool:
     return value in ORIGIN_DECISIONS
 
 
-def load_group_meta(bridge_id: str) -> dict[str, dict]:
+def load_group_meta(bridge_id: str, task_id: str | None = None) -> dict[str, dict]:
     """『组元数据』→ {组键: {主行, 组名}}；无/坏 → {}（合同：空=无元数据，主行走缺省最小行）。"""
-    raw = load_sidecar_payload(bridge_id).get(GROUP_META_KEY)
+    raw = load_sidecar_payload(bridge_id, task_id).get(GROUP_META_KEY)
     out: dict[str, dict] = {}
     if isinstance(raw, dict):
         for key, value in raw.items():
@@ -344,29 +399,30 @@ def load_group_meta(bridge_id: str) -> dict[str, dict]:
     return out
 
 
-def save_group_meta(bridge_id: str, meta: dict[str, dict]) -> dict[str, dict]:
+def save_group_meta(bridge_id: str, meta: dict[str, dict], task_id: str | None = None) -> dict[str, dict]:
     """整键规范写回『组元数据』（保留 sidecar 其它键）；组键=group_key(成员)。"""
     clean = {str(k): dict(v) for k, v in meta.items() if isinstance(v, dict)}
-    _save_sidecar_key(bridge_id, GROUP_META_KEY, clean)
+    _save_sidecar_key(bridge_id, GROUP_META_KEY, clean, task_id)
     return clean
 
 
-def sync_group_meta(bridge_id: str, groups: list[list[int]]) -> dict[str, dict]:
+def sync_group_meta(bridge_id: str, groups: list[list[int]],
+                    task_id: str | None = None) -> dict[str, dict]:
     """组表变化后对账『组元数据』：组键不再对应任何现存组 → 该键删除（AT-11 §3.7 解组清理）。
     『行决策覆盖』不动（行级覆盖不因解组无故清——那是行自身的决策，不是组的）。"""
     live = {group_key(g) for g in groups}
-    meta = load_group_meta(bridge_id)
+    meta = load_group_meta(bridge_id, task_id)
     stale = [k for k in meta if k not in live]
     if stale:
         for key in stale:
             meta.pop(key)
-        _save_sidecar_key(bridge_id, GROUP_META_KEY, meta)
+        _save_sidecar_key(bridge_id, GROUP_META_KEY, meta, task_id)
     return meta
 
 
-def load_row_decisions(bridge_id: str) -> dict[int, str]:
+def load_row_decisions(bridge_id: str, task_id: str | None = None) -> dict[int, str]:
     """『行决策覆盖』→ {行号: "keep_origin" | "dismissed"}；无/坏/未知值 → 丢弃（只认白名单值）。"""
-    raw = load_sidecar_payload(bridge_id).get(DECISIONS_KEY)
+    raw = load_sidecar_payload(bridge_id, task_id).get(DECISIONS_KEY)
     out: dict[int, str] = {}
     if isinstance(raw, dict):
         for key, value in raw.items():
@@ -375,11 +431,11 @@ def load_row_decisions(bridge_id: str) -> dict[int, str]:
     return out
 
 
-def save_row_decisions(bridge_id: str, decisions: dict[int, str]) -> dict[int, str]:
+def save_row_decisions(bridge_id: str, decisions: dict[int, str],
+                       task_id: str | None = None) -> dict[int, str]:
     """整键规范写回『行决策覆盖』（保留 sidecar 其它键）；值白名单=keep_origin / dismissed。"""
     clean = {int(n): str(d) for n, d in decisions.items() if str(d) in ORIGIN_DECISIONS}
-    _save_sidecar_key(bridge_id, DECISIONS_KEY,
-                      {str(n): d for n, d in sorted(clean.items())})
+    _save_sidecar_key(bridge_id, DECISIONS_KEY, {str(n): d for n, d in sorted(clean.items())}, task_id)
     return clean
 
 
@@ -392,10 +448,12 @@ def set_group_write(task_dir: Path, no: int, *, image_url: str | None = None,
     ReplaceError（错误不报整组成功）；调用方持任务级串行锁。
     desc（AT-22 E3 §3.2 组联动）：组=同一个东西，整组写同一个描述——不静默只改一行，否则
     同一张图在正文里出现两个描述。
+    AT-21 B0：组表与清单都按**任务作用域**读写（fork 任务的私有副本），源任务零触碰。
     """
     task = state.load(task_dir)
+    scope = private_scope(str(task.get("local_id") or task_dir.name), task)
     bridge = str(task.get("bridge_id") or "")
-    members = group_members(bridge, no)
+    members = group_members(bridge, no, scope)
     if len(members) < 2:
         raise ReplaceError(f"第 {no} 行不在任何确认组里（疑似不联动，先在详情页成组）")
     rows: list[dict] = []
@@ -405,13 +463,13 @@ def set_group_write(task_dir: Path, no: int, *, image_url: str | None = None,
         for m in members:
             try:
                 if image_url is not None:
-                    rows.append(set_row(bridge, m, image_urls=[image_url], overwrite=True))
+                    rows.append(set_row(bridge, m, image_urls=[image_url], overwrite=True, task_id=scope))
                 elif clear:
-                    rows.append(set_row(bridge, m, image_urls=[], overwrite=True))
+                    rows.append(set_row(bridge, m, image_urls=[], overwrite=True, task_id=scope))
                 elif desc is not None:
-                    rows.append(set_row(bridge, m, desc=desc))
+                    rows.append(set_row(bridge, m, desc=desc, task_id=scope))
                 else:
-                    rows.append(set_row(bridge, m, name=str(text or "")))
+                    rows.append(set_row(bridge, m, name=str(text or ""), task_id=scope))
             except ReplaceError as e:
                 raise ReplaceError(f"组 {members} 写清单在第 {m} 行失败（不报整组成功）: {e}") from None
     # 同步上传流水（语义同 _record_pending：清=撤流水；传图=落流水；命名=改已有流水）
@@ -498,7 +556,7 @@ def render_module():
     return _RENDER_MODULE
 
 
-def effective_entries(bridge_id: str) -> list[dict]:
+def effective_entries(bridge_id: str, task_id: str | None = None) -> list[dict]:
     """确认时点提交清单（AT-16 B1b 同源装配）：清单当前有效绑定 → 行→图号→提交条目。
 
     真源=待确认清单.md「资产图」列，**不是** pending_replace 上传流水：流水只是本次会话的
@@ -508,12 +566,13 @@ def effective_entries(bridge_id: str) -> list[dict]:
 
     条目形状沿用历史快照 {"no","img","url","name","desc"}：no 是**行号**（自检按行号查发号
     映射），列表序=提交序=图号序。
+    AT-21 B0：`task_id` 给了就按该任务的私有清单副本 + 私有 sidecar 装配（fork 的资产/组/决策）。
     """
     render = render_module()
-    path = checklist_path(bridge_id)
+    path = checklist_path(bridge_id, task_id)
     ents = render.parse_checklist(path)
-    units = render.effective_units(ents, load_groups(bridge_id),
-                                   load_row_decisions(bridge_id))
+    units = render.effective_units(ents, load_groups(bridge_id, task_id),
+                                   load_row_decisions(bridge_id, task_id))
     descs = {r["no"]: str(r.get("desc") or "")
              for r in parse_rows(path.read_text(encoding="utf-8-sig"))}
     out: list[dict] = []
@@ -533,6 +592,8 @@ def run_replace(task_dir: Path, *, assets: list[str] | None, map_spec: str | Non
                 name_spec: str | None, confirm: bool, verbose: bool = True,
                 empty_confirm: bool = False, ack_rows: list[int] | None = None) -> str:
     task = state.load(task_dir)
+    # AT-21 B0：一切清单/sidecar 读写都按本任务的作用域（fork → 私有副本，其余 → 共享 bridge 清单）。
+    scope = private_scope(str(task.get("local_id") or task_dir.name), task)
     cur = task["state"]
     if confirm:
         if cur != "awaiting_assets":
@@ -542,10 +603,10 @@ def run_replace(task_dir: Path, *, assets: list[str] | None, map_spec: str | Non
         bridge_id = str(task.get("bridge_id") or "")
         # AT-11 §3.4（B2）：同一确认动作内先算有效决策——「按原片行」（keep_origin / AT-12 dismissed）
         # 在发号/组装有效上传清单之前胜出；原值（清单图列/命名/流水）不动，restore 后原样回来。
-        ko_rows = {n for n, d in load_row_decisions(bridge_id).items() if is_origin_decision(d)}
+        ko_rows = {n for n, d in load_row_decisions(bridge_id, scope).items() if is_origin_decision(d)}
         # AT-16 B1b：提交清单、正文引用、资产清单、确认快照同一份有效映射（清单当前绑定）。
         # 组去重与按原片屏蔽都在 render.effective_units 里完成；上传流水 pending 只作回显。
-        confirmed = effective_entries(bridge_id)
+        confirmed = effective_entries(bridge_id, scope)
         acks = sorted({int(x) for x in (ack_rows or [])})
         ko_snap = sorted(ko_rows)
         if confirmed:
@@ -592,7 +653,7 @@ def run_replace(task_dir: Path, *, assets: list[str] | None, map_spec: str | Non
     if not images and not map_spec:
         raise ReplaceError("没有输入：--assets <目录/文件> 或 --map 必须给一个")
 
-    md_path = checklist_path(task["bridge_id"])
+    md_path = checklist_path(task["bridge_id"], scope)
     md = md_path.read_text(encoding="utf-8")
     rows = parse_rows(md)
     by_no = {r["no"]: r for r in rows}

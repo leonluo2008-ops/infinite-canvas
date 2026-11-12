@@ -206,6 +206,42 @@ def _deep_set(d: dict, dotted: str, value) -> None:
     cur[parts[-1]] = value
 
 
+# ---------------------------------------------------------------- AT-21 B0：fork 受控初始化
+
+FORK_BOOTSTRAP_STATE = "awaiting_assets"     # fork 唯一合法出生态（与现网「重试」落点一致）
+_FORK_REQUIRED_KEYS = ("local_id", "bridge_id", "derived_from", "checklist_private")
+
+
+def init_fork_task(task_dir: Path, task: dict, *, note: str = "") -> dict:
+    """fork 任务的**受控初始化**（双路审计 A2：受控初始化 + 完整 history，禁端点手写 state）。
+
+    为什么不让 fork 走 transition()：状态机只认逐级前进，ingested → awaiting_assets 中间必须是
+    discussing。fork 没有跑过拆解（它复用的是源任务 `bridge_id` 下的现成产物），从 transition 走
+    只有两种下场——要么伪造一条「拆解跑过」的历史，要么让任务在 discussing 上停一小会儿而没有
+    job，被假运行对账（`scan_lost_runs`）当成死运行降级。
+
+    所以出生态收敛到引擎里这一个函数：只认一个出生态、校验派生必备字段、history 从**这一条**
+    如实记起（派生起点），且**禁止覆盖已存在的任务文件**（重名 = 编号分配撞车，直接报错）。
+    """
+    tdir = Path(task_dir)
+    if task.get("state") != FORK_BOOTSTRAP_STATE:
+        raise StateError(f"fork 出生态只能是 {FORK_BOOTSTRAP_STATE}，收到 {task.get('state')!r}")
+    missing = [k for k in _FORK_REQUIRED_KEYS if not task.get(k)]
+    if missing:
+        raise StateError(f"fork 任务缺必备字段 {'/'.join(missing)}（派生关系必须可追）")
+    derived = task.get("derived_from")
+    if not isinstance(derived, dict) or not str(derived.get("local_id") or "").strip():
+        raise StateError("fork 任务的 derived_from 必须是 {local_id, bridge_id, at, changed}")
+    if (tdir / _TASK_FILE).exists():
+        raise StateError(f"任务 {tdir.name} 已存在，fork 不得覆盖")
+    payload = dict(task)
+    payload["history"] = [{"at": _now(), "from": None, "to": FORK_BOOTSTRAP_STATE,
+                           "note": note or f"派生自 {derived.get('local_id')}（复用拆解产物，未跑模型）"}]
+    tdir.mkdir(parents=True, exist_ok=True)
+    save(tdir, payload)
+    return payload
+
+
 def rollback_to_assets(task_dir: Path, *, note: str = "退回置换") -> dict:
     """受控回退边（AT-9 数据合同状态机增量 1）：awaiting_approval → awaiting_assets。
 

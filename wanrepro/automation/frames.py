@@ -17,14 +17,18 @@
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import subprocess
 import urllib.parse
 from pathlib import Path
 
+from . import config, replace
+
 ROOT = Path(__file__).resolve().parents[1]   # wanrepro/
 ANALYSIS = ROOT / "analysis" / "reverse"
+VIDEO_EXTS = tuple(config.VIDEO_EXTS)
 
 CACHE_TOL = 0.5        # 数据合同 v3：±0.5s 内有缓存帧就用缓存
 MAX_WIDTH = 960        # 最大宽，与 build_asset_frame 同口径
@@ -102,16 +106,63 @@ def span_mid(span: dict | None) -> float | None:
 _DURATION: dict[str, float] = {}
 
 
-def video_path(bridge_id: str) -> Path | None:
-    """`.源视频指纹.json` 的「路径」（相对 wanrepro/）→ 源视频；没有就 None（现抽只能落首帧兜底）。"""
+def _task_inbox_video(local_id: str, meta: dict) -> Path | None:
+    """任务自己 inbox 里的源视频（AT-21 B0）：fork 复制了同 sha 的源片，删了源任务也还读得到。
+
+    三级匹配，够用且不读大文件：① 指纹「路径」的同名文件；② inbox 里唯一的视频；③ 前 1MB sha 相等。
+    """
+    inbox = config.PROJECTS_DIR / str(local_id) / "inbox"
+    if not inbox.is_dir():
+        return None
+    cands = [p for p in inbox.iterdir() if p.is_file() and p.suffix.lower() in VIDEO_EXTS]
+    if not cands:
+        return None
+    name = Path(str(meta.get("路径") or "")).name
+    if name:
+        hit = next((p for p in cands if p.name == name), None)
+        if hit is not None:
+            return hit
+    if len(cands) == 1:
+        return cands[0]
+    want = str(meta.get("前1MB_sha256") or "")
+    if want:
+        for p in cands:
+            try:
+                if _first_mb_sha(p) == want:
+                    return p
+            except OSError:
+                continue
+    return cands[0]
+
+
+def _first_mb_sha(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as fh:
+        h.update(fh.read(1024 * 1024))
+    return h.hexdigest()
+
+
+def video_path(bridge_id: str, local_id: str = "") -> Path | None:
+    """`.源视频指纹.json` 的「路径」（相对 wanrepro/）→ 源视频；没有就 None（现抽只能落首帧兜底）。
+
+    AT-21 B0：给了 `local_id` 就**优先**用该任务 inbox 里的源片（fork 的 inbox 是它自己的副本）——
+    源任务被删、uploads 被回收之后，派生版本仍然能抽帧/看帧；拿不到再回落指纹路径（既有行为）。
+    指纹根走 `replace.analysis_root()`（认 WANREPRO_ANALYSIS_ROOT，与 generate/replace 同源）。
+    """
     if not bridge_id:
         return None
-    fp = ANALYSIS / bridge_id / ".源视频指纹.json"
+    fp = replace.analysis_root() / bridge_id / ".源视频指纹.json"
     try:
         meta = json.loads(fp.read_text(encoding="utf-8-sig"))
     except (OSError, json.JSONDecodeError):
+        meta = None
+    if local_id:
+        own = _task_inbox_video(local_id, meta if isinstance(meta, dict) else {})
+        if own is not None:
+            return own
+    if not isinstance(meta, dict):
         return None
-    raw = str((meta or {}).get("路径") or "").strip()
+    raw = str(meta.get("路径") or "").strip()
     if not raw:
         return None
     path = Path(raw)
