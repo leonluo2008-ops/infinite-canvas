@@ -26,9 +26,13 @@ class BridgeError(RuntimeError):
 
     `status`：HTTP 状态码（连接失败/超时为 None）。AT-13 §2.3 的提交结果二分类**只认它**，
     不靠错误文案猜「是前置拒绝还是未知收单」。
+    `payload` / `stage`：服务端错误体（JSON 对象）与其中的机器可读阶段标记（如 host_images）。
+    AT-16 B12：图床不可用是**我们自己**的前置拒绝，靠 stage 认，不靠文案匹配。
     """
 
     status: int | None = None
+    payload: dict | None = None
+    stage: str = ""
 
 
 def _request(method: str, path: str, *, body: bytes | None = None,
@@ -42,9 +46,15 @@ def _request(method: str, path: str, *, body: bytes | None = None,
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             raw = resp.read().decode("utf-8", errors="replace")
     except urllib.error.HTTPError as e:
-        detail = e.read().decode("utf-8", errors="replace")[:300]
-        err = BridgeError(f"bridge {method} {path} → HTTP {e.code}: {detail}")
+        raw = e.read().decode("utf-8", errors="replace")
+        err = BridgeError(f"bridge {method} {path} → HTTP {e.code}: {raw[:300]}")
         err.status = int(e.code)
+        try:
+            body = json.loads(raw)               # 错误体整份解析（不截断，避免自述被切半解析不出来）
+        except (json.JSONDecodeError, ValueError):
+            body = None
+        err.payload = body if isinstance(body, dict) else None
+        err.stage = str((err.payload or {}).get("stage") or "")
         raise err from None
     except urllib.error.URLError as e:
         raise BridgeError(f"bridge {method} {path} 连不上（{config.BRIDGE_BASE}）: {e.reason}") from None

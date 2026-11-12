@@ -251,12 +251,13 @@ def dispatch_blocks_create(task: dict) -> bool:
 
 
 def reject_back_to_approval(task_dir: Path, *, note: str = "前置拒绝：受控回退重批",
-                            error: str | None = None) -> dict:
+                            error: str | None = None, extra: dict | None = None) -> dict:
     """受控回退边（AT-13 §2.4）：approved → awaiting_approval，**仅前置拒绝路径**。
 
     清 approval/approval_snapshot（批准作废，必须重批）+ 提交链运行时键；
     保留 assets_confirmed / empty_confirm / 提示词 / gen_params / gen_channel（草稿）。
     不走 rollback_to_assets（那条会丢提示词，属"退回置换"语义）。
+    extra：随**同一次 save** 落盘的附加键（AT-16 B12 的图源自述 asset_host）——不另开写盘窗口。
     """
     task = load(task_dir)
     if task["state"] != "approved":
@@ -265,6 +266,8 @@ def reject_back_to_approval(task_dir: Path, *, note: str = "前置拒绝：受�
         task.pop(key, None)
     if error:
         task["gen_error"] = error
+    if extra:
+        task.update(extra)
     task["state"] = "awaiting_approval"
     task.setdefault("history", []).append({"at": _now(), "from": "approved",
                                            "to": "awaiting_approval", "note": note})

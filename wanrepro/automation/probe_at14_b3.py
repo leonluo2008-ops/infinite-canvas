@@ -523,8 +523,13 @@ def probe_fault_matrix() -> None:
                      dispatch_phase_of(tdir)))
 
         # ---- ④ local-tunnel 降级：uguu 空串 → sources 含 local-tunnel（不伪称 uguu）
+        # AT-16 B12 起：降级直链**必须验活**——隧道真挂着（530）时不再把死链交给调用方，
+        # 而是 ImageHostError（本地前置拒绝，零渠道请求）。这里拆两条：
+        #   ④a 隧道死 → 拒绝（新合同，B12 探针 probe_at16_b12 有真 HTTP 版）
+        #   ④b 隧道活（验活打桩）→ 来源如实标 local-tunnel（本条原本要验的「不伪称 uguu」）
         tid = "auto-9509"                        # 本条不建任务目录，占号只作登记顺位
         real_uguu, real_uploads = server.upload_uguu_bytes, server.UPLOADS
+        real_alive = server.image_url_alive
         tmp_up = Path(tempfile.mkdtemp(prefix="at14b3-up-"))
         server.upload_uguu_bytes = lambda data, name: ""
         server.UPLOADS = tmp_up
@@ -535,15 +540,27 @@ def probe_fault_matrix() -> None:
                                      "channel": {"baseUrl": "https://api.example.com",
                                                  "apiKey": "K", "model": "sd2.5-720p-ap"},
                                      "images": [{"name": "ref.png", "dataUrl": png}]})
-            body, sources = server.sdgf_host_images(plan)
-            check("④ uguu 空串 → sources 含 local-tunnel（不伪称 uguu）",
+            refused, why = False, ""
+            try:
+                server.sdgf_host_images(plan)
+            except server.ImageHostError as err:
+                refused, why = True, err.msg
+            check("④a 隧道返回死链（530）→ 拒绝放行（B12：格式对不等于拉得到）",
+                  refused and "图床不可用" in why and "HTTP 530" in why, why[:160])
+            server.image_url_alive = lambda url, timeout=8.0: (True, "HTTP 200")   # 只验来源标注
+            try:
+                body, sources = server.sdgf_host_images(plan)
+            finally:
+                server.image_url_alive = real_alive
+            check("④b uguu 空串 + 隧道验活通过 → sources 含 local-tunnel（不伪称 uguu）",
                   "local-tunnel" in sources and "uguu" not in sources, str(sources))
-            check("④ 降级直链仍是 https（隧道前缀）",
+            check("④b 降级直链仍是 https（隧道前缀）",
                   all(str(u).startswith("https://") for u in body.get("images") or []),
                   str(body.get("images"))[:80])
         finally:
             server.upload_uguu_bytes = real_uguu
             server.UPLOADS = real_uploads
+            server.image_url_alive = real_alive
             shutil.rmtree(tmp_up, ignore_errors=True)
         rows.append((4, "（装配链·服务端）", 0, 0, "-"))
 

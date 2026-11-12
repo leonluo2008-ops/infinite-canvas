@@ -154,10 +154,15 @@ NAMING_KEEP = 900                # 跑完的状态保留 15 分钟（供刷新�
 
 
 class ApiError(Exception):
-    def __init__(self, status: int, msg: str) -> None:
+    def __init__(self, status: int, msg: str, *, stage: str = "",
+                 extra: dict | None = None) -> None:
         super().__init__(msg)
         self.status = status
         self.msg = msg
+        # stage：机器可读的失败阶段（如 host_images）。调用方**只按它分类**，不猜文案——
+        # 「图床不可用」必须能被 automation 认成前置拒绝，而不是「提交结果未知」。
+        self.stage = stage
+        self.extra = dict(extra or {})   # 附加自述（逐图源结果等），随错误体一起回给调用方
 
 
 # ---------------------------------------------------------------- 基础读写
@@ -663,19 +668,33 @@ def decode_data_url(raw: str, name: str) -> tuple[bytes, str]:
 
 
 # ------------------------------------------- 参考图图床（asset/upload 与 sdgf 共用）
-# 渠道只收公网 HTTPS 直链：本地字节先留一份备份，再转传 uguu；uguu 不可用时降级到隧道直链。
-# 两条路都返回 https，调用方只需判「是不是 https」——别在这里替调用方决定失败。
+# 渠道只收公网 HTTPS 直链：本地字节先留一份备份，再转传 uguu；uguu 不可用时降级到隧道直链；
+# 本机配了腾讯云 videocache 凭证时再走第三顺位。
+# **拿到 URL 必须当场验活**（AT-16 B12）：只查「是不是 https」挡不住死链——uguu 挂掉时隧道
+# 前缀照样拼出一条看着完全正常的 URL，渠道拉图失败 → 403 拒创建（auto-0043 实测）。
 
-PUBLIC_IMAGE_TUNNEL = "https://vc-t.aistar.work/vc/"   # 图床降级直链前缀
+PUBLIC_IMAGE_TUNNEL = "https://vc-t.aistar.work/vc/"   # 图床降级直链前缀（本机 uploads/vc 的隧道入口）
+IMAGE_VERIFY_TIMEOUT = 8.0                            # 直链验活超时（秒）——验不过就当该图源不可用
+# CF 边缘对 Python-urllib 默认 UA 有内置拦截（error code 1010），验活必须带浏览器 UA
+IMAGE_VERIFY_UA = "Mozilla/5.0 (wanrepro-bridge)"
+# 直连优先、再环境代理（与 upload_uguu_bytes 的双路径同法）：本机出站与渠道拉图不是同一条链路
+_VERIFY_OPENERS = (urllib.request.build_opener(urllib.request.ProxyHandler({})), None)
+
+# 第三图源：腾讯云 videocache（nginx + WebDAV PUT）。凭证是机器级 env，没配就**如实跳过**（不静默）。
+VC_TOKEN_ENV = "TENCENT_VC_TOKEN"
+VC_UPLOAD_BASE = os.environ.get("WANREPRO_VC_UPLOAD_BASE", "http://1.14.74.186/upload/")
+VC_UPLOAD_TIMEOUT = 60
+VC_PUBLIC_BASE = os.environ.get("WANREPRO_VC_PUBLIC_BASE", "https://vc.aistar.work/vc/")   # 渠道只收 https
 
 # 上传渠道计数（AT-14 B3 A2，/api/hub/where 透出）：local=本地引用（零图床），
-# uguu=转传成功，tunnel=降级隧道。只增不减，进程内诊断面用。
-ASSET_COUNTERS = {"local": 0, "uguu": 0, "tunnel": 0}
+# uguu=转传成功，tunnel=降级隧道，tencent=腾讯云图床。只增不减，进程内诊断面用。
+ASSET_COUNTERS = {"local": 0, "uguu": 0, "tunnel": 0, "tencent": 0}
 _ASSET_COUNTERS_LOCK = threading.Lock()
+_UGUU_LAST_ERROR = ""       # 最近一次 uguu 上传失败的短原因（人话自述用，进程内诊断面）
 
 
 def _bump_asset_counter(source: str) -> None:
-    key = "tunnel" if source == "local-tunnel" else source
+    key = {"local-tunnel": "tunnel", "tencent-videocache": "tencent"}.get(source, source)
     if key in ASSET_COUNTERS:
         with _ASSET_COUNTERS_LOCK:
             ASSET_COUNTERS[key] += 1
@@ -685,16 +704,20 @@ def upload_uguu_bytes(data: bytes, name: str) -> str:
     """转传 uguu（Pomf API）返回直链；任何异常返回空串由调用方降级。
 
     直传与系统代理各试一次（uguu 是境外站，两种路径通哪个用哪个）。
+    失败原因落 _UGUU_LAST_ERROR（HTTP 码 / 连不上），供前置拒绝的人话自述用。
     """
+    global _UGUU_LAST_ERROR
+    CRLF = chr(13) + chr(10)          # multipart 边界串用字符拼，避免源码里的转义被工具链吃掉
     boundary = "----wanrepro" + secrets.token_hex(8)
     body = io.BytesIO()
-    body.write(f"--{boundary}\r\nContent-Disposition: form-data; name=\"files[]\"; "
-               f"filename=\"{name}\"\r\nContent-Type: application/octet-stream\r\n\r\n".encode())
+    body.write(f'--{boundary}{CRLF}Content-Disposition: form-data; name="files[]"; '
+               f'filename="{name}"{CRLF}Content-Type: application/octet-stream{CRLF}{CRLF}'.encode())
     body.write(data)
-    body.write(f"\r\n--{boundary}--\r\n".encode())
+    body.write(f"{CRLF}--{boundary}--{CRLF}".encode())
     payload = body.getvalue()
     headers = {"Content-Type": f"multipart/form-data; boundary={boundary}",
                "User-Agent": "Mozilla/5.0 (wanrepro-bridge)"}
+    reasons: list[str] = []
     for handlers in ([urllib.request.ProxyHandler({})], None):  # 先直连，后环境代理
         try:
             opener = urllib.request.build_opener(*(handlers or []))
@@ -703,23 +726,181 @@ def upload_uguu_bytes(data: bytes, name: str) -> str:
             resp = json.loads(opener.open(req, timeout=60).read().decode())
             url = str((resp.get("files") or [{}])[0].get("url") or "")
             if url.startswith("https://"):
+                _UGUU_LAST_ERROR = ""
                 return url
-        except Exception:
-            continue
+            reasons.append("上传返回里没有 https 直链")
+        except urllib.error.HTTPError as err:
+            reasons.append(f"HTTP {err.code}")
+        except (urllib.error.URLError, TimeoutError, OSError) as err:
+            reasons.append(f"连不上（{getattr(err, 'reason', err)}）")
+        except (json.JSONDecodeError, ValueError, KeyError, IndexError, TypeError):
+            reasons.append("上传响应看不懂")
+    _UGUU_LAST_ERROR = " / ".join(dict.fromkeys(reasons)) or "上传失败"
     return ""
 
 
-def store_public_image(data: bytes, raw_name: str) -> tuple[str, str]:
-    """参考图字节 → (公网 https 直链, 来源)。本地落 uploads/vc/ 作备份；先 uguu，失败降级隧道。"""
+class ImageHostError(ApiError):
+    """参考图没有公网地址：图源全不可用，或直链验活不过（**本地前置拒绝**，零渠道请求）。
+
+    stage=host_images 是机器可读标记：automation 据此回到 awaiting_approval（可改后重提），
+    而不是记成「提交结果未知」——后者会把人引导去渠道核单，而这次根本没发请求。
+    """
+
+    def __init__(self, msg: str, *, sources: list[dict] | None = None,
+                 skipped: list[dict] | None = None) -> None:
+        super().__init__(502, msg, stage="host_images",
+                         extra={"sources": sources or [], "skipped": skipped or []})
+        self.sources = sources or []
+        self.skipped = skipped or []
+
+
+def _verify_once(url: str, opener, timeout: float) -> tuple[bool, str]:
+    """HEAD 拿不到就 GET 首字节（有的站不支持 HEAD）；200/206 且能读到字节才算活。"""
+    for method in ("HEAD", "GET"):
+        req = urllib.request.Request(url, method=method, headers={"User-Agent": IMAGE_VERIFY_UA})
+        try:
+            resp = (opener.open(req, timeout=timeout) if opener
+                    else urllib.request.urlopen(req, timeout=timeout))
+            with resp:
+                code = int(getattr(resp, "status", 0) or 0)
+                if code not in (200, 206):
+                    return False, f"HTTP {code}"
+                if method == "GET":
+                    if not resp.read(1):
+                        return False, "0 字节（文件不在）"
+                    return True, f"HTTP {code}"
+                declared = (resp.headers.get("Content-Length") or "").strip()
+                if declared == "0":
+                    return False, "0 字节（文件不在）"      # 头里就自报空文件：不必再 GET
+                if not declared:
+                    continue                              # 没给长度（分块）：改用 GET 真取首字节
+                return True, f"HTTP {code}"
+        except urllib.error.HTTPError as err:
+            if method == "HEAD" and err.code not in (403, 404, 410):
+                continue                       # 头方法不支持（405/501）或 5xx：改用 GET 真取一次
+            return False, f"HTTP {err.code}"
+        except (urllib.error.URLError, TimeoutError, OSError) as err:
+            return False, f"连不上（{getattr(err, 'reason', err)}）"
+    return False, "HEAD/GET 都拿不到"
+
+def image_url_alive(url: str, timeout: float = IMAGE_VERIFY_TIMEOUT) -> tuple[bool, str]:
+    """公网直链验活 → (可达?, 原因/状态)。**只信「真能取到字节」这一个事实。**
+
+    直连优先、再环境代理；403/404/410 是「文件不在」，换出口也一样，不再重试。
+    """
+    reasons: list[str] = []
+    for opener in _VERIFY_OPENERS:
+        ok, why = _verify_once(url, opener, timeout)
+        if ok:
+            return True, why
+        reasons.append(why)
+        if why in ("HTTP 403", "HTTP 404", "HTTP 410"):
+            break
+    return False, " / ".join(dict.fromkeys(reasons)) or "不可达"
+
+
+def upload_tencent_vc(data: bytes, name: str, key: str, token: str) -> tuple[str, str]:
+    """第三图源：腾讯云 videocache（WebDAV PUT）→ (公网 https 直链, 失败原因)。
+
+    上传走明文直连（快）；对外直链必须是 https（渠道只收 https），前缀可用
+    WANREPRO_VC_PUBLIC_BASE 换。云服 6 小时定时清空 + 5GB 配额：只当提交瞬间的中转。
+    """
+    path = urllib.parse.quote(key, safe="/")
+    try:
+        req = urllib.request.Request(
+            f"{VC_UPLOAD_BASE.rstrip('/')}/{path}", data=data, method="PUT",
+            headers={"X-Token": token, "Content-Type": "application/octet-stream",
+                     "User-Agent": IMAGE_VERIFY_UA})
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open(req, timeout=VC_UPLOAD_TIMEOUT) as resp:
+            code = int(getattr(resp, "status", 0) or 0)
+            if code not in (200, 201, 204):
+                return "", f"上传 HTTP {code}"
+    except urllib.error.HTTPError as err:
+        return "", f"上传 HTTP {err.code}"
+    except (urllib.error.URLError, TimeoutError, OSError) as err:
+        return "", f"上传连不上（{getattr(err, 'reason', err)}）"
+    return f"{VC_PUBLIC_BASE.rstrip('/')}/{path}", ""
+
+
+def _host_failure_message(tried: list[dict], skipped: list[dict]) -> str:
+    """图床全不可用的人话指引：逐图源自述 + 明说「没发渠道请求、不扣费」。"""
+    parts = [f"{row.get('label') or row.get('source')} {row.get('reason') or '不可用'}"
+             for row in tried]
+    parts += [f"{row.get('label') or row.get('source')} {row.get('reason')}" for row in skipped]
+    detail = "；".join(parts) or "所有图源都不可用"
+    return (f"图床不可用（{detail}）——参考图没有公网地址，渠道拉不到图会拒创建。"
+            "本地已拒绝提交：这次没有向渠道发任何请求、不会扣费；图床修好后直接重试即可。")
+
+
+def host_image_detailed(data: bytes, raw_name: str) -> dict:
+    """参考图字节 → 公网 https 直链，**每个候选直链逐一验活** → {url, source, tried, skipped}。
+
+    图源顺序 uguu → 隧道 → 腾讯云 videocache（没配 TENCENT_VC_TOKEN 就如实跳过）。
+    本地一律留一份备份（uploads/vc/）——隧道源就是靠它出链。
+    全部不可用抛 ImageHostError：本地前置拒绝，参考图没有公网地址就不发任何渠道请求。
+    """
     safe_name = re.sub(r"[^\w.\-]", "_", raw_name or "ref.png")
-    key = f"m4/{secrets.token_hex(4)}/{safe_name}"
+    # 公网直链必须是 **ASCII 路径**：中文名的 URL 发出去要 percent-encode，渠道/隧道各按各自
+    # 规矩解，实测 urllib 直接在 putrequest 上炸 UnicodeEncodeError（B12 探针撞出来的）。
+    # 本地备份也用同一个 key，于是 /vc/ 路由与隧道直链一一对得上。
+    stem = re.sub(r"[^0-9A-Za-z._-]", "", Path(safe_name).stem)[:40] or "ref"
+    ext = Path(safe_name).suffix.lower() or ".png"
+    ascii_name = f"{stem}{ext}"
+    key = f"m4/{secrets.token_hex(4)}/{ascii_name}"
     dest = UPLOADS / "vc" / key
     dest.parent.mkdir(parents=True, exist_ok=True)
     dest.write_bytes(data)
-    url = upload_uguu_bytes(data, safe_name)
-    source = "uguu" if url else "local-tunnel"
-    _bump_asset_counter(source)                   # 计数只旁路观察，不改返回形状
-    return (url, source) if url else (f"{PUBLIC_IMAGE_TUNNEL}{key}", source)
+
+    tried: list[dict] = []
+    skipped: list[dict] = []
+
+    def accept(source: str, label: str, url: str) -> dict | None:
+        ok, why = image_url_alive(url)
+        if ok:
+            _bump_asset_counter(source)          # 计数只旁路观察，不改返回形状
+            return {"url": url, "source": source, "tried": tried, "skipped": skipped}
+        tried.append({"source": source, "label": label, "url": url,
+                      "reason": f"直链验活失败（{why}）"})
+        return None
+
+    uguu_url = upload_uguu_bytes(data, ascii_name)          # ① uguu
+    if uguu_url:
+        got = accept("uguu", "uguu", uguu_url)
+        if got:
+            return got
+    else:
+        tried.append({"source": "uguu", "label": "uguu",
+                      "reason": f"上传失败（{_UGUU_LAST_ERROR or '服务不可用'}）"})
+
+    got = accept("local-tunnel", "隧道", f"{PUBLIC_IMAGE_TUNNEL}{key}")   # ② 降级隧道
+    if got:
+        return got
+
+    token = os.environ.get(VC_TOKEN_ENV, "").strip()        # ③ 腾讯云 videocache
+    if not token:
+        skipped.append({"source": "tencent-videocache", "label": "腾讯云图床",
+                        "reason": f"未配置 {VC_TOKEN_ENV}，已跳过"})
+    else:
+        vc_url, vc_why = upload_tencent_vc(data, ascii_name, key, token)
+        if vc_url:
+            got = accept("tencent-videocache", "腾讯云图床", vc_url)
+            if got:
+                return got
+        else:
+            tried.append({"source": "tencent-videocache", "label": "腾讯云图床", "reason": vc_why})
+
+    raise ImageHostError(_host_failure_message(tried, skipped), sources=tried, skipped=skipped)
+
+
+def store_public_image(data: bytes, raw_name: str) -> tuple[str, str]:
+    """参考图字节 → (公网 https 直链, 来源)。本地落 uploads/vc/ 作备份。
+
+    拿到的每条 URL 都验活；全不可用抛 ImageHostError（502，可修复后重试），
+    **不再把格式对但拉不到的死链交给调用方**。
+    """
+    got = host_image_detailed(data, raw_name)
+    return str(got["url"]), str(got["source"])
 
 
 def wan_prepare_task(prompt: str, images: list) -> str:
@@ -1087,8 +1268,15 @@ def sdgf_plan(payload: dict) -> dict:
 
 
 def sdgf_http(url: str, key: str, *, method: str = "GET", body: dict | None = None,
-              timeout: int = SDGF_HTTP_TIMEOUT) -> bytes:
-    """渠道 HTTP（鉴权头与 JSON 序列化的唯一装配点；直连不走系统代理）。"""
+              timeout: int = SDGF_HTTP_TIMEOUT, passthrough_4xx: bool = False) -> bytes:
+    """渠道 HTTP（鉴权头与 JSON 序列化的唯一装配点；直连不走系统代理）。
+
+    passthrough_4xx：**只给创建链**（sdgf_create）用——AT-16 B11：渠道在 POST /videos 回 4xx
+    且带错误体，等于明确说「任务没建成」（auto-0043 现场：403 fail_to_fetch_task /
+    video_request_failed），必须把真实状态码+原文透出去，让上层判「已拒绝·可改后重提」；
+    一律包成 502 会把明确拒绝抹成「结果未知」，逼所有者去渠道控制台核对 + 走解除阻断绕路。
+    查询/下载链**不开**（那些阶段的 4xx/断连/超时确实是状态不明 → 仍 502/504）。
+    """
     headers = {"Accept": "application/json"}
     data = None
     if body is not None:
@@ -1104,6 +1292,9 @@ def sdgf_http(url: str, key: str, *, method: str = "GET", body: dict | None = No
         # AT-13 §2.8：**先脱敏后截断**——先截 600 字节会把 key 切半，剩下的前缀照样泄出去（R1 实证）
         raw = err.read(65536).decode("utf-8", errors="replace").strip()
         text = mask_secret(raw, key)[:600]
+        if passthrough_4xx and 400 <= err.code < 500:
+            # 创建阶段 4xx = 明确拒绝（任务没建成）：原码 + 原文一起透传，不抹成 502。
+            raise ApiError(err.code, f"渠道创建端点明确拒绝 HTTP {err.code}：{text or err.reason}") from None
         raise ApiError(502, f"渠道响应 HTTP {err.code}：{text or err.reason}") from None
     except urllib.error.URLError as err:
         raise ApiError(502, mask_secret(
@@ -1113,8 +1304,14 @@ def sdgf_http(url: str, key: str, *, method: str = "GET", body: dict | None = No
 
 
 def sdgf_create(api_base: str, key: str, body: dict) -> str:
-    """提交生成任务，返回渠道任务 id。任何「不确定有没有建成」都按失败报并要求核对，不自动重试。"""
-    raw = sdgf_http(f"{api_base}/videos", key, method="POST", body=body)
+    """提交生成任务，返回渠道任务 id。
+
+    渠道 4xx（带错误体）= 明确拒绝、任务没建成 → 原码透传（AT-16 B11：上层按「已拒绝·可改后
+    重提」处理，不用去控制台核对、也不用解除阻断）。
+    其余「不确定有没有建成」（5xx / 断连 / 超时 / 2xx 却没有任务 id）仍按 502 报并要求核对，
+    不自动重试——那几种情况下云端可能已经收单。
+    """
+    raw = sdgf_http(f"{api_base}/videos", key, method="POST", body=body, passthrough_4xx=True)
     try:
         obj = json.loads(raw.decode("utf-8") or "{}")
     except (UnicodeDecodeError, json.JSONDecodeError):
@@ -1210,11 +1407,14 @@ def sdgf_write_record(task_id: str, data: dict) -> None:
 
 
 def sdgf_host_images(plan: dict) -> tuple[dict, list[str]]:
-    """把预演体里的图片占位换成真 URL：URL 直接用；dataUrl 字节先换公网直链。
+    """把预演体里的图片占位换成真 URL：URL 直接用；dataUrl 字节先换公网直链（**换完验活**）。
 
-    换不到就报错——宁可失败也不发一条没有参考图的请求（那会出一版跟提示词无关的片子还照样扣费）。
+    换不到就报错——宁可失败也不发一条没有参考图（或图拉不到）的请求
+    （那会出一版跟提示词无关的片子，渠道还会拒创建并可能扣费）。
     AT-14 B3 A5：同时返回每张图的**实际来源**（(body, sources)，序=images 序）——
-    调用点把它作为 imageSources 透传给 automation 落账，装配链自述不伪称。
+    来源 ∈ uguu / local-tunnel / tencent-videocache / url，调用点把它当 imageSources 落账。
+    AT-16 B12：图源全不可用时这里抛 ImageHostError（502 + stage=host_images），
+    automation 认它做**前置拒绝**（零渠道请求、回 awaiting_approval），不记成「结果未知」。
     """
     body = dict(plan["body"])
     urls: list[str] = []
@@ -1227,7 +1427,9 @@ def sdgf_host_images(plan: dict) -> tuple[dict, list[str]]:
         else:
             sources.append("url")             # 调用方自带的直链：如实标注，不算图床上传
         if not url.lower().startswith("https://"):
-            raise ApiError(502, f"参考图 {img['name']} 换公网 URL 失败（图床不可用）")
+            raise ImageHostError(f"参考图 {img['name']} 换公网 URL 失败（图床不可用）",
+                                 sources=[{"source": sources[-1], "label": sources[-1],
+                                           "reason": "换出来的不是 https 直链"}])
         urls.append(url)
     if urls:
         body["images"] = urls
@@ -1889,7 +2091,8 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self.route_post(path)
         except ApiError as err:
-            self.send_json({"error": err.msg}, err.status)
+            self.send_json({"error": err.msg, **({"stage": err.stage} if err.stage else {}), **err.extra},
+                           err.status)
         except hub_api.HubError as e:      # 工作台业务错（状态不对/文件缺失）→ 4xx，原文给员工看
             # AT-13 §2.2：配置不合法（HubInputError）→ 400，不是状态冲突 409
             self.send_json({"error": str(e)}, getattr(e, "status", 409))

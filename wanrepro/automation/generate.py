@@ -516,14 +516,18 @@ def ref_state(ref: str, timeout: float = 8.0) -> str:
 
 
 def _pre_reject(task_dir: Path, guard, message: str, *, note: str = "",
-                secret: str = "") -> None:
-    """前置拒绝：受控回退 approved→awaiting_approval（清批准，保留资产/提示词/草稿配置）。"""
+                secret: str = "", extra: dict | None = None) -> None:
+    """前置拒绝：受控回退 approved→awaiting_approval（清批准，保留资产/提示词/草稿配置）。
+
+    extra：随同一次 save 落盘的附加键（AT-16 B12 的图源自述 asset_host）。
+    """
     msg = safe_error(message, secret)
     with guard():
         task = state.load(task_dir)
         if task["state"] != "approved":
             return                       # 续查路径的状态由调用方给明确错误，这里不动
-        state.reject_back_to_approval(task_dir, note=note or "前置拒绝：受控回退重批", error=msg)
+        state.reject_back_to_approval(task_dir, note=note or "前置拒绝：受控回退重批",
+                                      error=msg, extra=extra)
 
 
 def _enter_generating(task_dir: Path, guard, *, job: str, cloud: str, carrier: str = "",
@@ -829,6 +833,21 @@ def do_submit(task_dir: Path, verbose: bool = True,
         out = bridge.post_json(endpoint, body)
     except bridge.BridgeError as e:
         status = getattr(e, "status", None)
+        payload = getattr(e, "payload", None)
+        payload = payload if isinstance(payload, dict) else {}
+        if str(payload.get("stage") or getattr(e, "stage", "") or "") == "host_images":
+            # AT-16 B12：参考图没有公网地址 = **我们自己的**前置拒绝（本地就挡下了：
+            # 渠道零请求、零扣费）→ 回 awaiting_approval 等人修图床再重试。
+            # 判定只认 stage 标记、不猜文案；也**不许**记成「提交结果未知」——
+            # 那会把人引导去渠道核单，而这次根本没有发出任何渠道请求。
+            msg = safe_error(str(payload.get("error") or e), secret)
+            tried = [str(row.get("source") or "") for row in (payload.get("sources") or [])
+                     if isinstance(row, dict) and row.get("source")]
+            _pre_reject(task_dir, guard, msg,
+                        note="前置拒绝：参考图没有公网地址（图床不可用，零渠道请求）",
+                        secret=secret,
+                        extra={"asset_host": tried} if tried else None)   # 失败路径也落图源自述
+            raise GenError(msg) from None
         if status in (400, 409):                 # 前置拒绝：服务端在校验/并发闸就挡下了
             msg = safe_error(f"渠道前置拒绝（HTTP {status}）：{e}", secret)
             _pre_reject(task_dir, guard, msg, note=f"前置拒绝（HTTP {status}）：受控回退重批",
