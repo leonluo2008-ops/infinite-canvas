@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""dissect_gate.py — 拆解产物质量门禁（D1–D7）＋自动重拆驱动（AT-15 R1）。
+"""dissect_gate.py — 拆解产物质量门禁（D1–D8）＋自动重拆驱动（AT-15 R1）。
 
 与 gate.py 同一套范式（PASS/FAIL/WARN 清单 + 退出码），一处根本区别：**拆解不花钱，
 所以这里不签 token**。gate.py 问的是「这一条能不能花钱发出去」；本门禁问的是
@@ -14,6 +14,8 @@
   D5 同图跨卡唯一   cards.build 的「代表帧.url」全同值 ∧ 全兜底 → FAIL
   D6 十层标题齐     analyze.local_layer_check（调用方传入；CLI 自己按路径加载）
   D7 逐行空时段     「出现时段」空 ∧「画面位置」空 ∧ 无精确定位帧 → 该行 WARN；>2 行 → FAIL
+  D8 八声音结构化   有音轨时 BGM 四字段缺 / 台词缺说话人 → FAIL；无音轨片不触发（AT-17 B1）。
+                    解析用 extract.parse_sound_layer —— 与拆解落盘同一个函数，不另写正则。
 
 自动重拆（本模块驱动，重跑动作由调用方注入）：
   门禁 FAIL → build_diagnosis() 组装诊断（【…】非标题形态，红线 24）→ rework(诊断)
@@ -67,6 +69,10 @@ DIAGNOSIS_HINTS = {
           "不允许整片只给一镜或时间码缺失。",
     "D6": "十层标题（一~十）必须原样齐全，每层正文不许为空。",
     "D7": "逐行空时段：每条资产都要写「出现于」，判断不出就写「出现于：未标注」，不许省略这一段。",
+    "D8": "「八 声音」要有结构化字段：有音轨的片子必须写 `BGM.情绪` / `BGM.节奏` / "
+          "`BGM.乐器/织体` / `BGM.强弱走向` 四行（没有 BGM 就四行都写 `无BGM`，不许省略）；"
+          "每句台词写成 `台词：起-止｜「原文」｜说话人：画外音/出镜者`（说话人只许这两类）；"
+          "无音轨的片子这一层正文只写一行「无音轨」。",
 }
 
 
@@ -97,6 +103,15 @@ def _default_layer_check():
     return lambda disc: module.local_layer_check(Path(disc), extract_mod)
 
 
+def _extract_module():
+    """拆解侧解析件：八 声音结构化用 extract 里落盘时同一个函数（红线 25 同源）。"""
+    spec = importlib.util.spec_from_file_location("wanrepro_reverse_extract_for_gate",
+                                                 REVERSE / "extract.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def _read_json(path: Path) -> dict:
     try:
         value = json.loads(path.read_text(encoding="utf-8-sig"))
@@ -117,11 +132,41 @@ def short_ids(result: dict) -> str:
                     if item["verdict"] == F) or "无"
 
 
+def check_sound(markdown: str, extract_mod=None) -> tuple[str, str]:
+    """D8 八 声音结构化存在性（AT-17 B1）。纯读文本，可单独判（不依赖 cards/ffprobe）。
+
+    有音轨：BGM 四字段（情绪/节奏/乐器织体/强弱走向）缺任何一个 → FAIL；
+            有台词而某句没写说话人（或说话人不在 画外音/出镜者 两类里）→ FAIL。
+    无音轨：本项不触发——B0 附注 1「省字段不省层」只要求八层标题与正文在（D6 管）。
+    音轨标记读不到（旧产物/手写件）：如实 WARN 跳过，不拿它逼红也不假装通过。
+    """
+    ext = extract_mod or _extract_module()
+    audio = ext.audio_track_flag(markdown)
+    body = ext.sound_body(markdown)
+    sound = ext.parse_sound_layer(body)
+    points = len(sound["sound_points"])
+    dialogue = len(sound["dialogue"])
+    speakers = sum(1 for row in sound["dialogue"] if row["speaker"])
+    if audio is False:
+        return P, "无音轨片：本项不触发（省字段不省层，八层正文由 D6 判）"
+    if audio is None:
+        return W, "拆解头部读不到音轨标记（旧产物/手写件）：本项跳过，请人工核对八 声音"
+    if not body.strip():
+        return F, "「八 声音」正文为空（有音轨片必须有结构化正文）"
+    if sound["bgm_missing"]:
+        return F, ("缺 BGM 结构化字段：" + "、".join(sound["bgm_missing"])
+                   + "（四字段一个不许省；没有 BGM 就四行都写 `无BGM`）")
+    if sound["dialogue_missing_speaker"]:
+        return F, (f"台词缺说话人：{len(sound['dialogue_missing_speaker'])}/{dialogue} 句"
+                   "（说话人只许 画外音 / 出镜者）")
+    return P, (f"BGM 四字段齐｜音效点 {points} 条｜台词 {dialogue} 句（带说话人 {speakers} 句）")
+
+
 # ---------------------------------------------------------------- 判据
 
 def evaluate(outdir: Path, *, bridge_id: str | None = None, local_id: str | None = None,
              layer_check=None) -> dict:
-    """跑 D0/D1–D7，返回 {verdict, checks[{id,verdict,msg}], 缺项[], 兜底, 行数}。
+    """跑 D0/D1–D8，返回 {verdict, checks[{id,verdict,msg}], 缺项[], 兜底, 行数}。
 
     纯读：不写盘、不调模型、不改产物。判据对象 = cards.build()（下游同一份），
     只有 D1 额外调 confirm 的两条解析路，用来区分「严格可解析」与「宽松复算兜住」。
@@ -257,6 +302,13 @@ def evaluate(outdir: Path, *, bridge_id: str | None = None, local_id: str | None
                             "（单行缺口走复检清单，不触发重拆）")
     else:
         add("D7 空时段", P, "无时段/位置全空的行")
+
+    # D8 八声音结构化（AT-17 B1）：有音轨时 BGM 四字段/台词说话人缺 → FAIL；无音轨片不触发
+    try:
+        verdict8, msg8 = check_sound(markdown)
+    except Exception as exc:                      # noqa: BLE001 —— 解析炸了也是产物缺陷，如实记
+        verdict8, msg8 = F, f"{type(exc).__name__}: {exc}"
+    add("D8 八声音", verdict8, msg8)
 
     return _finish(checks, built=rows, markdown=markdown,
                    extra={"兜底": len(fallback), "行数": len(rows),
@@ -399,7 +451,7 @@ def render(result: dict) -> str:
 # ---------------------------------------------------------------- CLI
 
 def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(description="拆解产物质量门禁（D1–D7；不签 token、不花钱）")
+    ap = argparse.ArgumentParser(description="拆解产物质量门禁（D1–D8；不签 token、不花钱）")
     ap.add_argument("--outdir", required=True, help="拆解任务目录 analysis/reverse/<id>")
     ap.add_argument("--bridge", default=None, help="桥 id（默认取 outdir 目录名）")
     ap.add_argument("--session", default="", help="会话键（缺省按 outdir 路径算）")

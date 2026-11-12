@@ -28,6 +28,14 @@ SECTION_NAMES = ("必须换", "建议准备", "可沿用")
 DIALOGUE_HEADING = "台词改写"
 NO_DIALOGUE_MARK = "无台词"
 NOT_APPLICABLE_MARK = "不适用"
+# AT-17 B1：八 声音 v2.6 起逐句带说话人（枚举仅两类），台词改写.md 表尾追加「说话人」列。
+SPEAKER_COLUMN = "说话人"
+SPEAKER_LABELS = ("画外音", "出镜者")
+SPEAKER_RE = re.compile(r"说话人\s*[：:]\s*([^｜|\s，,；;。]+)")
+DIALOGUE_LINE_MARK = "台词："
+NEW_SCHEMA_MARKS = ("BGM.情绪", "BGM.节奏", "音效点：", DIALOGUE_LINE_MARK)
+# 「没人说话」的写法：不是语种（v2.6 起拆解会明写 `人声语言：无`）
+NO_SPEECH_VALUES = ("无", "无台词", "无对白", "不适用")
 ITEM_RE = re.compile(
     r"^\s*[-*+•]?\s*(?P<row>\d{1,4})\s*[|｜]\s*理由\s*[：:]\s*"
     r"(?P<reason>.*?)\s*[|｜]\s*镜次\s*[：:]\s*(?P<shots>.*?)\s*$"
@@ -288,16 +296,36 @@ def dialogue_layer(disc_text: str) -> str:
 
 
 def source_language(disc_text: str) -> str:
-    """拆解「八 声音」里写的语种（`人声语言：西班牙语（…）` → 西班牙语）；没有就空。"""
+    """拆解「八 声音」里写的语种（`人声语言：西班牙语（…）` → 西班牙语）；没有就空。
+
+    v2.6 起没人说话的片子会明写 `人声语言：无`——那不是语种，按「没有」处理。
+    """
     probe = dialogue_layer(disc_text).replace("**", "").replace("`", "")
     match = re.search(r"人声语言\s*[：:]\s*([^\s（(（；;，,。]+)", probe)
-    return match.group(1).strip() if match else ""
+    if not match:
+        return ""
+    lang = match.group(1).strip()
+    return "" if lang in NO_SPEECH_VALUES else lang
 
 
 def dialogue_lines(disc_text: str) -> list[tuple[str, str]]:
     """拆解「八 声音」里逐句台词：[(归一时间码, 原文)]，只认「时间码 + 引号」的行。"""
-    found: list[tuple[str, str]] = []
-    for raw in dialogue_layer(disc_text).splitlines():
+    return [(row["start_end"], row["original"]) for row in dialogue_rows(disc_text)]
+
+
+def dialogue_rows(disc_text: str) -> list[dict]:
+    """拆解「八 声音」逐句台词 + 说话人：[{start_end, original, speaker}]。
+
+    v2.6 形态是 `- 台词：00:01-00:03｜「原文」｜说话人：画外音`（逐句带说话人）；
+    v2.5 及更早是自由散文，靠「时间码 + 引号」抽句、speaker 为空（历史兼容，不炸也不猜）。
+    新形态只认带 `台词：` 标记的行——散文里夹着的音效点（时段 + 「拟声词」）不会被当成台词。
+    """
+    body = dialogue_layer(disc_text)
+    lines = body.splitlines()
+    if any(mark in body for mark in NEW_SCHEMA_MARKS):
+        lines = [line for line in lines if DIALOGUE_LINE_MARK in line]
+    found: list[dict] = []
+    for raw in lines:
         code = TIME_CODE_RE.search(raw)
         if not code:
             continue
@@ -307,7 +335,12 @@ def dialogue_lines(disc_text: str) -> list[tuple[str, str]]:
         text = quoted.group(1).strip()
         if not text:
             continue
-        found.append((_norm_time(code.group(0)), text))
+        speaker = ""
+        match = SPEAKER_RE.search(raw)
+        if match:
+            speaker = next((label for label in SPEAKER_LABELS if label in match.group(1)), "")
+        found.append({"start_end": _norm_time(code.group(0)), "original": text,
+                      "speaker": speaker})
     return found
 
 
@@ -327,11 +360,16 @@ def parse_dialogue(raw: str, disc_text: str) -> tuple[list[dict], dict]:
     """从模型输出里解析「台词改写」节，并用拆解「八 声音」逐句核对。
 
     只做两件事：时间码对不对得上拆解、原文在不在拆解里。对不上就丢，不猜。
-    返回 (行列表, 统计)；行字段 `start_end` / `original` / `chinese`。
+    返回 (行列表, 统计)；行字段 `start_end` / `original` / `chinese` / `speaker`。
+
+    AT-17 B1 附注 6：说话人列**按表头名定位**（表头写了「说话人」就取那一列，中间多列也不会错位）；
+    表头读不到才回退表尾位置读取（第 4 列起）；模型没给（或给的不是两类枚举）时，
+    用拆解该句自己写的说话人落定——拆解是原文真源，与「时间码以拆解为准」同一口径。
+    三列旧格式（无说话人列）照旧解析，speaker 为空，不崩。
     """
     stats = {
         "total": 0, "dropped": 0, "duplicates": 0, "repaired": 0,
-        "fabricated": [], "missing": [], "mark": "",
+        "fabricated": [], "missing": [], "mark": "", "speakers": 0,
     }
     section = next((lines for title, lines in _all_sections(raw).items()
                     if title.startswith(DIALOGUE_HEADING)), None)
@@ -346,21 +384,33 @@ def parse_dialogue(raw: str, disc_text: str) -> tuple[list[dict], dict]:
         stats["mark"] = NOT_APPLICABLE_MARK
         return [], stats
 
-    known = dialogue_lines(disc_text)
-    known_by_text = {_norm_ws(text): code for code, text in known}
-    order = {_norm_ws(text): index for index, (_code, text) in enumerate(known)}
+    known_rows = dialogue_rows(disc_text)
+    known_by_text = {_norm_ws(row["original"]): row["start_end"] for row in known_rows}
+    known_speaker = {_norm_ws(row["original"]): row["speaker"] for row in known_rows}
+    order = {_norm_ws(row["original"]): index for index, row in enumerate(known_rows)}
     rows: list[dict] = []
     seen: set[str] = set()
+    speaker_index: int | None = None
+    col_original, col_chinese = 1, 2
 
     for raw_line in section:
         cells = _table_cells(raw_line)
         if not cells or len(cells) < 3:
             continue
         if any(key in "".join(cells[:1] + cells[2:3]) for key in ("原文", "中文", "起-止")):
-            continue                      # 表头
+            # 表头行：按列名定位（说话人列找不到列名就留 None，行内回退表尾位置）
+            speaker_index = next((index for index, cell in enumerate(cells)
+                                  if SPEAKER_COLUMN in cell), None)
+            col_original = next((index for index, cell in enumerate(cells)
+                                 if "原文" in cell), 1)
+            col_chinese = next((index for index, cell in enumerate(cells)
+                                if "中文" in cell), 2)
+            continue
+        if col_original >= len(cells) or col_chinese >= len(cells):
+            continue                      # 列名读出来但行比表头短：这一行不可用，跳过不猜
         code_match = TIME_CODE_RE.search(cells[0])
-        original = cells[1].strip().strip(QUOTE_CHARS).strip()
-        chinese = cells[2].strip()
+        original = cells[col_original].strip().strip(QUOTE_CHARS).strip()
+        chinese = cells[col_chinese].strip()
         if not original or not chinese:
             stats["dropped"] += 1
             continue
@@ -377,23 +427,35 @@ def parse_dialogue(raw: str, disc_text: str) -> tuple[list[dict], dict]:
         if start_end != known_by_text[key]:
             start_end = known_by_text[key]
             stats["repaired"] += 1        # 时间码没照抄拆解：以拆解为准
-        rows.append({"start_end": start_end, "original": original, "chinese": chinese})
+        speaker = ""
+        if speaker_index is not None and speaker_index < len(cells):
+            speaker = cells[speaker_index]
+        elif speaker_index is None and len(cells) >= 4:
+            speaker = cells[-1]           # 表头读不到：回退表尾位置读（防中间列错位）
+        speaker = next((label for label in SPEAKER_LABELS if label in speaker), "")
+        speakers = speaker or known_speaker.get(key, "")
+        if speakers:
+            stats["speakers"] += 1
+        rows.append({"start_end": start_end, "original": original, "chinese": chinese,
+                     "speaker": speakers})
 
     rows.sort(key=lambda row: order.get(_norm_ws(row["original"]), 999))
-    stats["missing"] = [text for _code, text in known if _norm_ws(text) not in seen]
+    stats["missing"] = [row["original"] for row in known_rows
+                        if _norm_ws(row["original"]) not in seen]
     stats["total"] = len(rows)
     return rows, stats
 
 
 def dialogue_markdown(rows: list[dict], mark: str = "") -> str:
-    """`台词改写.md` 的规范形态：三列表格；没有台词时写一行标记。"""
+    """`台词改写.md` 的规范形态：四列表格（说话人列在表尾）；没有台词时写一行标记。"""
     lines = ["# 台词改写", ""]
     if not rows:
         lines.append(mark or NO_DIALOGUE_MARK)
         return "\n".join(lines) + "\n"
-    lines += ["| 起-止 | 原文 | 中文 |", "|---|---|---|"]
+    lines += [f"| 起-止 | 原文 | 中文 | {SPEAKER_COLUMN} |", "|---|---|---|---|"]
     for row in rows:
-        lines.append(f"| {row['start_end']} | {row['original']} | {row['chinese']} |")
+        speaker = str(row.get("speaker") or "").strip() if isinstance(row, dict) else ""
+        lines.append(f"| {row['start_end']} | {row['original']} | {row['chinese']} | {speaker} |")
     return "\n".join(lines) + "\n"
 
 

@@ -648,6 +648,167 @@ def format_missing(missing) -> str:
     return "\n".join(lines)
 
 
+# ---------------------------------------------------------------- 八 声音结构化（AT-17 B1）
+#
+# 「八 声音」是十层里唯一有机器可读形态的一层（任务书 v2.6 起）：BGM 四字段行 +
+# 音效点[] + 台词逐句带说话人（枚举仅 画外音/出镜者）。解析就放在 extract ——
+# 这一层的生产者与格式所有者这边，dissect_gate 导入同一个函数来判（红线 25：
+# 判据与消费同源，不另写一套正则）。
+#
+# 十层标题与 require_layers 一个字没动：结构化只是正文内容变了，切层/缺层判定照旧。
+
+SOUND_TITLE = "八 声音"
+NO_AUDIO_TEXT = "无音轨"
+BGM_FIELDS = ("BGM.情绪", "BGM.节奏", "BGM.乐器/织体", "BGM.强弱走向")
+SPEAKER_LABELS = ("画外音", "出镜者")
+# 行内键名**不带冒号**（_value_after 自己补全角/半角冒号，带了就永远匹配不上）
+DIALOGUE_MARK = "台词"
+SOUND_POINT_MARK = "音效点"
+LANGUAGE_MARK = "人声语言"
+NO_DIALOGUE_VALUES = ("无", "无台词", "不适用")
+TIME_SPAN_RE = re.compile(r"\d{1,2}:\d{2}(?:\.\d+)?\s*[-–—~～]\s*\d{1,2}:\d{2}(?:\.\d+)?")
+QUOTED_RE = re.compile(r"[「『“\"](.+?)[」』”\"]")
+SPEAKER_RE = re.compile(r"说话人\s*[：:]\s*([^｜|｜\s，,；;。]+)")
+
+
+def _plain_lines(body: str) -> list[str]:
+    """正文行 → 去项目符号/加粗后的行（只用来取键值，不改原文一个字）。"""
+    lines = []
+    for raw in body.splitlines():
+        line = raw.replace("**", "").replace("`", "").strip()
+        lines.append(re.sub(r"^[-*+•]\s*", "", line))
+    return lines
+
+
+def _value_after(line: str, key: str) -> str | None:
+    """`键：值` / `键:值` → 值；不是这一行返回 None。"""
+    for sep in ("：", ":"):
+        if line.startswith(key + sep):
+            return line[len(key) + len(sep):].strip()
+    return None
+
+
+def sound_body(markdown: str) -> str:
+    """拆解 markdown 的「八 声音」正文（没有这一层时返回空串）。"""
+    bodies, _missing = split_layers(markdown)
+    return bodies.get(normalize_heading(SOUND_TITLE), "")
+
+
+def audio_track_flag(markdown: str) -> bool | None:
+    """拆解头部元信息里的 `音轨: 有/无` → True/False；读不到返回 None（旧产物/手写件）。"""
+    match = re.search(r"音轨\s*[：:]\s*(有|无)", markdown)
+    if not match:
+        return None
+    return match.group(1) == "有"
+
+
+def parse_sound_layer(body: str) -> dict:
+    """八 声音正文 → 结构化字段。只读文本：不猜、不补、不发明。
+
+    返回：no_audio / bgm{字段: 值} / bgm_missing[] / sound_points[] /
+    dialogue[{start_end, original, speaker}] / dialogue_missing_speaker[] /
+    no_dialogue / spoken_language。
+    """
+    lines = _plain_lines(body)
+    result = {
+        "no_audio": body.replace("**", "").strip() == NO_AUDIO_TEXT,
+        "bgm": {},
+        "bgm_missing": [],
+        "sound_points": [],
+        "dialogue": [],
+        "dialogue_missing_speaker": [],
+        "no_dialogue": False,
+        "spoken_language": "",
+    }
+    for key in BGM_FIELDS:
+        value = ""
+        for line in lines:
+            found = _value_after(line, key)
+            if found is not None:
+                value = found
+                break
+        result["bgm"][key] = value
+        if not value:
+            result["bgm_missing"].append(key)
+
+    for line in lines:
+        value = _value_after(line, SOUND_POINT_MARK)
+        if value and value not in NO_DIALOGUE_VALUES:
+            result["sound_points"].append(value)
+
+    for line in lines:
+        value = _value_after(line, LANGUAGE_MARK)
+        if value is not None:
+            result["spoken_language"] = "" if value in NO_DIALOGUE_VALUES else value
+            break
+
+    for line in lines:
+        value = _value_after(line, DIALOGUE_MARK)
+        if value is None:
+            continue
+        if value in NO_DIALOGUE_VALUES:
+            result["no_dialogue"] = True
+            continue
+        code = TIME_SPAN_RE.search(value)
+        if not code:
+            continue
+        quoted = QUOTED_RE.search(value[code.end():])
+        if not quoted or not quoted.group(1).strip():
+            continue
+        speaker = ""
+        match = SPEAKER_RE.search(value)
+        if match:
+            speaker = next((label for label in SPEAKER_LABELS if label in match.group(1)), "")
+        result["dialogue"].append({
+            "start_end": re.sub(r"\s*[-–—~～]\s*", "-", code.group(0).strip()),
+            "original": quoted.group(1).strip(),
+            "speaker": speaker,
+        })
+        if not speaker:
+            result["dialogue_missing_speaker"].append(quoted.group(1).strip())
+
+    if not result["dialogue"] and not result["no_dialogue"]:
+        result["no_dialogue"] = True          # 逐句台词与「台词：无」都没有 = 这片没台词
+    return result
+
+
+def ensure_sound_layer(markdown: str, has_audio: bool | None) -> tuple[str, str]:
+    """无音轨片：八 声音正文必须只剩「无音轨」——省字段不省层（B0 附注 1）。
+
+    返回 (正文, 动作)：""=未动 / "filled"=模型没写正文，补一行 / "replaced"=模型照样写了
+    声音内容，但这条片子没有音轨（ffprobe 量出来的），按规则改写成「无音轨」——
+    不采信没音轨的片子里编出来的 BGM/台词，也不删层（十层标题照旧，红线 24）。
+    模型连八层标题都漏掉的，仍按缺层失败（不替它造标题）。
+    """
+    if has_audio is not False:
+        return markdown, ""
+    body = sound_body(markdown).strip()
+    if body == NO_AUDIO_TEXT:
+        return markdown, ""
+    key = normalize_heading(SOUND_TITLE)
+    bodies, _missing = split_layers(markdown)
+    if key not in bodies:
+        return markdown, ""
+    out: list[str] = []
+    inside = False
+    done = False
+    for line in markdown.splitlines():
+        match = HEADING_RE.match(line)
+        if match:
+            inside = normalize_heading(match.group(2)) == key
+            out.append(line)
+            if inside and not done:
+                out.append(NO_AUDIO_TEXT)
+                done = True
+            continue
+        if inside:
+            continue                      # 丢掉无音轨片里的声音内容（已记在动作里，不静默）
+        out.append(line)
+    if not done:
+        return markdown, ""
+    return "\n".join(out) + "\n", ("replaced" if body else "filled")
+
+
 # ---------------------------------------------------------------- 落盘
 
 def aspect_label(width: int, height: int) -> str:
@@ -1594,12 +1755,40 @@ def run_extract(video_path: Path, video_id: str, outdir: Path, timeout: float, i
             return 3
 
     # 3. 缺层校验（不过就不落盘，避免下游吃半份产物）
+    #    无音轨片先按「省字段不省层」改写八 声音正文（只留「无音轨」），
+    #    十层判定逻辑一个字不动：真缺标题的照样判缺层。
+    text, sound_action = ensure_sound_layer(text, probe.get("has_audio"))
+    if sound_action == "filled":
+        print(f"[八 声音] 无音轨片：模型没写本层正文，按「省字段不省层」补「{NO_AUDIO_TEXT}」"
+              "（十层标题不动）", flush=True)
+    elif sound_action == "replaced":
+        print(f"[八 声音] 无音轨片：模型写了声音内容，但这条片子没有音轨（ffprobe 实测），"
+              f"正文按规则改写为「{NO_AUDIO_TEXT}」（不采信编出来的 BGM/台词，十层标题不动）",
+              flush=True)
     try:
         require_layers(text)
     except LayerError as exc:
         print(f"ERROR 模型输出不完整：{format_missing(exc.missing)}", file=sys.stderr)
         print("ERROR 未写盘（缺层产物不进 analysis/）", file=sys.stderr)
         return 4
+
+    # 3.4 八 声音结构化回显：正文原样来自这一次模型调用（同一次带音轨多模态调用产出），
+    #     这里只读回来核对落盘结果，不改写一个字；缺字段只告警，判不合格是门禁 D8 的事。
+    sound = parse_sound_layer(sound_body(text))
+    if probe.get("has_audio") is False:
+        print(f"[八 声音] 无音轨片：落盘正文「{sound_body(text).strip()}」"
+              "，BGM/音效/台词字段按规则省略", flush=True)
+    else:
+        speakers = sum(1 for row in sound["dialogue"] if row["speaker"])
+        bgm_note = "四字段齐" if not sound["bgm_missing"] else "缺 " + "、".join(sound["bgm_missing"])
+        print(f"[八 声音] 结构化落盘：BGM {bgm_note}｜音效点 {len(sound['sound_points'])} 条"
+              f"｜台词 {len(sound['dialogue'])} 句（带说话人 {speakers} 句）", flush=True)
+        if sound["bgm_missing"]:
+            print(f"[警告] 八 声音缺 BGM 结构化字段：{'、'.join(sound['bgm_missing'])}"
+                  "（拆解产物门禁 D8 会判不合格）", file=sys.stderr, flush=True)
+        if sound["dialogue_missing_speaker"]:
+            print(f"[警告] 八 声音有 {len(sound['dialogue_missing_speaker'])} 句台词没写说话人"
+                  "（只许 画外音 / 出镜者；门禁 D8 会判不合格）", file=sys.stderr, flush=True)
 
     # 3.5 与机器实测对账：硬切次数是 ffmpeg 量出来的、0 秒那一帧的朝向是单帧判定读出来的，
     #     模型答错要留痕

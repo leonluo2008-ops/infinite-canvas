@@ -182,8 +182,8 @@ def probe_positive() -> None:
     with Patches():
         result = evaluate_now()
     verdicts = {item["id"]: item["verdict"] for item in result["checks"]}
-    check("8 项判据齐全（D0/D1/D2/D3/D4/D5/D6/D7）",
-          len(result["checks"]) == 8, str(list(verdicts)))
+    check("9 项判据齐全（D0/D1/D2/D3/D4/D5/D6/D7/D8）",
+          len(result["checks"]) == 9, str(list(verdicts)))
     check("verdict=PASS、0 FAIL、0 WARN",
           result["verdict"] == "PASS" and not result["缺项"] and not result["告警"],
           f"{result['verdict']}｜{result['缺项']}｜{result['告警']}")

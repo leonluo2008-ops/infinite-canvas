@@ -740,7 +740,7 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_LAYER
 
     # 5) 拆解产物门禁（AT-15 R1）：判下游真正消费的东西；不合格 → 按诊断自动重拆（上限 2 次）
-    banner("[5/5] 拆解产物门禁：D1–D7（不合格自动重拆，上限 2 次；到顶如实标红）")
+    banner("[5/5] 拆解产物门禁：D1–D8（不合格自动重拆，上限 2 次；到顶如实标红）")
     mark_stage(outdir, "门禁")
 
     def rework(diagnosis: str) -> tuple[bool, str]:

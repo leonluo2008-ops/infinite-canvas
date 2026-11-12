@@ -1,6 +1,9 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""AT-15 R2 探针：任务书 v2.5（每行位置正例 + 片尾分镜正例）＋ 门禁结果进自检面板。
+"""AT-15 R2 探针：任务书 v2.5 正例（每行位置正例 + 片尾分镜正例）＋ 门禁结果进自检面板。
+
+（v2.6 起本探针继续守 v2.5 那两处正例合同——AT-17 B1 只在八 声音层加行内指引，
+两层正例一字未动；frontmatter 版本断言跟当前版本走。）
 
 跑法：`wanrepro/` 下 `python -m automation.probe_at15_r2`（纯离线：无 HTTP、不调模型、
 零花钱）。判据全对才 exit 0，任何一条 FAIL 如实打印并 exit 1。
@@ -78,11 +81,13 @@ def prompt_body() -> str:
 # ---------------------------------------------------------------- [1] 任务书合同
 
 def probe_prompt_contract() -> None:
-    print("[1] 任务书 v2.5 合同（结构不变 + 锚点在场）")
+    print("[1] 任务书 v2.6 合同（结构不变 + 锚点在场）")
     raw = PROMPT_PATH.read_text(encoding="utf-8")
-    check("frontmatter version=2.5",
-          bool(re.search(r"^version:\s*2\.5\s*$", raw, re.M)),
-          "frontmatter 没有 version: 2.5")
+    # v2.5 → v2.6 只加了一层行内指引（AT-17 B1 八 声音结构化），v2.5 的两处正例合同照旧生效，
+    # 所以版本号跟着产品走：断言当前版本，防的是「改了任务书忘了升版本」。
+    check("frontmatter version=2.6",
+          bool(re.search(r"^version:\s*2\.6\s*$", raw, re.M)),
+          "frontmatter 没有 version: 2.6")
     body = prompt_body()
     extract = module_by_path("r2_extract", ROOT / "pipeline" / "reverse" / "extract.py")
     titles = [f"## {title}" for title in extract.LAYER_TITLES]

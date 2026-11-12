@@ -1784,6 +1784,8 @@ def suggestion_reasons(path: Path) -> dict[int, str]:
 # 甲方清单的台词在分镜里，段结构完全不同），只要原文出现在正文就换掉。
 # 替换结果写进同目录 `渲染回执.json`，不写进提示词正文（复制出去的就是能直接用的成品）。
 DIALOGUE_NAME = "台词改写.md"
+# 「没人说话」的写法：不是语种，读语种时一律当空（v2.6 起拆解会明写 `人声语言：无`）
+NO_SPEECH_VALUES = ("无", "无台词", "无对白", "不适用")
 RECEIPT_NAME = "渲染回执.json"
 TIME_CODE_RE = re.compile(r"\d{1,2}:\d{2}(?:\.\d+)?\s*[-–—~～]\s*\d{1,2}:\d{2}(?:\.\d+)?")
 QUOTE_CHARS = "\"'“”‘’「」『』"
@@ -1809,13 +1811,16 @@ def _load_intent_module():
 
 
 def load_dialogue_rows(path: Path) -> list[dict]:
-    """读 `台词改写.md`：只认「时间码 + 原文 + 中文」三列的行。
+    """读 `台词改写.md`：只认「时间码 + 原文 + 中文」三列，表尾有「说话人」列就一起带上。
 
     文件不存在 / 写的是「无台词」「不适用」→ 返回空列表，渲染行为与没有意图时逐字一致。
+    AT-17 B1 附注 7：说话人**保留在返回行里**（不许只扩存储不消费）——本批渲染不消费，
+    B2a 分角色落位时才用；三列旧格式没有这一列 → speaker 为空，解析行为不变。
     """
     if not path.is_file():
         return []
     rows: list[dict] = []
+    speaker_index: int | None = None
     for raw in path.read_text(encoding="utf-8-sig").splitlines():
         line = re.sub(r"\s*\|\s*", "｜", raw.strip())
         if "｜" not in line:
@@ -1824,21 +1829,36 @@ def load_dialogue_rows(path: Path) -> list[dict]:
         if len(cells) < 3 or all(re.fullmatch(r"[-: ]*", c) for c in cells):
             continue
         if any(key in c for c in cells for key in ("起-止", "原文", "中文")):
+            speaker_index = next((index for index, cell in enumerate(cells)
+                                  if "说话人" in cell), None)
             continue
         code = TIME_CODE_RE.search(cells[0])
         original = cells[1].strip().strip(QUOTE_CHARS).strip()
         chinese = cells[2].strip()
         if not code or not original or not chinese:
             continue
-        rows.append({"start_end": code.group(0), "original": original, "chinese": chinese})
+        speaker = ""
+        if speaker_index is not None and speaker_index < len(cells):
+            speaker = cells[speaker_index]
+        elif speaker_index is None and len(cells) >= 4:
+            speaker = cells[-1]
+        rows.append({"start_end": code.group(0), "original": original, "chinese": chinese,
+                     "speaker": speaker})
     return rows
 
 
 def spoken_language(sound_layer: str) -> str:
-    """拆解「八 声音」写的语种（`人声语言：西班牙语（…）` → 西班牙语）；读不到就空。"""
+    """拆解「八 声音」写的语种（`人声语言：西班牙语（…）` → 西班牙语）；读不到就空。
+
+    v2.6 起没人说话的片子会明写 `人声语言：无`——那不是语种，按「读不到」处理，
+    否则下游会把「无」当成一种外语再去替换。
+    """
     probe = sound_layer.replace("**", "").replace("`", "")
     match = re.search(r"人声语言\s*[：:]\s*([^\s（(（；;，,。]+)", probe)
-    return match.group(1).strip() if match else ""
+    if not match:
+        return ""
+    lang = match.group(1).strip()
+    return "" if lang in NO_SPEECH_VALUES else lang
 
 
 def rewrite_spoken_language(text: str, source_lang: str) -> tuple[str, bool]:
