@@ -451,18 +451,26 @@ def recheck_call(task_id: str, extra: list[str] | None = None) -> dict:
     return data
 
 
-def render_task(task_id: str, stem: str, optional: str = "") -> str:
+def render_task(task_id: str, stem: str, optional: str = "", audio_mode: str = "") -> str:
     """调 render.py 重渲染一版模板，返回落盘的模板名。模板不存在 → 400。
 
     `optional` 是要打开的可选段字母（如 `C`，逗号分隔可多个）：render.py 默认全关，
     不透传的话界面选了「品牌收束」也不会出现在正文里（2026-11-04 路 A 审计 B5——
     UI 是唯一入口，这里传了才算数）。
+
+    `audio_mode`：音频三态（AT-17 B2a）。界面改选后要传下来才生效；不传时渲染器自己读
+    任务目录 `audio_mode.json`（意图阶段落的默认值），所以老调用方不改也照常跑。
     """
     if not re.fullmatch(r"[0-9A-Za-z._-]{1,64}", stem) or not (TEMPLATES / f"{stem}.md").is_file():
         raise ApiError(400, f"模板不存在：templates/{stem}.md")
     argv = ["pipeline/reverse/render.py", "--id", task_id, "--template", stem]
     if str(optional or "").strip():
         argv += ["--optional", str(optional).strip()]
+    mode = str(audio_mode or "").strip()
+    if mode:
+        if mode not in AUDIO_MODE_VALUES:
+            raise ApiError(400, f"audio_mode 只认 {'/'.join(AUDIO_MODE_VALUES)}，收到「{mode}」")
+        argv += ["--audio-mode", mode]
     code, out, err = run_py(argv, timeout=120)
     if code != 0:
         raise ApiError(500, f"render.py 退出 {code}：{tail(err) or tail(out)}")
@@ -2233,7 +2241,8 @@ class Handler(BaseHTTPRequestHandler):
         if m:
             self.send_json(render_payload(urllib.parse.unquote(m.group(1)),
                                           urllib.parse.unquote(m.group(2)),
-                                          self.query_param("optional")))
+                                          self.query_param("optional"),
+                                          self.query_param("audio_mode")))
             return
         m = re.fullmatch(r"/api/job/([0-9a-f]+)", path)
         if m:
@@ -2840,7 +2849,12 @@ class Handler(BaseHTTPRequestHandler):
         template = str(payload.get("template") or "").strip()
         stem = template[:-3] if template.endswith(".md") else template
         # 可选段字母（如 C＝品牌收束与图文）：显式请求就要真进渲染 argv，不透传等于白选（B5）
-        render_task(task_id, stem, str(payload.get("optional") or ""))
+        # 音频三态（AT-17 B2a）：请求里带就用请求值；没带就用本任务 audio_mode.json 的落盘值
+        # （B3 界面改选走这里；两个都没有时渲染器自己推导，行为与老版本一致）。
+        mode = str(payload.get("audio_mode") or "").strip()
+        if not mode:
+            mode = str((task_audio_mode(task_id) or {}).get("audio_mode") or "")
+        render_task(task_id, stem, str(payload.get("optional") or ""), mode)
 
         text, tpl = latest_prompt(task_id)
         self.send_json({"ok": True, "template": tpl or stem,
@@ -3329,8 +3343,13 @@ def lapian_payload(tid: str, spec: str) -> dict:
             "markdown": render_lapian.render_markdown(tid, spec, blocks)}
 
 
-def render_payload(tid: str, spec_name: str, optional: str = "") -> dict:
-    """M3 bridge：生成规范 → 提示词正文（走 render.py，产物照常落盘可回看）。"""
+def render_payload(tid: str, spec_name: str, optional: str = "", audio_mode: str = "") -> dict:
+    """M3 bridge：生成规范 → 提示词正文（走 render.py，产物照常落盘可回看）。
+
+    AT-17 B2a：`audio_mode` 是音频三态（沿用原片 / 按新主体调整 / 不要）。GET 没有 body，
+    所以走 query 透传；不传就让渲染器自己读任务目录 `audio_mode.json`，老调用方不受影响。
+    枚举外的值直接 400——静默丢弃会让调用方以为参数生效了。
+    """
     sys.path.insert(0, str(ROOT / "pipeline" / "reverse"))
     from spec_registry import load_registry
     from render import Fail, main as render_main
@@ -3345,6 +3364,11 @@ def render_payload(tid: str, spec_name: str, optional: str = "") -> dict:
     argv = ["--id", tid, "--template", tpl_stem]
     if str(optional or "").strip():                  # bridge 与 handler 同口径：可选段要透传（B5）
         argv += ["--optional", str(optional).strip()]
+    mode = str(audio_mode or "").strip()
+    if mode:
+        if mode not in AUDIO_MODE_VALUES:
+            raise ApiError(400, f"audio_mode 只认 {'/'.join(AUDIO_MODE_VALUES)}，收到「{mode}」")
+        argv += ["--audio-mode", mode]
     try:
         code = render_main(argv)
     except Fail as e:

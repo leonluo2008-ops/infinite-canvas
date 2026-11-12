@@ -165,7 +165,7 @@ OPT_RE = re.compile(r"^###\s+可选段\s*([A-Za-z0-9]+)\s*[：:]\s*(.+?)\s*$")
 PART_RE = re.compile(r"\*\*Part\.(\d+)\*\*\s*[：:]\s*「(.+?)」")
 FIELD_RE = re.compile(
     r"^-\s*(写什么|数据来源|口吻|范例证据|原文依据|命名变体|渲染建议|反面证据|分镜列"
-    r"|实体指认|时段格式|连写|字样置换|原句输出)\s*[：:]\s*(.*)$"
+    r"|实体指认|时段格式|连写|字样置换|原句输出|声音段|台词渲染)\s*[：:]\s*(.*)$"
 )
 LAYER_HEAD_RE = re.compile(r"^##\s*([一二三四五六七八九十])\s+(\S.*?)\s*$")
 DUP_DECIMAL_RE = re.compile(r"(?<![\d.])(\d+\.\d{2,})(?![\d.])")
@@ -1890,13 +1890,214 @@ def residual_dialogue(text: str) -> list[str]:
     return found
 
 
+# ---------------------------------------------------------------- 音频三态声音段（AT-17 B2a）
+#
+# 作用域 = BGM + 音效点（B0②）；台词走既有改写链（intent.rewrite_dialogue），这里只负责
+# 把「谁说哪句」渲染成行，不改写译文。
+#
+# 三态是**纯字符串规则**，零模型调用（附注 10：新增模型调用要单独付费口径批准）：
+#   · `沿用原片`   = 八层原值原样进声音段（BGM 四字段原词、音效点逐条、台词逐句带说话人）；
+#   · `按新主体调整` = 只留**主体无关的骨架**（情绪 / 节奏 / 织体 / 强弱走向），
+#                    ① 音效点整类不沿用——它们由原片主体的动作产生（「瓶盖摩擦声」这类
+#                       物 specific 描述换主体后就是错的），留着等于沿用；
+#                    ② BGM 值里点名旧实体的名词（待确认清单实体核心词）一并剥掉，
+#                       剩下的就是换谁都能用的骨架；
+#   · `不要`       = 官方三档式「无 BGM，仅保留环境声」，原片 BGM 词一个不带。
+# 无音轨片：不写 BGM / 音效点 / 台词，如实写「无音轨」（省内容不省段，B0 附注 1）。
+#
+# 未指定三态（老调用方 / 老任务）→ kind="none"，整条链路走原路径，产物一字不变。
+
+AUDIO_MODE_VALUES = ("沿用原片", "按新主体调整", "不要")
+AUDIO_MODE_KEEP, AUDIO_MODE_ADJUST, AUDIO_MODE_MUTE = AUDIO_MODE_VALUES
+SOUND_LAYER = "八"
+NO_AUDIO_LINE = "无音轨：本条片子没有音轨，不写 BGM、音效点与台词；生成端音频开关随渠道默认。"
+MUTE_LINES = ["BGM：无 BGM，仅保留环境声。", "音效点：无（只保留环境声，不设计音效点）。"]
+ADJUST_SOUND_LINE = "音效点：不沿用原片声源（原片音效点由旧主体的动作产生），按新主体在对应时刻的动作重新拟声。"
+NO_BGM_LITERAL = "无BGM"
+# 键名与 extract.BGM_FIELDS 逐字一致（`BGM.情绪`…）；左边是解析键，右边是进提示词的标签。
+BGM_LABELS = (("BGM.情绪", "情绪"), ("BGM.节奏", "节奏"),
+              ("BGM.乐器/织体", "乐器/织体"), ("BGM.强弱走向", "强弱走向"))
+
+
+def _sound_parser():
+    """八 声音结构化解析与 B1/extract 同源（判据与消费同一个函数，不另写一套正则）。"""
+    from extract import parse_sound_layer       # 同目录；render.py 运行时 sys.path 已含此目录
+    return parse_sound_layer
+
+
+def _flat(value: str) -> str:
+    return re.sub(r"\s+", "", value or "")
+
+
+def _no_bgm_value(value: str) -> bool:
+    return _flat(value).lower().startswith(NO_BGM_LITERAL.lower())
+
+
+def _strip_subject_nouns(value: str, ents: list["Entity"]) -> str:
+    """BGM 值里点名旧实体的名词整串剥掉（实体核心名词短语，≥2 字；短于 2 字会误伤）。"""
+    out = value
+    for ent in ents:
+        core = entity_noun_core(ent)
+        if len(core) >= 2:
+            out = out.replace(core, "")
+    return re.sub(r"[，、；]{2,}", "，", out).strip("，、； ")
+
+
+def _dialogue_lines(info: dict, *, checklist: bool = False) -> list[str]:
+    """台词 → 行；说话人只认拆解侧那两类（画外音 / 出镜者），没标就如实写「未标」。"""
+    out: list[str] = []
+    lang = str(info.get("spoken_language") or "").strip()
+    if lang:
+        out.append(f"人声语言：{lang}。")
+    rows = info.get("dialogue") or []
+    if not rows:
+        if info.get("no_dialogue"):
+            out.append("台词：无。")
+        return out
+    for row in rows:
+        text = str(row.get("original") or "").strip()
+        if not text:
+            continue
+        speaker = str(row.get("speaker") or "").strip()
+        if checklist:                              # 甲方清单式：`[画外音] | 画外音：原文`
+            tag = speaker or "（说话人未标）"
+            out.append(f"[{tag}] | {tag}：{text}")
+        elif speaker:
+            out.append(f"台词：{speaker}「{text}」。")
+        else:
+            out.append(f"台词：「{text}」（说话人未标）。")
+    return out
+
+
+def sound_plan(layers: dict[str, str], ents: list["Entity"], audio_mode: str,
+               has_audio: bool | None = None) -> dict:
+    """音频三态 → 声音段骨架。返回 {kind, mode, bgm[], dialogue[], note}。
+
+    kind = `none`（没给三态，走原路径）/ `keep` / `adjust` / `mute`。
+    `bgm` 是 BGM+音效点那几行，`dialogue` 是台词行；两拨分开，是为了清单式模板能把
+    BGM 塞进行内（口播行）、台词另起 `[说话人] | 说话人：原文` 行。
+    """
+    mode = (audio_mode or "").strip()
+    if mode not in AUDIO_MODE_VALUES:
+        return {"kind": "none", "mode": "", "bgm": [], "dialogue": [], "dialogue_check": [],
+                "note": ""}
+
+    body = layers.get(SOUND_LAYER, "")
+    info = _sound_parser()(body)
+    dialogue = _dialogue_lines(info)
+    dialogue_check = _dialogue_lines(info, checklist=True)
+    no_audio = bool(info.get("no_audio")) or has_audio is False
+    if no_audio:
+        return {"kind": "mute", "mode": mode, "bgm": [NO_AUDIO_LINE], "dialogue": [],
+                "dialogue_check": [],
+                "note": "八 声音 标记无音轨：按「不要」渲染，不写 BGM / 音效点 / 台词"}
+
+    bgm = info.get("bgm") or {}
+    present = [(label, str(bgm.get(key) or "").strip()) for key, label in BGM_LABELS]
+    present = [(label, value) for label, value in present if value and not _no_bgm_value(value)]
+    points = [str(p).strip() for p in (info.get("sound_points") or []) if str(p).strip()]
+    has_bgm = bool(present)
+    structured = has_bgm or bool(points) or any(str(v or "").strip() for v in bgm.values())
+
+    if mode == AUDIO_MODE_MUTE:
+        return {"kind": "mute", "mode": mode, "bgm": list(MUTE_LINES), "dialogue": dialogue,
+                "dialogue_check": dialogue_check, "note": ""}
+
+    if mode == AUDIO_MODE_KEEP:
+        if not structured:                         # v2.5 自由散文：原样保留（逐行照抄）
+            raw = [line for line in _sound_raw_lines(body) if line]
+            return {"kind": "keep", "mode": mode, "bgm": raw, "dialogue": [],
+                    "dialogue_check": dialogue_check,
+                    "note": "" if raw else "八 声音 正文为空"}
+        lines: list[str] = []
+        if has_bgm:
+            bits = "，".join(f"{label}{value}" for label, value in present)
+            lines.append(f"BGM：{bits}。")
+        elif any(str(v or "").strip() for v in bgm.values()):
+            lines.append("BGM：无BGM（原片没有背景音乐）。")
+        lines += [f"音效点：{p}" if p.endswith(("。", "！", "？")) else f"音效点：{p}。"
+                  for p in points]
+        return {"kind": "keep", "mode": mode, "bgm": lines, "dialogue": dialogue,
+                "dialogue_check": dialogue_check, "note": ""}
+
+    # 按新主体调整
+    if has_bgm:
+        bits = "、".join(f"{label}（{_strip_subject_nouns(value, ents)}）"
+                         for label, value in present)
+        lines = [f"BGM：沿用原片的{bits}骨架，按新主体的气质重新配器，不重复原片旋律。",
+                 ADJUST_SOUND_LINE]
+        return {"kind": "adjust", "mode": mode, "bgm": lines, "dialogue": dialogue,
+                "dialogue_check": dialogue_check, "note": ""}
+    if structured:                                 # 原片无 BGM：保留骨架说法，不搬原曲目
+        return {"kind": "adjust", "mode": mode,
+                "bgm": ["BGM：原片没有背景音乐，按新主体重新配器。", ADJUST_SOUND_LINE],
+                "dialogue": dialogue, "dialogue_check": dialogue_check, "note": ""}
+    # 自由散文：拆不出四字段，只能给骨架指令，绝不逐字沿用（否则就是沿用）
+    return {"kind": "adjust", "mode": mode,
+            "bgm": ["BGM：沿用原片的情绪、节奏与强弱走向骨架，按新主体重新配器，不重复原片旋律。",
+                    ADJUST_SOUND_LINE],
+            "dialogue": dialogue, "dialogue_check": dialogue_check,
+            "note": "八 声音 是自由散文、没有 BGM 四字段：只给骨架指令，不逐字沿用（待人工核对）"}
+
+
+def _sound_raw_lines(body: str) -> list[str]:
+    """八层正文 → 逐行文本（去项目符号/加粗，保留原句一个字不改）。"""
+    out: list[str] = []
+    for raw in body.splitlines():
+        line = raw.replace("**", "").strip()
+        line = re.sub(r"^(?:[-*+•]|\d+\.)\s*", "", line)
+        if line:
+            out.append(sanitize(line))
+    return out
+
+
+def _sound_dialogue_claim(sec: "Section") -> bool:
+    """本段是否要渲染台词行（`台词渲染：说话人`）。"""
+    return bool(sec.field("台词渲染").strip())
+
+
+def _sound_section_style(sec: "Section") -> str:
+    """本段的声音段形态：`是`=多行块；`行内`=压成一行（清单式口播行）。空=本段不渲染声音段。"""
+    value = sec.field("声音段").strip()
+    if not value or value in ("否", "false"):
+        return ""
+    return "行内" if "行内" in value else "是"
+
+
+def resolve_audio_mode(explicit: str, task_dir: Path, disc: str) -> tuple[str, str]:
+    """三态取值：显式入参 > 任务目录 `audio_mode.json` > 按拆解推导。返回 (值, 来源)。
+
+    来源如实标出来，产物附注里能查：`请求参数`（hub/画布透传）/`audio_mode.json`（意图阶段落盘）
+    /`按拆解推导`（老任务、没有落盘文件）。推导只有一份实现（intent.audio_mode，B2c 同源）。
+    """
+    want = (explicit or "").strip()
+    if want:
+        if want not in AUDIO_MODE_VALUES:
+            raise Fail(EXIT_INPUT, f"audio_mode 只认 {'/'.join(AUDIO_MODE_VALUES)}，收到「{want}」")
+        return want, "请求参数"
+    try:
+        intent = _load_intent_module()
+        value = str((intent.read_audio_mode(task_dir) or {}).get("audio_mode") or "").strip()
+        if value in AUDIO_MODE_VALUES:
+            return value, "audio_mode.json"
+        value = str((intent.audio_mode(disc) or {}).get("audio_mode") or "").strip()
+        if value in AUDIO_MODE_VALUES:
+            return value, "按拆解推导"
+    except Exception as err:              # noqa: BLE001 —— 推不出来就退回原路径，但必须出声
+        print(f"[WARN] 音频三态推导失败（{err}）：八 声音 按原路径渲染", file=sys.stderr)
+    return "", ""
+
+
 def render_prompt(fm: dict[str, str], secs: list[Section], layers: dict[str, str],
                   ents: list[Entity], facts: dict[str, str], pid: str, tpl_stem: str,
                   reasons: dict[int, str] | None = None,
-                  body_mode: str = "") -> str:
+                  body_mode: str = "", audio_mode: str = "",
+                  audio_src: str = "", has_audio: bool | None = None) -> str:
     """body_mode：`流式` 时只输出一段可直接贴进生成平台的正文——无标题、无规格行、无附注。
 
     出处分两档：模板 frontmatter `正文模式:`，命令行 `--body-mode` 覆盖。
+    audio_mode：`沿用原片` / `按新主体调整` / `不要`（AT-17 B2a）；空=未指定，八 声音 走原路径
+    （老调用方产物一字不变）。取值来源见 `resolve_audio_mode()`。
     """
     mode = (body_mode or fm.get("正文模式", "")).strip()
     flow = mode in ("流式", "plain")
@@ -1917,11 +2118,46 @@ def render_prompt(fm: dict[str, str], secs: list[Section], layers: dict[str, str
     used: set[int] = set()
     took: dict[str, int] = {}          # 层 → 真正吃掉该层子块的第一段
     bodies: list[list[str]] = []
+    # ---- 音频三态（AT-17 B2a）：八 声音 由「逐块倒出」升级为「按三态渲染的声音段」 ----
+    plan = sound_plan(layers, ents, audio_mode, has_audio)
+    sound_styles = [_sound_section_style(s) for s in secs]
+    sound_sections = {i for i, style in enumerate(sound_styles) if style}
+    dialogue_sections = {i for i, s in enumerate(secs) if _sound_dialogue_claim(s)}
+    # 模板没声明声音段落位、但三态要求改写声音时，退回「谁独占声音维度谁吃」——
+    # 不标注就等于留着原片 BGM 词，那是漏，不是省。
+    if plan["kind"] in ("adjust", "mute") and not sound_sections and "声音" in owner:
+        sound_sections.add(owner["声音"])
+        sound_styles[owner["声音"]] = "是"
+    sound_claimed = bool(sound_sections or dialogue_sections)
+    # 结构化四字段之外的块（`对位：` 这类）只在**沿用**模式下原样跟着声音段走，不静默丢。
+    # 「调整」不带：这些旁支句里同样可能点名旧主体，剥不干净就是沿用；「不要」与无音轨更不带。
+    sound_extra: list[str] = []
+    if sound_claimed and plan["kind"] == "keep":
+        known = {"BGM", "音效点", "人声语言", "台词"}
+        for b in blocks.get(SOUND_LAYER, []):
+            if b.label.split(".")[0].split("（")[0] in known:
+                continue
+            sound_extra += [x for x in (sanitize_with_user_desc(strip_core_residue(
+                replace_uploaded_asset_refs(apply_naming(x, ents), ents, b.dim, b.layer), ents
+            ), ents) for x in b.lines) if x]
     for idx, sec in enumerate(secs):
         want = dims[idx][0]
         body_items: list[dict] = []
         dropped_count = [0]
         body: list[str] = []
+        sound_style = sound_styles[idx]
+        dialogue_here = idx in dialogue_sections
+        if plan["kind"] == "none":
+            # 没给三态（老调用方 / 推导失败）：两个落位都不生效，八 声音 走原路径——
+            # 老调用方的产物必须一字不变（probe_at9/at11/at16 都直接调 render_prompt）。
+            sound_style = ""
+            dialogue_here = False
+        if (plan["kind"] == "none" and flow and sound_styles[idx]
+                and {cn for cn, _name in layer_refs(sec)} == {SOUND_LAYER}):
+            # 流式模板里新加的「纯声音段」在老路径下无处落位（它本来就是为三态新建的）：
+            # 没有三态就整段不出，流式正文与改模板前一字不差。
+            bodies.append([])
+            continue
         # `分镜列`：这段把分镜表按声明的列拼成「一句一条」，不逐列倒出（叙事体唯一可行的路径）。
         ncols = shot_columns(sec)
         # 自带句子的段（实体指认 / 原句输出）不消费拆解子块——它们的正文就是那一句，
@@ -1960,6 +2196,12 @@ def render_prompt(fm: dict[str, str], secs: list[Section], layers: dict[str, str
         for cn, _name in (() if self_contained else layer_refs(sec)):
             for b in blocks.get(cn, []):
                 if id(b) in used:
+                    continue
+                if cn == SOUND_LAYER and sound_claimed and plan["kind"] != "none":
+                    # 八 声音 由三态渲染（声音段/台词行），不再逐块倒出——倒出来就是字段名回显，
+                    # 而且会把「沿用/调整/不要」三态的差异冲平（附注 9/10 的同一个根因）。
+                    used.add(id(b))
+                    took.setdefault(cn, idx)
                     continue
                 if ncols:
                     if b.dim != "分镜":
@@ -2014,6 +2256,25 @@ def render_prompt(fm: dict[str, str], secs: list[Section], layers: dict[str, str
         if dropped_count[0]:
             print(f"  [去重] 「{sec.title}」合并 {dropped_count[0]} 条重复资产行", file=sys.stderr)
             dropped_count[0] = 0
+
+        # —— 音频三态声音段（AT-17 B2a）——
+        # 本段声明 `声音段：是|行内` 就把三态渲染的声音行接进本段正文；`台词渲染：说话人`
+        # 另起台词行（清单式 `[画外音] | 画外音：原文`）。两句可并存：口播行只要 BGM，
+        # 分镜行只要台词——甲方清单式就是这样拆的，声音不独立成段。
+        if plan["kind"] != "none":
+            if sound_style:
+                sound_lines = list(plan["bgm"]) + sound_extra
+                if sound_style == "行内":
+                    # 行内：压成一条流水句（标点各留一个句号，不出现「。；」）
+                    joined = "；".join(x.rstrip("。；") for x in sound_lines if x)
+                    if joined:
+                        body = body + [sanitize(joined + "。")]
+                else:
+                    if not dialogue_sections:          # 台词没人另起行时，并进声音段
+                        sound_lines += list(plan["dialogue"])
+                    body = body + [sanitize(x) for x in sound_lines if x]
+            if dialogue_here:
+                body = body + [sanitize(x) for x in plan["dialogue_check"] if x]
 
         # —— 单段流式模板的段指令（templates/seedance-flow.md）——
         # `实体指认`：段首一句「全程使用参考图中的 @图片N 说明、…」，只给图号和短说明。
@@ -2139,6 +2400,12 @@ def render_prompt(fm: dict[str, str], secs: list[Section], layers: dict[str, str
     out.append(f"- 模板：{fm['name']}｜来源：{fm.get('来源', '')}")
     if fm.get("可信度"):
         out.append(f"- 可信度：{fm['可信度']}")
+    # 音频三态（AT-17 B2a）：产物自己说话——声音段为什么长这样，附注里能查。
+    if plan["mode"]:
+        src = f"，来源：{audio_src}" if audio_src else ""
+        out.append(f"- 音频三态：{plan['mode']}（声音段按该态渲染{src}）")
+    if plan["note"]:
+        out.append(f"- 音频三态提示：{plan['note']}")
     for sec in secs:
         src = sec.field("数据来源").replace("`", "").strip()
         out.append(sanitize(f"- 段 {sec.n} {sec.title}｜口吻：{sec.field('口吻')}｜数据来源：{src}"))
@@ -2261,6 +2528,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--out-dir", default="", help="产物目录（默认写回 --id 目录）")
     ap.add_argument("--body-mode", default="",
                     help="正文模式：留空=模板 frontmatter `正文模式:`（缺省文档模式）；`流式`=只出一段可直贴正文（无标题/无附注）")
+    ap.add_argument("--audio-mode", default="",
+                    help="音频三态：沿用原片 / 按新主体调整 / 不要（AT-17 B2a）；"
+                         "留空=任务目录 audio_mode.json → 按拆解推导（都没有则八 声音 走原路径）")
     args = ap.parse_args(argv)
 
     try:
@@ -2319,9 +2589,14 @@ def main(argv: list[str] | None = None) -> int:
             print("[WARN] 没有可用的待确认清单，命名替换跳过（原样用模型看到的描述）。", file=sys.stderr)
 
         out_dir = Path(args.out_dir) if args.out_dir else id_path
-        prompt = render_prompt(fm, secs, layers, ents, header_facts(disc), pid, tpl_path.stem,
+        # 音频三态（AT-17 B2a）：命令行请求参数 > 任务目录 audio_mode.json > 按拆解推导
+        audio_mode, audio_src = resolve_audio_mode(args.audio_mode, id_path, disc)
+        facts = header_facts(disc)
+        has_audio = str(facts.get("音轨", "")).startswith("有") if facts.get("音轨") else None
+        prompt = render_prompt(fm, secs, layers, ents, facts, pid, tpl_path.stem,
                                suggestion_reasons(id_path / "意图建议.md"),
-                               body_mode=args.body_mode)
+                               body_mode=args.body_mode, audio_mode=audio_mode,
+                               audio_src=audio_src, has_audio=has_audio)
         assets = render_assets(ents, layers, pid)
         # 台词改写：只有 intent.py 落了对照表才动正文；没有表 → 整段跳过，
         # 产物与「没有意图」时逐字一致（判据 B6）。

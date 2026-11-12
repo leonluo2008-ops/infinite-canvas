@@ -24,6 +24,7 @@ import re
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from contextlib import nullcontext
 from pathlib import Path
@@ -168,13 +169,23 @@ def parse_set(spec: str) -> dict:
     return out
 
 
-def do_render(task_dir: Path, set_spec: str, verbose: bool = True) -> dict:
-    """rendering → 渲染 → awaiting_approval（回显预演，等人工 approve）。"""
+def do_render(task_dir: Path, set_spec: str, verbose: bool = True,
+              audio_mode: str | None = None) -> dict:
+    """rendering → 渲染 → awaiting_approval（回显预演，等人工 approve）。
+
+    `audio_mode`：音频三态（AT-17 B2a），本函数负责把它**带进 bridge 请求**——
+    GET /api/render 没有 body，参数不加在 query 上就到不了渲染器（附注 11）。
+    缺省取任务.json 的 `audio_mode`（B2c 拆解完成时落的盘）；都没有就不带，渲染器自己推导。
+    """
     task = state.load(task_dir)
     if task["state"] != "rendering":
         raise GenError(f"render 需 rendering 状态（先完成置换确认），当前 {task['state']}")
     params = {**DEFAULT_PARAMS, **parse_set(set_spec)}
-    out = bridge.get(f"/api/render/{task['bridge_id']}/{DEFAULT_TEMPLATE}")
+    mode = str(audio_mode if audio_mode is not None else task.get("audio_mode") or "").strip()
+    url = f"/api/render/{task['bridge_id']}/{DEFAULT_TEMPLATE}"
+    if mode:
+        url += "?" + urllib.parse.urlencode({"audio_mode": mode})
+    out = bridge.get(url)
     prompt = out.get("text") or ""
     # 结构性校验（不假设模板格式——红线 14）：非空且够长即视为正文；
     # 模板差异（lumi 带 # 标题头 / seedance-flow 纯正文流）不是合同的一部分

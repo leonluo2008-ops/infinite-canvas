@@ -1049,10 +1049,16 @@ def frame_file(local_id: str, filename: str) -> Path:
 
 
 def do_render(local_id: str) -> dict:
-    """渲染（秒级，同步）→ 待审批 + 预演参数 + 提示词全文。"""
+    """渲染（秒级，同步）→ 待审批 + 预演参数 + 提示词全文。
+
+    AT-17 B2a：把任务.json 的音频三态显式带给 generate.do_render，由它加进 bridge 的
+    GET query（GET 没有 body，参数不上 query 就到不了渲染器）。
+    """
     task_dir = _task_dir(local_id)
+    task = state.load(task_dir)
+    mode = str(task.get("audio_mode") or "").strip()
     try:
-        prev = generate.do_render(task_dir, "5,9:16", verbose=False)
+        prev = generate.do_render(task_dir, "5,9:16", verbose=False, audio_mode=mode or None)
     except generate.GenError as e:
         raise HubError(str(e)) from None
     task = state.load(task_dir)
