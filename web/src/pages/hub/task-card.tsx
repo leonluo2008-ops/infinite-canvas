@@ -221,6 +221,93 @@ export function FailedReasonLine({ failed, fallbackError = "" }: { failed?: HubF
     );
 }
 
+// ---------------------------------------------------------------- 云端原文失败详情（后端原文置顶）
+
+/**
+ * 附属信息行标记（逐字对齐后端 `discuss._failure_detail` 的固定行前缀）。
+ *
+ * 后端把「云端原文：{message}」摆首行，退出码 / finish_reason / 错误类型 / 原转述 / 原始响应
+ * 逐行跟在后面并带这些标记。前端**只按标记挑样式**：不改字、不解析语义、不推断原因、不丢行
+ * （逐字等式由 `splitFailedReason` 的探针锁定）。
+ */
+export const FAILED_REASON_AUX_MARKERS = ["［附属］", "［转述］", "［原始响应］"] as const;
+
+/** 分段结果：main=主展示（云端原文行 / 无标记行），aux=附属信息（带标记的行，次要样式）。 */
+export type FailedReasonSegment = { kind: "main" | "aux"; text: string };
+
+/**
+ * 把后端失败详情按行分段（纯函数，探针直测）。
+ *
+ * 铁律：`splitFailedReason(r).map(s => s.text).join("\n") === String(r ?? "")`——只换样式不换字：
+ * 不 trim、不截断、不合并、不改写。未知前缀 / 后端新增行一律落在 main 里原样显示，所以加新字段
+ * 不会被吞掉（只会以主样式出现），也不会让页面报错。
+ */
+export function splitFailedReason(reason?: string | null): FailedReasonSegment[] {
+    const text = String(reason ?? "");
+    if (!text) return [];
+    return text.split("\n").map((line) => ({
+        kind: FAILED_REASON_AUX_MARKERS.some((marker) => line.startsWith(marker)) ? "aux" : "main",
+        text: line,
+    }));
+}
+
+/**
+ * 失败详情面板（任务详情页 failed 态的**唯一主展示件**）：云端原文等宽 + 可换行 + 全文不截断置顶，
+ * 转述 / 退出码 / finish_reason / 原始响应降为附属次要样式。
+ *
+ * 只渲染后端给的东西：正文取 `failed.reason`（后端唯一文案源；老任务回落 history 尾注 `error`），
+ * 不根据错误文本推断原因、不覆盖 / 改写后端文案、不丢未知行。「云端原文：未落盘（…）」这类文案
+ * 同样原样展示（它没有附属标记，落在主展示区）。
+ * `data-hub-cloud-failure` 是渲染钩子：backend=后端 failed.reason / history=老任务 error 尾注。
+ */
+export function CloudFailurePanel({ failed, fallbackError = "" }: { failed?: HubFailedView | null; fallbackError?: string }) {
+    const backend = (failed?.reason || "").trim();
+    const history = (fallbackError || "").trim();
+    const segments = splitFailedReason(backend || history);
+    if (!segments.length) return null; // 两处都空 → 交回既有兜底句（这里不造第二套文案）
+    // 主展示：无标记行（按契约就是首行的云端原文；未落盘文案也在这里）
+    const main = segments
+        .filter((segment) => segment.kind === "main")
+        .map((segment) => segment.text)
+        .join("\n")
+        .trim();
+    const aux = segments.filter((segment) => segment.kind === "aux");
+    return (
+        <section
+            className="rounded-lg border border-red-200 bg-red-50 p-3 dark:border-red-950 dark:bg-red-950/20"
+            data-hub-cloud-failure={backend ? "backend" : "history"}
+            data-hub-cloud-failure-aux={aux.length ? "1" : "0"}
+        >
+            <div className="flex items-center gap-1.5 text-xs font-medium text-red-700 dark:text-red-300">
+                <CircleAlert className="size-3.5 shrink-0" />
+                失败详情（后端原文，原样展示）
+            </div>
+            {main ? (
+                <div
+                    className="mt-1.5 min-w-0 whitespace-pre-wrap break-words font-mono text-[13px] leading-6 text-red-800 dark:text-red-200"
+                    data-hub-cloud-failure-main
+                >
+                    {main}
+                </div>
+            ) : null}
+            {aux.length ? (
+                <div className="mt-2 space-y-1 border-t border-red-200/70 pt-2 dark:border-red-900/60" data-hub-cloud-failure-auxlist>
+                    {aux.map((segment, index) => (
+                        <div
+                            key={`aux-${index}`}
+                            className="min-w-0 whitespace-pre-wrap break-words font-mono text-[11px] leading-5 text-red-700/75 dark:text-red-300/75"
+                            data-hub-cloud-failure-line={index}
+                        >
+                            {segment.text}
+                        </div>
+                    ))}
+                </div>
+            ) : null}
+            {failed?.at ? <div className="mt-1.5 text-xs text-red-600/70 dark:text-red-400/70">失败时间 {hubClockText(failed.at)}</div> : null}
+        </section>
+    );
+}
+
 export function TaskCard({ task, onStateChange, onRefresh }: { task: HubTaskSummary; onStateChange: (localId: string, state: string) => void; onRefresh: () => void }) {
     const { message } = App.useApp();
     const fileInputRef = useRef<HTMLInputElement>(null);

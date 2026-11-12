@@ -84,7 +84,7 @@ import {
 import { GenClearedBar, hubClearedDirect } from "./gen-cleared";
 import { lapianClockTexts, lapianStageName, useLapianClock } from "./lapian-clock";
 import { HubStateTag, SubmitResultLine, forceFinishGuard } from "./hub-status";
-import { FORCE_FINISH_CONFIRM_TITLE, ForceFinishButton, ForceFinishConfirmBody } from "./task-card";
+import { CloudFailurePanel, FORCE_FINISH_CONFIRM_TITLE, ForceFinishButton, ForceFinishConfirmBody } from "./task-card";
 import { TaskDeleteButton } from "./task-delete-confirm";
 
 /** 九宫格粗标配色（同帧多目标分色，AT-9 层1）。 */
@@ -2353,8 +2353,9 @@ function GateBadge({ item }: { item: HubSelfCheckItem }) {
     );
 }
 
-/** 审批/生成/成片段（§四）：批准出片/退回置换；生成进度；成片预览+下载；失败重试。 */
-function OutcomeSection({
+/** 审批/生成/成片段（§四）：批准出片/退回置换；生成进度；成片预览+下载；失败重试。
+ *  export 供前端探针 SSR 直渲染（云端原文失败详情 = failed 态主展示件，探针要验它只长在 failed 上）。 */
+export function OutcomeSection({
     detail,
     busy,
     act,
@@ -2388,14 +2389,21 @@ function OutcomeSection({
 
     if (state === "failed") {
         const issue = genIssue(detail);
+        // 失败详情（本卡）：云端原文置顶主展示；转述 / 退出码 / finish_reason 降为附属（后端文案原样透传）
+        const failureText = String(detail.failed?.reason || "").trim() || String(detail.error || "").trim();
         return (
             <>
+                <CloudFailurePanel failed={detail.failed} fallbackError={detail.error || ""} />
                 {/* 失败红条 + 阻断面板（原文由 GenIssueSection 出，避免与本段重复） */}
                 <GenIssueSection detail={detail} busy={busy} act={act} />
                 <section className="rounded-lg border border-stone-200 bg-card p-4 dark:border-stone-800">
                     <div className="flex flex-wrap items-center justify-between gap-2">
                         <span className="min-w-0 break-words text-xs text-stone-500 dark:text-stone-400">
-                            {detail.gen_error ? "失败原文见上（已脱敏）。" : detail.error ? "" : "任务失败，错误原文未返回。"}重试=重跑拆解与渲染（产物优先保留）。
+                            {detail.gen_error
+                                ? "失败原文见上（已脱敏）。"
+                                : failureText
+                                  ? "失败原因见上方原文（后端原样透传，未改写）。"
+                                  : "任务失败，错误原文未返回。"}重试=重跑拆解与渲染（产物优先保留）。
                         </span>
                         <div className="flex flex-wrap items-center justify-end gap-2">
                             {/* 阻断态（未知收单/在途）下不许重试：会重复建单扣费（§2.3） */}
