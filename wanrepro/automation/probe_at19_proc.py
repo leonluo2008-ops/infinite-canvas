@@ -10,6 +10,8 @@
   [2] 子进程正常退出非 0（真执行体，exit=3）→ 启动对账/扫描 failed，证据 = 退出码 3
   [3] server 自身重启后接续对账 → 真起 ui/server.py，[OK] 后 ≤10s 落成 failed + 摘要行
   [4] 幂等：同一任务连扫三次只迁移一次（history 不增行、failed_at 不变）；无僵尸 running 态
+  [5] 真重试：换 run 即作废旧退出码 → 新 run 死证 run_id=本次 exec_run_id（E1 可命中）；
+      旧 run 迟到写仍被栅栏拒绝（t_9eab1c56 两条验收判据的自动化版本）
 
 隔离手法：
   · WANREPRO_AUTO_DIR → 本次临时根（任务根唯一来源 automation.config.PROJECTS_DIR）；
@@ -56,6 +58,8 @@ class ProbeBridge:
 
     def __init__(self, bridge_id: str) -> None:
         self.bridge_id = bridge_id
+        self.job_status = "running"      # [5] 重试轮用 "error" 让第二轮快速落任务级失败
+        self.job_error = "probe：任务级失败（云端 429 限流）"
         outer = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -87,6 +91,10 @@ class ProbeBridge:
                                                 "has_check": False, "has_prompt": False}]})
                     return
                 if self.path.startswith("/api/job/"):
+                    if outer.job_status == "error":
+                        self._send(200, {"status": "error", "elapsed": 2,
+                                         "error": {"message": outer.job_error}})
+                        return
                     self._send(200, {"status": "running", "elapsed": 2, "stage": "等待远程"})
                     return
                 self._send(404, {"error": "probe bridge 不认这个 GET"})
@@ -281,6 +289,58 @@ check("[4] 无僵尸 running 态（运行态但执行体已死）", not zombies,
 check("[4] 三个夹具全部 failed",
       all(task_of(d).get("state") == "failed" for d in (D1, D2, D3)),
       str({d.name: task_of(d).get("state") for d in (D1, D2, D3)}))
+
+# ================================================================ [5] 真重试：凭证轮转
+print("\n[5] 真重试（failed → POST task/retry）：换 run 即作废旧退出码；新死证 run_id=本次 exec_run_id")
+D5 = seed("auto-9804", st="rendering")
+job5a = hub_api.start_discuss("auto-9804")
+ex5a = wait_for(lambda: (lambda e: e if e.get("exists") else None)(state.exec_read(D5)), 40)
+print(f"    第一轮：job={job5a.get('job_id')} 退出码={ex5a}")
+check("[5] 第一轮执行体收尾写了退出码（run_id=第一轮 job）",
+      bool(ex5a) and ex5a.get("run_id") == str(job5a.get("job_id")), str(ex5a))
+hub_api.scan_lost_runs(apply=True)
+check("[5] 第一轮对账落 failed（重试前置状态）",
+      task_of(D5).get("state") == "failed", task_of(D5).get("state"))
+check("[5] 重试前任务目录挂着第一轮死证（缺陷现场）",
+      state.exec_read(D5).get("run_id") == str(job5a.get("job_id")), str(state.exec_read(D5)))
+BRIDGE.job_status = "error"          # 第二轮快速落任务级失败（不等 1800s 轮询上限）
+retry5 = hub_api.start_retry("auto-9804")
+job5b = str(retry5.get("job_id") or "")
+check("[5] 重试起了新 run（job 与第一轮不同）",
+      bool(job5b) and job5b != str(job5a.get("job_id")), str(retry5))
+rot5 = state.exec_read(D5)
+check("[5] 重试 T0 即作废旧死证（不再挂第一轮的 exit）",
+      (not rot5.get("exists")) or rot5.get("run_id") == job5b, str(rot5))
+check("[5] 任务.json.exec_run_id 已换成新 run",
+      str(task_of(D5).get("exec_run_id") or "") == job5b,
+      str(task_of(D5).get("exec_run_id")))
+ex5b = wait_for(lambda: (lambda e: e if e.get("exists") else None)(state.exec_read(D5)), 60)
+rec5b = wait_for(lambda: (lambda r: r if r.get("status") in ("done", "failed") else None)(
+    hub_api.HUB_JOBS.get(job5b) or {}), 30) or {}
+print(f"    第二轮：job={job5b} 退出码={ex5b} job 记录 exit_code={rec5b.get('exit_code')}")
+check("[5] 新 run 死证 run_id == 本次 exec_run_id（判据 1）",
+      bool(ex5b) and ex5b.get("run_id") == job5b
+      and str(task_of(D5).get("exec_run_id")) == ex5b.get("run_id"), str(ex5b))
+check("[5] 新 run exit_code 与 job 记录一致（判据 1）",
+      ex5b.get("exit_code") is not None
+      and ex5b.get("exit_code") == rec5b.get("exit_code"),
+      f"exit={ex5b.get('exit_code')} job={rec5b.get('exit_code')}")
+old5 = str(job5a.get("job_id") or "")
+state.exec_write(D5, run_id=old5, pid=int(job5a.get("pid") or 0), exit_code=3,
+                 outcome="failed", error_tail="late-write-from-old-run")
+after5 = state.exec_read(D5)
+check("[5] 旧 run 迟到写被拒：文件仍是新 run 的死证（判据 2）",
+      after5.get("run_id") == job5b and after5.get("error_tail") != "late-write-from-old-run",
+      str(after5))
+view5 = state.exec_snapshot(D5)                 # 真跑完后的快照（心跳 + 退出码 + 所有者令牌）
+dead5, code5 = state.judge_exec_dead({"state": "discussing"}, view5)
+print(f"    重试后快照：exit_run={view5.get('exit_run_id')} owner={view5.get('task_exec_run_id')} "
+      f"→ {code5}")
+check("[5] 重试后 E1 可命中（exec_exit_written，非退化到 E2）",
+      dead5 and code5 == "exec_exit_written"
+      and str(view5.get("exit_run_id") or "") == job5b
+      and str(view5.get("task_exec_run_id") or "") == job5b, f"{code5} / {view5}")
+BRIDGE.job_status = "running"
 
 # ================================================================ 汇总
 total = len(RESULTS)

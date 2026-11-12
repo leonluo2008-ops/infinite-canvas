@@ -653,7 +653,8 @@ def _spawn_process(task_dir: Path, *, kind: str, argv_builder) -> dict:
     """起一个**独立子进程**当执行体，父进程只负责派发与读取（AT-19 §1.2）。
 
     写序写死（任何一步失败都留得下可判定痕迹）：
-      T0  heartbeat_begin(exec="child") + 任务.json.exec_run_id=run_id   ← Popen 之前
+      T0  heartbeat_begin(exec="child") + 任务.json.exec_run_id=run_id
+          + 作废上一轮 执行体退出码.json                        ← Popen 之前
       T0+ Popen（Windows: CREATE_NO_WINDOW|CREATE_NEW_PROCESS_GROUP / POSIX: setsid）→ pid_created_at → heartbeat_attach
       之后 父进程**不再写心跳**，beat/finish/退出码全归子进程（单写者合同）
     """
@@ -662,6 +663,9 @@ def _spawn_process(task_dir: Path, *, kind: str, argv_builder) -> dict:
     try:
         state.heartbeat_begin(task_dir, run_id=job_id, phase=kind, exec="child")
         state.stamp_exec_run(task_dir, job_id)
+        # 换 run 即作废上一轮退出码：否则任务目录在整个新 run 期间挂着上一轮的死证
+        # （t_9eab1c56：重试后 执行体退出码.json 停在上一轮 run_id/exit_code）。
+        state.exec_rotate(task_dir)
     except Exception as exc:  # noqa: BLE001 —— 锚写失败不挡真正的工作，但要如实留痕
         print(f"[hub] 心跳起手/令牌写失败（{kind}/{job_id}）：{exc}", file=sys.stderr)
     HUB_JOBS[job_id] = {"status": "running", "kind": kind, "started": _now(),

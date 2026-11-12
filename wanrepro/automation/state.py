@@ -935,18 +935,55 @@ def exec_read(task_dir: Path) -> dict:
     return out
 
 
+def exec_owner(task_dir: Path) -> str:
+    """任务当前 run 所有者令牌（任务.json.exec_run_id）——exec 写盘的**权威**栅栏锚。
+
+    读不到（任务文件坏了 / 旧任务没有这个键）→ 返回 ""，调用方退回文件级保守栅栏。
+    """
+    try:
+        task = load(Path(task_dir))
+    except (StateError, OSError, ValueError):
+        return ""
+    return str((task or {}).get(EXEC_RUN_ID_KEY) or "")
+
+
+def exec_rotate(task_dir: Path) -> dict:
+    """换 run 时作废上一轮退出码（派发方 T0 调用，紧跟 `stamp_exec_run`）。
+
+    删文件而不是写空值：`exists=False` 才是「本次 run 还没写退出码」的语义
+    （`judge_exec_dead` 的 E1 只认 `exit_run == 本次 run` 的记录；挂上一轮的死证
+    对诊断只会误导读盘的人）。作废后旧执行体的迟到写由 `exec_write` 的所有者栅栏拒掉，
+    所以「先作废再被旧 run 补写回来」不可能发生。
+    """
+    target = exec_path(task_dir)
+    try:
+        target.unlink()
+    except FileNotFoundError:
+        pass
+    return exec_read(task_dir)
+
+
 def exec_write(task_dir: Path, *, run_id: str, pid: int = 0, exit_code: int | None = None,
                outcome: str = "", error_tail: str = "", reason_source: str = "") -> dict:
     """执行体退出前**一次**原子写（tmp + replace）。
 
-    栅栏：已有退出码且 run_id 不是本次 run → 不覆盖（旧执行体不许盖新 run 的死证）。
+    栅栏锚 = **任务.json.exec_run_id（当前 run 所有者）**，不是文件里上一次写的 run_id：
+      · run_id ≠ 所有者        → 旧执行体迟到写，直接拒（返回现有内容，不落盘）；
+      · run_id = 所有者        → 放行：新 run 必须能覆盖上一轮的死证（否则第一个 run 的
+        凭证成了不可变单槽，重试后 `执行体退出码.json` 永远停在上一轮）；
+      · 所有者缺失（旧任务/坏任务文件）→ 退回文件级保守栅栏（不覆盖别的 run 的死证）。
     唯一由父代写的例外：spawn 失败（outcome="spawn_failed"，父用同一 run_id 写）。
     """
     task_dir = Path(task_dir)
+    want = str(run_id or "")
     current = exec_read(task_dir)
-    if current.get("exists") and str(current.get("run_id") or "") not in ("", str(run_id)):
-        return current
-    payload = {"schema": 1, "run_id": str(run_id or ""), "pid": int(pid or 0),
+    owner = exec_owner(task_dir)
+    if owner:
+        if want != owner:
+            return current                  # 所有者已换人：旧执行体迟到写 → 拒
+    elif current.get("exists") and str(current.get("run_id") or "") not in ("", want):
+        return current                      # 无令牌（旧任务）：文件级保守栅栏
+    payload = {"schema": 1, "run_id": want, "pid": int(pid or 0),
                "exit_code": None if exit_code is None else int(exit_code),
                "outcome": str(outcome or ""),
                "error_tail": str(error_tail or "")[:2000],

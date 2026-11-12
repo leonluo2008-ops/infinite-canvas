@@ -188,6 +188,47 @@ check("[5] 900/60/300/900/30 逐值不变",
        state.LOST_RUN_WATCHDOG_SECONDS, state.STALE_JOB_SECONDS) == (900, 60, 300, 900),
       "见 state.py 常量段")
 
+print("\n[6] 重试凭证轮转：新 run 写得进 / 旧 run 迟到写仍被拒")
+RUN1, RUN2 = "run-111111111111", "run-222222222222"
+D7 = task_dir("auto-9906", st="discussing")
+state.stamp_exec_run(D7, RUN1)
+w1 = state.exec_write(D7, run_id=RUN1, pid=111, exit_code=3, outcome="failed", error_tail="round-1")
+check("[6] 第一轮：本轮所有者 run 写得进（run_id=RUN1 / exit 3）",
+      w1["run_id"] == RUN1 and w1["exit_code"] == 3, str(w1))
+state.stamp_exec_run(D7, RUN2)                 # 重试：T0 换所有者
+state.exec_rotate(D7)                          # 重试：T0 作废上一轮死证
+rot = state.exec_read(D7)
+check("[6] 重试轮转：上一轮死证被作废（exists=False，不再挂 exit=3）",
+      (not rot["exists"]) and rot["exit_code"] is None, str(rot))
+late1 = state.exec_write(D7, run_id=RUN1, pid=111, exit_code=3, outcome="failed",
+                         error_tail="late-from-old-run")
+after_late1 = state.exec_read(D7)
+check("[6] 旧 run 迟到写被拒：文件仍不存在（不把旧死证补写回来）",
+      (not after_late1["exists"]) and late1.get("exists") is False, str(after_late1))
+w2 = state.exec_write(D7, run_id=RUN2, pid=222, exit_code=3, outcome="failed",
+                      error_tail="round-2")
+t7 = json.loads((D7 / "任务.json").read_text(encoding="utf-8"))
+check("[6] 新 run 退出码落盘：run_id == 任务.json.exec_run_id 且 exit_code 一致",
+      w2["run_id"] == RUN2 and t7["exec_run_id"] == RUN2
+      and state.exec_read(D7)["exit_code"] == 3, f"{w2} / owner={t7.get('exec_run_id')}")
+state.exec_write(D7, run_id=RUN1, pid=111, exit_code=0, outcome="done",
+                 error_tail="late-after-new-cert")
+fin = state.exec_read(D7)
+check("[6] 新死证落盘后，旧 run 迟到写仍不得覆盖",
+      fin["run_id"] == RUN2 and fin["exit_code"] == 3
+      and fin["error_tail"] == "round-2", str(fin))
+
+D8 = TMP / "auto-9907"
+D8.mkdir(parents=True, exist_ok=True)
+(D8 / "任务.json").write_text(json.dumps({"local_id": "auto-9907", "state": "discussing",
+                                          "history": []}, ensure_ascii=False),
+                              encoding="utf-8")
+state.exec_write(D8, run_id="run-legacy-a", exit_code=3, outcome="failed")
+state.exec_write(D8, run_id="run-legacy-b", exit_code=9, outcome="failed")
+leg = state.exec_read(D8)
+check("[6] 无 exec_run_id 的旧任务：退回文件级保守栅栏（别的 run 不许覆盖）",
+      leg["run_id"] == "run-legacy-a" and leg["exit_code"] == 3, str(leg))
+
 total = len(RESULTS)
 passed = sum(1 for _, ok in RESULTS if ok)
 print(f"\n共 {total} 项断言：PASS {passed} / FAIL {total - passed}")
