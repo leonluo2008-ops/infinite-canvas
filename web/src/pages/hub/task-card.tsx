@@ -161,13 +161,61 @@ export function hubFailedReason(failed?: HubFailedView | null, fallbackError?: s
     return (failed?.reason || "").trim() || (fallbackError || "").trim() || FAILED_REASON_FALLBACK;
 }
 
+/**
+ * 云端原文证据块（直渲 failed_evidence，冻结 schema 原样展示）：
+ * · cloud_error.message 主行，error_type / finish_reason / attempts 有值才跟附属行；
+ * · cloud_raw 给 on_disk/missing 徽标（discuss.py 落的标记，前端只认值不重判）。
+ * 红线 §7.25：不解析 failed_reason 文案、不改 evidence 结构，只做直渲；
+ * 字段缺失就不渲染对应行/徽标，不造假占位。
+ */
+function CloudErrorEvidence({ evidence }: { evidence: Record<string, unknown> }) {
+    const cloud = evidence.cloud_error && typeof evidence.cloud_error === "object" && evidence.cloud_error !== null
+        ? (evidence.cloud_error as Record<string, unknown>) : null;
+    const cloudRaw = typeof evidence.cloud_raw === "string" ? evidence.cloud_raw : "";
+    const message = cloud ? String(cloud.message ?? "").trim() : "";
+    const meta: string[] = [];
+    if (cloud) {
+        const errorType = String(cloud.error_type ?? "").trim();
+        const finish = cloud.finish_reason;
+        if (errorType) meta.push(`错误类型 ${errorType}`);
+        if (finish !== null && finish !== undefined && String(finish).trim()) meta.push(`finish_reason=${String(finish).trim()}`);
+        if (typeof cloud.attempts === "number" && cloud.attempts > 0) meta.push(`尝试 ${cloud.attempts} 次`);
+    }
+    const onDisk = cloudRaw === "on_disk";
+    const missing = cloudRaw === "missing";
+    if (!message && !onDisk && !missing) return null;
+    return (
+        <div
+            className="mt-2 rounded-md border border-red-200/70 bg-white/60 px-2.5 py-2 text-xs dark:border-red-900/60 dark:bg-red-950/30"
+            data-hub-cloud-error={message ? "1" : ""}
+            data-hub-cloud-raw={onDisk ? "on_disk" : missing ? "missing" : ""}
+        >
+            <div className="flex items-center justify-between gap-2">
+                <span className="text-red-600/80 dark:text-red-400/80">云端原文</span>
+                {onDisk || missing ? (
+                    <span className={onDisk
+                        ? "rounded border border-emerald-300 bg-emerald-50 px-1.5 py-0.5 font-mono text-emerald-700 dark:border-emerald-800 dark:bg-emerald-950/40 dark:text-emerald-300"
+                        : "rounded border border-stone-300 bg-stone-100 px-1.5 py-0.5 font-mono text-stone-500 dark:border-stone-600 dark:bg-stone-800/60 dark:text-stone-400"}>
+                        {onDisk ? "on_disk 已落盘" : "missing 未落盘"}
+                    </span>
+                ) : null}
+            </div>
+            {message ? <div className="mt-1 min-w-0 whitespace-pre-wrap break-words font-medium text-red-700 dark:text-red-300">{message}</div> : null}
+            {meta.length ? <div className="mt-1 break-words font-mono text-red-600/80 dark:text-red-400/80">{meta.join(" · ")}</div> : null}
+        </div>
+    );
+}
+
 export function FailedReasonLine({ failed, fallbackError = "" }: { failed?: HubFailedView | null; fallbackError?: string }) {
+    const evidence = failed?.evidence || null;
     return (
         <div className="rounded-md border border-red-200 bg-red-50 p-3 dark:border-red-950 dark:bg-red-950/20" data-hub-failed-reason={failed?.reason ? "backend" : fallbackError ? "history" : "empty"}>
             <div className="flex items-start gap-2 text-sm text-red-700 dark:text-red-300">
                 <CircleAlert className="mt-0.5 size-4 shrink-0" />
-                <div className="min-w-0 break-words">{hubFailedReason(failed, fallbackError)}</div>
+                {/* whitespace-pre-wrap：failed_reason 是多行文本（云端原文主位+附属行），不许折成一长句 */}
+                <div className="min-w-0 whitespace-pre-wrap break-words">{hubFailedReason(failed, fallbackError)}</div>
             </div>
+            {evidence ? <CloudErrorEvidence evidence={evidence} /> : null}
             {failed?.at ? <div className="mt-1 pl-6 text-xs text-red-600/80 dark:text-red-400/80">失败时间 {hubClockText(failed.at)}</div> : null}
         </div>
     );
