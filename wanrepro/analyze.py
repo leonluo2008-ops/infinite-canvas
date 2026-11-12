@@ -358,6 +358,20 @@ def mark_stage(outdir: Path, stage: str, error: str | None = None) -> None:
         pass
 
 
+def mark_failure(outdir: Path, step: str, code: int, detail: str = "") -> None:
+    """桥侧失败的**唯一**进度写法：进度.json = {stage:"失败", error:"<步骤>失败（退出码 N[；细节]）"}。
+
+    职责边界（与 automation/discuss.py 的失败回写配对）：
+      · 本文件（桥侧）只写 analysis/reverse/<id>/进度.json，**不写** 任务.json；
+      · 错误原文的主通道是 stderr——由 bridge（ui/server.py::analyze_video）采集尾部
+        并原样放进 /api/job 的 error 字段；这里补的是**机器可判定**的「哪一步 + 退出码」，
+        供轮询端在 job 记录丢失（服务重启）时仍能判失败并用同一套文案呈现；
+      · 同一句写进 history 由 discuss.py 负责，两边同源不同盘，不互相覆盖。
+    """
+    tail = f"；{detail}" if detail else ""
+    mark_stage(outdir, "失败", f"{step}失败（退出码 {code}{tail}）")
+
+
 def local_layer_check(disc: Path, extract_mod) -> tuple[bool, str]:
     """不调模型，只按 extract.py 的规矩复核十层。复用它的正则，不另写一套。"""
     try:
@@ -686,7 +700,7 @@ def main(argv: list[str] | None = None) -> int:
     code, state = stage_extract(video, video_id, outdir, extract_mod, current_intent,
                                 model=args.model, base_url=args.base_url, api_key=args.api_key)
     if code != EXIT_OK:
-        mark_stage(outdir, "失败", f"拆解失败（退出码 {code}，详见日志）")
+        mark_failure(outdir, "拆解", code, "详见日志")
         return code
     disc = outdir / DISC_NAME
 
@@ -697,7 +711,7 @@ def main(argv: list[str] | None = None) -> int:
         disc, outdir, current_intent, refresh=(state == "重跑")
     )
     if code != EXIT_OK:
-        mark_stage(outdir, "失败", f"清单生成失败（退出码 {code}）")
+        mark_failure(outdir, "清单生成", code)
         return code
     check = outdir / CHECK_NAME
 
@@ -706,7 +720,7 @@ def main(argv: list[str] | None = None) -> int:
     mark_stage(outdir, "专项判定")       # 按清单逐行判三档建议
     code, _intent_state = stage_intent(disc, check, outdir, current_intent)
     if code != EXIT_OK:
-        mark_stage(outdir, "失败", f"意图建议失败（退出码 {code}）")
+        mark_failure(outdir, "意图建议", code)
         return code
 
     # 两阶段：不带 --yes 就停在这里
@@ -732,7 +746,7 @@ def main(argv: list[str] | None = None) -> int:
     mark_stage(outdir, "投影")           # 提示词 + 资产清单落盘（轮询端「拉投影」读的就是它）
     code = stage_render(video_id, tpl_name)
     if code != EXIT_OK:
-        mark_stage(outdir, "失败", f"渲染失败（退出码 {code}）")
+        mark_failure(outdir, "渲染", code)
         return code
 
     prompt_path = outdir / f"提示词-{tpl_name}.md"
@@ -740,7 +754,7 @@ def main(argv: list[str] | None = None) -> int:
     missing = [p.name for p in (check, prompt_path, assets_path) if not p.is_file()]
     if missing:
         print(f"ERROR 渲染报成功，但缺产物：{'、'.join(missing)}", file=sys.stderr)
-        mark_stage(outdir, "失败", f"渲染报成功但缺产物：{'、'.join(missing)}")
+        mark_failure(outdir, "渲染", EXIT_LAYER, f"报成功但缺产物：{'、'.join(missing)}")
         return EXIT_LAYER
 
     # 5) 拆解产物门禁（AT-15 R1）：判下游真正消费的东西；不合格 → 按诊断自动重拆（上限 2 次）

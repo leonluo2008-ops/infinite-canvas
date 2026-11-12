@@ -11,8 +11,11 @@
 """
 import argparse
 import json
+import re
 import sys
+import threading
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 from . import bridge, config, state
@@ -151,6 +154,151 @@ def _fmt_wait(seconds: float) -> str:
     return f"{total // 60}分{total % 60}秒"
 
 
+# ---------------------------------------------------------------- 失败回写（桥侧原文 → 任务.json）
+#
+# 职责边界（本模块内唯一一套）：
+#   · analyze.py（桥侧）只写 `analysis/reverse/<bridge_id>/进度.json`，失败写
+#     {"stage": "失败", "error": "<步骤>失败（退出码 N）"}；它**不碰** 任务.json。
+#   · 本模块只写任务目录的 `任务.json`（失败原因/history/证据），**不写** 进度.json。
+#   · 桥侧 stderr 尾部由 ui/server.py::analyze_video 采集，原样拼进 /api/job 的 error 字段
+#     （形如「analyze.py 退出 3：<stderr 尾部>」）——这是错误原文的主通道；进度.json 的
+#     error 是结构化备用通道（job 记录随服务重启丢掉时只剩它）。
+#
+# 同一次失败只允许一次任务态迁移：所有任务级失败都经 _fail_task 落盘，它按
+# 「state 已 failed 且原因相同 → 不动盘」幂等；看门狗（fail_orphan_task，AT-18 唯一降级
+# 入口）先按冻结文案判死、随后桥侧原文才到的场景，只升级原因，不写 history、不刷新 failed_at。
+# 与 hub 侧退出码文件回写不重叠：那条链只在「执行体已不存在」时降级，本模块只在
+# run_discuss 活着并把失败报出来的路径里降级，二者互斥。
+
+_BRIDGE_EXIT_RE = re.compile(r"analyze\.py 退出 (\d+)")
+_PROGRESS_EXIT_RE = re.compile(r"退出码 (\d+)")
+_FAIL_LOCK = threading.RLock()      # 同进程内多执行体（hub 每任务一线程）串行化失败回写
+
+
+def _now_iso() -> str:
+    """与 state._now() 同格式（本地时区带偏移、秒精度）——失败原因与 history 同一口径。"""
+    return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+
+
+def _is_fallback_reason(text: str) -> bool:
+    """是否 AT-18 冻结文案（= 兜底句，不是错误原文）。"""
+    t = str(text or "").strip()
+    return bool(t) and (t == state.FAKE_RUN_REASON_FALLBACK
+                        or t in set(state.FAKE_RUN_REASONS.values()))
+
+
+def _task_failure(message: str, *, bridge_error: str | None = None,
+                  exit_code: int | None = None, source: str = "discuss") -> "DiscussError":
+    """造一个任务级失败异常，并把「原文」随异常带出（调用方不必解析文案）。
+
+    bridge_error：
+      · None → 不是桥侧失败，原文就是 str(e) 这条诊断；
+      · ""   → 是桥侧失败但原文缺失（job.error 与 进度.json 都空）→ 走冻结文案兜底；
+      · 非空 → 桥侧原文（原样写进 failed_reason，禁改写）。
+    """
+    err = DiscussError(message)
+    err.bridge_error = bridge_error
+    err.exit_code = exit_code
+    err.fail_source = source
+    return err
+
+
+def _bridge_failure(rec: dict) -> tuple[str, int | None]:
+    """从 /api/job 的 error 记录取（桥侧原文, 退出码）——不改写原文，只归一取字段。"""
+    raw = rec.get("error")
+    if isinstance(raw, dict):
+        text = str(raw.get("message") or raw.get("error") or "").strip()
+    else:
+        text = str(raw or "").strip()
+    if not text:
+        text = str(rec.get("stderr_tail") or rec.get("detail") or "").strip()
+    code: int | None = None
+    m = _BRIDGE_EXIT_RE.search(text)
+    if m:
+        code = int(m.group(1))
+    elif isinstance(rec.get("exit"), int):
+        code = int(rec["exit"])
+    return text, code
+
+
+def _progress_failure(bridge_id: str) -> tuple[str, int | None]:
+    """读桥侧 进度.json 的失败标记（analyze.py 唯一写者）→ (error, 退出码)。
+
+    只在 job 记录丢了（服务重启 → JOBS 内存态丢失）或 job.error 为空时用；
+    进度.json 不是「失败」阶段一律返回 ("", None)——正在跑的任务不许被判失败。
+    """
+    tid = str(bridge_id or "").strip()
+    if not tid:
+        return "", None
+    try:
+        data = json.loads((_ANALYSIS_ROOT / tid / "进度.json").read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return "", None
+    if not isinstance(data, dict) or str(data.get("stage") or "") != "失败":
+        return "", None
+    text = str(data.get("error") or "").strip()
+    code = data.get("退出码")
+    if not isinstance(code, int):
+        m = _PROGRESS_EXIT_RE.search(text)
+        code = int(m.group(1)) if m else None
+    return text, code
+
+
+def _fail_task(task_dir: Path, reason: str, *, source: str = "discuss",
+               exit_code: int | None = None) -> dict:
+    """任务级失败 → failed 的唯一写入口（discuss 侧）。返回 {changed, already?, reason}。
+
+    · 原文优先：有原文写原文；原文缺失（reason 为空）才用 AT-18 冻结文案兜底，
+      本模块**不新造**第二套用户可见文案；
+    · 幂等：已是 failed 且原因相同 → 不动盘（不写 history、不刷新 failed_at）——
+      同一次失败被重复触发不会产生第二次状态迁移；
+    · 原文升级：先前已按兜底句判死、随后拿到原文 → 只改 failed_reason（+证据来源），
+      不写 history、不刷新 failed_at（「兜底句只在原文缺失时用」由此保证）。
+    """
+    task_dir = Path(task_dir)
+    with _FAIL_LOCK:
+        task = state.load(task_dir)
+        cur = str(task.get("state") or "")
+        text = str(reason or "").strip()
+        fallback = not text
+        if fallback:
+            text = state.fake_run_reason(cur or "discussing")
+        now = _now_iso()
+
+        if cur == "failed":
+            old = str(task.get("failed_reason") or "")
+            if old == text:
+                return {"changed": False, "already": True, "reason": old}
+            if _is_fallback_reason(old) and not _is_fallback_reason(text):
+                evidence = task.get("failed_evidence")
+                evidence = dict(evidence) if isinstance(evidence, dict) else {}
+                evidence.update({"trigger": str(source or "bridge_exit"),
+                                 "decided_at": now,
+                                 "exit_code": exit_code if exit_code is not None
+                                 else evidence.get("exit_code")})
+                evidence["reason_upgraded_from"] = old
+                task["failed_reason"] = text
+                task["failed_evidence"] = evidence
+                state.save(task_dir, task)
+                return {"changed": True, "upgraded": True, "reason": text, "was": old}
+            # 已有真实原因（不是兜底句）：先到的原文为准，后续重复触发一律不动盘
+            return {"changed": False, "already": True, "reason": old}
+
+        # 写盘前重读一次（与 state.fail_orphan_task 同纪律）：判定窗口内已被看门狗/别处
+        # 降级 → 本次不再迁移，改走「已 failed」分支（幂等或原文升级），保证只一条 failed 迁移。
+        if str(state.load(task_dir).get("state") or "") == "failed":
+            return _fail_task(task_dir, reason, source=source, exit_code=exit_code)
+
+        state.transition(task_dir, "failed", note=text,
+                         extra={"failed_reason": text,
+                                "failed_at": now,
+                                "failed_evidence": {"trigger": str(source or "discuss"),
+                                                    "decided_at": now,
+                                                    "exit_code": exit_code,
+                                                    "fallback_text": fallback}})
+        return {"changed": True, "already": False, "reason": text}
+
+
 def start_and_wait(task: dict, on_stage=None, on_heartbeat=None,
                    heartbeat_interval: float | None = None) -> str:
     """POST lapian/run（409 排队重试）→ 轮询 job 至 done/error。返回 job id。
@@ -215,11 +363,16 @@ def start_and_wait(task: dict, on_stage=None, on_heartbeat=None,
             rec = bridge.get(f"/api/job/{job}")
         except bridge.BridgeError as e:
             if "HTTP 404" in str(e):
-                # 服务重启过（JOBS 丢）——产物优先：产物在就判完成
+                # 服务重启过（JOBS 丢）——产物优先：产物在就判完成；否则看桥侧进度文件
                 if _products_ready(task["bridge_id"]):
                     print("  [恢复] job 404 但产物齐——判已完成")
                     return job
-                raise DiscussError(f"job 丢失（桥重启）且产物未齐: {e}") from None
+                text, code = _progress_failure(task["bridge_id"])
+                if text:
+                    raise _task_failure(f"桥侧拆解失败（原文）: {text}",
+                                        bridge_error=text, exit_code=code,
+                                        source="bridge_exit") from None
+                raise _task_failure(f"job 丢失（桥重启）且产物未齐: {e}") from None
             raise
         st = rec.get("status")
         if st == "done":
@@ -227,8 +380,13 @@ def start_and_wait(task: dict, on_stage=None, on_heartbeat=None,
             _emit_gate_summary(task, on_stage=_emit)
             return job
         if st == "error":
-            _emit(f"失败：{rec.get('error')}")
-            raise DiscussError(f"桥侧拆解失败（原文）: {rec.get('error')}")
+            text, code = _bridge_failure(rec)
+            if not text:
+                # job.error 空 → 结构化备用通道（analyze.py 写的 进度.json）
+                text, code = _progress_failure(task["bridge_id"])
+            _emit(f"失败：{text or '桥侧未记下原因'}")
+            raise _task_failure(f"桥侧拆解失败（原文）: {text}" if text else "桥侧拆解失败（原文缺失）",
+                                bridge_error=text, exit_code=code, source="bridge_exit")
         stage = str(rec.get("stage") or "")
         if stage and stage != last_stage:
             last_stage = stage
@@ -241,7 +399,8 @@ def start_and_wait(task: dict, on_stage=None, on_heartbeat=None,
             if elapsed >= next_beat:
                 _beat(elapsed)
                 next_beat = elapsed + beat_every      # 一次只补一行，不追赶补发
-    raise DiscussError(f"拆解超 {POLL_MAX_SECONDS}s 未完成（job={job}）——不判失败，可重跑续查")
+    raise _task_failure(f"拆解超 {POLL_MAX_SECONDS}s 未完成（job={job}）——按失败落盘，可重试续查"
+                        "（重跑产物优先，不再盲重发）")
 
 
 def run_discuss(task_dir: Path, *, verbose: bool = True, on_stage=None, on_heartbeat=None) -> str:
@@ -251,10 +410,13 @@ def run_discuss(task_dir: Path, *, verbose: bool = True, on_stage=None, on_heart
     on_heartbeat(msg)：远程等待心跳回调，透传给 start_and_wait（只追加日志行，不碰阶段/锚）。
 
     失败语义分级（审计 WARN「busy=排队不记 failed」同类）：
-      · 任务级失败（桥报 error / done 但产物缺 / job 丢失且产物未齐）
-        → failed 终态，history 记原文；
-      · 环境级故障（桥连不上 / 超时放弃）→ 状态不迁移（留 ingested/discussing），
+      · 任务级失败（桥报 error / done 但产物缺 / job 丢失且产物未齐 / 轮询超时）
+        → failed 终态：failed_reason 写**桥侧原文**（job.error 的 stderr 尾部，或
+          进度.json 的结构化 error），原文缺失才用 AT-18 冻结文案兜底；history 记同一句；
+      · 环境级故障（桥连不上 / 非 404 的 HTTP 故障）→ 状态不迁移（留 ingested/discussing），
         重跑本命令即续——环境恢复不该把任务判死。
+    写盘职责：本函数只写 `任务.json`（state.transition / _fail_task），进度.json 归桥侧
+    analyze.py，两边不互相覆盖，故同一次失败只产生一条 failed 迁移。
     """
     task = state.load(task_dir)
     cur = task["state"]
@@ -302,7 +464,15 @@ def run_discuss(task_dir: Path, *, verbose: bool = True, on_stage=None, on_heart
             print(f"[环境故障] {task['local_id']}: {e} —— 状态保留 discussing，重跑续")
         raise
     except DiscussError as e:
-        state.transition(task_dir, "failed", note=str(e))
+        # 任务级失败：唯一写入口落盘——桥侧原文优先，缺失才用冻结文案兜底；
+        # 幂等（同一失败重复触发不再迁移），并只写 任务.json（进度.json 归桥侧）。
+        raw = getattr(e, "bridge_error", None)
+        info = _fail_task(task_dir,
+                          str(e) if raw is None else str(raw or ""),
+                          source=str(getattr(e, "fail_source", "") or "discuss"),
+                          exit_code=getattr(e, "exit_code", None))
+        if verbose:
+            print(f"[FAIL] {task['local_id']}: → failed（原因：{info.get('reason')}）")
         raise
 
 
