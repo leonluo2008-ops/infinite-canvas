@@ -9,10 +9,12 @@
  *  [A] splitFailedReason：只按后端固定行标记挑样式，**逐字等式**（分段拼回 === 原文）；
  *      未知前缀/新增行一律留主展示区——不吞字段、不改写、不推断。
  *  [B] CloudFailurePanel：云端原文等宽 + 可换行 + 全文不截断（长消息尾部也在），有附属行时分次要样式；
- *      「云端原文：未落盘（…）」照常展示；两处都空 → 渲染 null（交回既有兜底句，不造第二套文案）。
- *  [C] 详情页接线（OutcomeSection SSR 真代码）：failed 态看到面板 + 重试；done 态零面板（成功页不变）。
- *  [D] 改动边界：面板只消费后端文案（不出现错误分类关键词 / 不 replace / 不读 evidence），
- *      drawer 里只有一个挂载点且长在 failed 分支内。
+ *      「云端原文：未落盘（…）」照常展示；两处都空 → 渲染 null（交回既有兜底句，不造第二套文案）；
+ *      右上角 on_disk/missing 徽标 1 处（cloud_raw 字面值，缺/坏值零徽标），不二次渲染云端 error 正文。
+ *  [C] 详情页接线（OutcomeSection SSR 真代码）：failed 态看到面板 + 重试；done 态零面板（成功页不变）；
+ *      面板是 failed 区**唯一**主展示件（正文 1 次 / main 钩子 1 个 / 徽标 1 处），drawer 零 FailedReasonLine。
+ *  [D] 改动边界：面板只消费后端文案（不出现错误分类关键词 / 不 replace / evidence 只认 cloud_raw 徽标值），
+ *      drawer 里只有一个挂载点且长在 failed 分支内，且不再挂载 FailedReasonLine。
  *
  * 跑法：cd web && node scripts/probe-cloudraw-front.mjs      （失败 rc=1）
  */
@@ -174,6 +176,20 @@ const missingHtml = ssr.renderPanel({ reason: REASON_MISSING, at: "" });
 check("[B] 未落盘：文案原样可见 + 无附属区", missingHtml.includes("云端原文：未落盘（未找到 analysis/rev-abc/拆解错误.json：旧产物或非云端失败）") && missingHtml.includes('data-hub-cloud-failure-aux="0"') && !missingHtml.includes("data-hub-cloud-failure-auxlist"), missingHtml.slice(0, 200));
 check("[B] 未落盘：转述行也在（原转述逐字保留）", missingHtml.includes("analyze.py 退出 3：ERROR API 失败：接口返回 error"), "");
 
+// 落盘徽标（本卡：从 FailedReasonLine/CloudErrorEvidence 迁进面板，钩子沿用 data-hub-cloud-raw）
+console.log("2b) 面板自带 on_disk/missing 徽标（详情页唯一落盘徽标落点）");
+check("[B] 徽标 on_disk：面板内 1 处、文案 = 「on_disk 已落盘」", (html.match(/data-hub-cloud-raw="on_disk"/g) || []).length === 1 && html.includes("on_disk 已落盘"), String((html.match(/data-hub-cloud-raw=/g) || []).length));
+check("[B] 徽标 missing：面板内 1 处、文案 = 「missing 未落盘」", (() => {
+    const missingBadge = ssr.renderPanel({ reason: REASON_MISSING, evidence: { cloud_raw: "missing" } });
+    return (missingBadge.match(/data-hub-cloud-raw="missing"/g) || []).length === 1 && missingBadge.includes("missing 未落盘");
+})(), "");
+check("[B] 无 cloud_raw 字段 → 零徽标（不造占位）", !/data-hub-cloud-raw/.test(ssr.renderPanel({ reason: REASON_LONG })) && !/data-hub-cloud-raw/.test(longHtml), "");
+check("[B] 坏值（非 on_disk/missing）→ 零徽标（只认字面值）", !/data-hub-cloud-raw/.test(ssr.renderPanel({ reason: REASON_MISSING, evidence: { cloud_raw: "ON_DISK" } })), "");
+check("[B] 徽标不重复正文：正文区不出现第二遍 cloud_error.message", (() => {
+    const again = ssr.renderPanel({ reason: REASON_ON_DISK, evidence: { cloud_raw: "on_disk", cloud_error: { message: CLOUD_MSG, error_type: "api_error", attempts: 3 } } });
+    return (again.match(new RegExp(REAL_401_REQUEST_ID, "g")) || []).length === 1 && (again.match(/data-hub-cloud-failure-main/g) || []).length === 1;
+})(), "");
+
 const historyHtml = ssr.renderPanel(null, "DiscussError: bridge timeout");
 check("[B] 老任务回落 history 尾注（钩子=history）", historyHtml.includes('data-hub-cloud-failure="history"') && historyHtml.includes("DiscussError: bridge timeout"), historyHtml.slice(0, 200));
 
@@ -222,6 +238,9 @@ check("[C] failed 态：云端原文面板在主展示位（面板在失败红�
     const retryIdx = failedOutcome.indexOf("重试");
     return panelIdx > 0 && failedOutcome.includes("data-hub-cloud-failure-main") && failedOutcome.includes(REAL_401_MESSAGE) && retryIdx > panelIdx;
 })(), failedOutcome.slice(0, 240));
+// 本卡：面板是详情页 failed 区**唯一**主展示件——云端原文正文 / 主展示区 / 落盘徽标各只出现 1 次
+check("[C] 唯一主展示件：云端原文正文（含 request id）整页只出现 1 次", (failedOutcome.match(new RegExp(REAL_401_REQUEST_ID, "g")) || []).length === 1, String((failedOutcome.match(new RegExp(REAL_401_REQUEST_ID, "g")) || []).length));
+check("[C] 唯一主展示件：data-hub-cloud-failure-main 全页 1 个、徽标 1 处", (failedOutcome.match(/data-hub-cloud-failure-main/g) || []).length === 1 && (failedOutcome.match(/data-hub-cloud-raw/g) || []).length === 1, `${(failedOutcome.match(/data-hub-cloud-failure-main/g) || []).length}/${(failedOutcome.match(/data-hub-cloud-raw/g) || []).length}`);
 check("[C] failed 态：重试入口仍在（不吞既有动作面）", /data-hub-gen-retry/.test(failedOutcome) || /重\s?试/.test(failedOutcome), "");
 check("[C] failed 态：说明行不再谎称「错误原文未返回」", !failedOutcome.includes("任务失败，错误原文未返回。") && failedOutcome.includes("失败原因见上方原文（后端原样透传，未改写）。"), "");
 
@@ -246,8 +265,9 @@ const panelSlice = (() => {
 check("[D] 面板函数体可定位", panelSlice.length > 300, String(panelSlice.length));
 check("[D] 不出现错误分类关键词（不根据错误文本推断原因）", !/401|403|429|超时|限流|余额|余额不足|invalid_token/i.test(panelSlice), (panelSlice.match(/401|403|429|超时|限流|余额|invalid_token/gi) || []).join(","));
 check("[D] 不改写文案：函数体无 replace/slice/正则解析", !/\.replace\(|\.slice\(|\/\.\w+\/\.test/.test(panelSlice), "");
-check("[D] 不读 evidence（不自行取证据重判；只渲染 failed.reason / error）", !/evidence/.test(panelSlice), "");
+check("[D] evidence 只认 cloud_raw 徽标值：不读 cloud_error / 不二次渲染 message", /cloudRawOf/.test(panelSlice) && !/cloud_error/.test(panelSlice) && !/\.message/.test(panelSlice), "");
 check("[D] drawer 里只有一个挂载点", (drawerSrc.match(/<CloudFailurePanel/g) || []).length === 1, String((drawerSrc.match(/<CloudFailurePanel/g) || []).length));
+check("[D] drawer 零 FailedReasonLine（不双挂载：云端原文只由面板出一次）", !/<FailedReasonLine/.test(drawerSrc) && !/FailedReasonLine/.test(drawerSrc.match(/^import[\s\S]*?from "\.\/task-card";$/m)?.[0] || ""), String((drawerSrc.match(/FailedReasonLine/g) || []).length));
 check("[D] 挂载点长在 failed 分支内（不在 done / 生成设置分支）", (() => {
     const branch = drawerSrc.indexOf('if (state === "failed")');
     const mount = drawerSrc.indexOf("<CloudFailurePanel");

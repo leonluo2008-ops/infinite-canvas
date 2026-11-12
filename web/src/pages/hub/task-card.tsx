@@ -175,12 +175,18 @@ export function hubFailedReason(failed?: HubFailedView | null, fallbackError?: s
  */
 export type FailedRowSummary = { firstLine: string; cloudRaw: "on_disk" | "missing" | "" };
 
+/**
+ * `evidence.cloud_raw` 的字面值（后端 discuss.py 落的落盘标记，前端只认值不重判）。
+ * 缺字段 / 坏值一律返回空串——不造占位、不推断「应该落盘了」。
+ */
+export function cloudRawOf(failed?: HubFailedView | null): "on_disk" | "missing" | "" {
+    const raw = failed?.evidence && typeof failed.evidence === "object" ? failed.evidence.cloud_raw : "";
+    return raw === "on_disk" ? "on_disk" : raw === "missing" ? "missing" : "";
+}
+
 export function failedRowSummary(failed?: HubFailedView | null, fallbackError = ""): FailedRowSummary {
     const firstLine = (hubFailedReason(failed, fallbackError).split("\n")[0] || "").trimEnd();
-    const evidence = failed?.evidence;
-    const raw = evidence && typeof evidence === "object" ? evidence.cloud_raw : "";
-    const cloudRaw = raw === "on_disk" ? "on_disk" : raw === "missing" ? "missing" : "";
-    return { firstLine, cloudRaw };
+    return { firstLine, cloudRaw: cloudRawOf(failed) };
 }
 
 /**
@@ -319,10 +325,16 @@ export function splitFailedReason(reason?: string | null): FailedReasonSegment[]
  * 不根据错误文本推断原因、不覆盖 / 改写后端文案、不丢未知行。「云端原文：未落盘（…）」这类文案
  * 同样原样展示（它没有附属标记，落在主展示区）。
  * `data-hub-cloud-failure` 是渲染钩子：backend=后端 failed.reason / history=老任务 error 尾注。
+ *
+ * 右上角 `on_disk/missing` 徽标取 `evidence.cloud_raw` 字面值（`cloudRawOf`）：这是详情页唯一的落盘
+ * 徽标落点——原先由 FailedReasonLine 的证据块出，那一件在详情页已不再挂载（同一句云端原文会被
+ * 渲染第二遍），徽标随之迁到这里，`data-hub-cloud-raw` 钩子不变。徽标只认 cloud_raw 字面值，
+ * **不碰** evidence 里的云端 error 结构（正文已由 `failed.reason` 全量承载，再渲染一遍就是重复）。
  */
 export function CloudFailurePanel({ failed, fallbackError = "" }: { failed?: HubFailedView | null; fallbackError?: string }) {
     const backend = (failed?.reason || "").trim();
     const history = (fallbackError || "").trim();
+    const cloudRaw = cloudRawOf(failed);
     const segments = splitFailedReason(backend || history);
     if (!segments.length) return null; // 两处都空 → 交回既有兜底句（这里不造第二套文案）
     // 主展示：无标记行（按契约就是首行的云端原文；未落盘文案也在这里）
@@ -338,9 +350,21 @@ export function CloudFailurePanel({ failed, fallbackError = "" }: { failed?: Hub
             data-hub-cloud-failure={backend ? "backend" : "history"}
             data-hub-cloud-failure-aux={aux.length ? "1" : "0"}
         >
-            <div className="flex items-center gap-1.5 text-xs font-medium text-red-700 dark:text-red-300">
-                <CircleAlert className="size-3.5 shrink-0" />
-                失败详情（后端原文，原样展示）
+            <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="flex items-center gap-1.5 text-xs font-medium text-red-700 dark:text-red-300">
+                    <CircleAlert className="size-3.5 shrink-0" />
+                    失败详情（后端原文，原样展示）
+                </div>
+                {cloudRaw ? (
+                    <span
+                        className={cloudRaw === "on_disk"
+                            ? "shrink-0 rounded border border-emerald-300 bg-emerald-50 px-1.5 py-0.5 font-mono text-[10px] leading-4 text-emerald-700 dark:border-emerald-800 dark:bg-emerald-950/40 dark:text-emerald-300"
+                            : "shrink-0 rounded border border-stone-300 bg-stone-100 px-1.5 py-0.5 font-mono text-[10px] leading-4 text-stone-500 dark:border-stone-600 dark:bg-stone-800/60 dark:text-stone-400"}
+                        data-hub-cloud-raw={cloudRaw}
+                    >
+                        {cloudRaw === "on_disk" ? "on_disk 已落盘" : "missing 未落盘"}
+                    </span>
+                ) : null}
             </div>
             {main ? (
                 <div
