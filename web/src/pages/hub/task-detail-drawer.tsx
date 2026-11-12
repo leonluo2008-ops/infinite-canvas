@@ -45,6 +45,7 @@ import { useConfigStore, type AiConfig } from "@/stores/use-config-store";
 import {
     approveHubTask,
     confirmHubReplace,
+    deleteHubSelfcheckWhitelist,
     errorText,
     forceFinishHubTask,
     getHubTask,
@@ -58,8 +59,10 @@ import {
     hubQuickPhaseText,
     hubReworkGate,
     hubReworkUnknownSteps,
+    hubWhitelistGate,
     normalizeSelfCheck,
     postHubAsset,
+    postHubSelfcheckWhitelist,
     probeHubAssets,
     readApprovedDraft,
     releaseHubTask,
@@ -81,6 +84,7 @@ import {
     type HubSelfCheckFinding,
     type HubSelfCheckItem,
     type HubSelfCheckSegment,
+    type HubSelfcheckWhitelistEntry,
     type HubSuggestion,
     type HubTaskDetail,
     type HubTaskSummary,
@@ -1976,6 +1980,22 @@ type DescEditApi = {
 };
 const DescEditContext = createContext<DescEditApi | null>(null);
 
+/** AT-22 E4：自检误报豁免（行 × 词键）的一键动作与台账。
+ *
+ *  只搬四件事：起态门（`hubWhitelistGate` 唯一口径）、台账（`自检②的豁免`，回落任务.json 的
+ *  `selfcheck_whitelist`）、加白/撤销函数、忙态。**不搬判定**——「这个词该不该豁免」「豁免后算不算
+ *  通过」都由服务端与重跑后的自检束说话（红线 25：按钮只发 API）。
+ */
+type WhitelistApi = {
+    gate: { enabled: boolean; reason: string };
+    busy: boolean;
+    entries: HubSelfcheckWhitelistEntry[];
+    keep: (rows: number[], word: string) => Promise<void>;
+    remove: (row: number, word: string) => Promise<void>;
+    removeAll: () => Promise<void>;
+};
+const WhitelistContext = createContext<WhitelistApi | null>(null);
+
 /* hub-asset-exit:begin —— 受控资产出口（AT-16 B1a）。
    全 drawer **唯一**允许把资产引用赋给 <img src> / <a href> 的地方：只收 ref 原串，
    内部过 hubAssetRefView()（= hub-api 显示层唯一换算点 hubAssetDisplayUrl）出 src/href。
@@ -2210,8 +2230,34 @@ export function PromptSection({
         }),
         [cardsByNo, descGate, busy, editingRow, saveDesc, onWritten],
     );
+    // AT-22 E4：豁免台账优先取生产者台账（自检②的「豁免」，带状态/原因），回落任务.json 原样透出。
+    const residueItem = detail.自检?.find((item) => item.项 === "绑图行残留") ?? null;
+    const whitelistEntries = useMemo<HubSelfcheckWhitelistEntry[]>(
+        () => (residueItem?.豁免?.length
+            ? residueItem.豁免
+            : (detail.selfcheck_whitelist?.条目 ?? [])),
+        [residueItem, detail.selfcheck_whitelist],
+    );
+    const whitelistGate = useMemo(() => hubWhitelistGate(detail.state || ""), [detail.state]);
+    const keepWord = useCallback(async (rows: number[], word: string) => {
+        await postHubSelfcheckWhitelist(localId, { 行: rows, 词: word });
+        onWritten?.();                       // 重取详情：这一代自检与台账一起刷新（不乐观更新）
+    }, [localId, onWritten]);
+    const removeWord = useCallback(async (row: number, word: string) => {
+        await deleteHubSelfcheckWhitelist(localId, { 行: [row], 词: word });
+        onWritten?.();
+    }, [localId, onWritten]);
+    const removeAllWords = useCallback(async () => {
+        await deleteHubSelfcheckWhitelist(localId, { 全部: true });
+        onWritten?.();
+    }, [localId, onWritten]);
+    const whitelistApi = useMemo<WhitelistApi>(() => ({
+        gate: whitelistGate, busy: Boolean(busy), entries: whitelistEntries,
+        keep: keepWord, remove: removeWord, removeAll: removeAllWords,
+    }), [whitelistGate, busy, whitelistEntries, keepWord, removeWord, removeAllWords]);
     return (
         <DescEditContext.Provider value={descApi}>
+        <WhitelistContext.Provider value={whitelistApi}>
         <section className="rounded-lg border border-stone-200 bg-card p-4 dark:border-stone-800" data-hub-prompt-section>
             <div className="flex min-w-0 flex-wrap items-center gap-2" data-hub-prompt-head>
                 <h2 className="flex min-w-0 items-center gap-1.5 text-sm font-semibold">
@@ -2248,6 +2294,7 @@ export function PromptSection({
                 </div>
             )}
         </section>
+        </WhitelistContext.Provider>
         </DescEditContext.Provider>
     );
 }
@@ -2409,10 +2456,18 @@ function SelfCheckFold({ item }: { item: HubSelfCheckItem }) {
 }
 
 /** 一张 finding 卡：位置段（第 N 行「短名」·共用图·缩略图·定位）→ 命中词 → 上下文高亮 → 动作位。 */
-function SelfCheckCardView({ card, itemKey }: { card: SelfCheckCard; itemKey: string }) {
+function SelfCheckCardView({ card, itemKey, wordRows }: {
+    card: SelfCheckCard;
+    itemKey: string;
+    /** AT-22 E4：同一个词在本次自检里还命中哪些行（服务端 `发现[].行号` 的唯一来源）——
+     *  只用于「保留第 6 行 / 几行一起保留」的选择，**不参与判定**。 */
+    wordRows: Record<string, number[]>;
+}) {
     const { message } = App.useApp();
     const assetStates = useContext(AssetStateContext);
     const descApi = useContext(DescEditContext);
+    const whitelist = useContext(WhitelistContext);
+    const [askWord, setAskWord] = useState<string | null>(null);
     const lastWrite = useRef<HubAssetWriteResult | null>(null);
     const first = card.findings[0];
     const rowNo = card.行号;
@@ -2462,6 +2517,22 @@ function SelfCheckCardView({ card, itemKey }: { card: SelfCheckCard; itemKey: st
     const state = first.图引用 ? assetStates[first.图引用] : "";
     const hit = words.length > 1 ? `这句里的${words.map((word) => `『${word}』`).join("")}还在提示词里：`
         : words.length === 1 ? `『${words[0]}』还在提示词里：` : "";
+
+    const keepWord = async (word: string, rows: number[]) => {
+        if (!whitelist) return;
+        setAskWord(null);
+        try {
+            await whitelist.keep(rows, word);
+            message.success(
+                rows.length > 1
+                    ? `已保留「${word}」：第 ${rows.join("、")} 行都不再为它提醒（自检已重跑）`
+                    : `已保留「${word}」：这一行的这一项不再为它提醒（自检已重跑）`,
+            );
+        } catch (error) {
+            message.error(`没能保留「${word}」：${errorText(error)}`);
+        }
+    };
+    const rowsOfAsk = askWord === null ? [] : (wordRows[askWord] ?? (rowNo === null ? [] : [rowNo]));
 
     return (
         <article
@@ -2523,11 +2594,35 @@ function SelfCheckCardView({ card, itemKey }: { card: SelfCheckCard; itemKey: st
                             </Button>
                         </Tooltip>
                     ) : null}
-                    {words.map((word) => (
-                        <Tooltip key={word} title={`这个词是原物的，按我们的产品保留（E4 落地后可用）：${word}`}>
-                            <Button size="small" type="text" disabled data-hub-selfcheck-keep={word}>保留这个词</Button>
-                        </Tooltip>
-                    ))}
+                    {words.map((word) => {
+                        // AT-22 E4：豁免是**次级**路径（左主右次：改描述在前），只对「该行×该词」生效；
+                        // 同一个词还在别的行命中时先问「哪几行」——存储永远是行级多条，批量只是便利。
+                        const rowsOfWord = rowNo === null ? [] : (wordRows[word] ?? [rowNo]);
+                        const gate = whitelist?.gate ?? { enabled: false, reason: "这条详情还没接上自检面板" };
+                        const disabled = !gate.enabled || Boolean(whitelist?.busy) || rowNo === null;
+                        return (
+                            <Tooltip
+                                key={word}
+                                title={gate.enabled
+                                    ? `按你的裁量保留「${word}」：以后自检不再为它提醒（只对第 ${rowNo} 行生效，可随时撤销）`
+                                    : gate.reason}
+                            >
+                                <Button
+                                    size="small"
+                                    type="text"
+                                    disabled={disabled}
+                                    data-hub-selfcheck-keep={word}
+                                    onClick={() => {
+                                        if (rowNo === null || !whitelist) return;
+                                        if (rowsOfWord.length > 1) setAskWord(word);
+                                        else void keepWord(word, [rowNo]);
+                                    }}
+                                >
+                                    保留这个词
+                                </Button>
+                            </Tooltip>
+                        );
+                    })}
                 </div>
             ) : null}
             {editing && rowNo !== null && descApi ? (
@@ -2566,6 +2661,30 @@ function SelfCheckCardView({ card, itemKey }: { card: SelfCheckCard; itemKey: st
                     }}
                 />
             ) : null}
+            <Modal
+                open={askWord !== null}
+                title="这个词在不止一行还留在正文里"
+                footer={null}
+                onCancel={() => setAskWord(null)}
+                data-hub-selfcheck-keep-ask={askWord ?? ""}
+            >
+                <div className="space-y-3 text-sm text-stone-600 dark:text-stone-300">
+                    <div>
+                        『{askWord}』在第 {rowsOfAsk.join("、")} 行都还在正文里。要保留哪几行？
+                    </div>
+                    <div className="flex flex-wrap gap-2">
+                        <Button data-hub-selfcheck-keep-one onClick={() => void keepWord(String(askWord), [rowNo as number])}>
+                            只保留第 {rowNo} 行
+                        </Button>
+                        <Button type="primary" data-hub-selfcheck-keep-rows onClick={() => void keepWord(String(askWord), rowsOfAsk)}>
+                            一起保留（{rowsOfAsk.length} 行）
+                        </Button>
+                        <Button type="text" data-hub-selfcheck-keep-cancel onClick={() => setAskWord(null)}>
+                            取消
+                        </Button>
+                    </div>
+                </div>
+            </Modal>
         </article>
     );
 }
@@ -2577,6 +2696,20 @@ function SelfCheckItemView({ item }: { item: HubSelfCheckItem }) {
     const say = item.说明;
     const failed = item.结论 !== "PASS";
     const cards = say ? selfCheckCards(say.发现 ?? []) : [];
+    // AT-22 E4：同一个词在本次自检里还命中哪些行（唯一来源 = 服务端 发现[].行号），
+    // 只用于「只保留第 N 行 / 几行一起保留」的选择，不参与判定。
+    const wordRows = useMemo(() => {
+        const map: Record<string, number[]> = {};
+        for (const finding of say?.发现 ?? []) {
+            const word = finding.词;
+            const rowNo = finding.行号;
+            if (!word || rowNo === null) continue;
+            map[word] = Array.from(new Set([...(map[word] ?? []), rowNo])).sort((a, b) => a - b);
+        }
+        return map;
+    }, [say]);
+    const 豁免 = item.豁免 ?? [];
+    const 生效数 = 豁免.filter((entry) => !entry.状态 || entry.状态 === "生效").length;
     const v2 = cards.some((card) => card.findings.some((finding) => finding.词 || finding.行称呼 || finding.片段 || finding.人话));
     const shown = v2 ? cards.slice(0, 3) : [];
     const rest = v2 ? cards.slice(3) : [];
@@ -2604,8 +2737,15 @@ function SelfCheckItemView({ item }: { item: HubSelfCheckItem }) {
                             {say.结论人话}
                         </div>
                     ) : null}
+                    {豁免.length && !failed ? (
+                        <div className="break-words text-stone-600 dark:text-stone-300" data-hub-selfcheck-exempt>
+                            {生效数
+                                ? `其中 ${生效数} 个词是按你的裁量保留的（可撤销，见下方「已按你的裁量保留」）`
+                                : `${豁免.length} 个豁免条目已失效（可撤销，见下方「已按你的裁量保留」）`}
+                        </div>
+                    ) : null}
                     {shown.map((card) => (
-                        <SelfCheckCardView key={card.key} card={card} itemKey={item.项} />
+                        <SelfCheckCardView key={card.key} card={card} itemKey={item.项} wordRows={wordRows} />
                     ))}
                     {rest.length ? (
                         <div className="break-words text-stone-500 dark:text-stone-400" data-hub-selfcheck-more>
@@ -2634,6 +2774,102 @@ function SelfCheckItemView({ item }: { item: HubSelfCheckItem }) {
                 </div>
             )}
         </div>
+    );
+}
+
+/** AT-22 E4：「已按你的裁量保留」面板——台账逐条可查、逐条可撤，全部撤销也在这里。
+ *
+ *  数据源：`自检②的豁免`（生产者台账，带状态与原因），回落 `get_task.selfcheck_whitelist.条目`
+ *  （老/异常态）。失效条目不自动删：灰显 + 原因 + 撤销，决定权留在人手里（方案 §3.3/§4.3）。
+ */
+function WhitelistPanel() {
+    const { message } = App.useApp();
+    const whitelist = useContext(WhitelistContext);
+    if (!whitelist || !whitelist.entries.length) return null;
+    const entries = whitelist.entries;
+    const active = entries.filter((entry) => !entry.状态 || entry.状态 === "生效");
+    const locked = !whitelist.gate.enabled;
+    const confirmAll = () => {
+        Modal.confirm({
+            title: `撤销全部 ${entries.length} 个词的豁免？`,
+            content: "撤销后自检立即重跑，被保留的词会重新计入「提示词里的老词」。",
+            okText: "全部撤销",
+            cancelText: "取消",
+            onOk: async () => {
+                try {
+                    await whitelist.removeAll();
+                    message.success(`已撤销 ${entries.length} 个词，自检已重跑`);
+                } catch (error) {
+                    message.error(`撤销失败：${errorText(error)}`);
+                }
+            },
+        });
+    };
+    return (
+        <details className="w-full min-w-0" data-hub-whitelist data-hub-whitelist-count={entries.length}>
+            <summary className="cursor-pointer list-none text-xs text-stone-500 [&::-webkit-details-marker]:hidden dark:text-stone-400">
+                已按你的裁量保留 {entries.length} 个词
+                {active.length !== entries.length ? `（${active.length} 个生效）` : ""}
+            </summary>
+            <div className="mt-1.5 space-y-1 rounded-md border border-stone-200 bg-stone-50/60 p-2 dark:border-stone-800 dark:bg-stone-900/30">
+                {entries.map((entry) => {
+                    const status = entry.状态 || "生效";
+                    const live = status === "生效";
+                    return (
+                        <div
+                            key={`${entry.行}:${entry.词}`}
+                            className={`flex flex-wrap items-center gap-2 text-xs ${live ? "text-stone-700 dark:text-stone-200" : "text-stone-400 dark:text-stone-500"}`}
+                            data-hub-whitelist-row={`${entry.行}:${entry.词}`}
+                            data-hub-whitelist-state={status}
+                        >
+                            <span className="font-medium">第 {entry.行} 行</span>
+                            <span>「{entry.词}」</span>
+                            <span data-hub-whitelist-status>
+                                {live ? "生效" : `${status}`}
+                                {!live && entry.原因 ? ` —— ${entry.原因}` : ""}
+                            </span>
+                            <Button
+                                size="small"
+                                type="text"
+                                className="ml-auto shrink-0"
+                                disabled={locked || whitelist.busy}
+                                data-hub-whitelist-remove={`${entry.行}:${entry.词}`}
+                                onClick={async () => {
+                                    try {
+                                        await whitelist.remove(entry.行, entry.词);
+                                        message.success(`已撤销：第 ${entry.行} 行的「${entry.词}」重新计入自检`);
+                                    } catch (error) {
+                                        message.error(`撤销失败：${errorText(error)}`);
+                                    }
+                                }}
+                            >
+                                撤销
+                            </Button>
+                        </div>
+                    );
+                })}
+                {entries.length >= 2 ? (
+                    <Button
+                        size="small"
+                        type="text"
+                        disabled={locked || whitelist.busy}
+                        data-hub-whitelist-remove-all
+                        onClick={confirmAll}
+                    >
+                        全部撤销
+                    </Button>
+                ) : null}
+                {locked && whitelist.gate.reason ? (
+                    <div className="text-[11px] text-stone-400 dark:text-stone-500">{whitelist.gate.reason}</div>
+                ) : null}
+                {entries.length > 5 ? (
+                    // 方案 §6.2：白名单不是 E1 的替代品——条目一多就是「词表口径没收干净」的信号。
+                    <div className="text-[11px] text-stone-400 dark:text-stone-500" data-hub-whitelist-hint>
+                        保留的词有点多了：可能是词表口径没收干净，值得回头收口径（别用白名单兜底）
+                    </div>
+                ) : null}
+            </div>
+        </details>
     );
 }
 
@@ -2680,6 +2916,7 @@ function SelfCheckPanel({ items, gateItem }: { items: HubSelfCheckItem[] | null;
                     ) : null}
                 </div>
             ) : null}
+            <WhitelistPanel />
             {gateItem ? <GateBadge item={gateItem} /> : null}
         </div>
     );

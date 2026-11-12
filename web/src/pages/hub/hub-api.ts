@@ -322,6 +322,45 @@ export type HubSelfCheckItem = {
     证据: string;
     /** AT-16 B2 话术（生产者侧同源）；旧结构缺失 → undefined（读层降级，不改历史文件）。 */
     说明?: HubSelfCheckExplain;
+    /** AT-22 E4：本条检查的豁免台账（生产者产出，前端只渲染不重判）；没白名单 → 缺省。 */
+    豁免?: HubSelfcheckWhitelistEntry[];
+};
+
+/** AT-22 E4：白名单条目（任务.json `selfcheck_whitelist.条目` 原样透出的形状）。
+ *
+ *  唯一键 = (`行`, `词键`)；判定只认这两列，`图号`/`上下文` 只是加入当时的证据快照。
+ *  `状态`/`原因` 是**台账**（`自检.json` item② 的 `豁免` 里才有）：生效 / 失效-正文无此词 /
+ *  失效-行没绑图 / 失效-行不存在 / 未参与-不在词表。
+ */
+export type HubSelfcheckWhitelistEntry = {
+    行: number;
+    词: string;
+    词键?: string;
+    来源?: string;
+    图号?: number | null;
+    上下文?: string;
+    加入于?: string;
+    状态?: string;
+    原因?: string;
+};
+
+/** AT-22 E4：`任务.json.selfcheck_whitelist`（v1）——空列表 = 没豁免；老任务没有这个键。 */
+export type HubSelfcheckWhitelist = {
+    版本?: number;
+    更新于?: string;
+    条目: HubSelfcheckWhitelistEntry[];
+};
+
+/** 加白/撤销的响应：写后自检重跑的那一束（前端就地刷新，不再二次拉详情）。 */
+export type HubSelfcheckWhitelistResult = {
+    ok?: boolean;
+    task_id?: string;
+    state?: string;
+    selfcheck_whitelist?: HubSelfcheckWhitelist;
+    自检?: HubSelfCheckItem[] | null;
+    新增?: number;
+    已存在?: number;
+    移除?: number;
 };
 
 /** 批准前音频门禁结果（AT-17 B2b）：服务端 generate.run_audio_gate 落任务文件、get_task 透出。
@@ -341,6 +380,8 @@ export type HubTaskDetail = HubTaskSummary & {
     prompt_md: string;
     /** AT-9 B5 自检三项（渲染完成自动跑）；旧任务无文件 → null → 前端显「未检查」。 */
     自检?: HubSelfCheckItem[] | null;
+    /** AT-22 E4：误报豁免白名单（任务.json 原样透出）；老任务/没豁免 → null（前端视为空）。 */
+    selfcheck_whitelist?: HubSelfcheckWhitelist | null;
     /** 拆解实时阶段（bridge job stage 回写）；拆解中卡片显示。 */
     lapian_stage?: string;
     /** 批准前音频门禁结果（AT-17 B2b）；没跑过/老任务 → null（前端不显示，不当成通过）。 */
@@ -710,9 +751,43 @@ export function normalizeSubmitView(value: unknown): HubSubmitView {
     };
 }
 
+/** 白名单条目归一（AT-22 E4）：只搬真值 + 畸形片段丢弃（与 E2「透传不解析」同一条纪律）。
+ *
+ *  `状态`/`原因` 是生产者台账的原话，逐字带过——前端**不**重算「这条到底生不生效」。
+ */
+export function normalizeWhitelistEntries(value: unknown): HubSelfcheckWhitelistEntry[] {
+    if (!Array.isArray(value)) return [];
+    const out: HubSelfcheckWhitelistEntry[] = [];
+    for (const raw of value) {
+        if (!raw || typeof raw !== "object") continue;
+        const item = raw as JsonRecord;
+        const no = Number(item["行"]);
+        const word = hubText(item["词"]);
+        if (!Number.isInteger(no) || no < 1 || !word) continue;
+        const entry: HubSelfcheckWhitelistEntry = { 行: no, 词: word };
+        const key = hubText(item["词键"]);
+        if (key) entry.词键 = key;
+        const from = hubText(item["来源"]);
+        if (from) entry.来源 = from;
+        const image = Number(item["图号"]);
+        if (Number.isInteger(image) && image > 0) entry.图号 = image;
+        const context = hubText(item["上下文"]);
+        if (context) entry.上下文 = context;
+        const added = hubText(item["加入于"]);
+        if (added) entry.加入于 = added;
+        const status = hubText(item["状态"]);
+        if (status) entry.状态 = status;
+        const why = hubText(item["原因"]);
+        if (why) entry.原因 = why;
+        out.push(entry);
+    }
+    return out;
+}
+
 /** 自检归一：无文件/畸形 → null（「未检查」）；条目缺字段逐项兜底，结论非 PASS 一律按 ⚠ 显示。
  *  AT-16 B2：生产者话术字段（说明）**原样透传**——不在这里读「证据」文字派生任何结论
- *  （红线 25）；缺说明（旧结构）→ undefined，由展示层降级。 */
+ *  （红线 25）；缺说明（旧结构）→ undefined，由展示层降级。
+ *  AT-22 E4：`豁免` 台账字段同样原样透传（只做形状兜底，不重算条目状态）。 */
 export function normalizeSelfCheck(value: unknown): HubSelfCheckItem[] | null {
     if (!Array.isArray(value) || !value.length) return null;
     return value.map((raw) => {
@@ -726,6 +801,8 @@ export function normalizeSelfCheck(value: unknown): HubSelfCheckItem[] | null {
         if (shown) row.项显示名 = shown;
         const 说明 = normalizeSelfCheckExplain(item["说明"]);
         if (说明) row.说明 = 说明;
+        const 豁免 = normalizeWhitelistEntries(item["豁免"]);   // AT-22 E4：原样透传，不重算
+        if (豁免.length) row.豁免 = 豁免;
         return row;
     });
 }
@@ -1067,6 +1144,62 @@ export function hubDescEditGate(state: string): { enabled: boolean; reason: stri
         failed: "失败态：先点「重试」回到可编辑状态",
     };
     return { enabled: false, reason: reasons[s] || `当前状态（${s || "未知"}）不能改描述` };
+}
+
+/** 加白（AT-22 E4）：`POST /api/hub/task/<id>/selfcheck-whitelist`。
+ *
+ *  `行` 永远是行号数组——**存储永远是行级多条**，「同词多行一起保留」只是 UI 便利（方案 §4.2）。
+ *  服务端写后立刻重跑自检，响应自带这一代 `自检` 束，前端不必二次拉详情。
+ */
+export async function postHubSelfcheckWhitelist(
+    localId: string,
+    payload: { 行: number[]; 词: string },
+): Promise<HubSelfcheckWhitelistResult> {
+    return request<HubSelfcheckWhitelistResult>(
+        `/api/hub/task/${encodeURIComponent(localId)}/selfcheck-whitelist`,
+        {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ 行: payload.行, 词: payload.词 }),
+        },
+    );
+}
+
+/** 撤销豁免（AT-22 E4）：同一条路由的 DELETE 支（`全部: true` = 全撤）。 */
+export async function deleteHubSelfcheckWhitelist(
+    localId: string,
+    payload: { 行?: number[]; 词?: string; 全部?: boolean },
+): Promise<HubSelfcheckWhitelistResult> {
+    return request<HubSelfcheckWhitelistResult>(
+        `/api/hub/task/${encodeURIComponent(localId)}/selfcheck-whitelist`,
+        {
+            method: "DELETE",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload),
+        },
+    );
+}
+
+/** 改豁免的起态门（AT-22 E4 §4.5 唯一口径，与后端 `hub_api.WL_REFUSALS` 同序）。
+ *
+ *  只有 `awaiting_approval` 能改：自检只在渲染完才有结论，已批准/生成中的清单与提交快照已绑定
+ *  （要改先走既有「撤销批准」）。纯函数：探针直接 import 断言，不在页面里复制第二份状态表。
+ */
+export function hubWhitelistGate(state: string): { enabled: boolean; reason: string } {
+    const s = String(state || "");
+    if (s === "awaiting_approval") return { enabled: true, reason: "" };
+    const reasons: Record<string, string> = {
+        ingested: "任务还没开始拆解：先点「发起拆解」，自检跑完再改豁免",
+        ingesting: "视频还在入库：等它渲染出提示词、自检跑完再改豁免",
+        discussing: "拆解还没跑完：等提示词出来、自检跑完再改豁免",
+        awaiting_assets: "提示词还没出来（待置换区）：自检跑完才有可豁免的词",
+        rendering: "正在渲染：等提示词出来（待审批）再改豁免",
+        approved: "已批准：先点「撤销批准」回到待批准，再改豁免",
+        generating: "正在生成：改豁免会让自检口径和已提交的片子对不上",
+        done: "已完成：成片已出，这条不能再改豁免",
+        failed: "失败态：先点「重试」回到可审批状态",
+    };
+    return { enabled: false, reason: reasons[s] || `当前状态（${s || "未知"}）不能改豁免` };
 }
 
 /** 本地引用串形态（与 automation/local_assets.py 的 REF_RE 逐字对齐）：local:任务号/asset-uploads/16位hex.扩展名 */

@@ -28,6 +28,7 @@ import json
 import re
 import sys
 import traceback
+import unicodedata
 from bisect import bisect_right
 from pathlib import Path
 
@@ -561,7 +562,10 @@ def _check_all(task_dir: Path) -> list[dict]:
     lines = _checklist_lines(ck_path)
     return [
         _check_order(body, ents, row_to_no, submitted, ck_path, groups, labels, lines),
-        _check_residue(body, ents, render, bridge_id, labels, lines),
+        # AT-22 E4：白名单取**同一份任务快照**（上面 state.load 那一次），判定层不新增读盘——
+        # 否则自检跑到一半任务文件被改，会得到「半新半旧」的豁免口径。
+        _check_residue(body, ents, render, bridge_id, labels, lines,
+                       whitelist=task.get(WHITELIST_FIELD)),
         _check_lock(rows, must_rows, submitted, ack_rows, empty_confirm, ko_rows, groups, labels, lines),
         _check_groups(ents, row_to_no, submitted, groups, labels, lines),
     ]
@@ -670,6 +674,138 @@ def _check_order(body: str, ents, row_to_no: dict[int, int],
                         统计=stats, 清单行=_lines_block([p.get("行号") for p in problems], lines))}
 
 
+WHITELIST_FIELD = "selfcheck_whitelist"
+WHITELIST_VERSION = 1
+WHITELIST_MAX = 50                                  # 单任务上限（触顶 = 词表口径有病的信号）
+WHITELIST_WORD_MIN, WHITELIST_WORD_MAX = 3, 20      # V2 同值（残留词表只收 ≥3 字）
+
+
+def word_key(word: str) -> str:
+    """词键（唯一判定口径）：NFKC + strip + casefold。
+
+    现状词表全是汉字（`entity_noun_core` 已 strip 非汉字），词键与原文相同；存下来是为了 E1 将来
+    放宽到含字母/全角时不用改数据，也让「条目为什么失效」可 diff、可排障。
+    """
+    return unicodedata.normalize("NFKC", str(word or "")).strip().casefold()
+
+
+def whitelist_entries(container) -> list[dict]:
+    """`任务.json.selfcheck_whitelist` → 条目列表（畸形/缺字段一律丢弃，不猜、不补默认行）。
+
+    `空列表 = 没豁免`；老任务没有这个键 → `[]`。读侧只认 (`行`, `词键`) 两列真值，别的字段
+    （来源/图号/上下文/加入于）都是证据，缺失不影响判定。
+    """
+    if not isinstance(container, dict):
+        return []
+    raw = container.get("条目")
+    if not isinstance(raw, list):
+        return []
+    out: list[dict] = []
+    for it in raw:
+        if not isinstance(it, dict):
+            continue
+        try:
+            row = int(it.get("行") or 0)
+        except (TypeError, ValueError):
+            continue
+        key = word_key(it.get("词键") or it.get("词") or "")
+        if row < 1 or not key:
+            continue
+        out.append({**it, "行": row, "词键": key})
+    return out
+
+
+def row_word_closure(bridge_id: str) -> dict[int, dict]:
+    """每行的残留词表闭包（服务端校验白名单的**同一口径**：render.residue_words，不另写一份）。
+
+    返回 {行号: {"类别", "已传图", "不查", "图号", "词": {词键: 词}, "来源": {词键: core|gram}}}。
+    写路径的 V1/V3/V4 全查这张表——「词必须在这一行本次的词表里」是防整句/任意词混进来的硬闸。
+    """
+    out: dict[int, dict] = {}
+    if not bridge_id:
+        return out
+    render = _load_render()
+    ck_path = replace.checklist_path(bridge_id)
+    if not ck_path.is_file():
+        return out
+    ents = render.parse_checklist(ck_path)
+    render.assign_numbers(ents, replace.load_groups(bridge_id),
+                          replace.load_row_decisions(bridge_id))
+    for e in ents:
+        core = render.residue_core(e)
+        words = render.residue_words(e)
+        out[int(e.row_no)] = {
+            "类别": str(e.kind),
+            "已传图": bool(e.no and e.has_asset_image),
+            "不查": e.kind.startswith("品牌视觉"),
+            "图号": int(e.no or 0),
+            "词": {word_key(w): w for w in words},
+            "来源": {word_key(w): ("core" if w == core else "gram") for w in words},
+        }
+    return out
+
+
+def _split_exempt(row_no, words: list[str], exempt: set[tuple[int, str]]) -> tuple[list[str], list[str]]:
+    """一行原物词表 → (保留待查的, 被豁免的)。**唯一过滤点**：词表已成型、还没与正文比对。"""
+    kept: list[str] = []
+    dropped: list[str] = []
+    for word in words:
+        (dropped if (int(row_no), word_key(word)) in exempt else kept).append(word)
+    return kept, dropped
+
+
+def _exempt_ledger(entries: list[dict], ents, render, bound_rows: set[int],
+                   body: str) -> list[dict]:
+    """豁免台账（落 `自检.json` item② 的 `豁免`）：每条白名单这次到底管没管用，逐条说清。
+
+    失效条目**一律不自动删**（方案 §3.3）：自动删会在用户改回去时静默丢掉裁量；灰显 + 可撤销
+    把决定权留在人手里。五种状态与 UI 表现同表：
+      生效 / 失效-正文无此词 / 失效-行没绑图 / 失效-行不存在 / 未参与-不在词表
+    """
+    by_row: dict[int, list] = {}
+    for e in ents:
+        by_row.setdefault(int(e.row_no), []).append(e)
+    ledger: list[dict] = []
+    for it in entries:
+        row, key = int(it["行"]), str(it["词键"])
+        shown = str(it.get("词") or key)
+        item: dict = {"行": row, "词": shown, "词键": key}
+        if it.get("来源"):
+            item["来源"] = str(it["来源"])
+        if it.get("图号"):
+            item["图号"] = int(it["图号"])
+        if it.get("上下文"):
+            item["上下文"] = str(it["上下文"])[:40]
+        if row not in by_row:
+            item.update({"状态": "失效-行不存在", "原因": "清单里没有这一行了（清单重生成或删改过）"})
+        elif row not in bound_rows:
+            item.update({"状态": "失效-行没绑图", "原因": "这一行现在没有绑图，没有残留可豁免"})
+        else:
+            words = [w for e in by_row[row] for w in render.residue_words(e)]
+            hit = next((w for w in words if word_key(w) == key), "")
+            if not hit:
+                item.update({"状态": "未参与-不在词表", "原因": "词表口径已不含这个词，条目无害"})
+            elif not re.search(re.escape(hit), body):
+                item.update({"状态": "失效-正文无此词", "原因": "正文里已经没有这个词（改过描述后会失效）"})
+            else:
+                item.update({"状态": "生效", "词": hit, "原因": ""})
+        ledger.append(item)
+    return ledger
+
+
+def _exempt_note(active: list[dict], stale: list[dict]) -> str:
+    """豁免台账 → 证据里那一句。**永远可见**（不许静默通过），且只列已生效的，失效另起一句。"""
+    parts: list[str] = []
+    if active:
+        shown = "、".join(f"#{it['行']}「{it['词']}」" for it in active[:5])
+        parts.append(f"已按你的裁量保留 {len(active)} 个词：{shown}"
+                     + (f" 等 {len(active)} 个" if len(active) > 5 else ""))
+    if stale:
+        kinds = "、".join(dict.fromkeys(str(it["状态"]) for it in stale))
+        parts.append(f"{len(stale)} 个豁免条目已失效（{kinds}）")
+    return "；".join(parts)
+
+
 def _own_label_line(line: str, names: set[str]) -> bool:
     """实体自身标签行（AT-22 E1 R3）：`<命名>（<形态>）` 的孤立定义行。
 
@@ -688,7 +824,8 @@ def _own_label_line(line: str, names: set[str]) -> bool:
 
 def _check_residue(body: str, ents, render, bridge_id: str = "",
                    labels: dict[int, dict] | None = None,
-                   lines: dict[int, str] | None = None) -> dict:
+                   lines: dict[int, str] | None = None,
+                   whitelist: dict | None = None) -> dict:
     """② 绑图行残留：已传图行的原物核心词（实体名+特征词）零残留（词表=strip_core_residue 同源）。
 
     词表只收 ≥3 字的组：2 字组（香水/黑色这类品类与颜色词）不是特征词——我们的产品
@@ -701,9 +838,16 @@ def _check_residue(body: str, ents, render, bridge_id: str = "",
 
     AT-22 E2（呈现）：每条命中带 v2 槽位——词/句序/上下文/片段（同句多词在渲染层并成一张卡）、
     行称呼/图称呼/图引用（位置段与缩略图）、可修（E3 的动作声明）；`文字` 仍是检查器原句，`证据` 不变。
+
+    AT-22 E4（豁免）：`whitelist` = 任务.json 的 `selfcheck_whitelist`（调用方已在同一份任务快照里
+    读过，判定层**不新增读盘**）。过滤点唯一：词表成型后、与正文比对前由 `_split_exempt` 摘词；
+    摘掉的词按台账记进 `豁免`（生效/失效/未参与），命中项转 PASS 时必须把豁免写进证据——豁免是
+    **可见状态**，不是隐形通过。判定只认 (行, 词键)，图号不参与。
     """
     labels = labels or {}
     lines = lines or {}
+    entries = whitelist_entries(whitelist)
+    exempt = {(int(it["行"]), str(it["词键"])) for it in entries}
     bound = [e for e in ents
              if not e.kind.startswith("品牌视觉") and e.no and e.has_asset_image]
     names = {e.name for e in bound if e.name}
@@ -718,9 +862,9 @@ def _check_residue(body: str, ents, render, bridge_id: str = "",
     scanned: list[str] = []
     hits: list[dict] = []
     for e in bound:
-        words = render.residue_words(e)
-        scanned.append(f"#{e.row_no}→图{e.no}({len(words)}词)")
-        for w in words:
+        kept, _dropped = _split_exempt(e.row_no, render.residue_words(e), exempt)
+        scanned.append(f"#{e.row_no}→图{e.no}({len(kept)}词)")
+        for w in kept:
             for m in re.finditer(re.escape(w), body):
                 if _own_label_line(line_at(m.start()), names):
                     continue                    # 自指标签行不算残留证据，继续找后续真正文位置
@@ -734,14 +878,25 @@ def _check_residue(body: str, ents, render, bridge_id: str = "",
                                               片段=_segments(sentence, [w]) if sentence else None,
                                               可修={"类型": "改描述"})))
                 break
+    ledger = _exempt_ledger(entries, ents, render, {int(e.row_no) for e in bound}, body)
+    active = [it for it in ledger if it["状态"] == "生效"]
+    stale = [it for it in ledger if it["状态"] != "生效"]
+    note = _exempt_note(active, stale)
     ev = f"已传图行词表 {len(scanned)} 行（{'、'.join(scanned) or '无'}），正文 {len(body)} 字"
+    if note:
+        ev += "；" + note
     stats = {"词表行数": len(scanned), "正文字数": len(body),
              "行→图号": {str(e.row_no): int(e.no) for e in bound if e.no}}
+    extra = {"豁免": ledger} if ledger else {}
     if not hits:
+        say = "已传图的每一行，原物的名字和特征词都没残留在提示词正文里"
+        if active:
+            say += f"（其中 {len(active)} 个词按你的裁量保留）"
+        if stale:
+            say += f"；{len(stale)} 个豁免条目已失效，见「展开看证据」"
         return {"项": "绑图行残留", "结论": PASS, "项显示名": ITEM_DISPLAY["绑图行残留"],
-                "证据": "零残留｜" + ev,
-                "说明": _say("已传图的每一行，原物的名字和特征词都没残留在提示词正文里",
-                            处理="无需处理", 统计=stats)}
+                "证据": "零残留｜" + ev, **extra,
+                "说明": _say(say, 处理="无需处理", 统计=stats)}
     shown = "；".join(str(h["文字"]) for h in hits[:5])
     rows = list(dict.fromkeys(h["行号"] for h in hits if h.get("行号")))
     stats["词数"] = len(hits)
@@ -749,11 +904,14 @@ def _check_residue(body: str, ents, render, bridge_id: str = "",
     head = (f"提示词里还留着 {len(hits)} 个要换掉的原物词，都在{_row_phrase(rows[0], labels)}里"
             if len(rows) == 1 else
             f"提示词里还留着 {len(hits)} 个要换掉的原物词，分别在{_rows_phrase(rows, labels)}")
+    if active:
+        head += f"；另有 {len(active)} 个词按你的裁量保留"
     return {"项": "绑图行残留", "结论": FAIL, "项显示名": ITEM_DISPLAY["绑图行残留"],
-            "证据": shown + ("…" if len(hits) > 5 else "") + "｜" + ev,
+            "证据": shown + ("…" if len(hits) > 5 else "") + "｜" + ev, **extra,
             "说明": _say(head, 处理=HOW_DESC, findings=hits, 统计=stats,
                         清单行=_lines_block(rows, lines),
                         原句=_sentence_block(body, sent_spans, hits[0]))}
+
 
 
 def _check_lock(rows: list[dict], must_rows: list[int],

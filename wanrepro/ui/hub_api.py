@@ -565,6 +565,9 @@ def get_task(local_id: str) -> dict:
         # AT-17 B2b：批准前音频门禁结果（generate.run_audio_gate 落盘）——FAIL 时 UI 靠它
         # 说清「为什么批不了」；旧任务/未跑过门禁 → null（前端不显示，不当成通过）
         "audio_gate": task.get("audio_gate") or None,
+        # AT-22 E4：误报豁免白名单（任务.json 原样透出；老任务/没豁免 → null，前端视为空）。
+        # 详情页「已按你的裁量保留」面板读它，不依赖 自检.json 是否最新。
+        "selfcheck_whitelist": task.get(selfcheck.WHITELIST_FIELD) or None,
         "error": (task.get("history") or [{}])[-1].get("note", "")
         if task["state"] == "failed" else "",
         "gen": task.get("gen") or {},
@@ -1010,6 +1013,156 @@ def set_audio_mode(local_id: str, mode: str) -> dict:
             "prompt_chars": done.get("prompt_chars", 0),
             "prompt_md": _read(_prompt_path(task_dir, task)),
             "audio_gate": task.get("audio_gate") or None}
+
+
+# ---------------------------------------------------------------- AT-22 E4：误报豁免白名单
+
+# 白名单只收 awaiting_approval（V6）：自检只有渲染完（提示词已出、还没批准）才有结论，
+# 已批准的任务清单/正文口径已与提交快照绑定——要改就先走既有「撤销批准」受控回退。
+WL_STATE = "awaiting_approval"
+WL_REFUSALS = {
+    "ingested": "任务还没开始拆解：先点「发起拆解」，自检跑完再改豁免",
+    "ingesting": "视频还在入库：等它渲染出提示词、自检跑完再改豁免",
+    "discussing": "拆解还没跑完：等提示词出来、自检跑完再改豁免",
+    "awaiting_assets": "提示词还没出来（待置换区）：自检跑完才有可豁免的词",
+    "rendering": "正在渲染：等提示词出来（待审批）再改豁免",
+    "approved": "已批准：先点「撤销批准」回到待批准，再改豁免（批准后清单与提交快照已绑定）",
+    "generating": "正在生成：改豁免会让自检口径和已提交的片子对不上；等成片后再动",
+    "done": "已完成：成片已出，这条不能再改豁免——新需求请新建一条任务",
+    "failed": "失败态：先点「重试」回到可审批状态，再改豁免",
+}
+
+
+def whitelist_rows(payload: dict) -> list[int]:
+    """请求体 `行` → 行号列表（接受 `6` 或 `[5, 6]`；畸形一律 400，不猜）。"""
+    raw = (payload or {}).get("行")
+    if raw is None:
+        return []
+    values = raw if isinstance(raw, list) else [raw]
+    try:
+        rows = sorted({int(x) for x in values})
+    except (TypeError, ValueError):
+        raise HubInputError("「行」必须是清单行号或行号数组") from None
+    if any(r < 1 for r in rows):
+        raise HubInputError("「行」必须是正整数（待确认清单的行号）")
+    return rows
+
+
+def _whitelist_container(task: dict) -> dict:
+    """任务.json 里的白名单容器（缺/畸形 → 空容器；版本按当前值写回，不静默降版本）。"""
+    cur = task.get(selfcheck.WHITELIST_FIELD)
+    version = selfcheck.WHITELIST_VERSION
+    if isinstance(cur, dict):
+        try:
+            version = int(cur.get("版本") or version)
+        except (TypeError, ValueError):
+            version = selfcheck.WHITELIST_VERSION
+    return {"版本": version, "更新于": str((cur or {}).get("更新于") or "") if isinstance(cur, dict) else "",
+            "条目": selfcheck.whitelist_entries(cur)}
+
+
+def set_selfcheck_whitelist(local_id: str, rows: list[int] | None = None, *, word: str = "",
+                            remove: bool = False, remove_all: bool = False) -> dict:
+    """POST / DELETE `/api/hub/task/<id>/selfcheck-whitelist` —— 一键保留该词 / 撤销。
+
+    POST   body `{"行": 6 或 [5,6], "词": "右下角"}`   加白（**永远是行级多条**，批量只是 UI 便利）
+    DELETE body 同上（撤销这几行的这个词）或 `{"全部": true}`（全撤）
+
+    合同（方案 §2.3，错误一律 400/409 + 人话，不静默）：
+      V1 行必须存在于当前清单；V3 词键必须在该行本次词表闭包里（防整句/任意词混进来）；
+      V4 该行当前已传图；V5 单任务 ≤ 50 条；V6 状态 == awaiting_approval；V7 同 (行,词键) 幂等。
+    **撤销不受 V1/V3/V4 约束**：失效条目（行没了/没绑图/词表口径变了）必须能删，否则台账
+    只会越积越脏（方案 §3.3「失效一律不自动删，但必须可撤销」）。
+    只重跑自检，**不重渲染**：豁免不改任何渲染输入，重渲染会把纯判定动作耦合到 bridge 可用性上
+    （bridge 掉线时加不了白，正是被误报卡死的最坏时刻）。
+    """
+    task_dir = _task_dir(local_id)
+    word = str(word or "").strip()
+    key = selfcheck.word_key(word)
+    rows = sorted({int(r) for r in (rows or [])})
+    added = existed = removed = 0
+    with task_lock(local_id):
+        task = state.load(task_dir)
+        cur_state = str(task["state"])
+        if cur_state != WL_STATE:
+            raise HubError(WL_REFUSALS.get(cur_state, f"当前状态（{cur_state}）不能改豁免"),
+                           status=409)
+        container = _whitelist_container(task)
+        entries = list(container["条目"])
+
+        if remove_all:
+            removed = len(entries)
+            entries = []
+        else:
+            if not rows:
+                raise HubInputError("要改哪一行的豁免？请给「行」（清单行号或行号数组）")
+            if not key:
+                raise HubInputError("请给「词」——要保留（或撤销）的是 finding 上的那个词")
+            if not remove:
+                if not (selfcheck.WHITELIST_WORD_MIN <= len(key) <= selfcheck.WHITELIST_WORD_MAX):
+                    raise HubInputError(
+                        f"词长不合法（{len(key)} 字，要求 {selfcheck.WHITELIST_WORD_MIN}–"
+                        f"{selfcheck.WHITELIST_WORD_MAX} 字）：残留词表只收 ≥3 字的词")
+                closure = selfcheck.row_word_closure(str(task.get("bridge_id") or ""))
+                if not closure:
+                    raise HubError("读不到这次的待确认清单（清单还没生成或已失效）——刷新详情后重试",
+                                   status=409)
+                for r in rows:                       # V1 / V3 / V4
+                    if r not in closure:
+                        raise HubInputError(f"清单里没有第 {r} 行（现有 {sorted(closure)}）")
+                    row_info = closure[r]
+                    if row_info.get("不查"):
+                        raise HubError(f"第 {r} 行是品牌位，不参加残留检查，没有可豁免的词",
+                                       status=409)
+                    if not row_info.get("已传图"):
+                        raise HubError(f"第 {r} 行现在没有绑图，没有残留可豁免", status=409)
+                    if key not in row_info["词"]:
+                        raise HubInputError(
+                            f"『{word}』不在第 {r} 行的残留词表里（词表口径可能已变，"
+                            "刷新详情后重试）")
+                for r in rows:                       # V7 幂等
+                    if any(int(it["行"]) == r and str(it["词键"]) == key for it in entries):
+                        existed += 1
+                        continue
+                    entries.append({
+                        "行": r,
+                        "词": word,
+                        "词键": key,
+                        "来源": closure[r]["来源"].get(key, "gram"),
+                        "图号": int(closure[r].get("图号") or 0) or None,
+                        "加入于": state._now(),
+                        "操作人": "owner-hub",
+                    })
+                    added += 1
+                if len(entries) > selfcheck.WHITELIST_MAX:      # V5
+                    raise HubError(f"本任务已豁免 {len(entries)} 个词（上限 "
+                                   f"{selfcheck.WHITELIST_MAX}）——先查词表口径是不是没收干净，"
+                                   "别用白名单兜底", status=409)
+            else:
+                keep: list[dict] = []
+                for it in entries:
+                    if int(it["行"]) in rows and str(it["词键"]) == key:
+                        removed += 1
+                        continue
+                    keep.append(it)
+                if not removed:
+                    raise HubError(f"没有可撤销的条目：第 {'、'.join(str(r) for r in rows)} 行的"
+                                   f"『{word}』本来就不在豁免清单里", status=404)
+                entries = keep
+
+        if entries:
+            container = {"版本": selfcheck.WHITELIST_VERSION, "更新于": state._now(),
+                         "条目": entries}
+            task[selfcheck.WHITELIST_FIELD] = container
+        else:
+            task.pop(selfcheck.WHITELIST_FIELD, None)   # 空 = 没豁免，不留空壳
+        state.save(task_dir, task)
+        items = selfcheck.run_selfcheck(task_dir)        # 写后重跑自检（毫秒级、纯本地）
+    task = state.load(task_dir)
+    return {"ok": True, "task_id": local_id, "state": task["state"],
+            "selfcheck_whitelist": task.get(selfcheck.WHITELIST_FIELD)
+            or {"版本": selfcheck.WHITELIST_VERSION, "条目": []},
+            "自检": items, "新增": added, "已存在": existed, "移除": removed}
 
 
 def _spawn_discuss(task_dir: Path, first_line: str) -> dict:

@@ -2092,6 +2092,11 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         self.dispatch("GET")
 
+    def do_DELETE(self) -> None:
+        # AT-22 E4：撤销豁免走 DELETE（body 同 POST 的 {行, 词}，或 {"全部": true}）。
+        # dispatch 把非 GET 一律交给 route_post，路由内按 self.command 分流。
+        self.dispatch("DELETE")
+
     def do_HEAD(self) -> None:
         self.dispatch("GET")
 
@@ -2497,6 +2502,23 @@ class Handler(BaseHTTPRequestHandler):
             payload = self.read_json()
             self.send_json(hub_api.set_audio_mode(urllib.parse.unquote(m.group(1)),
                                                   str(payload.get("audio_mode") or "")))
+            return
+        m = re.fullmatch(r"/api/hub/task/([^/]+)/selfcheck-whitelist", path)
+        if m:
+            # AT-22 E4：误报豁免白名单（行×词键）。
+            #   POST   {"行": 6|[5,6], "词": "右下角"} → 加白 + 自检重跑回显
+            #   DELETE 同上（撤销这几行的这个词）或 {"全部": true}（全撤）
+            payload = self.read_json()
+            local_id = urllib.parse.unquote(m.group(1))
+            if str(getattr(self, "command", "POST") or "POST").upper() == "DELETE":
+                self.send_json(hub_api.set_selfcheck_whitelist(
+                    local_id, hub_api.whitelist_rows(payload),
+                    word=str(payload.get("词") or ""), remove=True,
+                    remove_all=payload.get("全部") is True))
+                return
+            self.send_json(hub_api.set_selfcheck_whitelist(
+                local_id, hub_api.whitelist_rows(payload),
+                word=str(payload.get("词") or "")))
             return
         m = re.fullmatch(r"/api/hub/task/([^/]+)/revoke", path)
         if m:
