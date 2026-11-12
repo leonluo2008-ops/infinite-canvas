@@ -498,7 +498,11 @@ def probe_fault_matrix() -> None:
         stub.install()
         assemble_calls["n"] = 0
         try:
-            expect_gen_error(tdir, contains="前置拒绝", label="②创建被拒(400) → 前置拒绝回退")
+            # AT-16 B11 起：创建阶段 4xx 的 GenError 原文是「创建请求被明确拒绝（HTTP 4xx）：…」
+            # （「前置拒绝」只进 note/state，异常串里没有了）。断言跟 B11 合同走「明确拒绝」，
+            # 不为旧断言去改产品文案；行为仍是 _pre_reject 受控回退 → awaiting_approval，
+            # 由下面 rows 的 state/dispatch 逐条核。
+            expect_gen_error(tdir, contains="明确拒绝", label="②创建被拒(400) → 明确拒绝·前置拒绝回退")
         finally:
             restore_bridge()
         rows.append((2, state.load(tdir)["state"], len(stub.posts), assemble_calls["n"],
