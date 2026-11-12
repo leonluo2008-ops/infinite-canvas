@@ -3,11 +3,17 @@
 
 用法（仓库根运行）：
     py -3 automation/probe_e1_residue.py               # 语料体检：样本量/误报率/判类/潜在误报面
-    py -3 automation/probe_e1_residue.py --rules       # 规则候选对比：R0/R1/R2/R3/A/B/C/D
+    py -3 automation/probe_e1_residue.py --rules       # 规则候选对比：R0/R1/R2/R3/A/B/C/D + 实际实现
+    py -3 automation/probe_e1_residue.py --assert      # **落地验收**：断言真残留 213 零损失 + 误报清零
     py -3 automation/probe_e1_residue.py --task auto-0066   # 只读复现某任务的自检②（不落盘）
 
-口径与 automation/selfcheck.py:348 _check_residue 完全一致：
+本探针**只读**（不写任务/清单/自检.json、不联网、不调模型），故不需要 `--isolated` 隔离实例。
+
+口径与 automation/selfcheck.py:_check_residue 完全一致：
 正文=挖掉「# 附注」「## 本片替换说明」；词表=core ∪ 2-3 字组，len≥3；每词每文件最多报 1 条。
+AT-22 E1 R3 落地（B1）后：`--rules` 的「实际实现」行与 `--assert` 直调 `render.residue_core /
+residue_words`（判定与清扫的唯一取词点），R0–R3 行仍是**历史候选规则的独立模拟**（用 render 的
+同一张动作词表，但按各候选自己的口径跑），两者对不上即报错——这本身是取词口径的交叉校验。
 
 `FA` 是人工判类锚点（19 条误报的命中行特征子串）：改判定口径前先跑本探针，
 「真残留」条数不得下降、「误报」条数下降才算达标（红线见 docs/方案-AT22-E1-*）。
@@ -53,13 +59,11 @@ FA = [
     ("3", "提示词-seedance-flow.md", "全程使用参考图中的@图片1。0-2秒", "F-ACT"),
 ]
 
-ACTION_WORDS = ("入画", "出画", "视角", "第一人称", "第二人称", "人称", "视点", "镜头", "运镜", "机位",
-                "前景", "背景", "右手", "左手", "双手", "手部", "手持", "握持", "特写", "近景",
-                "中景", "远景", "全景", "俯视", "仰视", "平视", "右下角", "左下角", "右上角",
-                "左上角", "右下", "左下", "右上", "左上", "画面", "边缘", "转身", "托举", "推近",
-                "拉远", "平移", "跟拍", "环绕", "俯拍", "仰拍", "空镜")
-GENERIC_NAMES = {"我们的产品", "我们的道具", "我的产品", "产品", "道具", "人物", "场景",
-                 "你上传的素材", "用户上传资产", "你的产品", "你的道具", "你的角色", "你的场景"}
+# 动作/方位/视角词表与通用占位名：**唯一来源是实现侧**（render.ACTION_VIEW_WORDS /
+# render.GENERIC_ENTITY_NAMES，AT-22 E1 R3）。探针只做模拟与对账，不再自带副本——两处各存一份
+# 就是口径分裂的开始（E1 约束 2）。REAL_NOUNS 只服务于被否决的候选 B/C，留在探针里。
+ACTION_WORDS = render.ACTION_VIEW_WORDS
+GENERIC_NAMES = render.GENERIC_ENTITY_NAMES
 REAL_NOUNS = ("瓶", "盒", "袋", "罐", "杯", "碗", "刀", "剪", "表", "机", "车", "柱", "球", "管",
               "笔", "包", "纸", "卡", "链", "环", "盖", "喷雾", "香水", "液体", "膏", "霜", "精",
               "奖杯", "托盘", "餐具", "鞋", "衣", "镜", "灯", "椅", "桌")
@@ -194,6 +198,34 @@ def cmd_stats() -> None:
     for h in hits:
         if h["cls"] != "T":
             print(f"  {h['cls']:<8}{h['bridge']:<8}{h['prompt'][:20]:<22}行{h['row']}  词「{h['word']}」")
+    impl = scan_impl()
+    ic = collections.Counter(h["cls"] for h in impl)
+    print(f"\n▲ 以上「现状」段是 R0 历史基线（人工判类锚点）。实际实现（render.residue_words，"
+          f"AT-22 E1 R3）：命中={len(impl)} 真残留={ic.get('T', 0)} 误报={len(impl) - ic.get('T', 0)}"
+          f"　落地验收跑 --assert")
+
+
+def scan_impl() -> list[dict]:
+    """**实际实现**（render.residue_core/residue_words + 自身标签行豁免）在语料上的命中明细。
+
+    与 selfcheck._check_residue 同口径（每词每文件最多 1 条，落在自身标签行上的命中不算证据）。
+    """
+    hits: list[dict] = []
+    for bridge, _d, bound, files in corpus():
+        names = {e.name for e in bound if e.name}
+        for p in files:
+            body = prompt_body(p.read_text(encoding="utf-8", errors="replace"))
+            lines = body.splitlines()
+            for e in bound:
+                for w in render.residue_words(e):
+                    for m in re.finditer(re.escape(w), body):
+                        i = body.count("\n", 0, m.start())
+                        if is_own_label(lines[i], names):
+                            continue
+                        hits.append({"bridge": bridge, "prompt": p.name, "row": e.row_no,
+                                     "word": w, "cls": line_class(bridge, p.name, lines[i])})
+                        break
+    return hits
 
 
 def cmd_rules() -> None:
@@ -229,12 +261,106 @@ def cmd_rules() -> None:
                         continue
                     i = body.count("\n", 0, m.start())
                     res["D 长度阈值≥4"].append(line_class(bridge, p.name, lines[i]))
-    print(f"{'规则':<24}{'词条':>6}{'真残留':>7}{'误报':>6}{'误报率':>8}")
+    res["★ 实际实现（render.residue_words）"] = [h["cls"] for h in scan_impl()]
+    print(f"{'规则':<34}{'词条':>6}{'真残留':>7}{'误报':>6}{'误报率':>8}")
     for name, v in res.items():
         c = collections.Counter(v)
         tp = c.get("T", 0)
         fp = len(v) - tp
-        print(f"{name:<24}{len(v):>6}{tp:>7}{fp:>6}{fp / max(len(v), 1) * 100:>7.1f}%")
+        print(f"{name:<34}{len(v):>6}{tp:>7}{fp:>6}{fp / max(len(v), 1) * 100:>7.1f}%")
+
+
+def _ent(name: str, kind: str = "道具", row_no: int = 6, no: int = 1):
+    return render.Entity(kind, "", name, "x.png", "", no=no, row_no=row_no)
+
+
+def cmd_assert() -> int:
+    """落地验收断言（AT-22 B1）：真残留零损失 + 误报清零 + 删词不跳行 + 单一取词点。"""
+    ok = True
+
+    def check(name: str, cond: bool, detail: str = "") -> None:
+        nonlocal ok
+        ok = ok and cond
+        print(f"  [{'PASS' if cond else 'FAIL'}] {name}" + (f" —— {detail}" if detail else ""))
+
+    print("[1] 全量 66 任务重放（实际实现）")
+    hits = scan_impl()
+    cls = collections.Counter(h["cls"] for h in hits)
+    tp, fp = cls.get("T", 0), len(hits) - cls.get("T", 0)
+    fps = [h for h in hits if h["cls"] != "T"]
+    print(f"      命中={len(hits)} 真残留={tp} 误报={fp} 明细={dict(cls)}")
+    check("真残留 213 条零损失（E1 验收红线，不得下降）", tp == 213, f"实测 {tp}")
+    # E1 §七.2 已认账的残余：品类泛化词「外包装」撞拍摄手法句，靠 E4 行×词白名单兜底。
+    known = [h for h in fps if h["bridge"] == "1-103" and h["word"] == "外包装"]
+    check("误报 19→0（允许 ±2 边界，须逐条解释）",
+          fp <= 2 and (fp == 0 or len(known) == fp),
+          "无残余" if fp == 0 else f"残余 {fp} 条，逐条：" +
+          "；".join(f"{h['bridge']}/{h['row']}「{h['word']}」{h['cls']}" for h in fps))
+    for h in fps:
+        why = ("E1 §七.2 已认账的品类泛化词（3 字组「外包装」撞拍摄手法句），靠 E4 用户白名单兜底"
+               if h in known else "**未认账的误报**（须当缺陷处理，禁静默容忍）")
+        print(f"      残余误报：{h['bridge']} 行{h['row']}「{h['word']}」{h['cls']} → {why}")
+    pure = collections.Counter((h["bridge"], h["prompt"]) for h in fps)
+    pure_only = [k for k in pure if not any(
+        h["bridge"] == k[0] and h["prompt"] == k[1] and h["cls"] == "T" for h in hits)]
+    check("纯误报文件 3→0（只因误报判红的文件）", not pure_only, str(pure_only))
+
+    print("[2] 收词口径（空表=不建表，不是跳过检查）")
+    tables, empty = [], []
+    for bridge, _d, bound, _f in corpus():
+        for e in bound:
+            core_core, core_r3, words = render.entity_noun_core(e), render.residue_core(e), render.residue_words(e)
+            tables.append((bridge, e.row_no, core_core, core_r3, len(words)))
+            if not words:
+                empty.append((bridge, e.row_no, core_core))
+    check("绑图行 36 / 空表 6（5 行通用占位名 + 1 行纯动作名）",
+          len(tables) == 36 and len(empty) == 6,
+          f"绑图行={len(tables)} 空表={len(empty)}：{empty}")
+    check("通用占位名不进表（我们的产品 ×5）",
+          sum(1 for _b, _r, n in empty if n in GENERIC_NAMES) == 5, str(empty))
+    check("纯动作名 3#6 自然空表（用户撞到的那一例）",
+          any(b == "3" and r == 6 for b, r, _n in empty), str(empty))
+
+    print("[3] 删词不跳行（E1 §五 反例逐例实跑）")
+    for name, n_words, must in (("从右下角入画的第一人称右手", 0, None),
+                                ("入画式香水瓶", 3, "香水瓶"),
+                                ("第一人称视角的黑色香水瓶", 5, "香水瓶"),
+                                ("前景右手握持的喷雾瓶", 3, "喷雾瓶")):
+        words = render.residue_words(_ent(name))
+        cond = len(words) == n_words and (must is None or must in words)
+        check(f"「{name}」→ {len(words)} 词" + (f"（含「{must}」）" if must else ""),
+              cond, str(words))
+
+    print("[4] 单一取词点（判定与清扫同源，禁两套口径）")
+    line_action = "前景右手自右下角入画@图片1，无剪切。"
+    kept = render.strip_core_residue(line_action, [_ent("从右下角入画的第一人称右手")])
+    check("清扫器不再吃掉合法构图词（E1 §1.2 缺陷）", kept == line_action, kept)
+    eaten = render.strip_core_residue("取出黑色奖杯香水@图片1，无剪切。",
+                                      [_ent("双耳奖杯形态玻璃香水小物体", "主体", 1, 1)])
+    check("原物核心词照旧被吃掉（AT-9 B2 零回归）", eaten == "取出@图片1，无剪切。", eaten)
+    import inspect
+    from automation import selfcheck as sc
+    check("render.strip_core_residue 走 residue_core", "residue_core(" in inspect.getsource(render.strip_core_residue))
+    check("selfcheck._check_residue 走 residue_words", "residue_words(" in inspect.getsource(sc._check_residue))
+
+    print("[5] 现场复现 auto-0066（用户撞到的那一例，只读）")
+    task_dir = ROOT / "automation/projects/auto-0066"
+    if not task_dir.is_dir():
+        check("auto-0066 现场可复现", False, "任务目录不存在（语料被清）")
+    else:
+        from automation import replace as rep
+        task = sc.state.load(task_dir)
+        bridge_id = str(task.get("bridge_id") or "")
+        ents = render.parse_checklist(ROOT / "analysis/reverse" / bridge_id / rep.LIST_NAME)
+        render.assign_numbers(ents, rep.load_groups(bridge_id), rep.load_row_decisions(bridge_id))
+        body = sc._prompt_body((task_dir / "提示词.md").read_text(encoding="utf-8"))
+        res = sc._check_residue(body, ents, render, bridge_id)
+        words = [w for w in ("右下角", "角入画", "下角入") if w in str(res["证据"])]
+        check("自检②不再报「右下角/角入画/下角入」", not words, str(res["证据"])[:200])
+        check("该任务词表 #6 为 0 词", "#6→图1(0词)" in str(res["证据"]), str(res["证据"])[:200])
+
+    print(f"\n{'全绿（exit 0）' if ok else 'FAIL（exit 1）'}")
+    return 0 if ok else 1
 
 
 def cmd_task(task_id: str) -> None:
@@ -261,13 +387,17 @@ def cmd_task(task_id: str) -> None:
 
 def main() -> None:
     argv = sys.argv[1:]
-    if "--rules" in argv:
+    code = 0
+    if "--assert" in argv:
+        code = cmd_assert()
+    elif "--rules" in argv:
         cmd_rules()
     elif "--task" in argv:
         idx = argv.index("--task")
         cmd_task(argv[idx + 1] if len(argv) > idx + 1 else "auto-0066")
     else:
         cmd_stats()
+    sys.exit(code)
 
 
 if __name__ == "__main__":

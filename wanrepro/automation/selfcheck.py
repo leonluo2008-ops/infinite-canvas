@@ -10,8 +10,9 @@
     同源函数重算（清单行号与 @图片N 是两套编号，禁行号==图号字面比较；组内 N 行共用
     1 图号——AT-11 B1），提交次序取确认时点快照 任务.json assets_confirmed（列表序=提交序，
     确认时已按组去重）。
-  ② 绑图行残留：已传图行的原物核心词（该行实体名+特征词，复用 B2 strip_core_residue
-    的词表思路：entity_noun_core + 2-3 字组）不得残留在提示词正文（附注/替换说明除外）。
+  ② 绑图行残留：已传图行的原物核心词（该行实体名+特征词，词表与 strip_core_residue 同源：
+    render.residue_words = 核心词去动作/方位/视角词后切 2-3 字组，≥3 字，AT-22 E1 R3）不得
+    残留在提示词正文（附注/替换说明/实体自身标签行除外）。
   ③ 锁点对账：必换未换集合 == 确认时点『按原样』/『按原片』/empty_confirm 记录。独立从
     任务.json 快照核对（不自证）：assets_confirmed/empty_confirm/按原样确认/按原片确认
     都在确认动作落账，这里只读比对。
@@ -27,6 +28,7 @@ import json
 import re
 import sys
 import traceback
+from bisect import bisect_right
 from pathlib import Path
 
 from . import replace, state
@@ -345,26 +347,52 @@ def _check_order(body: str, ents, row_to_no: dict[int, int],
                         findings=problems)}
 
 
+def _own_label_line(line: str, names: set[str]) -> bool:
+    """实体自身标签行（AT-22 E1 R3）：`<命名>（<形态>）` 的孤立定义行。
+
+    旧模板 lumi-4section 把实体定义行整行写进正文，词表在这行上是**自指**（「粉红色标签款（透明圆柱形
+    喷雾小小物体）」命中的就是它自己的命名与形态词），按设计该出现，不构成残留证据。
+    """
+    s = line.strip()
+    for name in names:
+        if not name or not s.startswith(name):
+            continue
+        rest = s[len(name):].strip()
+        if rest.startswith("（") and rest.endswith("）") and len(rest) <= 30:
+            return True
+    return False
+
+
 def _check_residue(body: str, ents, render, bridge_id: str = "") -> dict:
     """② 绑图行残留：已传图行的原物核心词（实体名+特征词）零残留（词表=strip_core_residue 同源）。
 
     词表只收 ≥3 字的组：2 字组（香水/黑色这类品类与颜色词）不是特征词——我们的产品
     常与原物同品类（香水换香水），别的行描述也常带同色词，2 字组必误红（实测见探针正例）。
+
+    AT-22 E1 R3（判定精度）：取词走 `render.residue_words`（动作/方位/视角词不进表、通用占位名
+    不建表），匹配时跳过实体自身标签行——五类源结构的误报由此清零（66 任务实测 19→1，
+    剩余 1 条「品类泛化词撞拍摄手法句」靠 E4 用户白名单兜底）。**删词不跳行**：混合名里的
+    实物词照旧参与判定，「入画式香水瓶」仍拦。
     """
+    bound = [e for e in ents
+             if not e.kind.startswith("品牌视觉") and e.no and e.has_asset_image]
+    names = {e.name for e in bound if e.name}
+    starts = [0] + [m.end() for m in re.finditer(r"\n", body)]
+
+    def line_at(offset: int) -> str:
+        idx = bisect_right(starts, offset) - 1
+        end = body.find("\n", offset)
+        return body[starts[max(idx, 0)]:end if end != -1 else len(body)]
+
     scanned: list[str] = []
     hits: list[dict] = []
-    for e in ents:
-        if e.kind.startswith("品牌视觉"):
-            # AT-16 B1b：品牌位有图号后「命名」是客户字样而非原物核心词，按它取词会误红。
-            continue
-        if not (e.no and e.has_asset_image):
-            continue
-        core = render.entity_noun_core(e)
-        words = sorted({core} | set(render._noun_grams(core)), key=len, reverse=True)
-        words = [w for w in words if len(w) >= 3]
+    for e in bound:
+        words = render.residue_words(e)
         scanned.append(f"#{e.row_no}→图{e.no}({len(words)}词)")
         for w in words:
             for m in re.finditer(re.escape(w), body):
+                if _own_label_line(line_at(m.start()), names):
+                    continue                    # 自指标签行不算残留证据，继续找后续真正文位置
                 left = max(0, m.start() - 10)
                 hits.append(_finding("残留",
                                      f"#{e.row_no} 的「{w}」残留于正文: …{body[left:m.end() + 10]}…",

@@ -1229,6 +1229,55 @@ def entity_noun_core(ent: "Entity") -> str:
     return re.sub(r"[^一-龥]", "", noun)
 
 
+# ---------------------------------------------------------------- 残留词表收词口径（AT-22 E1 R3）
+#
+# docs/方案-AT22-E1-残留词表收词规则-20261112.md §六 / docs/审计收敛-AT21-AT22-双路裁决-20261112.md。
+# 误报根因只有一条：**取词**把动作/方位/视角词当成了原物特征词——「从右下角入画的第一人称右手」
+# 被切成「右下角/角入画/下角入/第一人」，于是用户合法保留的构图描述被判成旧物残留（66 任务实测
+# 命中 232 条里 19 条误报，全落五类源结构）。
+#
+# R3 在收词侧三步收窄，一律**删词不跳行**（混合名里的实物部分照旧活着，纯动作名自然空表）：
+#   ① 核心词先删动作/方位/视角词，再切 2-3 字组；
+#   ② 通用占位名（我们的产品…）不建表——它对正文任何「…的产品」句都成立，没有判定价值；
+#   ③ 匹配侧跳过实体自身标签行（`<命名>（<形态>）`），落在 selfcheck._check_residue。
+# 黑名单只增不减：新增一条词必须跑一次 66 任务语料回归（automation/probe_e1_residue.py --assert）。
+ACTION_VIEW_WORDS = (
+    "入画", "出画", "视角", "第一人称", "第二人称", "人称", "视点", "镜头", "运镜", "机位",
+    "前景", "背景", "右手", "左手", "双手", "手部", "手持", "握持", "特写", "近景",
+    "中景", "远景", "全景", "俯视", "仰视", "平视", "右下角", "左下角", "右上角",
+    "左上角", "右下", "左下", "右上", "左上", "画面", "边缘", "转身", "托举", "推近",
+    "拉远", "平移", "跟拍", "环绕", "俯拍", "仰拍", "空镜",
+)
+GENERIC_ENTITY_NAMES = frozenset({
+    "我们的产品", "我们的道具", "我的产品", "产品", "道具", "人物", "场景",
+    "你上传的素材", "用户上传资产", "你的产品", "你的道具", "你的角色", "你的场景",
+})
+# 长词先删：「第一人称」先于「人称」，否则先删「人称」会留下「第一」这种无意义残片。
+_ACTION_VIEW_LONG_FIRST = tuple(sorted(ACTION_VIEW_WORDS, key=len, reverse=True))
+
+
+def strip_action_words(core: str) -> str:
+    """删核心词里的动作/方位/视角词（长词优先）。删词不是跳行：删完剩下的实物词仍参与判定。"""
+    for word in _ACTION_VIEW_LONG_FIRST:
+        core = core.replace(word, "")
+    return core
+
+
+def residue_core(ent: "Entity") -> str:
+    """绑图行残留的**唯一取词口径**（判定与清扫同源）：核心词去动作视角词；通用占位名 → 空串（不建表）。"""
+    core = strip_action_words(entity_noun_core(ent))
+    return "" if core in GENERIC_ENTITY_NAMES else core
+
+
+def residue_words(ent: "Entity") -> list[str]:
+    """残留词表：core ∪ 2-3 字组，只收 ≥3 字（2 字组是同品类/同色词，必误红——见 AT-9 B2）。"""
+    core = residue_core(ent)
+    if not core:
+        return []
+    words = sorted({core} | set(_noun_grams(core)), key=len, reverse=True)
+    return [w for w in words if len(w) >= 3]
+
+
 def _noun_grams(noun: str) -> frozenset:
     """实体名的 2-3 字组（特征词组）：残留清扫的可匹配词集。"""
     out: set[str] = set()
@@ -1277,8 +1326,10 @@ def strip_core_residue(line: str, ents: list["Entity"]) -> str:
             # 不是原物核心词——按它取词组会把正文里的中性词当旧物残留扫掉。
             continue
         if e.no and e.has_asset_image:
+            # AT-22 E1 R3：与自检②共用 residue_core（动作/方位/视角词不进表）——否则清扫器会把
+            # 「自右下角入画」这类合法构图词削掉（§1.2 实测）。claimed 计数照旧含每行，组语义不变。
             uploaded[e.no] = (uploaded.get(e.no, frozenset())
-                              | _noun_grams(entity_noun_core(e)))
+                              | _noun_grams(residue_core(e)))
             claimed[e.no] = claimed.get(e.no, 0) + 1
     if not uploaded:
         return line
