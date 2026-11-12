@@ -63,12 +63,16 @@ function HubTableView() {
         }
     }, []);
 
-    // 5s 列表轮询（摘要端点，列表不拉详情）。
+    /**
+     * 列表轮询（摘要端点，列表不拉详情）。
+     * AT-16 B8：提交在途时加密到 2s——主状态条要跟着 submit 形态走（提交处理中 → 结果未知），
+     * 5s 粒度会把短于一轮的在途窗口整个跳过去（auto-0043 实测在途只有 4.5s，全程零变化）。
+     */
     useEffect(() => {
         void load();
-        const timer = window.setInterval(() => void load(), 5000);
+        const timer = window.setInterval(() => void load(), quickBusy ? 2000 : 5000);
         return () => window.clearInterval(timer);
-    }, [load]);
+    }, [load, quickBusy]);
 
     const patchState = useCallback((localId: string, state: string) => {
         setTasks((prev) => prev.map((item) => (item.local_id === localId ? { ...item, state } : item)));
@@ -101,6 +105,10 @@ function HubTableView() {
             try {
                 await runHubQuickAction(task.local_id, action, {
                     onPhase: (phase, state, note) => {
+                        // AT-16 B8：受理/收尾都**立刻重取主状态**，不等 runHubQuickAction 内部
+                        // 轮询跑完（它最长 40s）——点提交后 1 秒内列表行必须从「已批准·待提交」
+                        // 走到「提交处理中」；这条刷新是三处入口共用的一次动作，不是第二套判定。
+                        void load();
                         const line = hubQuickPhaseText(phase, state);
                         const text = note || line.text;
                         if (!text) return;
@@ -113,6 +121,8 @@ function HubTableView() {
             } catch (quickError) {
                 // 后端原文（如「已有提交在跑」409）直接透出——不吞、不美化
                 message.error(errorText(quickError));
+                // 被拒也要回到后端事实（主状态不留在旧文案上）
+                void load();
             } finally {
                 setQuickBusy("");
             }

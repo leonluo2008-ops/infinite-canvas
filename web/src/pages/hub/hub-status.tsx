@@ -68,11 +68,25 @@ export function hubStateMeta(state: string | undefined, submit?: HubSubmitView |
     return HUB_STATE_META[state || ""] || { label: state || "未知状态", color: "default" };
 }
 
-/** 状态彩色标签（表格「状态」列、详情头、抽屉顶部共用同一映射）。 */
+/**
+ * 状态彩色标签（表格「状态」列、详情头、抽屉顶部共用同一映射）。
+ *
+ * AT-16 B8：这就是**主状态条**——它消费的是摘要 `submit`（B5a-1 唯一生产源）而不是只看
+ * `state`，所以「已批准·待提交 → 提交处理中 → 结果未知」这条迁移在标签上真会走。
+ * `data-hub-main-status` / `data-hub-state-form` 给探针与真机核对留一个稳定抓手（形态口径
+ * 只认后端 form，不是前端另算的）。
+ */
 export function HubStateTag({ state, submit }: { state: string | undefined; submit?: HubSubmitView | null }) {
     const meta = hubStateMeta(state, submit);
+    const form = submit?.form && submit.form !== "none" ? submit.form : "";
     return (
-        <Tag color={meta.color} className="m-0">
+        <Tag
+            color={meta.color}
+            className="m-0"
+            data-hub-main-status="1"
+            data-hub-state={state || ""}
+            data-hub-state-form={form || "none"}
+        >
             {meta.label}
         </Tag>
     );

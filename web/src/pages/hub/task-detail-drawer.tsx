@@ -163,16 +163,18 @@ export function TaskDetailDrawer({
     }, [localId, onStateChange]);
 
     // 详情轮询仅 Drawer 开启时；关闭瞬间作废在途响应。
+    // AT-16 B8：提交在途（busy=submit，最长 40s）时加密到 2s——顶栏主状态条要跟着 submit
+    // 形态走（提交处理中 → 结果未知/失败），5s 粒度会把短于一轮的在途窗口整个跳过去。
     useEffect(() => {
         if (!open || !localId) return;
         reportedStateRef.current = "";
         void load();
-        const timer = window.setInterval(() => void load(), 5000);
+        const timer = window.setInterval(() => void load(), busy === "submit" ? 2000 : 5000);
         return () => {
             window.clearInterval(timer);
             seqRef.current += 1;
         };
-    }, [open, localId, load]);
+    }, [open, localId, load, busy]);
 
     // Drawer 已关闭 → 在途响应一律丢弃。
     useEffect(() => {
@@ -212,6 +214,10 @@ export function TaskDetailDrawer({
             try {
                 await runHubQuickAction(localId, action, {
                     onPhase: (phase, phaseState, note) => {
+                        // AT-16 B8：受理/收尾立刻重取主状态（顶栏状态条 + 列表行同步），
+                        // 不等 runHubQuickAction 内部 40s 轮询跑完。
+                        void load();
+                        onRefresh();
                         const line = hubQuickPhaseText(phase, phaseState);
                         const text = note || line.text;
                         if (!text) return;
@@ -224,6 +230,7 @@ export function TaskDetailDrawer({
                 onRefresh();
             } catch (quickError) {
                 message.error(errorText(quickError));      // 后端原文（如「已有提交在跑」409）直接透出
+                void load();                               // 被拒也回到后端事实
             } finally {
                 setQuickBusy(false);
             }
@@ -244,6 +251,8 @@ export function TaskDetailDrawer({
                 onRefresh();
             } catch (error) {
                 message.error(errorText(error));
+                // AT-16 B8：动作失败也要回到后端事实——主状态条不许停在旧文案上
+                void load();
             } finally {
                 setBusy(null);
             }
@@ -2598,6 +2607,8 @@ function GenSettingsSection({ detail, busy, act }: { detail: HubTaskDetail; busy
         void act("submit", async () => {
             await runHubQuickAction(localId, submitAction, {
                 onPhase: (phase, phaseState, note) => {
+                    // AT-16 B8：主状态条由父级抽屉驱动——act 先把 busy 置 submit，父级轮询随即
+                    // 加密到 2s 并立刻重取一次，所以这里只报人话，不另起一套刷新。
                     const line = hubQuickPhaseText(phase, phaseState);
                     const text = note || line.text;
                     if (!text) return;
