@@ -101,12 +101,15 @@ def new_record(job_id: str, local_id: str = "auto-9700", kind: str = "probe-kind
 
 def main() -> int:                                          # noqa: C901 —— 探针按组平铺
     print("=== [1] 写入点收敛（静态合同） ===")
+    running_hits = SOURCE.count('"status": "running"')
     check("[1a] 创建态 status=running 只出现在 _spawn / _spawn_process 两处",
-          SOURCE.count('"status": "running"') == 2,
-          f"命中 {SOURCE.count('\"status\": \"running\"')} 处")
+          running_hits == 2,
+          f"命中 {running_hits} 处")
+    done_hits = SOURCE.count('"status": "done"')
+    failed_hits = SOURCE.count('"status": "failed"')
     check("[1b] 源码里没有任何 status=done/failed 直写（终态只经 _finalize_job）",
-          SOURCE.count('"status": "done"') == 0 and SOURCE.count('"status": "failed"') == 0,
-          f"done={SOURCE.count('\"status\": \"done\"')} failed={SOURCE.count('\"status\": \"failed\"')}")
+          done_hits == 0 and failed_hits == 0,
+          f"done={done_hits} failed={failed_hits}")
     check("[1c] HUB_JOBS 记录创建点 = 2（_spawn / _spawn_process）",
           SOURCE.count("HUB_JOBS[job_id] = {") == 2,
           f"命中 {SOURCE.count('HUB_JOBS[job_id] = {')} 处")
