@@ -7,12 +7,13 @@
 锁的是「用户看到的是不是桥侧原文」这件事本身，不是函数返回值。全程真实 HTTP（进程内假桥）
 + 真实 run_discuss + 真实任务.json，夹具全部在临时根里：
 
-  [1] 退出码 3（job.error 带 stderr 尾部）→ 任务 failed；failed_reason 与桥侧原文逐字相同，
+  [1] 退出码 3（job.error 带 stderr 尾部）→ 任务 failed；failed_reason **以桥侧原文开头**
+      （原文逐字保留，不降级成兜底句）+「云端原文：未落盘」标注（没有 拆解错误.json），
       退出码进 failed_evidence，history 只 +1（附前后对比）
   [2] 原文缺失（job.error 空、进度.json 无失败标记）→ 走 AT-18 冻结文案兜底，
       failed_evidence.fallback_text=true
   [3] job 记录丢失（服务重启 → /api/job 404）+ 进度.json 已写「失败」→ 仍判 failed，
-      原因取进度.json 的结构化 error，退出码从文案里取回
+      原因以进度.json 的结构化 error 开头（+ 未落盘标注），退出码从文案里取回
   [4] 幂等：同一失败重复触发 → 不写 history、不刷新 failed_at；先被看门狗按兜底句判死、
       随后拿到原文 → 只升级原因（history / failed_at 不动）
   [5] 职责边界：discuss.py 全程不动 进度.json（字节哈希不变），也不存在第二套写盘入口；
@@ -196,8 +197,15 @@ dump_history("跑后", D1)
 t1 = task_of(D1)
 check("[1] 抛的是任务级失败", ok, msg)
 check("[1] 任务终态 failed", t1["state"] == "failed", str(t1["state"]))
-check("[1] failed_reason == 桥侧原文（逐字）", t1.get("failed_reason") == BRIDGE_ERROR,
+check("[1] failed_reason 以桥侧原文开头（逐字保留）",
+      str(t1.get("failed_reason") or "").startswith(BRIDGE_ERROR),
       repr(t1.get("failed_reason")))
+check("[1] 缺 拆解错误.json → 显式标「云端原文：未落盘」",
+      "云端原文：未落盘" in str(t1.get("failed_reason") or ""),
+      repr(t1.get("failed_reason")))
+check("[1] failed_evidence.cloud_raw=missing",
+      (t1.get("failed_evidence") or {}).get("cloud_raw") == "missing",
+      str(t1.get("failed_evidence")))
 check("[1] 原文不是冻结文案（不误用兜底）",
       t1.get("failed_reason") != state.fake_run_reason("discussing"),
       repr(t1.get("failed_reason")))
@@ -240,8 +248,12 @@ BRIDGE.default_job = None                                 # 服务重启过：jo
 ok, msg = run_discuss_expect_fail(D3)
 t3 = task_of(D3)
 check("[3] 任务终态 failed（job 丢了也判失败）", t3["state"] == "failed", str(t3["state"]))
-check("[3] 原因取进度.json 的结构化 error",
-      t3.get("failed_reason") == "拆解失败（退出码 3；详见日志）", repr(t3.get("failed_reason")))
+check("[3] 原因以进度.json 的结构化 error 开头",
+      str(t3.get("failed_reason") or "").startswith("拆解失败（退出码 3；详见日志）"),
+      repr(t3.get("failed_reason")))
+check("[3] 缺 拆解错误.json → 显式标「云端原文：未落盘」",
+      "云端原文：未落盘" in str(t3.get("failed_reason") or ""),
+      repr(t3.get("failed_reason")))
 check("[3] 退出码从原文里取回 3", (t3.get("failed_evidence") or {}).get("exit_code") == 3,
       str(t3.get("failed_evidence")))
 
@@ -267,7 +279,9 @@ up = discuss._fail_task(D4, BRIDGE_ERROR, source="bridge_exit", exit_code=3)
 t4b = task_of(D4)
 check("[4] 兜底句 + 后来的原文 → 升级 changed=true/upgraded=true",
       up.get("changed") is True and up.get("upgraded") is True, str(up))
-check("[4] 升级后 failed_reason 为原文", t4b.get("failed_reason") == BRIDGE_ERROR,
+check("[4] 升级后 failed_reason 以原文开头（+ 未落盘标注）",
+      str(t4b.get("failed_reason") or "").startswith(BRIDGE_ERROR)
+      and "云端原文：未落盘" in str(t4b.get("failed_reason") or ""),
       repr(t4b.get("failed_reason")))
 check("[4] 升级不写 history", len(t4b["history"]) == hist4, f"{hist4} → {len(t4b['history'])}")
 check("[4] 升级不刷新 failed_at", t4b.get("failed_at") == at4, f"{at4} → {t4b.get('failed_at')}")

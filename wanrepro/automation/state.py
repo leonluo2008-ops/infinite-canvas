@@ -1190,6 +1190,9 @@ def _write_failed(task_dir: Path, *, reason: str, probe: dict, trigger: str,
                 evidence = dict(evidence) if isinstance(evidence, dict) else {}
                 evidence["reason_upgraded_from"] = old
                 evidence["reason_source"] = str((probe or {}).get("reason_source") or "")
+                for extra_key in ("exit_code", "cloud_error", "cloud_raw"):
+                    if extra_key in (probe or {}):
+                        evidence[extra_key] = probe[extra_key]
                 task["failed_reason"] = str(reason)
                 task["failed_evidence"] = evidence
                 save(task_dir, task)
@@ -1218,7 +1221,11 @@ def _write_failed(task_dir: Path, *, reason: str, probe: dict, trigger: str,
         }
         if reason_code:
             evidence["reason_code"] = str(reason_code)
-        for extra_key in ("exit_code", "fallback_text", "reason_source"):
+        for extra_key in ("exit_code", "fallback_text", "reason_source",
+                          # 云端原文（extract.py 落盘的 拆解错误.json）：冻结 schema 原样透传，
+                          # 前端直接取 cloud_error.message 渲染，不需要解析 failed_reason 文案；
+                          # cloud_raw=on_disk/missing 区分「有原文」与「未落盘」，见 discuss._failure_detail。
+                          "cloud_error", "cloud_raw"):
             if extra_key in probe:
                 evidence[extra_key] = probe[extra_key]
         view = probe.get("exec")

@@ -191,9 +191,95 @@ def _fmt_wait(seconds: float) -> str:
 # 入口）先按冻结文案判死、随后桥侧原文才到的场景，只升级原因，不写 history、不刷新 failed_at。
 # 与 hub 侧退出码文件回写不重叠：那条链只在「执行体已不存在」时降级，本模块只在
 # run_discuss 活着并把失败报出来的路径里降级，二者互斥。
+#
+# 云端原文优先（缺陷：失败详情只有转述、云端原始错误被 tail 挤掉）：
+#   桥侧 tail 只留 analyze.py 输出的最后一段，extract 打印的「接口返回 error：…」
+#   被它的总结行挤出窗口——于是用户看不到真正的失败原因。可读的原文由 extract.py 落盘到
+#   `analysis/<bridge_id>/拆解错误.json`（schema 冻结：error_type / message / finish_reason /
+#   raw_response，对齐 call_vlm 的 vision_error.json），本模块只做两件事：
+#     1) 读它，把「云端原文：{message}」摆到 failed_reason 主位；
+#     2) 退出码 / finish_reason / raw_response / 原转述行全部降级为附属信息跟在后面（不丢弃）。
+#   读不到（旧产物、非 extract 失败）→ 保留原转述行为 + 显式「云端原文：未落盘」，
+#   绝不静默伪装成有原文。全文逐字透传进 failed_evidence.cloud_error（不截断、不摘要、不重判）。
+
+CLOUD_ERROR_NAME = "拆解错误.json"
+CLOUD_RAW_ON_DISK = "on_disk"      # failed_evidence.cloud_raw：原文已落盘并已进主位
+CLOUD_RAW_MISSING = "missing"      # failed_evidence.cloud_raw：查过、没落盘（未落盘标注同源）
 
 _BRIDGE_EXIT_RE = re.compile(r"analyze\.py 退出 (\d+)")
 _PROGRESS_EXIT_RE = re.compile(r"退出码 (\d+)")
+
+
+def _cloud_error(bridge_id: str) -> dict | None:
+    """读 extract.py 落盘的云端原文 → dict（原样，冻结 schema 透传）或 None。
+
+    路径与 extract.py 写入一致：`analysis/<bridge_id>/拆解错误.json`（同一个
+    WANREPRO_ANALYSIS_ROOT / analysis.reverse 根，本模块 _ANALYSIS_ROOT 与 analyze.py 的
+    ANALYSIS_ROOT 默认同源）。文件缺失、JSON 坏、message 空 → None：调用方据此走
+    「未落盘」分支，不许拿空壳当原文。
+    """
+    tid = str(bridge_id or "").strip()
+    if not tid:
+        return None
+    try:
+        data = json.loads((_ANALYSIS_ROOT / tid / CLOUD_ERROR_NAME).read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    if not str(data.get("message") or "").strip():
+        return None
+    return data
+
+
+def _exit_code_of(text: str, exit_code: int | None) -> int | None:
+    """退出码：调用方给的优先，没给就从原文里取回（口径与 _bridge_failure/_progress_failure 同源）。"""
+    if isinstance(exit_code, int):
+        return exit_code
+    for pattern in (_BRIDGE_EXIT_RE, _PROGRESS_EXIT_RE):
+        m = pattern.search(str(text or ""))
+        if m:
+            return int(m.group(1))
+    return None
+
+
+def _failure_detail(bridge_id: str, text: str, exit_code: int | None,
+                    cloud: dict | None) -> tuple[str, str]:
+    """组装用户可见的失败详情 → (failed_reason, cloud_raw 标记)。
+
+    · 有云端原文：主位「云端原文：{message}」，退出码/finish_reason/原转述行/raw_response
+      逐条作为附属信息追加——转述照留，只是不再占主位；
+    · 没有原文但转述在：转述原样保留（与改动前逐字一致）+ 显式「云端原文：未落盘」；
+    · 两者都空：返回 ("", ...)，交给 _fail_task 的 AT-18 冻结文案兜底（那条契约不动）。
+    """
+    transcript = str(text or "").strip()
+    code = _exit_code_of(transcript, exit_code)
+    if cloud is None:
+        if not transcript:
+            return "", CLOUD_RAW_MISSING
+        where = f"analysis/{bridge_id}/{CLOUD_ERROR_NAME}"
+        return (f"{transcript}\n云端原文：未落盘（未找到 {where}：旧产物或非云端失败）",
+                CLOUD_RAW_MISSING)
+
+    msg = str(cloud.get("message") or "").strip()
+    lines = [f"云端原文：{msg}"]
+    meta: list[str] = []
+    if code is not None:
+        meta.append(f"退出码 {code}")
+    finish = cloud.get("finish_reason")
+    if finish not in (None, ""):
+        meta.append(f"finish_reason={finish}")
+    error_type = str(cloud.get("error_type") or "").strip()
+    if error_type:
+        meta.append(f"错误类型 {error_type}")
+    if meta:
+        lines.append("［附属］" + "｜".join(meta))
+    if transcript:
+        lines.append(f"［转述］{transcript}")
+    raw_response = str(cloud.get("raw_response") or "").strip()
+    if raw_response:
+        lines.append(f"［原始响应］{raw_response}")
+    return "\n".join(lines), CLOUD_RAW_ON_DISK
 
 
 def _task_failure(message: str, *, bridge_error: str | None = None,
@@ -254,11 +340,15 @@ def _progress_failure(bridge_id: str) -> tuple[str, int | None]:
 
 
 def _fail_task(task_dir: Path, reason: str, *, source: str = "discuss",
-               exit_code: int | None = None) -> dict:
+               exit_code: int | None = None, cloud_error: dict | None = None) -> dict:
     """任务级失败 → failed 的唯一写入口（discuss 侧）。返回 {changed, already?, reason}。
 
-    · 原文优先：有原文写原文；原文缺失（reason 为空）才用 AT-18 冻结文案兜底，
-      本模块**不新造**第二套用户可见文案；
+    · 原文优先：桥侧失败（source=bridge_exit）先读 `拆解错误.json` 的云端原文——
+      读到 → failed_reason 主位「云端原文：…」（转述降为附属，见 _failure_detail）；
+      读不到 → 原转述照旧 + 「云端原文：未落盘」；两者都没有（reason 为空）才用
+      AT-18 冻结文案兜底，本模块**不新造**第二套用户可见文案；
+    · 云端原文**逐字透传**进 failed_evidence.cloud_error（冻结 schema 原样，不截断/不摘要/
+      不重判），failed_evidence.cloud_raw 标 on_disk/missing 供前端直接取，不必解析文案；
     · 写盘委托 `state.write_failed`（AT-19 §4.3 唯一写盘核）：进程间文件锁 + run_id 栅栏 +
       起态准入都在那里，本函数只管「取哪一句原文」；
     · 幂等：已是 failed 且原因相同 → 不动盘（不写 history、不刷新 failed_at）——同一次失败
@@ -267,14 +357,25 @@ def _fail_task(task_dir: Path, reason: str, *, source: str = "discuss",
     task_dir = Path(task_dir)
     task = state.load(task_dir)
     cur = str(task.get("state") or "")
-    text = str(reason or "").strip()
+    bridge_id = str(task.get("bridge_id") or "").strip()
+    src = str(source or "discuss")
+    # 云端原文只在桥侧失败路径上查：其它失败类型（超时/产物不全）若读同一目录，会把上一次
+    # 尝试遗留的 拆解错误.json 错挂到本次失败上——那是新的「猜原因」，宁可标「未落盘」。
+    if isinstance(cloud_error, dict):
+        cloud = cloud_error
+    else:
+        cloud = _cloud_error(bridge_id) if src == "bridge_exit" else None
+    text, cloud_raw = _failure_detail(bridge_id, str(reason or ""), exit_code, cloud)
     fallback = not text
     if fallback:
         text = state.fake_run_reason(cur or "discussing")
-    res = state.write_failed(task_dir, reason=text, source=str(source or "discuss"),
-                             exit_code=exit_code,
+    probe: dict = {"fallback_text": fallback, "cloud_raw": cloud_raw}
+    if cloud is not None:
+        probe["cloud_error"] = dict(cloud)
+    res = state.write_failed(task_dir, reason=text, source=src,
+                             exit_code=_exit_code_of(text, exit_code),
                              run_id=os.environ.get("WANREPRO_EXEC_RUN_ID", ""),
-                             probe={"fallback_text": fallback})
+                             probe=probe)
     out = dict(res or {})
     out["reason"] = str(out.get("reason") or text)
     return out
