@@ -279,6 +279,22 @@ def main() -> int:
     verdict, resp = retry(local)
     check("[5c] 连续两次强制结束后再重试 → 仍成功", verdict == "ok", f"{verdict} {resp}")
 
+    # 删除通道同源（同一份 _job_alive/_job_blocks_retry）：强制结束后的残留记录也不许挡删除
+    local = "auto-9632"
+    seed(local, "discussing", heartbeat_at=iso(-5))
+    reset_jobs(job("ff-del", local, "running", age=120))
+    hub_api.force_finish(local, confirm=True, confirm_name=local, reason="探针：强制结束后删")
+    try:
+        deleted = hub_api.delete_task(local)
+        del_err = ""
+    except hub_api.HubError as exc:
+        deleted, del_err = {}, str(exc)
+    check("[5d] 强制结束后的残留记录不挡删除（删除通道同源判据）",
+          bool(deleted.get("ok")) and not (TMP_ROOT / local).exists(), f"{del_err or deleted}")
+    check("[5d] 删除对账明细里能看到被豁免的 job",
+          any(s.startswith("hub-discuss:") for s in deleted.get("ignored_stale_jobs") or []),
+          f"{deleted.get('ignored_stale_jobs')}")
+
     print("=== [6] 隔离与自清理 ===")
     after = {"projects": snapshot(REAL_PROJECTS), "analysis": snapshot(REAL_ANALYSIS),
              "uploads": snapshot(REAL_UPLOADS)}
