@@ -45,6 +45,7 @@ UPLOADS_DIR = ROOT / "uploads"
 # import；automation/frames.py 已有同款先例）。老任务兜底反查 uploads 落盘名全靠它的「路径」。
 FP_NAME = ".源视频指纹.json"
 TOMBSTONES = TASKS_DIR / ".tombstones.json"     # 删除墓碑（数据合同 B0）
+_TOMBSTONE_LOCK = threading.Lock()              # 墓碑读-改-写互斥（并发删除不互相覆盖条目）
 
 
 def _analysis_reverse() -> Path:
@@ -1169,8 +1170,33 @@ DELETABLE_STATES = ("ingested", "failed", "done")             # 免确认就能�
 TEARDOWN_IDLE_STATES = ("awaiting_assets", "awaiting_approval")  # 拆解过但 idle：要任务名确认
 RUNNING_STATES = ("ingesting", "discussing", "rendering", "generating")  # 一律 409
 
+# ── 删除通道的原子提交与 Windows 占用处置（卡 t_4f779245）────────────────────────
+# 本机实测（2026-11-12，scratch/rename_probe.py，子进程持有目录内 `拆解日志.txt` 追加句柄时）：
+#   · `shutil.rmtree(任务目录)` → PermissionError WinError 32，且**边遍历边删**：先把没被占用的
+#     `任务.json` 删掉了，抛错时已不可回滚 —— 这正是事故「任务从 API 消失、目录残留」的机制；
+#   · `os.rename(任务目录 → .trash/…)` → PermissionError WinError 5：Windows 只要目录内有任何
+#     未带 FILE_SHARE_DELETE 的打开句柄，就拒绝整目录改名；
+#   · 句柄释放后，两者都正常。
+# 结论：本平台**没有**「目录被占用时仍原子搬走」的手段，但「改得动 == 可整删」是精确判据。
+# 于是把**改名进隔离箱**当提交点：改名成功 ⇒ 任务从 API 原子消失（`.trash` 不匹配 `auto-*`，
+# 不进 list_tasks / scan_lost_runs / 桥引用判定 / uploads 共享判定 / ingest 编号分配）；
+# 改名失败 ⇒ 零删除 + 409 人话。清箱失败只留残留，永不半删在原位。
+TRASH_DIR = TASKS_DIR / ".trash"          # 删除隔离箱（同卷改名，秒级）
+TRASH_MIN_AGE_SECONDS = 60                # 清扫器只碰静置够久的箱内条目（避让在途删除）
+ORPHAN_MIN_AGE_SECONDS = 600              # 孤儿目录（无 任务.json 且无 inbox/）静置阈值
+ORPHAN_INBOX_GRACE_SECONDS = 3600          # 含 inbox/ 的孤儿：超过它就上报「疑似陈旧摄取」，但仍不自动删
+DELETE_RENAME_DELAYS = (0.1, 0.3, 0.6)    # 占用退避重试（杀毒/索引服务的瞬时占用）
+RMTREE_DELAYS = (0.1, 0.3, 0.6)
+LOCKPROBE_SUFFIX = ".lockprobe"           # 占用诊断用的临时后缀（改名即刻改回）
+
 
 def _tombstones_load() -> list[dict]:
+    """墓碑列表（读不了/坏文件 → []）。**只给只读/展示路径用**（如清扫上报）。
+
+    写路径（append/remove）一律走 `_tombstones_load_or_raise`：把「文件损坏」当成空表会让
+    一次写把历史条目整份覆盖掉（墓碑是「编号不复用」的唯一持久锚，丢历史 = 历史编号全部
+    变回可复用），代价远大于「删除中止」。
+    """
     try:
         data = json.loads(TOMBSTONES.read_text(encoding="utf-8-sig"))
         return [item for item in data if isinstance(item, dict)] if isinstance(data, list) else []
@@ -1178,15 +1204,63 @@ def _tombstones_load() -> list[dict]:
         return []
 
 
-def _tombstones_append(local_id: str, run_id: str = "") -> None:
-    items = _tombstones_load()
-    entry = {"id": local_id, "时间": _now()}
-    if run_id:
-        entry["run_id"] = str(run_id)          # AT-19 X7：墓碑登记 run，活执行体据此自行退场
-    items.append(entry)
+def _tombstones_load_or_raise() -> list[dict]:
+    """写路径专用 loader：文件不存在 → []；存在但读不懂/结构不对 → 抛 OSError（拒绝覆盖）。"""
+    if not TOMBSTONES.is_file():
+        return []
+    raw = TOMBSTONES.read_text(encoding="utf-8-sig")
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise OSError(f"墓碑文件损坏（{exc}），拒绝覆盖写：{TOMBSTONES}") from None
+    if not isinstance(data, list):
+        raise OSError(f"墓碑文件结构不对（不是数组），拒绝覆盖写：{TOMBSTONES}")
+    return [item for item in data if isinstance(item, dict)]
+
+
+def _tombstones_save(items: list[dict]) -> None:
     tmp = TOMBSTONES.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(items, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     tmp.replace(TOMBSTONES)
+
+
+def _tombstones_append(local_id: str, run_id: str = "") -> None:
+    """写墓碑（幂等：同 id 已登记就不再追加，只补 run_id）。
+
+    读-改-写全程持 `_TOMBSTONE_LOCK`：两个任务并发删除时不会互相覆盖条目（删除通道原子化时
+    墓碑从「删完之后的通知」变成「删之前的提交前置」，丢条目的代价从「少条记录」升级成
+    「编号可能被复用」，必须加锁）。
+
+    异常向上抛：调用方（`delete_task`）必须在做任何删除动作**之前**拿到它——写不成就不删。
+    """
+    with _TOMBSTONE_LOCK:
+        items = _tombstones_load_or_raise()
+        for item in items:
+            if item.get("id") == local_id:
+                if run_id and not item.get("run_id"):
+                    item["run_id"] = str(run_id)
+                    _tombstones_save(items)
+                return
+        entry = {"id": local_id, "时间": _now()}
+        if run_id:
+            entry["run_id"] = str(run_id)          # AT-19 X7：墓碑登记 run，活执行体据此自行退场
+        items.append(entry)
+        _tombstones_save(items)
+
+
+def _tombstones_remove(local_id: str) -> bool:
+    """回滚墓碑（删除被拒时用）：抹掉该 id 的全部条目 → 是否真改动过文件。
+
+    为什么需要回滚：墓碑先行之后，「任务原样还在 + 墓碑里有它」是自相矛盾的中间态——它会永久
+    占掉该编号（`ingest._next_local_id` 跳过墓碑号）并让探针/运维误判「已删」。
+    """
+    with _TOMBSTONE_LOCK:
+        items = _tombstones_load_or_raise()
+        kept = [item for item in items if item.get("id") != local_id]
+        if len(kept) == len(items):
+            return False
+        _tombstones_save(kept)
+        return True
 
 
 def _bridge_still_referenced(bridge_id: str, exclude: str) -> bool:
@@ -1305,14 +1379,175 @@ def resolve_uploads_video(task_dir: Path, task: dict) -> tuple[str, str, str]:
     return "", "", ",".join(miss) if miss else "no_candidate"
 
 
+def _rmtree_retry(target: Path, *, delays: tuple[float, ...] = RMTREE_DELAYS) -> tuple[bool, str]:
+    """删目录（占用时退避重试）→ (是否删净, 最后一条错误)。
+
+    只用于**已不在 API 视野内**的路径（隔离箱条目、专属 analysis 目录、孤儿目录）：这些地方
+    删不净只是留垃圾，不会再造成「任务半删」。任务目录本体从不用它（走 `_move_to_trash`）。
+    """
+    target = Path(target)
+    last = ""
+    for i in range(len(delays)):
+        try:
+            shutil.rmtree(target)
+            return True, ""
+        except FileNotFoundError:
+            return True, ""                     # 已经不在了 = 目的达成
+        except OSError as exc:
+            last = f"{type(exc).__name__}: {exc}"
+            if i + 1 < len(delays):
+                time.sleep(delays[i])
+    return False, last
+
+
+def _trash_path(local_id: str) -> Path:
+    """隔离箱条目路径（唯一：任务号 + 时间 + pid + 随机尾）。"""
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    return TRASH_DIR / f"{local_id}.{stamp}-{os.getpid()}-{uuid.uuid4().hex[:6]}"
+
+
+def _move_to_trash(task_dir: Path) -> tuple[Path | None, str, bool]:
+    """把任务目录**整体改名**进隔离箱 → (落位路径, 失败原因, 源目录是否已不存在)。
+
+    这是删除的提交点，也是「该目录当前能否整删」的精确探针：Windows 只要目录内有打开句柄就
+    拒绝改名（WinError 5），所以「改名成功」等价于「此刻没有任何东西占用它」。失败时源码目录
+    一个字节都没动 —— 这正是「要么完整存在、要么完整消失」的实现方式。
+
+    第三个返回值单列 `FileNotFoundError`（源目录已不在，例如运维/别人刚删过）：那不是「占用」，
+    调用方必须**保留墓碑**按幂等成功收尾——否则「目录没了 + 墓碑被回滚」正好又是编号可复用窗口。
+    """
+    local_id = Path(task_dir).name
+    if not Path(task_dir).is_dir():
+        return None, "源目录已不存在", True
+    try:
+        TRASH_DIR.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        return None, f"隔离箱建不出来：{type(exc).__name__}: {exc}", False
+    last = ""
+    for i in range(len(DELETE_RENAME_DELAYS)):
+        target = _trash_path(local_id)
+        try:
+            os.rename(task_dir, target)
+            try:
+                os.utime(target)                # 箱内条目从「进箱时刻」起算龄，别继承原目录 mtime
+            except OSError:
+                pass
+            return target, "", False
+        except FileNotFoundError as exc:        # 并发已被别人删掉：不是占用
+            return None, f"{type(exc).__name__}: {exc}", True
+        except OSError as exc:
+            last = f"{type(exc).__name__}: {exc}"
+            if i + 1 < len(DELETE_RENAME_DELAYS):
+                time.sleep(DELETE_RENAME_DELAYS[i])
+    return None, last, False
+
+
+def _locked_entries(task_dir: Path, *, limit: int = 5) -> list[str]:
+    """诊断：目录内**第一个**搬不走的文件是谁（rename-probe：改名即刻改回，不删内容）。
+
+    只在删除已失败后调用，用于把「哪个文件搬不走」写进人话消息。改名失败 = 该文件被某个进程
+    以不带 FILE_SHARE_DELETE 的方式打开（Windows）。
+
+    三条自我约束（审计 t_4f779245 二次审计 IMPL-2）：
+      · **只测到第一个被占用文件即停**：诊断目的已达成，没必要把整目录（含 inbox 视频）都改名
+        一遍，扰动面越小越好；
+      · **跳过 API 可见性/心跳锚**（`任务.json` / `心跳.json`）：万一复位失败，把这两个文件留在
+        `.lockprobe` 上会让任务从列表消失——409 路径绝不许制造这种事；
+      · 复位带重试；仍失败就把真实残留名写进消息（不隐瞒，也不假装目录干净）。
+    """
+    out: list[str] = []
+    root = Path(task_dir)
+    try:
+        files = sorted(p for p in root.rglob("*") if p.is_file())
+    except OSError:
+        return out
+    for p in files:
+        if p.parent == root and p.name in {"任务.json", "心跳.json"}:
+            continue                            # 见上：这两个名字不许动
+        probe = p.with_name(p.name + LOCKPROBE_SUFFIX)
+        try:
+            os.rename(p, probe)
+        except OSError:
+            rel = str(p.relative_to(root)).replace("\\", "/")
+            out.append(rel)
+            if len(out) >= limit:
+                break
+            continue                            # 继续看下一个（可能也有多个被占）
+        restored = False
+        for i in range(3):
+            try:
+                os.rename(probe, p)
+                restored = True
+                break
+            except OSError:
+                time.sleep(0.05 * (i + 1))
+        if not restored:
+            rel = str(p.relative_to(root)).replace("\\", "/")
+            out.append(f"{rel}（诊断改名未复位，请人工确认 {probe.name}）")
+    return out
+
+
+def _drop_empty_trash() -> bool:
+    """隔离箱空了就删掉箱子本身（不留一个永远存在的空目录给目录集断言添噪音）。"""
+    try:
+        TRASH_DIR.rmdir()
+        return True
+    except OSError:
+        return False
+
+
+def _tombstones_rollback_quiet(local_id: str) -> None:
+    """回滚墓碑；回滚失败只打 stderr（不覆盖真正要报给用户的 409 原因）。"""
+    try:
+        _tombstones_remove(local_id)
+    except OSError as exc:
+        print(f"[hub][WARN] 墓碑回滚失败（{local_id}）：{type(exc).__name__}: {exc}"
+              "——该编号将不再复用，需人工核 projects/.tombstones.json", file=sys.stderr)
+
+
+def _delete_blocked_message(locked: list[str], exec_view: dict, cause: str,
+                            *, lock_busy: bool = False) -> str:
+    """删除被占用时的 409 人话（口径：只报「哪个文件搬不走 + 执行体心跳是否新鲜」）。
+
+    不许写「pid 19728 正持有该文件」——rename-probe 只测得出**哪个文件**被占，测不出**谁**占。
+    等任务文件锁超时（`lock_busy`）时可能一个文件都没被占，首句必须换口径，不能诬指「被占用」。
+    """
+    if lock_busy and not locked:
+        parts = ["删除中止（未做任何删除）：执行体正在写任务文件（任务文件锁被占用），整目录暂时不能动。"]
+    else:
+        parts = ["删除中止（未做任何删除）：任务目录被正在运行的程序占用，整目录搬不走。"]
+    if locked:
+        names = "、".join(locked)
+        more = f"（共 {len(locked)} 个，可能还有更多）" if len(locked) >= 5 else ""
+        parts.append(f"被占用文件：{names}{more}。")
+    pid = exec_view.get("pid") or 0
+    if exec_view.get("pid_alive"):
+        parts.append(f"执行体（pid={pid}）的心跳仍新鲜，可能仍在运行。")
+    elif pid:
+        parts.append(f"执行体（pid={pid}）已退出，占用很可能来自别的程序（杀毒/索引/编辑器）。")
+    parts.append("稍后重试即可——占用释放后同一个删除按钮就能删干净；系统不会替你杀进程。"
+                 "若一直占用，等拆解/生成跑完或那个进程退出后再删。")
+    if cause:
+        parts.append(f"（诊断：{cause}）")
+    return "".join(parts)
+
+
 def delete_task(local_id: str, *, confirm_name: str | None = None) -> dict:
-    """POST /api/hub/task/{id}/delete —— AT-9 §六删除合同。
+    """POST /api/hub/task/{id}/delete —— AT-9 §六删除合同（t_4f779245：原子化重写破坏段）。
 
     仅 idle 态可删：ingested/failed/done 免确认；拆解过但 idle
     （awaiting_assets/awaiting_approval）请求体必须带 confirm_name=任务号（或任务名）。
     运行中（ingesting/discussing/rendering/generating）与排队 JOB → 409。
     删除范围=projects/<id>/ + 专属 analysis/reverse/<bridge_id>/（无其他任务引用才删）
     + uploads/<参考片>（无其他任务同内容才删）；写墓碑 projects/.tombstones.json。
+
+    **原子性（卡 t_4f779245）**：破坏段的提交点是「把任务目录整体改名进隔离箱
+    `projects/.trash/`」，不是 rmtree（见 `_move_to_trash` 的实测说明）。三种结局，各有一条断言：
+      · 改名成功 + 清箱成功 → 整删成功（墓碑在案、箱空）；
+      · 改名成功 + 清箱失败 → 200 + `trash_pending=true`：任务从 API 完整消失、残留只在隔离箱，
+        由 `sweep_residue` 后继回收（**永不半删在原位**）；
+      · 改名失败（Windows 文件占用 / 等文件锁超时）→ `HubError 409` + 回滚墓碑 + 零删除，
+        任务完整存在且仍可管、可重试。
     """
     task_dir = _task_dir(local_id)
     task = state.load(task_dir)
@@ -1345,33 +1580,84 @@ def delete_task(local_id: str, *, confirm_name: str | None = None) -> dict:
     bridge_id = str(task.get("bridge_id") or "")
     # 删除合同认**落盘文件**不认名字：ingestion.video_name 修复后=桥侧落地名；老任务（只记
     # 上传原名）走指纹「路径」反查。候选还必须与 inbox 同内容（sha 相等），重名的旧参考片
-    # （uploads/官号参考1.mp4 这类真实参考片）绝不顶锅。必须在 rmtree 之前定位——任务目录
-    # 一删 inbox sha 就没了。定位失败照常删任务目录，但 uploads 如实留痕（不假报 removed=true）。
+    # （uploads/官号参考1.mp4 这类真实参考片）绝不顶锅。必须在破坏段之前定位——任务目录
+    # 一移走 inbox sha 就没了。定位失败照常删任务目录，但 uploads 如实留痕（不假报 removed=true）。
     uploads_name, uploads_source, uploads_miss = resolve_uploads_video(task_dir, task)
     # AT-19 X7：failed-but-alive——任务已判 failed 但执行体还活着（900s 兜底降级后的窗口）。
     # 删除优先（用户意图），不杀进程：墓碑记 run_id，活执行体下一次写盘会被栅栏拒绝并自行退场。
     exec_view = state.exec_snapshot(task_dir, task)
     executor_alive = bool(exec_view.get("pid_alive"))
     dead_run_id = str(exec_view.get("heartbeat_run_id") or "")
+
     with task_lock(local_id):
-        shutil.rmtree(task_dir)
+        # ① 墓碑先行（审计 B1）：删之前先落墓碑。写不成就不删——宁可删不掉，也不许出现
+        #    「API 消失 + 墓碑没写」那种编号可被摄取复用的窗口。
+        try:
+            _tombstones_append(local_id, run_id=dead_run_id)
+        except OSError as exc:
+            raise HubError(
+                f"删除中止：墓碑写入失败（{type(exc).__name__}: {exc}），"
+                f"任务目录与产物一个字节都没动，可稍后重试") from None
+
+        # ② 提交点：整目录改名进隔离箱。改名成功 = 该目录当前可整删（没有任何打开句柄）；
+        #    改名失败 = 一个字节都没动。包一层进程间文件锁，避让执行体在途写盘。
+        trash_path: Path | None = None
+        move_error = ""
+        move_missing = False
+        lock_busy = ""
+        try:
+            with state._file_lock(task_dir):
+                trash_path, move_error, move_missing = _move_to_trash(task_dir)
+        except state.StateError as exc:
+            lock_busy = str(exc)
+        if trash_path is None and not move_missing:
+            # ③ 改名失败（占用 / 等锁超时）⇒ 回滚墓碑 + 清空箱 + 409 人话（零删除，任务仍可管）
+            _tombstones_rollback_quiet(local_id)
+            _drop_empty_trash()
+            locked = _locked_entries(task_dir)
+            raise HubError(_delete_blocked_message(locked, exec_view, lock_busy or move_error,
+                                                   lock_busy=bool(lock_busy)))
+
+        # ④ 任务已不在原位（改名成功，或源目录本来就已被别人删掉）：保留墓碑按成功收尾。
+        #    清箱/analysis/uploads 全部尽力而为，失败留痕，绝不 500。
+        trash_removed = True
+        trash_error = ""
+        if trash_path is not None:
+            trash_removed, trash_error = _rmtree_retry(trash_path)
+            if trash_removed:
+                _drop_empty_trash()
         removed_analysis = False
-        if bridge_id and not _bridge_still_referenced(bridge_id, exclude=local_id):
-            target = _analysis_reverse() / bridge_id
-            if target.is_dir():
-                shutil.rmtree(target)
-                removed_analysis = True
+        analysis_skip = ""
+        if bridge_id:
+            if _bridge_still_referenced(bridge_id, exclude=local_id):
+                analysis_skip = "shared"           # 同桥任务还有别的 local_id 在用：留着，如实说
+            else:
+                target = _analysis_reverse() / bridge_id
+                if target.is_dir():
+                    removed_analysis, err = _rmtree_retry(target)
+                    if not removed_analysis:
+                        analysis_skip = f"locked:{err}"
+                else:
+                    analysis_skip = "missing"
+        else:
+            analysis_skip = "no_bridge_id"
         removed_upload = False
         uploads_skip = uploads_miss
         if uploads_name:
             f = UPLOADS_DIR / uploads_name
-            if not _uploads_video_shared(uploads_name, exclude=local_id):
-                f.unlink()
-                removed_upload = True
-                uploads_skip = ""
+            if _uploads_video_shared(uploads_name, exclude=local_id):
+                uploads_skip = "shared"            # 同内容还有别的任务在用：留着，如实说
             else:
-                uploads_skip = "shared"          # 同内容还有别的任务在用：留着，如实说
-        _tombstones_append(local_id, run_id=dead_run_id)
+                try:
+                    f.unlink()
+                    removed_upload = True
+                    uploads_skip = ""
+                except FileNotFoundError:
+                    # 文件已经不在了（别人删过/上次删到一半）：按已删报，不写「locked」
+                    removed_upload = True
+                    uploads_skip = "already_gone"
+                except OSError as exc:             # 被占用/权限：留痕，绝不把删除拖成 500
+                    uploads_skip = f"locked:{type(exc).__name__}"
     return {"ok": True, "deleted": local_id, "state_was": st,
             "analysis_dir_removed": removed_analysis,
             "uploads_video_removed": removed_upload,
@@ -1380,7 +1666,14 @@ def delete_task(local_id: str, *, confirm_name: str | None = None) -> dict:
             "uploads_video": uploads_name,
             "uploads_video_source": uploads_source if uploads_name else "",
             "uploads_video_skip": uploads_skip,
+            "analysis_skip": analysis_skip,
             "tombstone": True,
+            # t_4f779245：隔离箱残留（任务已从 API 完整消失，清箱没做完 → 交给 sweep_residue）
+            "trash_pending": not trash_removed,
+            "trash_path": "" if (trash_removed or trash_path is None) else str(trash_path),
+            "trash_error": trash_error,
+            # 删除竞态如实留痕：校验通过后源目录已不在（别人先删了）→ 按幂等成功收尾
+            "task_dir_missing": move_missing,
             # AT-19 §6.1（X7）：删除时执行体仍活 → 如实告知（不杀进程、不删用户意图）
             "executor_alive": executor_alive,
             "executor_run_id": dead_run_id,
@@ -1497,6 +1790,105 @@ def scan_lost_runs(*, apply: bool = False) -> dict:
             "threshold_seconds": int(state.FAKE_RUN_SILENCE_SECONDS),
             "checked_at": checked_at, "scanned": scanned, "exec_unknown": exec_unknown,
             "lost": lost, "skipped": skipped, "errors": errors}
+
+
+# ------------------------------------------------ 残留清扫（AT-19 X7 删除通道的兜底，卡 t_4f779245）
+
+def sweep_residue(*, apply: bool = False,
+                  trash_min_age: int = TRASH_MIN_AGE_SECONDS,
+                  orphan_min_age: int = ORPHAN_MIN_AGE_SECONDS) -> dict:
+    """清扫删除通道留下的两类残留 —— `POST /api/hub/maintenance/sweep-residue`。
+
+    为什么要它：删除的提交点是「改名进隔离箱」，清箱可能因为文件仍被占用而暂时失败（Windows），
+    那部分残留只在 `.trash/` 里，**从 API 完全不可见**（`.trash` 不匹配 `auto-*`），只能靠这里
+    回收；另一类是历史/崩溃留下的「目录还在但 `任务.json` 已没」的孤儿目录（事故 auto-0061 的
+    形态），API 同样不可达，但它会永久占着磁盘。
+
+    两类判据都带**静置阈值**（避让在途操作），且孤儿目录额外排除「含 `inbox/`」的形态——那是
+    `ingest._create_task` 正在上行视频的中间态（`任务.json` 在 `bridge.upload_video` 之后才写），
+    误删它就是杀掉一次正在进行的摄取（而且视频正被读句柄持有，Windows 上又是一次半删）。
+
+    `apply=False`（默认，HTTP 端点默认档）只报不动；启动对账与 watchdog 走 `apply=True`。
+    """
+    apply = bool(apply)
+    started = _now()
+    removed: list[dict] = []
+    pending: list[dict] = []
+    errors: list[dict] = []
+    now = time.time()
+
+    def _age_dir(d: Path) -> int:
+        try:
+            return int(max(0, now - d.stat().st_mtime))
+        except OSError:
+            return 0
+
+    # ① 隔离箱条目：清箱失败留下的残货（任务已从 API 消失，这里删净就彻底干净）
+    if TRASH_DIR.is_dir():
+        for d in sorted(TRASH_DIR.iterdir()):
+            item = {"kind": "trash", "name": d.name, "path": str(d), "age_seconds": _age_dir(d)}
+            if not d.is_dir():
+                pending.append({**item, "reason": "not_a_dir"})
+                continue
+            if item["age_seconds"] < trash_min_age:
+                pending.append({**item, "reason": "too_young"})
+                continue
+            if not apply:
+                pending.append({**item, "reason": "dry_run"})
+                continue
+            ok, err = _rmtree_retry(d)
+            if ok:
+                removed.append(item)
+            else:
+                errors.append({**item, "error": err})
+
+    # ② 孤儿任务目录：目录在、`任务.json` 不在（API 再也管不到它），静置够久才回收
+    tombstoned_ids = {str(t.get("id") or "") for t in _tombstones_load()}
+    for d in sorted(TASKS_DIR.glob("auto-*")):
+        if not d.is_dir() or d.is_symlink():
+            continue
+        if (d / "任务.json").is_file():
+            continue                                   # 正常任务，永不碰
+        if (d / "inbox").exists():
+            # 摄取中间态（`任务.json` 在桥侧上行之后才写）：绝不自动删——慢上行可能远超 600s。
+            # 但静置到「明显不是一次进行中的上传」时换个原因码如实上报，交人工判定，仍不删。
+            age = _age_dir(d)
+            pending.append({"kind": "orphan", "name": d.name, "path": str(d),
+                            "age_seconds": age,
+                            "reason": "ingest_in_progress" if age < ORPHAN_INBOX_GRACE_SECONDS
+                                      else "inbox_stale_manual",
+                            "tombstoned": d.name in tombstoned_ids})
+            continue
+        item = {"kind": "orphan", "name": d.name, "path": str(d), "age_seconds": _age_dir(d),
+                "tombstoned": d.name in tombstoned_ids}
+        if item["age_seconds"] < orphan_min_age:
+            pending.append({**item, "reason": "too_young"})
+            continue
+        if not apply:
+            pending.append({**item, "reason": "dry_run"})
+            continue
+        ok, err = _rmtree_retry(d)
+        if ok:
+            removed.append(item)
+        else:
+            errors.append({**item, "error": err})
+
+    if apply:
+        _drop_empty_trash()
+    return {"ok": True, "applied": apply, "started_at": started,
+            "trash_dir": str(TRASH_DIR),
+            "trash_min_age_seconds": int(trash_min_age),
+            "orphan_min_age_seconds": int(orphan_min_age),
+            "removed": removed, "pending": pending, "errors": errors}
+
+
+def _sweep_residue_quiet() -> dict:
+    """后台（启动对账 / watchdog）的清扫入口：异常只写 stderr，绝不影响对账与 HTTP 服务。"""
+    try:
+        return sweep_residue(apply=True)
+    except Exception as exc:                       # noqa: BLE001 —— 清扫是兜底，不许反过来打断主流程
+        print(f"[sweep][WARN] 残留清扫失败：{type(exc).__name__}: {exc}——本轮跳过", file=sys.stderr)
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
 
 
 FORCE_FINISH_JOB_STATUS = "force_finished"   # 内存 job 终态（文件侧终态仍是 failed，两者不混用）
@@ -1640,6 +2032,7 @@ def startup_reconcile_async() -> dict:
                 return
             try:
                 slot["result"] = scan_lost_runs(apply=True)
+                slot["sweep"] = _sweep_residue_quiet()      # 删除通道残留（隔离箱 / 孤儿目录）
             finally:
                 _RECONCILE_LOCK.release()
             slot["state"] = "done"
@@ -1667,6 +2060,7 @@ def _watchdog_loop() -> None:
         else:
             try:
                 scan_lost_runs(apply=True)
+                _sweep_residue_quiet()               # 删除通道残留（隔离箱 / 孤儿目录）
             except Exception as exc:  # noqa: BLE001 —— 单轮失败只写 stderr，绝不影响 HTTP 服务
                 print(f"[watchdog] 对账扫描失败：{type(exc).__name__}: {exc}"
                       "——本轮跳过，不影响服务", file=sys.stderr)

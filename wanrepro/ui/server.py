@@ -2393,6 +2393,12 @@ class Handler(BaseHTTPRequestHandler):
             payload = self.read_json()
             self.send_json(hub_api.scan_lost_runs(apply=payload.get("apply") is True))
             return
+        if path == "/api/hub/maintenance/sweep-residue":
+            # t_4f779245：删除通道残留清扫（隔离箱 `.trash/` + 无 任务.json 的孤儿目录）。
+            # 同样默认 dry-run 只报清单；apply=true 才真删（启动对账/watchdog 走 apply=True）。
+            payload = self.read_json()
+            self.send_json(hub_api.sweep_residue(apply=payload.get("apply") is True))
+            return
         if path == "/api/hub/ingest":
             self.do_hub_ingest()
             return

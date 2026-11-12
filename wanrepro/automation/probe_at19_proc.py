@@ -303,6 +303,14 @@ check("[5] 第一轮对账落 failed（重试前置状态）",
       task_of(D5).get("state") == "failed", task_of(D5).get("state"))
 check("[5] 重试前任务目录挂着第一轮死证（缺陷现场）",
       state.exec_read(D5).get("run_id") == str(job5a.get("job_id")), str(state.exec_read(D5)))
+# 第一轮子进程写完退出码后，reaper 线程才把 HUB_JOBS 记录落终态。这中间的重试守卫仍会按
+# 「60s 启动宽限期」把这条 running 记录判活（产品语义：刚起的 job 一律拦），探针不等这一步
+# 就会随机红在「任务已有拆解任务在跑」上（2026-11-12 实测 1/3 概率）。等 reaper 收尾，
+# 顺带把「终态出口真的闭环」变成一条断言，而不是把守卫放松。
+final5a = wait_for(lambda: (lambda r: r if r.get("status") != "running" else None)(
+    hub_api.HUB_JOBS.get(str(job5a.get("job_id"))) or {}), 30) or {}
+check("[5] 第一轮 job 已落终态（reaper 闭环；此后重试不受启动宽限期影响）",
+      final5a.get("status") in ("failed", "done", "force_finished"), str(final5a))
 BRIDGE.job_status = "error"          # 第二轮快速落任务级失败（不等 1800s 轮询上限）
 retry5 = hub_api.start_retry("auto-9804")
 job5b = str(retry5.get("job_id") or "")
