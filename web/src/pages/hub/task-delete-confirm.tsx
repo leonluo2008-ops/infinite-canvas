@@ -25,6 +25,7 @@ export function TaskDeleteButton({
     disabled = false,
     stopPropagation = false,
     onDeleted,
+    onError,
 }: {
     task: HubTaskSummary;
     label?: string;
@@ -34,6 +35,12 @@ export function TaskDeleteButton({
     /** 行内/抽屉容器点击会开详情——默认拦掉，别让点删除顺带把抽屉也打开。 */
     stopPropagation?: boolean;
     onDeleted: (localId: string) => void;
+    /**
+     * AT-18 §4 错误处理：桥端拒绝（如「任务运行中（discussing），删除拒绝」）除了 toast，
+     * 再回调一次，让**调用方在行内**留下可读文案（行内文案比一闪而过的 toast 活得久）。
+     * 可选：不传就还是只有 toast（既有调用点行为零变化）。
+     */
+    onError?: (message: string) => void;
 }) {
     const { message } = App.useApp();
     const [busy, setBusy] = useState(false);
@@ -50,7 +57,9 @@ export function TaskDeleteButton({
             onDeleted(task.local_id);
         } catch (error) {
             // 桥端原文透出（如「任务运行中（generating），删除拒绝」）——不吞、不美化
-            message.error(`删除失败：${errorText(error)}`);
+            const text = errorText(error);
+            message.error(`删除失败：${text}`);
+            onError?.(text);
         } finally {
             setBusy(false);
         }

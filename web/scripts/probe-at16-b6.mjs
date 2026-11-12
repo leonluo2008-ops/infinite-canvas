@@ -182,7 +182,10 @@ check("[B] 运行态由 deleteGuard 管住（blocked = guard.disabled || disable
 check("[B] 确认弹层写明任务号与「不可恢复」（二键也让人看清删的是谁）",
     confirmSrc.includes("删除任务 ${task.local_id}？") && confirmSrc.includes("不可恢复"));
 check("[B] 桥端原文透出（409「运行中删除拒绝」不被吞成通用失败）",
-    confirmSrc.includes("message.error(`删除失败：${errorText(error)}`)"));
+    // AT-18：同一句「删除失败：<原文>」现在除了 toast 还会回调 onError 交给调用方在行内留痕；
+    // 断言口径改为「文案前缀在 + 走 errorText 原文 + 有行内回调」，语义只增不减。
+    confirmSrc.includes("message.error(`删除失败：") && confirmSrc.includes("errorText(error)")
+    && confirmSrc.includes("onError?.(text)"));
 
 // ════════════════════════════════════════════════════════════ [C] confirm_name 自动带任务号
 console.log("3) confirm_name：二键确认后自动带当前任务号（用户零键入），请求形状直测");

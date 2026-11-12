@@ -163,3 +163,29 @@ export function deleteGuard(task: Pick<HubTaskSummary, "state">): { disabled: bo
     }
     return { disabled: false, reason: "", needName: HUB_DELETE_CONFIRM_STATES.includes(state) };
 }
+
+/**
+ * AT-18 §4.6 强制结束可见集（**与后端 `state.RUNNING_STATES_MACHINE` 逐字一致**）：
+ * `discussing` / `rendering` / `generating` 三个真实运行态才有「人工兜底口」。
+ *
+ * 为什么不是 `HUB_RUNNING_STATES`：那个多了 `ingesting`（建任务的一瞬），它没有可兜底的进程。
+ * 两套集合不合并——删除守卫说「运行中不可删」（含 ingesting），强制结束说「哪个态能人工判死」，
+ * 是两个问题两个答案；混用会造成「已建任务也能强制结束」的假入口。
+ */
+export const HUB_FORCE_FINISH_STATES = ["discussing", "rendering", "generating"];
+
+/**
+ * 强制结束可用性（任务行按钮与将来抽屉入口共用同一判定，红线 25：不各写一套）。
+ *
+ * 语义：`visible=false` 时**整颗按钮不渲染**（不给非运行态造一个点了报错的假出口）；
+ * 可见即意味着后端会接受（其余拒绝条件是 job 忙/参数缺失，都由后端 409/400 兜底，错误原文透出）。
+ */
+export function forceFinishGuard(task: Pick<HubTaskSummary, "state">): { visible: boolean; disabled: boolean; reason: string } {
+    const state = task.state || "";
+    const visible = HUB_FORCE_FINISH_STATES.includes(state);
+    return {
+        visible,
+        disabled: !visible,
+        reason: visible ? "" : `任务当前不是运行态（${state || "空"}），无需强制结束`,
+    };
+}

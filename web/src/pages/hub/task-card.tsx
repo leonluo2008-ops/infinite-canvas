@@ -1,9 +1,11 @@
-import { ArrowRight, CheckCircle2, ChevronLeft, ChevronRight, CircleAlert, Download, FileText, ImageOff, LoaderCircle, RefreshCw, Sparkles, Type, Upload, Video } from "lucide-react";
-import { App, Button, Image as AntdImage, Input, Progress, Tag } from "antd";
+import { Activity, ArrowRight, CheckCircle2, ChevronLeft, ChevronRight, CircleAlert, CircleStop, Download, FileText, ImageOff, LoaderCircle, RefreshCw, Sparkles, TriangleAlert, Type, Upload, Video } from "lucide-react";
+import { App, Button, Image as AntdImage, Input, Modal, Progress, Tag } from "antd";
 import { useCallback, useEffect, useRef, useState, type DragEvent } from "react";
 import { Streamdown } from "streamdown";
 
-import { approveHubTask, confirmHubReplace, errorText, getHubTask, hubOutputUrl, postHubAsset, renderHubTask, retryHubTask, submitHubTask, uploadHubAssets, uploadHubImage, type HubAssetCard, type HubPairLine, type HubRenderPreview, type HubTaskDetail, type HubTaskSummary } from "./hub-api";
+import { approveHubTask, confirmHubReplace, errorText, forceFinishHubTask, getHubTask, hubOutputUrl, postHubAsset, renderHubTask, retryHubTask, submitHubTask, uploadHubAssets, uploadHubImage, type HubActivity, type HubAssetCard, type HubFailedView, type HubHeartbeat, type HubLostRun, type HubPairLine, type HubRenderPreview, type HubTaskDetail, type HubTaskSummary } from "./hub-api";
+import { forceFinishGuard } from "./hub-status";
+import { TaskDeleteButton } from "./task-delete-confirm";
 
 const STATE_META: Record<string, { label: string; dot: string; pill: string }> = {
     ingested: { label: "已建任务", dot: "bg-stone-400", pill: "bg-stone-100 text-stone-600 dark:bg-stone-800 dark:text-stone-300" },
@@ -19,6 +21,158 @@ const STATE_META: Record<string, { label: string; dot: string; pill: string }> =
 
 const DOWNLOAD_LINK_CLASS = "inline-flex h-8 items-center gap-1.5 rounded-md bg-stone-900 px-3 text-sm font-medium text-white transition hover:bg-stone-700 dark:bg-stone-100 dark:text-stone-900 dark:hover:bg-stone-300";
 
+// ---------------------------------------------------------------- AT-18 运行态可观测 + 人工兜底口
+
+/**
+ * 强制结束的二次确认文案（冻结）。改这三句 = 改合同：它们同时是界面文案与探针断言点。
+ *
+ * 为什么必须写「不删任何东西 / 不杀进程」：这是一颗**看起来像破坏性操作、实际上只改状态**的按钮，
+ * 用户按下之前得知道代价是什么（老任务产物还在、进程可能继续跑），否则会以为点了就丢掉两小时产物。
+ */
+export const FORCE_FINISH_CONFIRM_TITLE = "强制结束这个任务？";
+export const FORCE_FINISH_CONFIRM_SCOPE = "只把状态置为「失败」：任务目录、拆解产物、参考视频全部保留，不删除任何文件，也不杀进程。";
+export const FORCE_FINISH_CONFIRM_SIDE_EFFECT = "如果它其实还活着，进程会继续跑完，但状态仍是失败——之后可点「重试」续跑，或「删除」清掉。";
+
+/** 失败原因兜底（与既有文案一致，改它会让「没拿到原因」和「拿到了空原因」长得一样）。 */
+export const FAILED_REASON_FALLBACK = "任务失败，错误原文未返回。";
+
+/** 秒 → 人话时长。非有限数 → 「—」（不知道就说不知道，不编一个 0 秒出来）。 */
+export function hubDurationText(seconds: number | null | undefined): string {
+    if (typeof seconds !== "number" || !Number.isFinite(seconds) || seconds < 0) return "—";
+    const total = Math.round(seconds);
+    if (total < 60) return `${total} 秒`;
+    if (total < 3600) return `${Math.floor(total / 60)} 分钟`;
+    const hours = Math.floor(total / 3600);
+    const minutes = Math.floor((total % 3600) / 60);
+    return minutes ? `${hours} 小时 ${minutes} 分` : `${hours} 小时`;
+}
+
+/**
+ * ISO → 本地「MM-DD HH:mm:ss」，**手写补零**而不是 `toLocaleString`。
+ *
+ * 为什么不用 toLocaleString：同一个 zh-CN 在 Node（ICU）与浏览器里格式不一致（实测 Node 出 `11/12 15:29:41`），
+ * 探针与真机就会对不上同一句人话。心跳/静默这类「是不是还活着」的读数必须两边逐字一致。
+ */
+export function hubClockText(value: string): string {
+    const text = (value || "").trim();
+    if (!text) return "";
+    const date = new Date(text);
+    if (Number.isNaN(date.getTime())) return text;
+    const pad = (n: number) => String(n).padStart(2, "0");
+    return `${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+}
+
+/**
+ * 运行态行的「最近活动」+「疑似失联」红字（AT-18 §4.6）。
+ *
+ * 数据源只有后端透出的三键：`activity`（六源取 max）/`heartbeat`（心跳侧车）/`lost_run`（判定）。
+ * 三条纪律写在这里：
+ *  1. `activity` 缺失 → 明说「活动时间不可用」，**不拿 created_at 或日志反推**（会假装活着）；
+ *  2. 红字只认 `lost_run.suspect === true`，**绝不按 state 猜**——阈值判定只有后端有；
+ *  3. 心跳/静默时间都给绝对值 + 人话，让用户自己判断「这条是不是还活着」。
+ */
+export function RunningActivityLine({ activity, heartbeat, lost_run }: { activity?: HubActivity | null; heartbeat?: HubHeartbeat | null; lost_run?: HubLostRun | null }) {
+    const at = activity?.last_activity_at || heartbeat?.at || "";
+    const silence = activity?.silence_seconds ?? heartbeat?.age_seconds ?? null;
+    if (!at) {
+        return (
+            <div className="flex items-center gap-1.5 text-xs text-stone-400 dark:text-stone-500" data-hub-activity="missing">
+                <Activity className="size-3.5 shrink-0" />
+                活动时间不可用
+            </div>
+        );
+    }
+    const suspect = lost_run?.suspect === true;
+    return (
+        <div className="space-y-1.5">
+            <div
+                className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-xs text-stone-500 dark:text-stone-400"
+                data-hub-activity="ok"
+                data-hub-activity-source={activity?.source || ""}
+                data-hub-activity-at={at}
+                data-hub-silence-seconds={silence === null ? "" : String(silence)}
+            >
+                <Activity className="size-3.5 shrink-0" />
+                <span>
+                    最近活动 {hubClockText(at)}
+                    {activity?.source ? <span className="text-stone-400 dark:text-stone-500">（{activity.source}）</span> : null}
+                </span>
+                <span data-hub-silence-text="1">已静默 {hubDurationText(silence)}</span>
+                {heartbeat?.phase ? <span className="min-w-0 truncate text-stone-400 dark:text-stone-500">· {heartbeat.phase}</span> : null}
+            </div>
+            {suspect ? (
+                <div
+                    className="flex items-start gap-1.5 rounded-md border border-red-200 bg-red-50 px-2 py-1.5 text-xs text-red-700 dark:border-red-950 dark:bg-red-950/20 dark:text-red-300"
+                    data-hub-lost-run="suspect"
+                    data-hub-lost-silence={lost_run?.silence_seconds === null || lost_run?.silence_seconds === undefined ? "" : String(lost_run.silence_seconds)}
+                >
+                    <TriangleAlert className="mt-0.5 size-3.5 shrink-0" />
+                    <span className="min-w-0 break-words">
+                        疑似失联：静默 {hubDurationText(lost_run?.silence_seconds ?? silence)} 已超过阈值 {hubDurationText(lost_run?.threshold_seconds)}
+                        {lost_run?.reason ? `（${lost_run.reason}）` : ""}。可点「强制结束」把它置为失败，再重试或删除。
+                    </span>
+                </div>
+            ) : null}
+        </div>
+    );
+}
+
+/** 强制结束按钮：非运行态整颗不渲染（可见性判定在 hub-status.forceFinishGuard，唯一来源）。 */
+export function ForceFinishButton({ task, busy = false, onAsk }: { task: HubTaskSummary; busy?: boolean; onAsk: () => void }) {
+    const guard = forceFinishGuard(task);
+    if (!guard.visible) return null;
+    return (
+        <Button
+            danger
+            ghost
+            size="small"
+            icon={<CircleStop className="size-3.5" />}
+            loading={busy}
+            data-hub-force-finish={task.local_id}
+            title={guard.reason || "把这条卡住的任务置为失败（不删产物），失败后可重试或删除"}
+            onClick={(event) => {
+                event.stopPropagation();
+                onAsk();
+            }}
+        >
+            强制结束
+        </Button>
+    );
+}
+
+/** 二次确认弹层正文（正文独立成件：真机走查与探针都按这段文案核对代价说明）。 */
+export function ForceFinishConfirmBody({ task }: { task: HubTaskSummary }) {
+    return (
+        <div className="space-y-2 text-xs" data-hub-force-confirm={task.local_id}>
+            <div className="break-words text-stone-600 dark:text-stone-300">{FORCE_FINISH_CONFIRM_SCOPE}</div>
+            <div className="break-words text-stone-600 dark:text-stone-300">{FORCE_FINISH_CONFIRM_SIDE_EFFECT}</div>
+            <div className="text-stone-500 dark:text-stone-400">
+                任务号 <span className="font-mono">{task.local_id}</span> · 当前状态 {task.state || "未知"}
+            </div>
+        </div>
+    );
+}
+
+/**
+ * 失败原因（AT-18 §4.6 顺序写死）：`failed.reason`（后端唯一文案源）→ 既有 `error`（history 尾注）→ 兜底句。
+ * 前端**不自造**失败原因：新任务的原因由后端 fail_orphan_task 落盘，老任务回落到原来的 error 字段。
+ */
+export function hubFailedReason(failed?: HubFailedView | null, fallbackError?: string): string {
+    return (failed?.reason || "").trim() || (fallbackError || "").trim() || FAILED_REASON_FALLBACK;
+}
+
+export function FailedReasonLine({ failed, fallbackError = "" }: { failed?: HubFailedView | null; fallbackError?: string }) {
+    return (
+        <div className="rounded-md border border-red-200 bg-red-50 p-3 dark:border-red-950 dark:bg-red-950/20" data-hub-failed-reason={failed?.reason ? "backend" : fallbackError ? "history" : "empty"}>
+            <div className="flex items-start gap-2 text-sm text-red-700 dark:text-red-300">
+                <CircleAlert className="mt-0.5 size-4 shrink-0" />
+                <div className="min-w-0 break-words">{hubFailedReason(failed, fallbackError)}</div>
+            </div>
+            {failed?.at ? <div className="mt-1 pl-6 text-xs text-red-600/80 dark:text-red-400/80">失败时间 {hubClockText(failed.at)}</div> : null}
+        </div>
+    );
+}
+
 export function TaskCard({ task, onStateChange, onRefresh }: { task: HubTaskSummary; onStateChange: (localId: string, state: string) => void; onRefresh: () => void }) {
     const { message } = App.useApp();
     const fileInputRef = useRef<HTMLInputElement>(null);
@@ -31,6 +185,10 @@ export function TaskCard({ task, onStateChange, onRefresh }: { task: HubTaskSumm
     const [renderError, setRenderError] = useState("");
     const [preview, setPreview] = useState<HubRenderPreview | null>(null);
     const [renderPrompt, setRenderPrompt] = useState("");
+    // ---- AT-18：强制结束二次确认 + 行内错误（行内文案比一闪而过的 toast 活得久）----
+    const [forceOpen, setForceOpen] = useState(false);
+    const [forceBusy, setForceBusy] = useState(false);
+    const [actionError, setActionError] = useState("");
 
     const loadDetail = useCallback(async () => {
         try {
@@ -175,12 +333,16 @@ export function TaskCard({ task, onStateChange, onRefresh }: { task: HubTaskSumm
 
     const retry = async () => {
         setBusy("retry");
+        setActionError("");
         try {
-            await retryHubTask(task.local_id);
-            message.success("已触发重试");
-        } catch {
-            // 重试端点可能尚未上桥：按合同退化为「仅刷新任务状态」。
-            message.info("已刷新任务状态");
+            const data = await retryHubTask(task.local_id);
+            message.success(data.previous_reason ? "已触发重试（上一次失败原因留在任务历史里）" : "已触发重试");
+        } catch (error) {
+            // 缺陷 R5 根治：桥端原文透出（「重试需 failed 状态…」/「任务已有拆解任务在跑」），
+            // 不再吞成一句「已刷新任务状态」——那正是「点了没反应」的来源。
+            const text = errorText(error);
+            setActionError(`重试失败：${text}`);
+            message.error(`重试失败：${text}`);
         } finally {
             setBusy(null);
             onRefresh();
@@ -188,7 +350,36 @@ export function TaskCard({ task, onStateChange, onRefresh }: { task: HubTaskSumm
         }
     };
 
+    /**
+     * AT-18 §4.2 强制结束：**只有用户在本卡的二次确认弹层里按下「确认强制结束」才会走到这里**。
+     * 取消 = 只关弹层（`setForceOpen(false)`），零请求。
+     * 成功后行内状态立即刷新为 failed（`onStateChange` + 拉详情），不删任何文件。
+     */
+    const forceFinish = async () => {
+        if (forceBusy) return;
+        setForceBusy(true);
+        setActionError("");
+        try {
+            const data = await forceFinishHubTask(task.local_id);
+            setForceOpen(false);
+            onStateChange(task.local_id, data.state || "failed");
+            message.success(data.already ? `任务 ${task.local_id} 已是失败状态` : `已强制结束：${task.local_id} 置为失败（产物全保留，可重试或删除）`);
+            void loadDetail();
+        } catch (error) {
+            // 行内留痕：409「任务当前不是运行态…」/400「需二次确认…」都原样透出，不吞、不白屏
+            const text = errorText(error);
+            setForceOpen(false);
+            setActionError(`强制结束失败：${text}`);
+            message.error(`强制结束失败：${text}`);
+        } finally {
+            setForceBusy(false);
+            onRefresh();
+        }
+    };
+
     const meta = STATE_META[task.state] || { label: task.state || "未知状态", dot: "bg-stone-400", pill: "bg-stone-100 text-stone-600 dark:bg-stone-800 dark:text-stone-300" };
+    // 强制结束可见性（唯一判定在 hub-status.forceFinishGuard；本卡不另写状态枚举）
+    const forceGuard = forceFinishGuard(task);
     const pairLines = detail?.pair_lines || [];
     const filledLines = pairLines.filter((line) => Boolean(line.url));
     const promptMd = renderPrompt || detail?.prompt_md || "";
@@ -372,15 +563,18 @@ export function TaskCard({ task, onStateChange, onRefresh }: { task: HubTaskSumm
 
         if (task.state === "failed") {
             return (
-                <div className="rounded-md border border-red-200 bg-red-50 p-3 dark:border-red-950 dark:bg-red-950/20">
-                    <div className="flex items-start gap-2 text-sm text-red-700 dark:text-red-300">
-                        <CircleAlert className="mt-0.5 size-4 shrink-0" />
-                        <div className="min-w-0 break-words">{detail?.error || "任务失败，错误原文未返回。"}</div>
-                    </div>
-                    <div className="mt-2 flex justify-end">
-                        <Button danger size="small" icon={<RefreshCw className="size-3.5" />} loading={busy === "retry"} onClick={() => void retry()}>
-                            重试
-                        </Button>
+                <div className="space-y-2">
+                    {/* AT-18 §4.6：原因只认后端 failed.reason，老任务回落既有 error，都没有才兜底 */}
+                    <FailedReasonLine failed={task.failed || detail?.failed} fallbackError={detail?.error || ""} />
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                        <span className="text-xs text-stone-500 dark:text-stone-400">重试=重新拆解（已有产物优先复用）；删除=写墓碑防任务号复用，不可恢复。</span>
+                        <div className="flex items-center gap-1.5">
+                            <Button danger size="small" icon={<RefreshCw className="size-3.5" />} loading={busy === "retry"} data-hub-retry={task.local_id} onClick={() => void retry()}>
+                                重试
+                            </Button>
+                            {/* 删除走既有二键确认件（同承接、同墓碑说明），成功即刷新列表；拒绝原因同时进 toast 与行内 */}
+                            <TaskDeleteButton task={task} size="small" onDeleted={() => onRefresh()} onError={(text) => setActionError(`删除失败：${text}`)} />
+                        </div>
                     </div>
                 </div>
             );
@@ -410,6 +604,26 @@ export function TaskCard({ task, onStateChange, onRefresh }: { task: HubTaskSumm
             <div className="mt-3 border-t border-stone-100 pt-3 dark:border-stone-800">
                 {detailError ? <div className="mb-2 text-xs text-amber-600 dark:text-amber-400">详情刷新失败：{detailError}</div> : null}
                 {operation}
+                {/* AT-18 §4.6 运行态尾部：最近活动（列表摘要优先，详情更新）+ 人工兜底口「强制结束」。
+                    只有 discussing/rendering/generating 三种真实运行态才渲染（可见性判定在 hub-status.forceFinishGuard）。 */}
+                {forceGuard.visible ? (
+                    <div className="mt-2 space-y-1.5 border-t border-stone-100 pt-2 dark:border-stone-800" data-hub-running-footer={task.local_id}>
+                        <RunningActivityLine activity={detail?.activity || task.activity} heartbeat={detail?.heartbeat || task.heartbeat} lost_run={detail?.lost_run || task.lost_run} />
+                        <div className="flex justify-end">
+                            <ForceFinishButton task={task} busy={forceBusy} onAsk={() => setForceOpen(true)} />
+                        </div>
+                    </div>
+                ) : null}
+                {/* 接口报错一律在行内留一句（不吞错、不白屏）；点右侧可主动关掉 */}
+                {actionError ? (
+                    <div className="mt-2 flex items-start gap-2 rounded-md border border-red-200 bg-red-50 px-2 py-1.5 text-xs text-red-700 dark:border-red-950 dark:bg-red-950/20 dark:text-red-300" data-hub-action-error={task.local_id}>
+                        <CircleAlert className="mt-0.5 size-3.5 shrink-0" />
+                        <span className="min-w-0 flex-1 break-words">{actionError}</span>
+                        <button type="button" className="shrink-0 text-red-500 underline decoration-dotted dark:text-red-400" onClick={() => setActionError("")}>
+                            知道了
+                        </button>
+                    </div>
+                ) : null}
             </div>
 
             {detail?.summary_md ? <MarkdownDetails title="拆解摘要" markdown={detail.summary_md} defaultOpen={task.state === "awaiting_assets" && !(detail.asset_cards || []).length} /> : null}
@@ -427,6 +641,21 @@ export function TaskCard({ task, onStateChange, onRefresh }: { task: HubTaskSumm
                     event.target.value = "";
                 }}
             />
+
+            {/* AT-18 §4.2 二次确认：取消只关弹层（零请求），确认才调 force-finish；成功即把行内状态刷成 failed */}
+            <Modal
+                open={forceOpen}
+                title={FORCE_FINISH_CONFIRM_TITLE}
+                okText="确认强制结束"
+                cancelText="取消"
+                okButtonProps={{ danger: true, "data-hub-force-confirm-ok": task.local_id }}
+                cancelButtonProps={{ "data-hub-force-confirm-cancel": task.local_id }}
+                confirmLoading={forceBusy}
+                onOk={() => void forceFinish()}
+                onCancel={() => setForceOpen(false)}
+            >
+                <ForceFinishConfirmBody task={task} />
+            </Modal>
         </article>
     );
 }

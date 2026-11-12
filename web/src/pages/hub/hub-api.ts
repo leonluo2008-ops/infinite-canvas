@@ -47,7 +47,37 @@ export type HubTaskSummary = {
      * 旧 bridge 缺字段 → 归一成 {form:"none"}（不假装有结果）。
      */
     submit?: HubSubmitView;
+    // ---- AT-18 §4.5 读面四键（列表与详情同源；旧 bridge 缺 → null，前端明说「不可用」，不按 state 猜）----
+    /** 最近心跳（`心跳.json` 侧车锚）；null = 这份任务没有心跳文件（旧任务/从未起跑）。 */
+    heartbeat?: HubHeartbeat | null;
+    /** 最近活动（六源取 max，`activity.source` 是冻结枚举）；null = 无任何活动证据。 */
+    activity?: HubActivity | null;
+    /** 假运行判定（只读）；null = 旧 bridge 未透出，此时**不显示**疑似失联，绝不按 state 猜。 */
+    lost_run?: HubLostRun | null;
+    /** 失败原因（`failed_reason`，唯一给用户看的文案源）；仅 state="failed" 时非空。 */
+    failed?: HubFailedView | null;
 };
+
+/**
+ * AT-18 §4.5 `heartbeat`：本次 run 的心跳锚（`<任务目录>/心跳.json` 读时合并）。
+ * `phase` 是自由中文串（与 lapian_stage 同口径），不做枚举、不参与判定。
+ */
+export type HubHeartbeat = { at: string; age_seconds: number | null; phase: string; count: number };
+
+/** AT-18 §2.2/§4.5 `activity`：六源取 max 的最近活动。`source` 冻结枚举之一。 */
+export type HubActivity = { last_activity_at: string; source: string; silence_seconds: number | null };
+
+/** AT-18 §4.5 `lost_run`：静默已超阈值但本轮还没降级时 suspect=true（给前端提前红字）。 */
+export type HubLostRun = {
+    suspect: boolean;
+    silence_seconds: number | null;
+    threshold_seconds: number;
+    reason_code: string;
+    reason: string;
+};
+
+/** AT-18 §3.3/§4.5 `failed`：失败原因 + 判定证据（字段名冻结，前端只读）。 */
+export type HubFailedView = { reason: string; at: string; evidence: Record<string, unknown> | null };
 
 /**
  * 拆解双锚（AT-16 B4a 透传合同）：
@@ -355,6 +385,11 @@ export async function listHubTasks(): Promise<HubTaskSummary[]> {
         lapian: normalizeLapianAnchors(row.lapian),
         // 列表只靠摘要就能说清提交结果（5 秒轮询整表替换也不会把错误信息抹掉）
         submit: normalizeSubmitView(row.submit),
+        // AT-18 §4.5：运行态活动锚 + 失败原因（列表与详情同源，缺 → null）
+        heartbeat: normalizeHeartbeat(row.heartbeat),
+        activity: normalizeActivity(row.activity),
+        lost_run: normalizeLostRun(row.lost_run),
+        failed: normalizeFailedView(row.failed),
     }));
 }
 
@@ -387,6 +422,11 @@ export async function getHubTask(localId: string): Promise<HubTaskDetail> {
         audio_mode_依据: hubText(task.audio_mode_依据),
         audio_mode_待核对: Boolean(task.audio_mode_待核对),
         audio_mode_来源: hubText(task.audio_mode_来源),
+        // AT-18 §4.5：四键与摘要同一归一函数（详情比列表多的是产物/日志，不是口径）
+        heartbeat: normalizeHeartbeat(task.heartbeat),
+        activity: normalizeActivity(task.activity),
+        lost_run: normalizeLostRun(task.lost_run),
+        failed: normalizeFailedView(task.failed),
     };
 }
 
@@ -411,6 +451,62 @@ export function normalizeLapianAnchors(value: unknown): HubLapianAnchors {
  */
 function contractText(value: unknown): string {
     return typeof value === "string" ? value.trim() : "";
+}
+
+/** 秒数归一：只认有限数字（字符串/NaN/负值 → null，前端显示「—」而不是 NaN 秒）。 */
+function contractSeconds(value: unknown): number | null {
+    return typeof value === "number" && Number.isFinite(value) ? Math.max(0, Math.round(value)) : null;
+}
+
+/**
+ * AT-18 §4.5 读面四键归一（旧 bridge / 畸形值一律降级为 null）。
+ *
+ * 为什么统一在这里而不在各页面：列表 5 秒轮询、详情、抽屉三处都读同一批字段，
+ * 归一只要一处，界面就永远拿不到 `[object Object]` / NaN 这类半成品。
+ * **null 的语义是明确的**：`activity=null` → 「活动时间不可用」；`lost_run=null` → 不显示疑似失联
+ * （绝不按 state 猜，见方案 §4.6）；`failed=null` → 回落 history 尾注 `error`。
+ */
+export function normalizeHeartbeat(value: unknown): HubHeartbeat | null {
+    if (!value || typeof value !== "object") return null;
+    const raw = value as JsonRecord;
+    const at = contractText(raw.at);
+    if (!at) return null;
+    return {
+        at,
+        age_seconds: contractSeconds(raw.age_seconds),
+        phase: contractText(raw.phase),
+        count: contractSeconds(raw.count) ?? 0,
+    };
+}
+
+export function normalizeActivity(value: unknown): HubActivity | null {
+    if (!value || typeof value !== "object") return null;
+    const raw = value as JsonRecord;
+    const lastAt = contractText(raw.last_activity_at);
+    if (!lastAt) return null;
+    return { last_activity_at: lastAt, source: contractText(raw.source), silence_seconds: contractSeconds(raw.silence_seconds) };
+}
+
+export function normalizeLostRun(value: unknown): HubLostRun | null {
+    if (!value || typeof value !== "object") return null;
+    const raw = value as JsonRecord;
+    return {
+        suspect: raw.suspect === true,
+        silence_seconds: contractSeconds(raw.silence_seconds),
+        // 阈值缺省 900 = 方案 §2.1 冻结值（只用于「阈值 15 分钟」这句人话，不参与判定）
+        threshold_seconds: contractSeconds(raw.threshold_seconds) ?? 900,
+        reason_code: contractText(raw.reason_code),
+        reason: contractText(raw.reason),
+    };
+}
+
+export function normalizeFailedView(value: unknown): HubFailedView | null {
+    if (!value || typeof value !== "object") return null;
+    const raw = value as JsonRecord;
+    const reason = contractText(raw.reason);
+    const at = contractText(raw.at);
+    if (!reason && !at) return null;
+    return { reason, at, evidence: raw.evidence && typeof raw.evidence === "object" ? (raw.evidence as Record<string, unknown>) : null };
 }
 
 /** 未知收单标记归一：只有真对象/true 才算（字符串/空 → null，UI 视为未阻断）。 */
@@ -895,9 +991,66 @@ export async function releaseHubTask(localId: string, note?: string): Promise<{ 
     });
 }
 
-/** failed 态续跑入口（AT-9 B5：POST /api/hub/task/<id>/retry；非 failed 桥端 409，错误原文透出）。 */
-export async function retryHubTask(localId: string): Promise<{ state?: string; job_id?: string }> {
-    return request<{ state?: string; job_id?: string }>(`/api/hub/task/${encodeURIComponent(localId)}/retry`, { method: "POST" });
+/**
+ * failed 态续跑入口（AT-9 B5：POST /api/hub/task/<id>/retry；非 failed 桥端 409，错误原文透出）。
+ *
+ * AT-18 §4.3：响应补 `heartbeat_reset`（重试即重建心跳锚）与 `previous_reason`（上一次失败原因回显）；
+ * 新增一道 409「任务已有拆解任务在跑」——连点两次第二次命中它，不会起第二个线程。
+ */
+export async function retryHubTask(localId: string): Promise<{ state?: string; job_id?: string; heartbeat_reset?: boolean; previous_reason?: string }> {
+    return request<{ state?: string; job_id?: string; heartbeat_reset?: boolean; previous_reason?: string }>(`/api/hub/task/${encodeURIComponent(localId)}/retry`, { method: "POST" });
+}
+
+/**
+ * AT-18 §4.2 强制结束（人工兜底口 / 界面二次确认后调用的唯一接口）。
+ *
+ * 语义写死：置 failed + 写原因，**不删任何东西**（任务目录 / 拆解产物 / 参考视频全留），**不杀进程**。
+ * 二次确认参数是唯一「这是所有者手动操作」的显式证据：`confirm` 必须是布尔 true，
+ * `confirm_name` 必须是本任务号（后端逐字校验，字符串 "true" 一律 400）。
+ * 幂等：对已 failed 的任务再调 → 200 `already=true`、`changed=false`，不重复写 history。
+ */
+export async function forceFinishHubTask(
+    localId: string,
+    reason = "人工强制结束（所有者操作）",
+): Promise<{ ok?: boolean; local_id?: string; state?: string; state_was?: string; changed?: boolean; already?: boolean; reason?: string; kept?: Record<string, boolean> }> {
+    return request<{ ok?: boolean; local_id?: string; state?: string; state_was?: string; changed?: boolean; already?: boolean; reason?: string; kept?: Record<string, boolean> }>(
+        `/api/hub/task/${encodeURIComponent(localId)}/force-finish`,
+        {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ confirm: true, confirm_name: localId, reason }),
+        },
+    );
+}
+
+/**
+ * AT-18 §4.1 假运行对账扫描（dry-run 先行：默认 apply=false 只返回清单，不写任何任务）。
+ * 界面不自动调它（自动通道在 bridge 的 watchdog 里）；这里留给排障/核对脚本与将来的手动扫描入口。
+ */
+export async function scanLostRuns(apply = false): Promise<{
+    ok?: boolean;
+    applied?: boolean;
+    threshold_seconds?: number;
+    checked_at?: string;
+    scanned?: number;
+    lost?: unknown[];
+    skipped?: unknown[];
+    errors?: unknown[];
+}> {
+    return request<{
+        ok?: boolean;
+        applied?: boolean;
+        threshold_seconds?: number;
+        checked_at?: string;
+        scanned?: number;
+        lost?: unknown[];
+        skipped?: unknown[];
+        errors?: unknown[];
+    }>("/api/hub/maintenance/scan-lost-runs", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ apply: Boolean(apply) }),
+    });
 }
 
 export function hubOutputUrl(localId: string) {
