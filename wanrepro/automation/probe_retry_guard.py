@@ -242,13 +242,29 @@ def main() -> int:
     check("[4c] 非 failed 且残留已豁免 → 落到状态文案（豁免不放宽状态机）",
           verdict == "err" and "重试需 failed 状态" in err, err)
 
-    print("=== [5] 隔离与自清理 ===")
+    print("=== [5] 与方案 A 合体：真调 force_finish 清退内存记录 → 重试立刻放行 ===")
+    local = "auto-9631"
+    seed(local, "discussing", heartbeat_at=iso(-5))
+    reset_jobs(job("ff-real", local, "running", age=120))
+    fin = hub_api.force_finish(local, confirm=True, confirm_name=local, reason="探针：人工强制结束")
+    check("[5a] force_finish 把任务置 failed（changed=true）",
+          fin.get("state") == "failed" and fin.get("changed") is True, f"{fin}")
+    check("[5a] 内存 running 记录被置终态 force_finished",
+          (hub_api.HUB_JOBS.get("j1") or {}).get("status") == "force_finished",
+          f"{hub_api.HUB_JOBS}")
+    verdict, resp = retry(local)
+    check("[5b] 强制结束后立刻重试 → 放行（A 清退 + B 豁免协同）", verdict == "ok", f"{verdict} {resp}")
+    check("[5b] 放行回执里能看到被豁免的那条 force_finished",
+          any("force_finished" in s for s in resp.get("ignored_stale_jobs") or []),
+          f"{resp.get('ignored_stale_jobs')}")
+
+    print("=== [6] 隔离与自清理 ===")
     after = {"projects": snapshot(REAL_PROJECTS), "analysis": snapshot(REAL_ANALYSIS),
              "uploads": snapshot(REAL_UPLOADS)}
     for key in BEFORE:
-        check(f"[5] 真实 {key}/ 顶层集合跑前跑后一致", BEFORE[key] == after[key],
+        check(f"[6] 真实 {key}/ 顶层集合跑前跑后一致", BEFORE[key] == after[key],
               f"-{sorted(BEFORE[key] - after[key])} +{sorted(after[key] - BEFORE[key])}")
-    check("[5] 任务根自述 = 本探针隔离根（没有写进真实 projects/）",
+    check("[6] 任务根自述 = 本探针隔离根（没有写进真实 projects/）",
           str(hub_api.TASKS_DIR) == str(TMP_ROOT), f"{hub_api.TASKS_DIR} vs {TMP_ROOT}")
 
     passed = sum(1 for _, ok in RESULTS if ok)
