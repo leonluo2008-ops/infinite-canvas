@@ -3020,6 +3020,37 @@ function GenSettingsSection({ detail, busy, act }: { detail: HubTaskDetail; busy
                     </div>
                 ) : null}
 
+                {/* AT-17 B2b：音频门禁失败原因（同源 GateBadge 红条样式，不新造面板）——
+                    批准会被后端拒（409），这里先把「为什么批不了」摆在按钮上方，防反复点击。
+                    结果来自 get_task.audio_gate（服务端门禁落盘），前端只渲染不重判。 */}
+                {state === "awaiting_approval" && detail.audio_gate?.verdict === "FAIL" ? (
+                    <div
+                        className="mt-3 w-full space-y-1 rounded-md border border-red-300 bg-red-50 p-2 dark:border-red-900 dark:bg-red-950"
+                        data-hub-audio-gate="fail"
+                        data-hub-audio-gate-mode={detail.audio_gate.audio_mode || ""}
+                    >
+                        <div className="flex flex-wrap items-center gap-1.5">
+                            <Tag color="red" className="m-0">
+                                音频门禁 ✗ 批不了
+                            </Tag>
+                            <span className="text-xs text-stone-600 dark:text-stone-300">
+                                提示词的声音段与任务声明的音频三态不一致（只拒绝批准，渲染产物保持原状）
+                            </span>
+                        </div>
+                        {(detail.audio_gate.发现 ?? []).map((line, index) => (
+                            <div key={index} className="break-words whitespace-pre-wrap text-xs leading-5 text-stone-600 dark:text-stone-300">
+                                {line}
+                            </div>
+                        ))}
+                        {detail.audio_gate.处理 ? (
+                            <div className="break-words text-xs leading-5 text-red-700 dark:text-red-300" data-hub-audio-gate-how>
+                                <span className="font-medium">怎么处理：</span>
+                                {detail.audio_gate.处理}
+                            </div>
+                        ) : null}
+                    </div>
+                ) : null}
+
                 <div className="mt-3 flex flex-wrap items-center justify-end gap-2">
                     {state === "awaiting_approval" ? (
                         <>

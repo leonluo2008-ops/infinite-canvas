@@ -343,6 +343,9 @@ def get_task(local_id: str) -> dict:
         "audio_mode_依据": mode["依据"],
         "audio_mode_待核对": mode["待核对"],
         "audio_mode_来源": mode["来源"],
+        # AT-17 B2b：批准前音频门禁结果（generate.run_audio_gate 落盘）——FAIL 时 UI 靠它
+        # 说清「为什么批不了」；旧任务/未跑过门禁 → null（前端不显示，不当成通过）
+        "audio_gate": task.get("audio_gate") or None,
         "error": (task.get("history") or [{}])[-1].get("note", "")
         if task["state"] == "failed" else "",
         "gen": task.get("gen") or {},

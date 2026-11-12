@@ -68,7 +68,7 @@ SUBMIT_RUNTIME_KEYS = ("gen_job", "gen_task_id", "cloud_task_id", "submit_unknow
                        "dispatch", "gen_error", "gen_progress")
 # 退回置换时一并作废的键（AT-13 §2.5 清理键表扩展 + B2 提交链键）
 ROLLBACK_CLEARED_KEYS = ("approval", "approval_snapshot", "gen_params",
-                         "gen_channel", "snapshot_version") + SUBMIT_RUNTIME_KEYS
+                         "gen_channel", "snapshot_version", "audio_gate") + SUBMIT_RUNTIME_KEYS
 
 
 def _blob_hash(blob: dict) -> str:

@@ -202,14 +202,104 @@ def do_render(task_dir: Path, set_spec: str, verbose: bool = True,
     from . import selfcheck
     check_items = selfcheck.run_selfcheck(task_dir)
     bad = [x for x in check_items if x.get("结论") != "PASS"]
+    # AT-17 B2b：渲染完就把音频门禁结果挂到任务上——**不阻断渲染**（预演照样给），
+    # 只是让人在「批准」之前就看到「这条批不了、为什么」（批准时还会按最新提示词重跑一次）。
+    gate = run_audio_gate(task_dir, state.load(task_dir))
     if verbose:
         print(f"  自检：{len(check_items) - len(bad)}/{len(check_items)} 项通过 → {task_dir / selfcheck.SELFCHECK_NAME}")
         for item in bad:
             print(f"  [自检⚠] {item.get('项')}：{item.get('证据', '')[:200]}")
+        print(f"  音频门禁：{gate.get('verdict')}（三态 {gate.get('audio_mode') or '未落'}）")
+        for line in (gate.get("发现") or []):
+            print(f"  [音频门禁⚠] {line}")
         print(f"[待审批] {task['local_id']} 预演参数: {json.dumps(params, ensure_ascii=False)}")
         print(f"  快照 {snap[:16]}…；提示词已落 {PROMPT_FILE}（{len(prompt)} 字）")
         print(f"  批准: py -3 -m automation.generate approve {task['local_id']}")
     return {"params": params, "snapshot": snap, "prompt_chars": len(prompt)}
+
+
+# ------------------------------------------------ 批准前音频门禁（AT-17 B2b，方案 §4 B2b）
+
+_audio_gate_module = None
+
+
+def _audio_gate_mod():
+    """按路径加载 pipeline/reverse/audio_gate.py（与 discuss._intent_mod 同一做法）。
+
+    它按脚本形态加载 render/extract 两个同目录模块（B1/B2a 的解析与实体取词都只有那一份实现），
+    门禁的判定口径因此与渲染、拆解门禁同源，不另写一套正则。
+    """
+    global _audio_gate_module
+    if _audio_gate_module is None:
+        import importlib.util
+        path = ROOT / "pipeline" / "reverse" / "audio_gate.py"
+        spec = importlib.util.spec_from_file_location("wanrepro_reverse_audio_gate_for_generate",
+                                                      path)
+        if spec is None or spec.loader is None:
+            raise GenError(f"导不进 {path}")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _audio_gate_module = module
+    return _audio_gate_module
+
+
+def _audio_gate_sources(task_dir: Path, task: dict) -> tuple[str, str, Path | None]:
+    """(三态, 拆解正文, 待确认清单路径)：读不到就给空——门禁按「跳过」处理，不误伤老任务。
+
+    三态取值口径 = 任务.json `audio_mode`（hub 链落盘面）> analysis 目录 `audio_mode.json`
+    （画布链节点状态）；两处都没有 = 老任务/未落盘。**不按拆解现推**——现推出来的值不是
+    「任务声明的三态」，拿它执法等于替用户改主意。
+    """
+    bridge = str(task.get("bridge_id") or "").strip()
+    analysis = ROOT / "analysis" / "reverse" / bridge if bridge else None
+    mode = str(task.get("audio_mode") or "").strip()
+    if not mode and analysis is not None and (analysis / "audio_mode.json").is_file():
+        try:
+            side = json.loads((analysis / "audio_mode.json").read_text(encoding="utf-8-sig"))
+        except (OSError, json.JSONDecodeError):
+            side = {}
+        mode = str((side or {}).get("audio_mode") or "").strip()
+
+    def _first(name: str) -> Path | None:
+        for path in ((analysis / name) if analysis is not None else None, task_dir / name):
+            if path is not None and path.is_file():
+                return path
+        return None
+
+    disc_path = _first("拆解.md")
+    try:
+        disc = disc_path.read_text(encoding="utf-8-sig") if disc_path else ""
+    except OSError:
+        disc = ""
+    return mode, disc, _first("待确认清单.md")
+
+
+def run_audio_gate(task_dir: Path, task: dict) -> dict:
+    """跑音频门禁并把结果写进任务文件（`audio_gate`）——只读提示词与拆解，**不动渲染产物**。
+
+    附注 13：失败只拒绝批准，绝不回滚渲染。结果落盘是为了让 get_task 能把它透出给 UI
+    （5 秒轮询也看得到「为什么批不了」，不靠一次性 toast）。
+    """
+    module = _audio_gate_mod()
+    try:
+        prompt = (task_dir / PROMPT_FILE).read_text(encoding="utf-8")
+    except OSError:
+        prompt = ""
+    mode, disc, checklist = _audio_gate_sources(task_dir, task)
+    result = module.evaluate(prompt, mode, disc_text=disc, checklist_path=checklist)
+    task["audio_gate"] = result
+    state.save(task_dir, task)
+    return result
+
+
+def audio_gate_refusal(result: dict) -> str:
+    """门禁失败 → 给员工看的一句完整原因（UI toast 与 CLI 共用这一句）。"""
+    reasons = [str(x).strip() for x in (result.get("发现") or []) if str(x).strip()]
+    head = ("音频门禁拒绝批准：提示词的声音段与任务声明的音频三态不一致"
+            "（只拒绝批准，已渲染的产物保持原状、不自动回滚）")
+    body = "；".join(reasons)
+    tail = str(result.get("处理") or "").strip()
+    return f"{head}——{body}。{tail}" if body else f"{head}。{tail}"
 
 
 def do_approve(task_dir: Path, config: tuple | None = None, verbose: bool = True) -> str:
@@ -218,6 +308,10 @@ def do_approve(task_dir: Path, config: tuple | None = None, verbose: bool = True
     config=None：旧语义——批准 render 时落下的 approval_snapshot（**v1 快照**，老任务与 CLI）。
     config=(gen_params, gen_channel)：AT-13 §2.2 审批时序——服务端已校验固化的非敏感配置
     （无 key）此时落进任务文件并按 **v2 快照**（prompt+params+渠道身份+model+mode）绑定。
+
+    AT-17 B2b：动批准之前先过**音频门禁**（提示词声音段 × 任务声明的音频三态，方案 §4 B2b）。
+    不通过就只拒绝本次批准——已渲染的提示词/产物一字不动（附注 13：不自动回滚），
+    门禁结果落任务文件 `audio_gate`（get_task 透出，UI 用它说清「为什么批不了」）。
     """
     task = state.load(task_dir)
     st = task["state"]
@@ -227,6 +321,13 @@ def do_approve(task_dir: Path, config: tuple | None = None, verbose: bool = True
             raise GenError(f"任务已批准（快照 v{version}）：改配置请先「撤销批准」走受控回退边"
                            f"（approved→awaiting_approval，不自动重批），再带新配置批准")
         raise GenError(f"approve 需 awaiting_approval，当前 {st}")
+    gate = run_audio_gate(task_dir, task)
+    if gate.get("verdict") == _audio_gate_mod().FAIL:
+        raise GenError(audio_gate_refusal(gate))
+    if verbose:
+        print(f"  音频门禁：{gate.get('verdict')}（三态 {gate.get('audio_mode') or '未落'}）")
+        for line in (gate.get("发现") or []):
+            print(f"  [音频门禁⚠] {line}")
     if config is not None:
         gen_params, gen_channel = config
         prompt = (task_dir / PROMPT_FILE).read_text(encoding="utf-8")

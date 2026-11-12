@@ -212,6 +212,17 @@ export type HubSelfCheckItem = {
     说明?: HubSelfCheckExplain;
 };
 
+/** 批准前音频门禁结果（AT-17 B2b）：服务端 generate.run_audio_gate 落任务文件、get_task 透出。
+ *  verdict=FAIL 时「批准」会被拒（只拒批准，不回滚渲染）；发现=失败原因原文，处理=怎么修。 */
+export type HubAudioGate = {
+    verdict: string;
+    audio_mode?: string;
+    checks?: { id: string; verdict: string; msg: string }[];
+    发现?: string[];
+    处理?: string;
+    at?: string;
+};
+
 export type HubTaskDetail = HubTaskSummary & {
     summary_md: string;
     checklist_md: string;
@@ -220,6 +231,8 @@ export type HubTaskDetail = HubTaskSummary & {
     自检?: HubSelfCheckItem[] | null;
     /** 拆解实时阶段（bridge job stage 回写）；拆解中卡片显示。 */
     lapian_stage?: string;
+    /** 批准前音频门禁结果（AT-17 B2b）；没跑过/老任务 → null（前端不显示，不当成通过）。 */
+    audio_gate?: HubAudioGate | null;
     /** 拆解日志尾 15 行（排查留痕）。 */
     log_tail?: string;
     pair_lines: HubPairLine[];
