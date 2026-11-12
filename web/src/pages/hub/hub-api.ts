@@ -901,7 +901,8 @@ export async function ungroupHubRows(localId: string, rows: number[]): Promise<{
  * 红线 25：**不新造提交链**——动作仍是抽屉 submitOnly 那一条（POST /api/hub/submit，key 一次性
  * 透传），这里只把三件事收口成一份共享实现：
  *   ① `hubQuickAction`  纯函数：状态 + 摘要 + 画布渠道 + 批准快照 → 可点否 / 用哪条渠道的 key（探针直测）
- *   ② `runHubQuickAction` 执行：HTTP 受理只报「提交处理中」，轮询确认 generating/done 才报「云端已收单」
+ *   ② `runHubQuickAction` 执行：HTTP 受理只报「提交处理中」；state 转 generating/done 才报「云端已收单」，
+ *      后端已给结论（submit.form = unknown / rejected / failed）则立刻按该形态收尾（AT-16 B10）
  *   ③ `hubQuickPhaseText` 阶段人话（两处入口同一份文案，禁各写一套 toast）
  * 两个入口（index.tsx 行内按钮、task-detail-drawer.tsx 顶部入口与底部 submitOnly）都只调这三个，
  * 所以「同承接（同一 API + 同一 key 解析）／同凭据（按批准渠道取 key）／同守卫（blocksRetry /
@@ -1315,9 +1316,46 @@ export function hubQuickRunning(localId: string): boolean {
     return HUB_QUICK_RUNNING.has(String(localId || ""));
 }
 
-export type HubQuickPhase = "accepted" | "confirmed" | "timeout" | "rejected";
+/**
+ * 执行阶段（AT-16 B10 起五态）：
+ *   accepted   HTTP 受理（请求接住了，不等于云端收单）
+ *   confirmed  state 自己推进了（generating / done / failed）
+ *   concluded  后端已给结论的形态（unknown / rejected / failed）→ 按该形态立刻收尾，不再空跑
+ *   timeout    真在途：state 没推进、submit 也没有结论（既有文案不动）
+ *   rejected   入口不可用（准入判定没过 / 重复点击 / 无可用动作）——零请求
+ */
+export type HubQuickPhase = "accepted" | "confirmed" | "concluded" | "timeout" | "rejected";
 
-export type HubQuickRunResult = { phase: HubQuickPhase; state: string; note: string };
+/** 后端已经给出结论的三种提交形态（与 automation/submit_view.py 的 FORMS 同字面量）。 */
+export type HubQuickConclusionForm = "unknown" | "rejected" | "failed";
+
+export type HubQuickRunResult = {
+    phase: HubQuickPhase;
+    state: string;
+    note: string;
+    /** 仅 concluded 有：按哪种后端形态收的尾（unknown / rejected / failed）。 */
+    form?: HubQuickConclusionForm;
+};
+
+/**
+ * 提交形态 → 收尾结论（AT-16 B10 的**唯一判定点**，探针直测；两个入口不各写一套）。
+ *
+ * 病根（B8 施工中发现）：收尾只看 `state ∈ {generating, done, failed}`，而提交落到
+ * unknown / rejected 时 `state` 仍停在 `approved` / `awaiting_approval` → 循环跑满
+ * 20 轮 × 2s = 40 秒落 `timeout`，两处入口弹「提交仍在处理中」；此时主状态条（B8）早在
+ * 2-5 秒内按后端 `label` 说了「结果未知·先核对」——同一任务同一时刻两块 UI 两套话。
+ *
+ * 判据只读后端 B5a-1 的 `submit`（摘要/详情同一生产源 `automation/submit_view.build`）：
+ *   · 形态 ∈ {unknown, rejected, failed} → 立刻收尾，note **逐字**取后端 `conclusion`
+ *     （缺则 `label`）；前端不新写劝退话（红线 25：判据与文案同源生产）
+ *   · inflight（真在途）/ none（没提交过）/ 畸形值 → null，继续轮询（timeout 只留给它们）
+ */
+export function hubQuickSubmitConclusion(submit?: HubSubmitView | null): { form: HubQuickConclusionForm; note: string } | null {
+    const view = normalizeSubmitView(submit);
+    const form = view.form;
+    if (form !== "unknown" && form !== "rejected" && form !== "failed") return null;
+    return { form, note: view.conclusion || view.label };
+}
 
 /** 阶段人话（两处入口同一份；颜色由调用方按 level 映射到 message.xxx）。 */
 export function hubQuickPhaseText(phase: HubQuickPhase, state = ""): { level: "success" | "info" | "warning"; text: string } {
@@ -1329,6 +1367,11 @@ export function hubQuickPhaseText(phase: HubQuickPhase, state = ""): { level: "s
         if (state === "failed") return { level: "warning", text: "云端已回执：失败——按详情原文处理（可重试）" };
         return { level: "success", text: state === "done" ? "云端已收单：成片已出（云端 taskId 已确认）" : "云端已收单：已转 generating，等成片" };
     }
+    if (phase === "concluded") {
+        // 文案不在前端生产：调用方用 note（= 后端 conclusion，见 hubQuickSubmitConclusion）覆盖；
+        // 这里只定语气（要人处理 = warning）。拿不到后端结论时宁可不弹，也不编一句劝退话。
+        return { level: "warning", text: "" };
+    }
     if (phase === "timeout") {
         return { level: "info", text: "提交仍在处理中：还没转成 generating——前端超时 ≠ 云端失败，5 秒刷新会自己跟上；按 taskId 可续查" };
     }
@@ -1338,8 +1381,8 @@ export function hubQuickPhaseText(phase: HubQuickPhase, state = ""): { level: "s
 export type HubQuickRunDeps = {
     /** 提交（默认=既有 submitHubTask，POST /api/hub/submit；续查也是它——后端 generating 分支只查不建） */
     submit?: (localId: string, key: string) => Promise<unknown>;
-    /** 读任务（默认=getHubTask；轮询确认用） */
-    fetchTask?: (localId: string) => Promise<{ state?: string }>;
+    /** 读任务（默认=getHubTask；轮询确认用——**带 submit**，收尾判定要读后端结论） */
+    fetchTask?: (localId: string) => Promise<{ state?: string; submit?: HubSubmitView | null }>;
     sleep?: (ms: number) => Promise<void>;
     intervalMs?: number;
     maxPolls?: number;
@@ -1349,8 +1392,12 @@ export type HubQuickRunDeps = {
 /**
  * 执行快捷动作（两个入口共用这一条链）。
  *
- * 节奏是本次验收的核心：POST 返回 → 只报「提交处理中」（accepted）；再轮询详情，**看到
- * generating / done（或云端明确 failed）** 才报「云端已收单」；超时如实说「仍在处理中」。
+ * 节奏是本次验收的核心：POST 返回 → 只报「提交处理中」（accepted）；再轮询详情，按两级收尾：
+ *   ① state 自己推进到 generating / done → 报「云端已收单」；failed（且 submit 没给结论）→ 如实回执失败
+ *   ② **后端已给结论**（submit.form ∈ unknown / rejected / failed，B5a-1 同一生产源）→ 立刻按该形态
+ *      收尾（concluded），note 逐字取后端 conclusion——AT-16 B10：这几种形态下 state 停在
+ *      approved / awaiting_approval，旧实现会白跑 40 秒后弹「仍在处理中」，与主状态条打架
+ * 只有「state 没推进、submit 也没有结论」的真在途才落 timeout（文案不动）。
  * 重复点击：同任务在跑直接 rejected（不发第二个请求）；后端还有 active 409 兜底。
  * 提交失败（如 409 已有提交在跑）**原样抛出**，由调用方把后端原文透出（不吞、不美化）。
  */
@@ -1369,20 +1416,34 @@ export async function runHubQuickAction(localId: string, action: HubQuickAction,
     const fetchTask = deps.fetchTask || ((id: string) => getHubTask(id));
     const sleep = deps.sleep || ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
     const intervalMs = deps.intervalMs ?? 2000;
+    // 真在途（state=generating、submit=inflight）仍按既有上限轮询——timeout 只留给它们
     const maxPolls = deps.maxPolls ?? 20;
     try {
         await submit(localId, action.key);            // 受理（HTTP 2xx）
         say("accepted", "", "");
         for (let i = 0; i < maxPolls; i += 1) {
             await sleep(intervalMs);
-            let task: { state?: string } | null = null;
+            let task: { state?: string; submit?: HubSubmitView | null } | null = null;
             try {
                 task = await fetchTask(localId);
             } catch {
                 continue;                             // 读失败不是终态：继续轮询，别把网络抖动说成「已收单」
             }
             const state = String(task?.state || "");
-            if (state === "generating" || state === "done" || state === "failed") {
+            // ① state 自己推进了（正向终态 / 生成中）——既有语义与文案一行不动
+            if (state === "generating" || state === "done") {
+                say("confirmed", state, "");
+                return { phase: "confirmed", state, note: "" };
+            }
+            // ② 后端已给结论（unknown / rejected / failed）→ 立刻按该形态收尾，不再空跑到 40s。
+            //    主状态条（B8）消费的是同一份 submit.label——toast 与状态条从此同一结论、同一文案源。
+            const concluded = hubQuickSubmitConclusion(task?.submit);
+            if (concluded) {
+                say("concluded", state, concluded.note);
+                return { phase: "concluded", state, note: concluded.note, form: concluded.form };
+            }
+            // ③ 明确失败但 submit 没给结论（如旧 bridge 缺字段）→ 沿用既有「云端已回执：失败」文案
+            if (state === "failed") {
                 say("confirmed", state, "");
                 return { phase: "confirmed", state, note: "" };
             }
