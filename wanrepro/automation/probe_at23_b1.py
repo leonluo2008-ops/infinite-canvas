@@ -24,9 +24,16 @@
   [6] 真实任务只读：auto-0068 / auto-0067 重算后都是 1 词（完整原词）+ 5 切片 + 判定词数 6，
       且真实 projects/analysis 跑前跑后零变化（只调 `_check_all`，不落盘）。
   [7] 临时根跑完删净。
+  [8] **读取层折叠兜底**（返工）：折叠前落盘的旧格式 自检.json（同句 6 词并存、统计.词数=6、
+      无 判定词数）经 `selfcheck.load_selfcheck` 读出 → 1 条完整原词 + 5 切片 + 判定词数 6 +
+      「还留着 1 个」；处理/清单行/原句/证据一字不改、自检.json 字节不变（不落盘、不重跑自检）；
+      已折叠载荷幂等直通（不重复折叠、不添第二次痕）；无包含关系的旧载荷原样透出；坏文件仍 → None；
+      hub_api 三处「自检」组装全走 load_selfcheck（后端唯一出口）；真实存量 auto-0067/0068
+      读路径即收口且 SHA256 前后不变。
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -361,6 +368,141 @@ def boundary_phase() -> bool:
 # 真 DOM），本探针只负责隔离根内的判定口径与白名单语义。
 
 
+# ---------------------------------------------------------------- [8] 读取层折叠兜底
+#
+# 前卡（t_b27d8d63）验收 FAIL 的根因：折叠只挂在「新跑自检」的产出路径，**存量任务**的
+# 自检.json 仍是折叠前落盘（同句 6 词并存），GET /api/hub/task 原样透出 → 真机仍列 6 词。
+# 重跑存量任务自检是禁止动作，所以兜底落在读取层唯一出口 `selfcheck.load_selfcheck`。
+
+
+def legacy_payload(words: list[str]) -> list[dict]:
+    """折叠前落盘的 自检.json（= auto-0067/0068 的真实形态：同句多词并存、统计.词数=命中数）。"""
+    findings = [{
+        "文字": f"#1 的「{word}」残留于正文: …参考图中的@图片1 {WORD}。0-3秒…",
+        "行号": 1, "图号": 1, "行称呼": "本品主体", "类别": "主体",
+        "图称呼": "你传的产品图", "图引用": ref(TASK, "row1.png"), "词": word, "句序": 1,
+        "上下文": f"全程使用参考图中的@图片1 {WORD}。",
+        "原文": f"#1 的「{word}」残留于正文: …参考图中的@图片1 {WORD}。0-3秒…",
+        "可修": {"类型": "改描述"},
+    } for word in words]
+    return [
+        {
+            "项": "绑图行残留", "结论": "FAIL", "项显示名": "提示词里的老词",
+            "证据": "；".join(f["文字"] for f in findings[:5]) + ("…" if len(findings) > 5 else "")
+                    + "｜已传图行词表 1 行（#1→图1(6词)），正文 448 字",
+            "说明": {
+                "结论人话": f"提示词里还留着 {len(findings)} 个要换掉的原物词，都在第 1 行「本品主体」里",
+                "处理": "在下面这条发现上点「改这一行的描述」，写完点「保存并重渲染」——提示词按新描述重出",
+                "发现": findings,
+                "统计": {"词表行数": 1, "正文字数": 448, "行→图号": {"1": 1},
+                         "词数": len(findings), "句数": 1},
+                "清单行": {"1": WORD},
+                "原句": {"句序": 1, "段": f"全程使用参考图中的@图片1 {WORD}。", "行号": 1},
+            },
+        },
+        {"项": "次序对账", "结论": "PASS", "项显示名": "图号与提交次序", "证据": "图号与提交次序一致"},
+    ]
+
+
+def read_layer_phase() -> bool:
+    print("[8] 读取层折叠兜底：旧格式 6 词载荷 → 1 个完整原词（存量任务不重跑自检也收口）")
+    ok = True
+    d = TMP_PROJECTS / "auto-9952"
+    d.mkdir(parents=True, exist_ok=True)
+    path = d / selfcheck.SELFCHECK_NAME
+    legacy = legacy_payload([WORD, "亮橙色", "橙色标", "裹亮橙", "标签款", "色标签"])
+    path.write_text(json.dumps(legacy, ensure_ascii=False, indent=2), encoding="utf-8")
+    raw_before = path.read_bytes()
+
+    items = selfcheck.load_selfcheck(d) or []
+    item = residue_of(items)
+    found = findings_of(item)
+    say = item.get("说明") or {}
+    stats = say.get("统计") or {}
+
+    ok &= check("[8] 数据层：旧格式 6 词并存 → 读出 1 条 finding，词=7 字完整原词",
+                len(found) == 1 and found[0].get("词") == WORD,
+                json.dumps([f.get("词") for f in found], ensure_ascii=False))
+    ok &= check("[8] 切片 5 个逐字一致（按原词内起始位置定序）",
+                bool(found) and list(found[0].get("切片") or []) == SLICES,
+                json.dumps((found[0].get("切片") if found else None), ensure_ascii=False))
+    ok &= check("[8] 统计留痕：判定词数=6 / 展示 词数=1 / 句数=1",
+                stats.get("判定词数") == 6 and stats.get("词数") == 1 and stats.get("句数") == 1,
+                json.dumps(stats, ensure_ascii=False))
+    ok &= check("[8] 折叠来源如实标注（读取层兜底，不是重跑自检）",
+                "读取层" in str(stats.get("折叠来源")), json.dumps(stats.get("折叠来源"), ensure_ascii=False))
+    ok &= check("[8] 判定侧统计原样（词表行数/正文字数/行→图号 一个不改）",
+                stats.get("词表行数") == 1 and stats.get("正文字数") == 448
+                and stats.get("行→图号") == {"1": 1}, json.dumps(stats, ensure_ascii=False))
+    ok &= check("[8] 结论人话按展示集改口（「还留着 1 个」；不再嘴上说 6 个）",
+                "还留着 1 个要换掉的原物词" in str(say.get("结论人话")), str(say.get("结论人话")))
+    ok &= check("[8] 处理/清单行/原句 一字不改（判定侧事实不重写）",
+                say.get("处理") == legacy[0]["说明"]["处理"]
+                and say.get("清单行") == legacy[0]["说明"]["清单行"]
+                and say.get("原句") == legacy[0]["说明"]["原句"])
+    ok &= check("[8] 证据一字不改（检查器原始输出只进折叠区，不当判定改写）",
+                item.get("证据") == legacy[0]["证据"], str(item.get("证据"))[:160])
+    ok &= check("[8] 只读：自检.json 字节不变（折叠只在读路径，不落盘）",
+                path.read_bytes() == raw_before)
+    ok &= check("[8] 非残留项原样透出（次序对账 PASS 一字不动）",
+                len(items) == 2 and items[1] == legacy[1])
+
+    # 幂等：把折叠后的载荷（= 新格式落盘）再读一遍，必须逐字相同。
+    path.write_text(json.dumps([item, legacy[1]], ensure_ascii=False, indent=2), encoding="utf-8")
+    again = residue_of(selfcheck.load_selfcheck(d) or [])
+    ok &= check("[8] 幂等：已折叠载荷再读逐字相同（不重复折叠、不添第二次痕）", again == item)
+    ok &= check("[8] 幂等：判定词数仍 6、切片仍 5 个、折叠来源不被改写",
+                ((again.get("说明") or {}).get("统计") or {}).get("判定词数") == 6
+                and list(findings_of(again)[0].get("切片") or []) == SLICES
+                and ((again.get("说明") or {}).get("统计") or {}).get("折叠来源")
+                == stats.get("折叠来源"))
+
+    # 同句互不包含的两个词：没有可折叠的，原样透出（不给干净数据添痕）。
+    plain = TMP_PROJECTS / "auto-9953"
+    plain.mkdir(parents=True, exist_ok=True)
+    plain_path = plain / selfcheck.SELFCHECK_NAME
+    plain_items = legacy_payload([WORD, "香水喷雾瓶"])
+    plain_path.write_text(json.dumps(plain_items, ensure_ascii=False, indent=2), encoding="utf-8")
+    read_plain = selfcheck.load_selfcheck(plain) or []
+    ok &= check("[8] 无包含关系的老载荷 → 原样透出（不落 判定词数、不改任何字段）",
+                residue_of(read_plain) == plain_items[0],
+                json.dumps(((residue_of(read_plain).get("说明") or {}).get("统计")), ensure_ascii=False))
+
+    # 坏文件/空文件语义不变（前端「未检查」）。
+    bad = TMP_PROJECTS / "auto-9954"
+    bad.mkdir(parents=True, exist_ok=True)
+    (bad / selfcheck.SELFCHECK_NAME).write_text("{坏 json", encoding="utf-8")
+    ok &= check("[8] 坏 自检.json 语义不变 → None（不因兜底把坏文件当空自检）",
+                selfcheck.load_selfcheck(bad) is None)
+
+    # 结构性守卫：hub_api 三处「自检」组装全走 load_selfcheck，别的路径不许直接读 自检.json。
+    src = (ROOT / "ui" / "hub_api.py").read_text(encoding="utf-8")
+    ok &= check("[8] 后端唯一出口：hub_api 的 3 处「自检」组装全走 selfcheck.load_selfcheck",
+                src.count('"自检": selfcheck.load_selfcheck(') == 3
+                and "SELFCHECK_NAME" not in src,
+                f"hit={src.count(chr(34) + '自检' + chr(34) + ': selfcheck.load_selfcheck(')}"
+                f" direct={src.count('SELFCHECK_NAME')}")
+
+    # 真实存量任务只读：读路径也收口，且 自检.json 字节零变化。
+    for real_id in ("auto-0067", "auto-0068"):
+        real_path = REAL_PROJECTS / real_id / selfcheck.SELFCHECK_NAME
+        if not real_path.is_file():
+            continue
+        before = hashlib.sha256(real_path.read_bytes()).hexdigest()
+        real_found = findings_of(residue_of(selfcheck.load_selfcheck(REAL_PROJECTS / real_id) or []))
+        after = hashlib.sha256(real_path.read_bytes()).hexdigest()
+        ok &= check(f"[8] 真实存量 {real_id}：读路径 1 词完整原词 + 5 切片 + 判定词数 6",
+                    len(real_found) == 1 and real_found[0].get("词") == WORD
+                    and list(real_found[0].get("切片") or []) == SLICES
+                    and ((next((i for i in (selfcheck.load_selfcheck(REAL_PROJECTS / real_id) or [])
+                                if i.get("项") == "绑图行残留"), {}).get("说明") or {})
+                         .get("统计") or {}).get("判定词数") == 6,
+                    json.dumps([f.get("词") for f in real_found], ensure_ascii=False))
+        ok &= check(f"[8] 真实存量 {real_id}：自检.json SHA256 前后不变（只读，不重跑自检）",
+                    before == after)
+    return ok
+
+
 def main() -> int:
     print(f"[probe-at23-b1] 隔离根 {TMP_ROOT}")
     print(f"[probe-at23-b1] 假 bridge {STUB.base}")
@@ -374,6 +516,7 @@ def main() -> int:
         ok &= evidence_phase(d)
         ok &= whitelist_phase(d)
         ok &= boundary_phase()
+        ok &= read_layer_phase()
     finally:
         STUB.__exit__(None, None, None)
         shutil.rmtree(TMP_ROOT, ignore_errors=True)

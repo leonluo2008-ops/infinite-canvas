@@ -411,12 +411,65 @@ def run_selfcheck(task_dir: Path) -> list[dict]:
     return items
 
 
+def _fold_report_item(item: dict) -> dict:
+    """读取层折叠兜底（AT-23 B1 返工）：**存量任务**的 自检.json 落盘早于折叠落地，读的时候收口。
+
+    病根同上（`_fold_contained_words`）：折叠最初只挂在「新跑自检」的产出路径，存量任务
+    （auto-0067/0068 的 自检.json 是折叠前落盘：同句 6 词并存、统计.词数=6、无展示词数留痕）
+    经 GET /api/hub/task 原样透出 → 真机红字仍列 6 词、6 个「保留这个词」。重跑存量任务自检
+    是禁止动作（真实任务只读），所以兜底只能落在**读取层**这一个出口（`load_selfcheck`，
+    hub_api 三处「自检」组装全走它）。
+
+    幂等判据：`统计.判定词数` 已是折叠后产出的留痕键——键在就说明这份载荷是新格式，
+    原样透出（不重复折叠、不留第二次痕）。旧载荷里没有任何词被包含（没折掉一条）时也原样
+    透出：折叠是展示收口，不是给干净数据添痕。
+
+    改的只有展示侧：`发现` 折成完整原词 + `切片`、`统计` 补 `判定词数`（=判定集词数，
+    一个不少）与折叠后的 `词数`、`结论人话` 里的「还留着 N 个」按展示集改口。`证据` 一字不动
+    ——那是检查器原始输出（判定证据），只进折叠区「检查器原始输出」。
+    """
+    if item.get("项") != "绑图行残留" or item.get("结论") != FAIL:
+        return item
+    say = item.get("说明")
+    if not isinstance(say, dict):
+        return item
+    findings = say.get("发现")
+    if not isinstance(findings, list) or len(findings) < 2:
+        return item
+    stats = say.get("统计") if isinstance(say.get("统计"), dict) else {}
+    if FOLD_STAT_KEY in stats:
+        return item                                  # 新产出已折叠：幂等跳过
+    if not all(isinstance(f, dict) and f.get("词") for f in findings):
+        return item                                  # 有非词类发现：不猜，原样透出
+    hits = [dict(f) for f in findings]
+    folded = _fold_contained_words(hits)
+    if len(folded) >= len(hits):
+        return item                                  # 一句里没有包含关系：不用收口
+    new_stats = dict(stats)
+    new_stats["词数"] = len(folded)
+    new_stats[FOLD_STAT_KEY] = len(hits)
+    new_stats["句数"] = len({(f.get("行号"), f.get("句序")) for f in folded})
+    new_stats[FOLD_SOURCE_KEY] = "读取层（存量任务的自检.json 早于折叠落地，未重跑自检）"
+    new_say = dict(say)
+    new_say["发现"] = folded
+    new_say["统计"] = new_stats
+    head = str(say.get("结论人话") or "")
+    if head:
+        new_say["结论人话"] = FOLD_HEAD_COUNT.sub(lambda m: f"{m.group(1)}{len(folded)}{m.group(2)}", head)
+    out = dict(item)
+    out["说明"] = new_say
+    return out
+
+
 def load_selfcheck(task_dir: Path) -> list[dict] | None:
     """读 自检.json（get_task 透出用）；无文件/坏文件/非列表 → None（前端显「未检查」）。
 
     AT-15 R2：追加一条「拆解门禁」合成条目（只读 analysis/reverse/<bridge>/门禁.json，
     不落盘、不改 B5 自检合同的原有四项）——门禁数据是渲染后门禁步落的另一份文件，
     前端自检面板只认 自检.json 这一束，所以在读路径汇总（白名单判据汇总位）。
+
+    AT-23 B1 返工：透出前做一次**读取层折叠兜底**（`_fold_report_item`）——存量任务不重跑
+    自检也能看到「一句话一个完整原词」，新格式载荷幂等直通。后端唯一出口，前端零改动。
     """
     items: list[dict] | None = None
     path = task_dir / SELFCHECK_NAME
@@ -426,7 +479,7 @@ def load_selfcheck(task_dir: Path) -> list[dict] | None:
         except (OSError, json.JSONDecodeError):
             data = None
         if isinstance(data, list):
-            rows = [row for row in data if isinstance(row, dict)]
+            rows = [_fold_report_item(row) for row in data if isinstance(row, dict)]
             items = rows or None
     gate = load_gate_item(task_dir)
     if gate is not None:
@@ -830,6 +883,11 @@ def _own_label_line(line: str, names: set[str]) -> bool:
     return False
 
 
+FOLD_STAT_KEY = "判定词数"          # 判定集词数留痕（折叠后产出必带；读取层兜底也以它为幂等判据）
+FOLD_SOURCE_KEY = "折叠来源"        # 只在读取层兜底时落（存量载荷被收口时才出现）
+FOLD_HEAD_COUNT = re.compile(r"(还留着\s*)\d+(\s*个要换掉的原物词)")
+
+
 def _fold_contained_words(hits: list[dict]) -> list[dict]:
     """把同一「行×句」的命中词按**包含关系折叠**成展示集（AT-23 B1：判定集不动，展示集取最大词）。
 
@@ -963,7 +1021,7 @@ def _check_residue(body: str, ents, render, bridge_id: str = "",
     shown = "；".join(str(h["文字"]) for h in hits[:5])
     rows = list(dict.fromkeys(h["行号"] for h in hits if h.get("行号")))
     stats["词数"] = len(hits)
-    stats["判定词数"] = judgment_words
+    stats[FOLD_STAT_KEY] = judgment_words
     stats["句数"] = len({(h.get("行号"), h.get("句序")) for h in hits})
     head = (f"提示词里还留着 {len(hits)} 个要换掉的原物词，都在{_row_phrase(rows[0], labels)}里"
             if len(rows) == 1 else
