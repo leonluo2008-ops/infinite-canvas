@@ -1,6 +1,6 @@
 import { ArrowRight, CheckCircle2, CircleAlert, Download, FileText, ImageOff, LoaderCircle, MoreHorizontal, RefreshCw, Sparkles, Type, Upload } from "lucide-react";
 import { App, Button, Checkbox, Drawer, Dropdown, Empty, Image as AntdImage, Input, Modal, Radio, Select, Slider, Tag, Tooltip } from "antd";
-import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type DragEvent } from "react";
+import { createContext, memo, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, type DragEvent } from "react";
 import { Streamdown } from "streamdown";
 
 import { ModelPicker } from "@/components/model-picker";
@@ -39,7 +39,7 @@ import {
     type GenDraft,
 } from "@/lib/hub/gen-settings";
 import { mergeBadge, mergeBarText, mergeImageBranch, mergeMembershipChanged, mergeSelectable, mergeShotUnion, groupBoxRow, pruneSelection, toggleMergeRow } from "@/lib/hub/merge-mode";
-import { flashPromptHit } from "@/lib/hub/prompt-anchor";
+import { applyPromptHighlights, buildPromptHighlightPlan, scrollToPromptHighlight, unwrapPromptHighlights, type PromptHighlightItem } from "@/lib/hub/prompt-highlight";
 import { activeCards, decisionBadgeText, decisionErrorText, decisionFeedback, lockCounters, lockRows, originRowNumbers, originStripLabel, rowDecisionAction, type RowDecisionAction } from "@/lib/hub/row-decision";
 import { useConfigStore, type AiConfig } from "@/stores/use-config-store";
 
@@ -2025,6 +2025,40 @@ const WhitelistContext = createContext<WhitelistApi | null>(null);
 type PromptAnchorApi = { reveal: (candidates: string[]) => void };
 const PromptAnchorContext = createContext<PromptAnchorApi | null>(null);
 
+/** SSR（探针跑 react-dom/server）没有 layout 阶段：那里退化成 useEffect，避免 React 的告警。 */
+const useIsoLayoutEffect = typeof window === "undefined" ? useEffect : useLayoutEffect;
+
+/** 正文渲染件（第 2 批）：Streamdown 照原样解析 markdown，渲染完在**真实文本节点**上包 `<mark>`
+ *  打**常驻**高亮（命中段 amber 底色 + amber 下划线，不自动消失）。
+ *
+ *  取舍（为什么不在 JSX 里按字符切）：正文是整段 markdown，按字符下标切源串会把段落/强调/代码块
+ *  切成互不相连的碎片（每片各自成段、空白全变），违反「markdown 完整性」；所以保持 Streamdown 的
+ *  输出不动，只在其文本节点上做字符级包裹——结构、标签、转义全都不经过我们手。
+ *
+ *  生命周期：包上去的 mark 含 React 自己渲染的文本节点，因此必须**在 React 改这棵子树之前**展开回去。
+ *  `useLayoutEffect` 的清理正好跑在 mutation 阶段（先 destroy 再做 DOM 改动），所以重渲染（正文变了）
+ *  与卸载都不会踩到「node is not a child of this node」。`memo` 让无关状态（展开/收起行内编辑器等）
+ *  的重渲染不碰这棵子树，高亮也就不需要反复重算。 */
+const PromptMarkdown = memo(function PromptMarkdown({
+    markdown,
+    plan,
+}: {
+    markdown: string;
+    /** 全部 findings 的结构化高亮计划（`buildPromptHighlightPlan` 产出，已在 PromptSection 里 useMemo）。 */
+    plan: PromptHighlightItem[];
+}) {
+    const hostRef = useRef<HTMLDivElement | null>(null);
+    useIsoLayoutEffect(() => {
+        const marks = applyPromptHighlights(hostRef.current, plan);
+        return () => unwrapPromptHighlights(marks);
+    }, [markdown, plan]);
+    return (
+        <div ref={hostRef} data-hub-prompt-markdown>
+            <Streamdown>{markdown}</Streamdown>
+        </div>
+    );
+});
+
 /* hub-asset-exit:begin —— 受控资产出口（AT-16 B1a）。
    全 drawer **唯一**允许把资产引用赋给 <img src> / <a href> 的地方：只收 ref 原串，
    内部过 hubAssetRefView()（= hub-api 显示层唯一换算点 hubAssetDisplayUrl）出 src/href。
@@ -2254,8 +2288,14 @@ export function PromptSection({
     const descGate = useMemo(() => hubDescEditGate(detail.state || ""), [detail.state]);
     // AT-21 B0：手改正文起态门（与后端 PROMPT_EDIT_REFUSALS 同序；不可改时按钮置灰 + tooltip 给出口）
     const promptGate = useMemo(() => hubPromptEditGate(detail.state || ""), [detail.state]);
-    /** 只读定位（交互设计 §2.4）：不可编辑态下「看正文里的这一句」——滚到命中句 + 临时高亮 2 秒。
-     *  简版：不改正文渲染路径、不常驻（常驻/字符级高亮是第 2 批）。**永不弹「先退回置换」**。 */
+    /** 常驻高亮计划（第 2 批）：全部 findings 的结构化 `上下文/片段`，按 `自检` 束 useMemo 一次，
+     *  不随每次 render 重算。 */
+    const promptHighlightPlan = useMemo(
+        () => buildPromptHighlightPlan(detail.自检),
+        [detail.自检],
+    );
+    /** 只读定位（交互设计 §2.4 → 第 2 批升级）：高亮**常驻**在正文里，点击只负责把那一处滚进视野。
+     *  **永不弹「先退回置换」**，也不再包临时 mark / 定时摘掉。 */
     const promptAnchor = useMemo<PromptAnchorApi>(() => ({
         reveal: (candidates: string[]) => {
             const wants = (candidates || [])
@@ -2268,7 +2308,7 @@ export function PromptSection({
             }
             setCollapsed(false);                     // 正文可能处于收起态：先让它出现在 DOM 里
             const attempt = (left: number) => {
-                if (flashPromptHit(promptBodyRef.current, wants)) return;
+                if (scrollToPromptHighlight(promptBodyRef.current, wants)) return;
                 if (left > 0) window.setTimeout(() => attempt(left - 1), 80);
                 else message.info("正文里没找到这一句：提示词可能已经被改过了");
             };
@@ -2391,8 +2431,9 @@ export function PromptSection({
                         className="agent-streamdown thin-scrollbar mt-3 max-h-96 w-full overflow-auto rounded-md border border-stone-200 px-3 py-2 text-sm dark:border-stone-800"
                         data-hub-prompt-body
                         data-expanded="1"
+                        data-hub-prompt-highlights={promptHighlightPlan.length ? String(promptHighlightPlan.length) : "0"}
                     >
-                        <Streamdown>{prompt}</Streamdown>
+                        <PromptMarkdown markdown={prompt} plan={promptHighlightPlan} />
                     </div>
                 )
             ) : (
@@ -2691,7 +2732,7 @@ function SelfCheckCardView({ card, itemKey, wordRows }: {
                         </Tooltip>
                     ) : null}
                     {canLocate && !editGate.enabled ? (
-                        <Tooltip title="只读：把正文滚到这一句、高亮 2 秒——不改任何东西，也不换状态">
+                        <Tooltip title="只读：把正文滚到这一句（命中段已常驻高亮）——不改任何东西，也不换状态">
                             <Button
                                 size="small"
                                 type="text"

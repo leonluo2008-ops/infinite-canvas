@@ -1,18 +1,25 @@
 /**
  * 质检面板就地处理闭环 · 第 1 批前端探针（本地免费、不联网、不动真实任务）。
  *
+ * 第 2 批（字符级常驻高亮）起：`[A]` 里「临时高亮 2 秒」那几条断言已按新合同换成常驻高亮的
+ * 纯逻辑断言（`buildPromptHighlightPlan` / `promptHighlightSpans`），`[B]` 的接线断言换成
+ * `scrollToPromptHighlight` + `PromptMarkdown`；其余断言逐条不动。
+ *
  * 断言四组：
- *  [A] 纯逻辑（esbuild 打包 src/lib/hub/toast.ts + src/lib/hub/prompt-anchor.ts 后直接 import）
+ *  [A] 纯逻辑（esbuild 打包 src/lib/hub/toast.ts + prompt-anchor.ts + prompt-highlight.ts 后直接 import）
  *      · `claimToast`：同文案 1s 内只放行第一条；被吞的点击**不续期**（连点不会无限延长静默期）；
  *        超过 1s 可再弹；不同文案互不影响；非文本载荷（ReactNode）不拦；判重表按窗口自清（有界）。
  *      · `promptHitRange`：整句命中给准确区间；句首被 markdown 切开时退到最长前缀；找不到如实 null。
- *      · 临时高亮的接线常量/调用形态（2 秒、`data-hub-prompt-hit`、`scrollIntoView`、摘除后 normalize）。
+ *      · 常驻高亮的两层纯运算：计划只收结构化槽位（上下文优先 / 词兜底）；`片段` 的 `起/止` 当区间用；
+ *        重叠与相邻区间取并集（不重复渲染）；整句落空退最长前缀；短词不拿前缀猜。
  *  [B] 静态合同（源码）
  *      · 「去这一行」假动作整条路径已删：`data-hub-selfcheck-locator` 0 命中、按行号查资产行 DOM 的
  *        querySelector 0 命中、那句「先点「退回置换」…」Toast 0 命中（**全 web/src 一起扫**，不只本文件）。
  *      · 动作位收敛：只剩「改这一行的描述」（置灰判据与 tooltip 都读 `editGate`＝`hubDescEditGate`
  *        单一口径）＋ 不可编辑态的「看正文里的这一句」（`canLocate && !editGate.enabled`）。
- *      · 只读定位锚正文容器（`ref={promptBodyRef}` 与 `data-hub-prompt-body` 同一元素），不锚资产行。
+ *      · 只读定位锚正文容器（`ref={promptBodyRef}` 与 `data-hub-prompt-body` 同一元素），不锚资产行；
+ *        正文渲染件 = Streamdown 原样输出 + 渲染后包常驻 mark（**不切 markdown 源**），
+ *        点击定位＝滚到已存在的高亮段（不再有 2 秒定时摘除）。
  *      · Toast 薄封装：hub 页不再解构 `App.useApp().message`，全部走 `useHubMessage`。
  *  [C] 真渲染（esbuild + react-dom/server，streamdown 打桩）
  *      · 状态矩阵：可编辑两态 → 「改这一行的描述」可点、**没有**定位按钮（动作位收敛）；
@@ -65,13 +72,14 @@ const pureBuilt = await esbuild.build({
     stdin: {
         contents:
             'export * from "../../../src/lib/hub/toast";\n' +
-            'export * from "../../../src/lib/hub/prompt-anchor";\n',
+            'export * from "../../../src/lib/hub/prompt-anchor";\n' +
+            'export * from "../../../src/lib/hub/prompt-highlight";\n',
         resolveDir: CACHE,
         loader: "ts",
     },
     bundle: true, format: "esm", platform: "node", outfile: pureOut, logLevel: "silent",
 });
-check("[A] 纯逻辑模块打包成功（toast / prompt-anchor）", pureBuilt.errors.length === 0,
+check("[A] 纯逻辑模块打包成功（toast / prompt-anchor / prompt-highlight）", pureBuilt.errors.length === 0,
     pureBuilt.errors.map((e) => e.text).join("; "));
 const pure = await import(pathToFileURL(pureOut).href + `?t=${Date.now()}`);
 
@@ -114,19 +122,65 @@ console.log("2) promptHitRange：整句 → 最长前缀 → 如实找不到");
     check("[A] 正文里确实没有这一句 → null（不瞎指位置）",
         pure.promptHitRange(hay, "这句话根本不在这一版正文里") === null);
     check("[A] 太短的串（<2 字）不猜", pure.promptHitRange(hay, "桌") === null);
-    check("[A] 高亮存活时长＝2000ms（简版：2 秒后摘掉）", pure.PROMPT_HIT_MS === 2000, String(pure.PROMPT_HIT_MS));
-    check("[A] 临时高亮带可断言的锚点属性", pure.PROMPT_HIT_ATTR === "data-hub-prompt-hit", pure.PROMPT_HIT_ATTR);
-    const anchorSrc = read("src/lib/hub/prompt-anchor.ts");
-    check("[A] 定位动作＝滚动到命中处 + 定时摘除（不常驻、不改正文渲染路径）",
-        /scrollIntoView\(\{ block: "center" \}\)/.test(anchorSrc)
-        && /setTimeout\(\(\) => unwrapPromptHit\(mark\), windowMs\)/.test(anchorSrc)
-        && /parent\.normalize\(\)/.test(anchorSrc));
-    check("[A] 摘除时节点已不在（React 重渲染换掉）就静默跳过，不抛",
-        /if \(!mark \|\| !mark\.isConnected\) return;/.test(anchorSrc));
+    check("[A] 正文定位只留纯下标运算：临时高亮路径已删（无 flashPromptHit / 无 2 秒定时摘除）",
+        typeof pure.flashPromptHit === "undefined"
+        && !/setTimeout/.test(read("src/lib/hub/prompt-anchor.ts")));
+    check("[A] 常驻高亮的锚点沿用 data-hub-prompt-hit，值＝persistent（与第 1 批临时高亮可区分）",
+        pure.PROMPT_HL_ATTR === "data-hub-prompt-hit" && pure.PROMPT_HL_STATE === "persistent",
+        `${pure.PROMPT_HL_ATTR}=${pure.PROMPT_HL_STATE}`);
 }
 
+console.log("3) 常驻高亮纯运算：计划收口结构 → 片段区间 → 并集合并 → 前缀回退");
+const SENTENCE = "全程使用参考图中的@图片1 裹亮橙色标签款。";
+const HL_ITEMS = [{
+    说明: {
+        发现: [
+            { 上下文: SENTENCE, 词: "裹亮橙色标签款", 片段: [
+                { 起: 0, 止: 14, 文: "全程使用参考图中的@图片1 ", 高亮: false },
+                { 起: 14, 止: 21, 文: "裹亮橙色标签款", 高亮: true },
+                { 起: 21, 止: 22, 文: "。", 高亮: false },
+            ] },
+            { 上下文: SENTENCE, 词: "亮橙色", 片段: [{ 起: 15, 止: 18, 文: "亮橙色", 高亮: true }] },
+            { 上下文: SENTENCE, 词: "标签款", 片段: [{ 起: 18, 止: 21, 文: "标签款", 高亮: true }] },
+            { 上下文: SENTENCE, 词: "裹亮橙色标签款", 片段: [] },
+        ],
+    },
+}];
+const PLAN = pure.buildPromptHighlightPlan(HL_ITEMS);
+check("[A] 计划：同上下文+同词去重（4 条 finding → 3 条计划项）", PLAN.length === 3, String(PLAN.length));
+check("[A] 计划只用结构化槽位：非高亮片段丢弃，命中片段原样保留（相对上下文下标）",
+    PLAN[0] && PLAN[0].片段.length === 1 && PLAN[0].片段[0].起 === 14 && PLAN[0].片段[0].止 === 21,
+    JSON.stringify(PLAN[0] && PLAN[0].片段));
+const body = `0-3秒，中景，人物与@图片1，微幅晃动。${SENTENCE}8-10秒，中景，保持静止。`;
+const spans = pure.promptHighlightSpans(body, PLAN);
+const hitText = spans.map((s) => body.slice(s.起, s.止));
+check("[A] 三个滑窗切片（7 字 / 3 字 / 3 字）取并集后只剩一段：命中词本身",
+    spans.length === 1 && hitText[0] === "裹亮橙色标签款", JSON.stringify(hitText));
+check("[A] 并集不重复渲染：区间互不重叠、也不相邻",
+    spans.every((s, i) => i === 0 || s.起 > spans[i - 1].止), JSON.stringify(spans));
+check("[A] 只上色真正命中的那段字（句首非命中部分不跟着上色）",
+    !hitText[0].includes("全程使用"), hitText[0]);
+const noPiecePlan = pure.buildPromptHighlightPlan([{ 说明: { 发现: [{ 上下文: SENTENCE, 词: "裹亮橙色标签款" }] } }]);
+const wholeSpans = pure.promptHighlightSpans(body, noPiecePlan);
+check("[A] 没有片段（旧数据）→ 整句上色，区间正好是上下文整句",
+    wholeSpans.length === 1 && body.slice(wholeSpans[0].起, wholeSpans[0].止) === SENTENCE, JSON.stringify(wholeSpans));
+const cutBody = "0-3秒。全程使用参考图中的图片 裹亮橙色标签款。";
+const cutSpans = pure.promptHighlightSpans(cutBody, noPiecePlan);
+check("[A] 整句落空（markdown 把 @图片1 拆走）→ 退最长前缀，仍落在这一句开头",
+    cutSpans.length === 1 && cutBody.slice(cutSpans[0].起, cutSpans[0].止) === "全程使用参考图中的",
+    JSON.stringify(cutSpans.map((s) => cutBody.slice(s.起, s.止))));
+const wordPlan = pure.buildPromptHighlightPlan([{ 说明: { 发现: [{ 词: "裹亮橙色标签款" }] } }]);
+const wordSpans = pure.promptHighlightSpans(body, wordPlan);
+check("[A] 旧数据没有上下文 → 词兜底（精确匹配，不拿两字前缀瞎猜）",
+    wordSpans.length === 1 && body.slice(wordSpans[0].起, wordSpans[0].止) === "裹亮橙色标签款", JSON.stringify(wordSpans));
+const absentPlan = pure.buildPromptHighlightPlan([{ 说明: { 发现: [{ 上下文: "这句话根本不在这一版正文里" }] } }]);
+check("[A] 整句与前缀都找不到 → 一段都不上色（不瞎指位置）",
+    pure.promptHighlightSpans(body, absentPlan).length === 0);
+check("[A] 空自检束／空输入 → 空计划（正文照常渲染，不上任何色）",
+    pure.buildPromptHighlightPlan([]).length === 0 && pure.buildPromptHighlightPlan(undefined).length === 0);
+
 // ════════════════════════════════════════════════ [B] 静态合同
-console.log("3) 假动作整条路径已删（全 web/src 一起扫）");
+console.log("4) 假动作整条路径已删（全 web/src 一起扫）");
 const drawerSrc = read("src/pages/hub/task-detail-drawer.tsx");
 const DEAD_COPY = "先点「退回置换」回到资产置换区，再点这里";
 const walk = (dir, out = []) => {
@@ -148,7 +202,7 @@ check("[B] 不再按行号去查资产置换区的行 DOM（假定位的根因�
     && !drawerSrc.includes('querySelectorAll("[data-hub-asset-rows]")'));
 check("[B] 「去这一行」这个按钮文案已不存在", !/去这一行<\/Button>/.test(drawerSrc) && !drawerSrc.includes(">去这一行"));
 
-console.log("4) 动作位收敛：一个改入口（置灰讲真原因）+ 不可编辑态的只读定位");
+console.log("5) 动作位收敛：一个改入口（置灰讲真原因）+ 不可编辑态的只读定位");
 check("[B] 质检卡动作位仍有唯一的改入口（生产者指引点名的「改这一行的描述」逐字未变）",
     drawerSrc.includes("改这一行的描述") && /data-hub-selfcheck-fix\b/.test(drawerSrc));
 check("[B] 置灰判据与 tooltip 同源（都读 editGate＝hubDescEditGate 单一口径，不自造第二份状态表）",
@@ -161,7 +215,17 @@ check("[B] 新增只读定位按钮：仅有它、且只在**不可编辑**态�
     && drawerSrc.includes("看正文里的这一句"));
 check("[B] 定位锚正文容器（恒渲染），不锚资产行：ref 与 data-hub-prompt-body 同一元素",
     /ref=\{promptBodyRef\}\s+className="agent-streamdown[^"]*"\s+data-hub-prompt-body/.test(drawerSrc)
-    && /flashPromptHit\(promptBodyRef\.current, wants\)/.test(drawerSrc));
+    && /scrollToPromptHighlight\(promptBodyRef\.current, wants\)/.test(drawerSrc));
+check("[B] 正文渲染件＝Streamdown 原样输出 + 渲染后包常驻 mark（不按字符切 markdown 源）",
+    /<PromptMarkdown markdown=\{prompt\} plan=\{promptHighlightPlan\} \/>/.test(drawerSrc)
+    && /<Streamdown>\{markdown\}<\/Streamdown>/.test(drawerSrc)
+    && !/Streamdown>\{prompt\}/.test(drawerSrc));
+check("[B] 高亮计划一次算好（useMemo 按自检束），不随每次 render 重算",
+    /const promptHighlightPlan = useMemo\(\s*\(\) => buildPromptHighlightPlan\(detail\.自检\),\s*\[detail\.自检\],\s*\);/.test(drawerSrc));
+check("[B] 常驻高亮的生命周期：包在 layout effect 里、清理时展开回去（先拆再让 React 改 DOM）",
+    /useIsoLayoutEffect\(\(\) => \{\s*const marks = applyPromptHighlights\(hostRef\.current, plan\);\s*return \(\) => unwrapPromptHighlights\(marks\);/.test(drawerSrc));
+check("[B] 常驻高亮不再有 2 秒定时摘除（临时高亮那条路径整条已删）",
+    !/unwrapPromptHit\b|flashPromptHit\b|PROMPT_HIT_MS/.test(drawerSrc) && !/setTimeout[^\n]*unwrap/.test(drawerSrc));
 check("[B] 正文可能在收起态：定位前先展开（不是让用户自己去找）",
     /setCollapsed\(false\);\s+\/\/ 正文可能处于收起态/.test(drawerSrc));
 check("[B] 定位路径永不要求退状态（没有「退回置换」指路文案）",
@@ -171,7 +235,7 @@ check("[B] 开关语义：单一 editingRow + toggle（结构上不可能出现�
     && /onClick=\{\(\) => descApi\.setEditingRow\(editing \? null : rowNo\)\}/.test(drawerSrc)
     && /const editing = rowNo !== null && descApi\?\.editingRow === rowNo;/.test(drawerSrc));
 
-console.log("5) Toast 薄封装接线（同文案 1s 去重）");
+console.log("6) Toast 薄封装接线（同文案 1s 去重）");
 check("[B] 详情页不再解构 App.useApp().message（全部走 useHubMessage）",
     !/const \{ message[^}]*\} = App\.useApp\(\);/.test(drawerSrc)
     && (drawerSrc.match(/const message = useHubMessage\(\);/g) || []).length >= 10,
@@ -268,7 +332,7 @@ const buttonOf = (html, marker) => {
     return start >= 0 && end > start ? html.slice(start, end + 1) : "";
 };
 
-console.log("6) 状态矩阵：可编辑两态＝就地改（无定位按钮）；其余每态＝置灰 + 只读定位");
+console.log("7) 状态矩阵：可编辑两态＝就地改（无定位按钮）；其余每态＝置灰 + 只读定位");
 const EDITABLE = ["awaiting_assets", "awaiting_approval"];
 for (const state of STATES) {
     const html = ssr.renderPrompt(DETAIL(state));
@@ -291,7 +355,7 @@ check("[C] 未知状态不默认放行（置灰 + 定位可用）",
     buttonOf(unknownHtml, "data-hub-selfcheck-fix").includes("disabled")
     && unknownHtml.includes("data-hub-selfcheck-locate"));
 
-console.log("7) 不可编辑态的解释来自起态门（真实原因，不是自造文案）");
+console.log("8) 不可编辑态的解释来自起态门（真实原因，不是自造文案）");
 const apiBundle = path.join(CACHE, "hub-api.bundle.mjs");
 await esbuild.build({
     entryPoints: [path.join(WEB, "src/pages/hub/hub-api.ts")], bundle: true, format: "esm",
