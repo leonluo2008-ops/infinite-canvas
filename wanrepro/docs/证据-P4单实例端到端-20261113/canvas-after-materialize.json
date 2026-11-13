@@ -1,0 +1,108 @@
+{
+  "lapianNodeId": "tp4full-1-lapian-1793901293075-gl4cw",
+  "nodes": [
+    {
+      "id": "tp4full-1-video-1793901289325-25d4s",
+      "type": "video"
+    },
+    {
+      "id": "tp4full-1-lapian-1793901293075-gl4cw",
+      "type": "lapian"
+    },
+    {
+      "id": "tp4full-1-text-1793901665795-amrfn",
+      "type": "text"
+    },
+    {
+      "id": "tp4full-1-text-1793901665795-jx3cx",
+      "type": "text"
+    },
+    {
+      "id": "tp4full-1-config-1793901665795-kooye",
+      "type": "config",
+      "mode": "text",
+      "lapianSourceId": "tp4full-1-lapian-1793901293075-gl4cw"
+    },
+    {
+      "id": "tp4full-1-jERtWnPXyzFhmbUxLLM4G",
+      "type": "text"
+    },
+    {
+      "id": "tp4full-1-config-1793903256858-naerp",
+      "type": "config",
+      "mode": "video"
+    },
+    {
+      "id": "tp4full-1-image-1793901490523-chxhe",
+      "type": "image"
+    },
+    {
+      "id": "tp4full-1-image-1793901490618-p42to",
+      "type": "image"
+    },
+    {
+      "id": "tp4full-1-image-1793901493028-xpa34",
+      "type": "image"
+    },
+    {
+      "id": "tp4full-1-image-1793901316874-tfjaz",
+      "type": "image"
+    },
+    {
+      "id": "tp4full-1-image-1793901333240-smntt",
+      "type": "image"
+    },
+    {
+      "id": "tp4full-1-image-1793901447125-74tq3",
+      "type": "image"
+    },
+    {
+      "id": "tp4full-1-image-1793901538358-h020v",
+      "type": "image"
+    },
+    {
+      "id": "tp4full-1-image-1793901538358-vskz4",
+      "type": "image"
+    },
+    {
+      "id": "tp4full-1-image-1793901538358-w6yss",
+      "type": "image"
+    },
+    {
+      "id": "tp4full-1-image-1793901538358-ad6d4",
+      "type": "image"
+    },
+    {
+      "id": "tp4full-1-image-1793901538358-v9489",
+      "type": "image"
+    },
+    {
+      "id": "tp4full-1-image-1793901538358-804w8",
+      "type": "image"
+    },
+    {
+      "id": "tp4full-1-image-1793901590315-gi82n",
+      "type": "image"
+    },
+    {
+      "id": "tp4full-1-image-1793901608610-4jw4n",
+      "type": "image"
+    },
+    {
+      "id": "tp4full-1-image-1793901615579-3sknz",
+      "type": "image"
+    },
+    {
+      "id": "tp4full-1-image-1793901630803-ezmen",
+      "type": "image"
+    },
+    {
+      "id": "tp4full-1-image-1793901643258-gnj0d",
+      "type": "image"
+    },
+    {
+      "id": "tp4full-1-image-1793902957746-mmuf5",
+      "type": "image"
+    }
+  ]
+}

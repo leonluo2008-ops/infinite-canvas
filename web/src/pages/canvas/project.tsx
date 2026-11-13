@@ -39,6 +39,7 @@ import { LapianAssetGroupModal, type LapianAssetGroupOption } from "@/components
 import { LapianAssetAttachModal, type LapianAssetAttachImage } from "@/components/canvas/lapian-asset-attach-modal";
 import { LapianPromptTemplateModal } from "@/components/canvas/lapian-prompt-template-modal";
 import { LapianOptionalModal, parseLapianOptional } from "@/components/canvas/lapian-optional-modal";
+import { LAPIAN_PROJECTION_TEMPLATE, LapianProjectionError, lapianOptionalLetters, renderLapianProjection } from "@/lib/canvas/lapian-projection";
 import { LapianModelModal } from "@/components/canvas/lapian-model-modal";
 import { AudioModePicker } from "@/components/audio-mode-picker";
 import { InfiniteCanvas } from "@/components/canvas/infinite-canvas";
@@ -347,7 +348,9 @@ function InfiniteCanvasPage() {
     const selectedNodeIdsRef = useRef(selectedNodeIds);
     const viewportRef = useRef(viewport);
     const focusAnimRef = useRef<number | null>(null);
-    const generateNodeRef = useRef<((nodeId: string, mode: CanvasNodeGenerationMode, prompt: string) => Promise<void>) | null>(null);
+    // P4（G18）：生成链必须能回报「本次新建的输出节点 id」——编排器据此绑定产物，禁按「最新节点」猜。
+    // 可选参数，旧调用方（面板/连线/Agent ops）签名不变。
+    const generateNodeRef = useRef<((nodeId: string, mode: CanvasNodeGenerationMode, prompt: string, options?: { onChildNodeCreated?: (childNodeId: string) => void }) => Promise<void>) | null>(null);
     const connectingParamsRef = useRef(connectingParams);
     const connectionTargetNodeIdRef = useRef(connectionTargetNodeId);
     const selectionBoxRef = useRef(selectionBox);
@@ -718,7 +721,7 @@ function InfiniteCanvasPage() {
     // 所有者 2026-11-05 拍板默认）。此前默认 timeline-narrative（模板 D）。
     // 二期预留：多模板/多结构提示词接入画布原生「提示词源」系统（config-prompt-sources / prompt-source-editor-drawer），
     // 到时把 LAPIAN_DEFAULT_TEMPLATE 改为从提示词源库取——本常量即唯一接入点。
-    const LAPIAN_DEFAULT_TEMPLATE = "seedance-flow";
+    const LAPIAN_DEFAULT_TEMPLATE = LAPIAN_PROJECTION_TEMPLATE;   // P4：与编排器同一常量（禁两处各写一份模板 id）
     // 剥离「# 附注」节（v4 审计 B-03：附注随提示词提交会在聚鑫链复发——唯一转换点在这里）。
     // T6-B5 画布侧：源拉片节点 metadata.lapianOptional（勾选的可选段字母）透传 `?optional=`，
     // 勾了的段才进正文；空/缺省 = 现状行为。generateVideoFromLapianNode 等路径都经这里取数，透传一处收口。
@@ -731,18 +734,18 @@ function InfiniteCanvasPage() {
                 message.warning(t("canvas.lapianOptional.missingTask"));
                 return "";
             }
-            const optional = parseLapianOptional(String(lapianNode.metadata?.lapianOptional || "")).join(",");
+            const optional = lapianOptionalLetters(String(lapianNode.metadata?.lapianOptional || ""));
             try {
-                const d = await fetch(`/api/render/${encodeURIComponent(taskId)}/${LAPIAN_DEFAULT_TEMPLATE}?optional=${encodeURIComponent(optional)}`).then((r) => r.json());
-                if (!d || d.error) {
+                // P4：投影渲染收口到 `lapian-projection.ts`（与实例编排器同一实现，禁复制第二份）。
+                // URL / 附注截断口径逐字节不变；错误分流（渲染错误 vs 网络错误）保持原文案。
+                const projection = await renderLapianProjection({ taskId, optionalSegments: optional, template: LAPIAN_DEFAULT_TEMPLATE }, { fetch });
+                return projection.text;
+            } catch (e) {
+                if (e instanceof LapianProjectionError) {
                     // 渲染失败（如模板没有该可选段/任务不在数据根里）→ 明确提示，再走正文回退，不做黑盒。
-                    message.warning(t("canvas.lapianOptional.renderFailed", { error: String(d?.error || "") }));
+                    message.warning(t("canvas.lapianOptional.renderFailed", { error: e.message }));
                     return "";
                 }
-                const text = String(d.text || "");
-                const cut = text.indexOf("\n# 附注");
-                return (cut >= 0 ? text.slice(0, cut) : text).trim();
-            } catch (e) {
                 // 网络层失败（代理断/服务挂）同样出提示——静默吞掉=黑盒回退（T6-F4① 抓到的现场）。
                 message.warning(t("canvas.lapianOptional.presetFetchFailed", { error: String((e as Error)?.message || e) }));
                 return "";
@@ -3245,7 +3248,12 @@ function InfiniteCanvasPage() {
     }, []);
 
     const handleGenerateNode = useCallback(
-        async (nodeId: string, mode: CanvasNodeGenerationMode, prompt: string) => {
+        async (nodeId: string, mode: CanvasNodeGenerationMode, prompt: string, options?: { onChildNodeCreated?: (childNodeId: string) => void }) => {
+            // P4（G18）：本次新建的输出节点 id 是「产物身份」的唯一真源——在**建节点那一刻**回报，
+            // 不在生成完成后按「最新节点/最大 id」反猜（Config 每次生成都是新 nanoid，反猜必错）。
+            const notifyChildCreated = (childId: string) => {
+                if (childId && childId !== nodeId) options?.onChildNodeCreated?.(childId);
+            };
             const sourceNode = nodesRef.current.find((node) => node.id === nodeId);
             const generationConfig = buildGenerationConfig(effectiveConfig, sourceNode, mode);
             if (!isAiConfigReady(generationConfig, generationConfig.model)) {
@@ -3329,6 +3337,7 @@ function InfiniteCanvasPage() {
                     const rootId = reuseImageNode ? nodeId : nanoid();
                     const imageIds = Array.from({ length: count }, () => nanoid());
                     pendingChildIds = [rootId];
+                    notifyChildCreated(rootId);
                     const rootNode: CanvasNodeData = {
                         id: rootId,
                         type: CanvasNodeType.Image,
@@ -3485,6 +3494,7 @@ function InfiniteCanvasPage() {
                         },
                     };
                     pendingChildIds = [videoId];
+                    notifyChildCreated(videoId);
                     setNodes((prev) =>
                         reuseVideoNode
                             ? prev.map((node) => (node.id === nodeId ? { ...node, ...videoNode } : node))
@@ -3524,6 +3534,7 @@ function InfiniteCanvasPage() {
                         metadata: { prompt: effectivePrompt, status: NODE_STATUS_LOADING, ...buildAudioGenerationMetadata(generationConfig) },
                     };
                     pendingChildIds = [audioId];
+                    notifyChildCreated(audioId);
                     setNodes((prev) =>
                         reuseAudioNode
                             ? prev.map((node) => (node.id === nodeId ? { ...node, ...audioNode } : node))
@@ -3569,6 +3580,7 @@ function InfiniteCanvasPage() {
                     },
                 };
                 pendingChildIds = [rootId];
+                notifyChildCreated(rootId);
                 setNodes((prev) =>
                     reuseTextNode
                         ? prev.map((node) => (node.id === nodeId ? { ...node, ...rootNode } : node))

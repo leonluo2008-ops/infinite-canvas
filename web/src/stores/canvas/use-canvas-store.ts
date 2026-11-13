@@ -5,6 +5,8 @@ import { nanoid } from "nanoid";
 import i18n from "@/i18n";
 import { localForageStorage } from "@/lib/localforage-storage";
 import type { CanvasBackgroundMode } from "@/lib/canvas-theme";
+import { acceptWorkflowInstances } from "@/lib/canvas/workflow-instance-identity";
+import type { WorkflowInstanceIdentityRecord } from "@/lib/canvas/workflow-instance-run";
 import type { CanvasWorkflowTemplate } from "@/lib/canvas/workflow-template";
 import type { CanvasAssistantSession, CanvasConnection, CanvasNodeData, ViewportTransform } from "@/types/canvas";
 
@@ -26,6 +28,11 @@ export type CanvasProject = {
      * 不建第二份图 DSL、不进节点 metadata。创建项目时缺省不存在；导入/更新必须透传（逐字段构造会丢未知顶层字段）。
      */
     workflowTemplate?: CanvasWorkflowTemplate;
+    /**
+     * 实例→hub 身份记录（P4，P0a §5.1）：实例id ↔ hub local_id/bridge_id ↔ 画布节点集（含执行期回填的
+     * 产物节点 id）↔ 后端任务号 ↔ 正文修订。随项目持久化/导出同路，只存身份不存状态（§5.3）。
+     */
+    workflowInstances?: WorkflowInstanceIdentityRecord[];
 };
 
 /** 导入侧校验：只要形如模板声明就透传（版本号留给后续迁移，不静默丢未知新版本）。 */
@@ -52,7 +59,7 @@ type CanvasStore = {
     renameProject: (id: string, title: string) => void;
     deleteProjects: (ids: string[]) => void;
     replaceProjects: (projects: CanvasProject[], deletedProjects?: CanvasDeletedProject[]) => void;
-    updateProject: (id: string, patch: Partial<Pick<CanvasProject, "nodes" | "connections" | "chatSessions" | "activeChatId" | "backgroundMode" | "showImageInfo" | "viewport" | "workflowTemplate">>) => void;
+    updateProject: (id: string, patch: Partial<Pick<CanvasProject, "nodes" | "connections" | "chatSessions" | "activeChatId" | "backgroundMode" | "showImageInfo" | "viewport" | "workflowTemplate" | "workflowInstances">>) => void;
 };
 
 const initialViewport: ViewportTransform = { x: 0, y: 0, k: 1 };
@@ -123,6 +130,8 @@ export const useCanvasStore = create<CanvasStore>()(
                     viewport: source.viewport || initialViewport,
                     // P2：模板声明随项目走（导入逐字段构造，显式透传，否则未知顶层字段会被丢——Codex §3.3）。
                     workflowTemplate: acceptWorkflowTemplate(source.workflowTemplate),
+                    // P4：实例身份记录随项目走（导入显式透传，理由同上）。
+                    workflowInstances: acceptWorkflowInstances(source.workflowInstances),
                 };
                 set((state) => ({ projects: [project, ...state.projects] }));
                 return project.id;

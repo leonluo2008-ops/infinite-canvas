@@ -3,6 +3,8 @@ import { Checkbox, Modal, Typography } from "antd";
 import { ListChecks } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
+import { parseLapianOptional } from "@/lib/canvas/lapian-projection";
+
 /**
  * 拉片可选段勾选（T6-B5 画布侧）。
  *
@@ -20,14 +22,9 @@ export const LAPIAN_OPTIONAL_SEGMENTS = [
 
 export const LAPIAN_OPTIONAL_VALUES = LAPIAN_OPTIONAL_SEGMENTS.map((segment) => segment.value);
 
-/** metadata 里存的是逗号分隔字母（"A,C"）；解析时容错空白/大小写，不认识的字母丢弃。 */
-export function parseLapianOptional(value?: string): string[] {
-    const picked = String(value || "")
-        .split(",")
-        .map((item) => item.trim().toUpperCase())
-        .filter((item) => LAPIAN_OPTIONAL_VALUES.includes(item as (typeof LAPIAN_OPTIONAL_VALUES)[number]));
-    return LAPIAN_OPTIONAL_VALUES.filter((value) => picked.includes(value));
-}
+// P4：解析口径收口到 `@/lib/canvas/lapian-projection`（实例编排器也要用同一份，禁复制第二份）。
+// 本文件只保留「标签/说明文案」这份展示用常量，并把解析函数原样再导出（既有调用方无需改）。
+export { parseLapianOptional };
 
 export function LapianOptionalModal({
     open,

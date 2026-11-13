@@ -1,0 +1,43 @@
+[probe-p4-hub] 自隔离模式：实例 http://127.0.0.1:64405，数据根 C:\Users\leon3\AppData\Local\Temp\wanprobe-p4hub-3ge9v_l_\projects，假 bridge http://127.0.0.1:64406
+  [PASS] 服务端自述 TASKS_DIR == 探针根（读写同源）
+1) ingest 身份闭合
+  [PASS] ingest 真建任务（ai视频参考3-10.mp4）→ 200 + local_id/bridge_id
+  [PASS] 复投 → HIT 同任务（视频 sha 幂等，不产生第二条身份）
+  [PASS] 任务目录带 任务.json（approve/rollback 的硬前提，_task_dir 只认它）
+  [PASS] 身份锚一致：local_id/bridge_id 与 ingest 回执同源
+  [PASS] 非法 local_id 被拒（不认无 任务.json 的壳）
+2) 推进到 awaiting_approval（真状态机 + 夹具产物）
+  [PASS] 逐级迁移合法且状态=awaiting_approval
+  [PASS] GET 详情 200 且状态待审批
+3) 正文保存 + 快照 + 自检（真端点）
+  [PASS] 保存正文 → 200（正文来源：编排器产物 assembly-A.txt）
+  [PASS] 正文逐字节落盘（画布终稿 == hub 提示词.md）
+  [PASS] 审批快照 = 独立复算值（同一正文 → 同一快照）
+  [PASS] 手改留痕（prompt_edited_at/prompt_edit_reason）
+  [PASS] 自检真跑（非空 items 且每项有结论）
+  [PASS] 自检结果与盘上 自检.json 同源（G16：不另写评分器）
+4) approve / 改正文被拒 / revoke / 新修订 / 再批准
+  [PASS] approve（带画布配置）→ 200 approved
+  [PASS] 批准快照 = v2 独立复算（prompt+params+渠道身份+model+mode）
+  [PASS] gen_channel 落盘且 key 不落（渠道身份三键 + model + mode）
+  [PASS] 已批准后改正文被拒（409 + 人话：先撤销批准）
+  [PASS] 被拒的写入零落地（提示词.md 逐字节不变）
+  [PASS] revoke → 回到 awaiting_approval（受控回退边，不自动重批）
+  [PASS] 乐观锁通过后写入新修订（expect_text=旧正文）
+  [PASS] 新修订快照与旧批准快照不同（旧批准对新正文失效）
+  [PASS] 乐观锁失败 → 409 且不写（别处改过要先刷新）
+  [PASS] 再批准（v1 语义，无 config）→ approved 且快照=盘上新正文口径
+5) rollback（受控回退边：approved 不可直退，先 revoke 再退回置换）
+  [PASS] approved 上直接 rollback 被拒（回退边只在 awaiting_approval，不绕过批准）
+  [PASS] revoke → awaiting_approval（撤销批准后才允许退回）
+  [PASS] rollback → awaiting_assets
+  [PASS] 批准键连根清（approval/snapshot/gen_params/gen_channel/dispatch…）
+  [PASS] 当前提示词已丢弃（画布侧必须重新走一遍修订）
+6) 零付费提交
+  [PASS] 全程未调 /submit：任务文件无 dispatch/gen_job/submit_unknown
+  [PASS] 隔离根里没有 记录.json（没有云端任务被创建）
+     [清理] 已删自建任务 C:\Users\leon3\AppData\Local\Temp\wanprobe-p4hub-3ge9v_l_\projects\auto-0001
+  [PASS] 真实 projects 零丢失（跑后 ⊆ 跑前）
+  [PASS] 真实 projects 未被改动（目录集不变）
+
+[probe-p4-hub] 33/33 PASS

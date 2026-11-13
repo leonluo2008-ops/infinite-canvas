@@ -1,0 +1,266 @@
+{
+  "pass": 52,
+  "fail": 0,
+  "results": [
+    {
+      "name": "A 单测进程零失败",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "A 单测用例数 ≥ 10",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "A 单测 fail 计数为 0",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "B 找到真实样本项目",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "B 找到已跑通的拉片链根",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "B 骨架边界齐全（video→lapian→config text→占位终稿→config video）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "B 全量模板含真实挂图的资产位",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "B 全量模板自足（无悬空引用）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "C 实例 1 落库（created）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "C 实例 1 全链成功（无 failure）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "C 实例状态=待审批（停在付费闸前）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "C 五槽代入校验 5/5 PASS",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "C 组装只调文本链一次（非付费）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "C 付费视频创建调用 = 0（P0b 闸前置）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "C 提交的 ops 里零 run_generation",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "C P0b 闸在位复验：这些 ops 过付费提取 = 0 条付费动作",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "C 可选段投影按本次字母请求（?optional=A,C）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "C 投影正文已写进拉片节点（changed=true）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "C 本次发送正文 = 既有 buildNodeGenerationContext 同源算出",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "C 本次正文含拉片投影 + 意图 + 挂图标签",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "C 本次产物节点 id 由生成链回报（不是猜的）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "C 本次产物带唯一标识串（下游消费可判定）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "C 模板占位产物已退役（节点不在画布上）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "C 下游 token 指向本次产物（G18 判据）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "C 下游连线指向本次产物（占位产物那条边已随节点删除）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "C 下游实际消费本次产物正文（含唯一标识串）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "C 全实例零悬空引用（token 与连线端点都落在画布上）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "C hub 身份：ingest → 资产按槽序 → 正文保存（同一 local_id）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "C hub 身份：local_id/bridge_id 与 ingest 回执一致",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "C hub 身份：修订 digest = 本次正文 digest",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "C hub 身份：保存的正文就是本次产物正文（逐字节）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "C hub 身份：资产引用按槽序记录",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "C hub 身份：审批快照已回填（快照是批准绑定物）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "C hub 自检结果原样回传（G16：不另写评分器）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "C 身份记录缺口为空（四件套齐）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "C 身份记录已落库（随项目持久化 seam 被调用）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "C 既有 approve/rollback/revoke 可消费（stub 契约）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "C 改正文挂钩：已批准 → 必须先 revoke（revoke_required）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "D 打乱挂图传参序的实例落库",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "D 打乱传参序不影响五槽校验（槽序是唯一真源）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "D 实际请求图序 = 槽序（与传参序无关）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "D 请求图序首项 = 槽 0 的挂图",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "D 换槽 0/1 挂图 → 请求图序前两位互换",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "D 可选段 B：投影 URL 只带 B",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "D 可选段 B：本次正文与实例 1（A,C）不同（真实生效，不是 metadata 变）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "D 可选段 B：拉片节点正文也被换成 B 的投影",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "D 两条实例各自正文互不串（token 各指自己产物）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "E 重跑成功",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "E 重跑换了新产物",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "E 重跑后旧产物已退役",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "E 重跑后下游指向新产物",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "E 重跑后零悬空引用",
+      "ok": true,
+      "detail": ""
+    }
+  ]
+}
