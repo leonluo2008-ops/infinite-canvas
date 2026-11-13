@@ -8,6 +8,7 @@ import type { CanvasBackgroundMode } from "@/lib/canvas-theme";
 import { createPersistQueue, type FlushResult } from "@/lib/canvas/canvas-persist-queue";
 import { acceptWorkflowBatches, type WorkflowBatchRecord } from "@/lib/canvas/workflow-batch";
 import { acceptWorkflowInstances } from "@/lib/canvas/workflow-instance-identity";
+import { acceptWanFileTasks, type WanFileTaskRecord } from "@/lib/canvas/wan-file-task-map";
 import type { WorkflowInstanceIdentityRecord } from "@/lib/canvas/workflow-instance-run";
 import type { CanvasWorkflowTemplate } from "@/lib/canvas/workflow-template";
 import type { CanvasAssistantSession, CanvasConnection, CanvasNodeData, ViewportTransform } from "@/types/canvas";
@@ -41,6 +42,11 @@ export type CanvasProject = {
      * 只存身份不存状态：状态一律由 `workflow-batch-status.ts` 现查派生。
      */
     workflowBatches?: WorkflowBatchRecord[];
+    /**
+     * Wan 成片映射登记表（S2，P6）：job → 成片 taskId。旧实现只落 `localStorage["wan_video_file_tasks"]`
+     * 且仅留 200 条、导出不带；这里是**真源**（随项目持久化 + 随 v3 导出同路），老 localStorage 仍可读。
+     */
+    workflowWanFileTasks?: WanFileTaskRecord[];
 };
 
 /** 导入侧校验：只要形如模板声明就透传（版本号留给后续迁移，不静默丢未知新版本）。 */
@@ -78,7 +84,7 @@ type CanvasStore = {
     renameProject: (id: string, title: string) => void;
     deleteProjects: (ids: string[]) => void;
     replaceProjects: (projects: CanvasProject[], deletedProjects?: CanvasDeletedProject[]) => void;
-    updateProject: (id: string, patch: Partial<Pick<CanvasProject, "nodes" | "connections" | "chatSessions" | "activeChatId" | "backgroundMode" | "showImageInfo" | "viewport" | "workflowTemplate" | "workflowInstances" | "workflowBatches">>) => void;
+    updateProject: (id: string, patch: Partial<Pick<CanvasProject, "nodes" | "connections" | "chatSessions" | "activeChatId" | "backgroundMode" | "showImageInfo" | "viewport" | "workflowTemplate" | "workflowInstances" | "workflowBatches" | "workflowWanFileTasks">>) => void;
     /**
      * 立即落盘当前 projects（不等 400ms 防抖窗口）。编排器在实例关键节点（落库/待批）调用；
      * 失败结果同时写进 `lastFlush` 并原样返回，绝不静默吞掉。
@@ -169,6 +175,8 @@ export const useCanvasStore = create<CanvasStore>()(
                     workflowInstances: acceptWorkflowInstances(source.workflowInstances),
                     // P5：批次身份记录随项目走（导入显式透传，理由同上）。
                     workflowBatches: acceptWorkflowBatches(source.workflowBatches),
+                    // P6/S2：Wan 成片映射随项目走（导入显式透传，理由同上）。
+                    workflowWanFileTasks: acceptWanFileTasks(source.workflowWanFileTasks),
                 };
                 set((state) => ({ projects: [project, ...state.projects] }));
                 return project.id;

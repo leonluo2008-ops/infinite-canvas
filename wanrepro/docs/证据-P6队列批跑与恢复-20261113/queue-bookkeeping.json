@@ -1,0 +1,219 @@
+{
+  "note": "磁盘 payload（localforage 落盘）里真实的排队簿记摘录，由 probe 输出的 persisted-store.json 原样抽出，未经改写",
+  "projectTitle": "无限画布 3 · P6 探针",
+  "batchCount": 6,
+  "wanFileTasks": [
+    {
+      "job": "wan-job-s2",
+      "fileTaskId": "wan-file-s2",
+      "provider": "wan",
+      "recordedAt": "2026-11-13T15:48:09.586Z"
+    }
+  ],
+  "batches": [
+    {
+      "batchId": "batch-092a0f6a",
+      "title": "P6 探针批次",
+      "members": 3,
+      "queue": {
+        "concurrency": 3,
+        "phase": "finished",
+        "summary": {
+          "attempted": 3,
+          "awaitingApproval": 3,
+          "canvasReady": 0,
+          "failed": [],
+          "heldSubmitUnknown": [],
+          "skippedDone": [],
+          "congestionRequeues": 0,
+          "concurrencyPeak": 3
+        },
+        "entries": [
+          {
+            "instanceId": "p6skeleton#1",
+            "instanceIndex": 1,
+            "attempts": 1,
+            "congestionRetries": 0,
+            "nextEligibleAt": null,
+            "lastRun": {
+              "outcome": "awaiting_approval",
+              "stage": null,
+              "reason": null
+            }
+          },
+          {
+            "instanceId": "p6skeleton#2",
+            "instanceIndex": 2,
+            "attempts": 1,
+            "congestionRetries": 0,
+            "nextEligibleAt": null,
+            "lastRun": {
+              "outcome": "awaiting_approval",
+              "stage": null,
+              "reason": null
+            }
+          },
+          {
+            "instanceId": "p6skeleton#3",
+            "instanceIndex": 3,
+            "attempts": 1,
+            "congestionRetries": 0,
+            "nextEligibleAt": null,
+            "lastRun": {
+              "outcome": "awaiting_approval",
+              "stage": null,
+              "reason": null
+            }
+          }
+        ]
+      }
+    },
+    {
+      "batchId": "batch-p6-slot",
+      "title": null,
+      "members": 2,
+      "queue": {
+        "concurrency": null,
+        "phase": null,
+        "summary": null,
+        "entries": []
+      }
+    },
+    {
+      "batchId": "batch-p6-rate",
+      "title": null,
+      "members": 1,
+      "queue": {
+        "concurrency": null,
+        "phase": null,
+        "summary": null,
+        "entries": []
+      }
+    },
+    {
+      "batchId": "batch-p6-unknown",
+      "title": null,
+      "members": 1,
+      "queue": {
+        "concurrency": 3,
+        "phase": "idle",
+        "summary": null,
+        "entries": [
+          {
+            "instanceId": "p6skeleton#6",
+            "instanceIndex": 6,
+            "attempts": 0,
+            "congestionRetries": 0,
+            "nextEligibleAt": null,
+            "lastRun": null,
+            "submitGuard": {
+              "nodeId": "tp6skeleton-6-lapian-1793901293075-gl4cw",
+              "receipt": null,
+              "reconcile": {
+                "verdict": null,
+                "rounds": null,
+                "reason": null
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "batchId": "batch-p6-isolate",
+      "title": null,
+      "members": 3,
+      "queue": {
+        "concurrency": null,
+        "phase": null,
+        "summary": null,
+        "entries": []
+      }
+    },
+    {
+      "batchId": "batch-p6-resume",
+      "title": null,
+      "members": 5,
+      "queue": {
+        "concurrency": 3,
+        "phase": "finished",
+        "summary": {
+          "attempted": 2,
+          "awaitingApproval": 2,
+          "canvasReady": 0,
+          "failed": [],
+          "heldSubmitUnknown": [],
+          "skippedDone": [
+            "p6skeleton#11",
+            "p6skeleton#12",
+            "p6skeleton#13"
+          ],
+          "congestionRequeues": 0,
+          "concurrencyPeak": 2
+        },
+        "entries": [
+          {
+            "instanceId": "p6skeleton#11",
+            "instanceIndex": 11,
+            "attempts": 1,
+            "congestionRetries": 0,
+            "nextEligibleAt": null,
+            "lastRun": {
+              "outcome": "awaiting_approval",
+              "stage": null,
+              "reason": null
+            }
+          },
+          {
+            "instanceId": "p6skeleton#12",
+            "instanceIndex": 12,
+            "attempts": 1,
+            "congestionRetries": 0,
+            "nextEligibleAt": null,
+            "lastRun": {
+              "outcome": "awaiting_approval",
+              "stage": null,
+              "reason": null
+            }
+          },
+          {
+            "instanceId": "p6skeleton#13",
+            "instanceIndex": 13,
+            "attempts": 1,
+            "congestionRetries": 0,
+            "nextEligibleAt": null,
+            "lastRun": {
+              "outcome": "awaiting_approval",
+              "stage": null,
+              "reason": null
+            }
+          },
+          {
+            "instanceId": "p6skeleton#14",
+            "instanceIndex": 14,
+            "attempts": 1,
+            "congestionRetries": 0,
+            "nextEligibleAt": null,
+            "lastRun": {
+              "outcome": "awaiting_approval",
+              "stage": null,
+              "reason": null
+            }
+          },
+          {
+            "instanceId": "p6skeleton#15",
+            "instanceIndex": 15,
+            "attempts": 1,
+            "congestionRetries": 0,
+            "nextEligibleAt": null,
+            "lastRun": {
+              "outcome": "awaiting_approval",
+              "stage": null,
+              "reason": null
+            }
+          }
+        ]
+      }
+    }
+  ]
+}

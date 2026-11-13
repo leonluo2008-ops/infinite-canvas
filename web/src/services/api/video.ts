@@ -8,6 +8,8 @@ import { readVideoTaskProgress, waitForVideoTaskOutput } from "@/lib/canvas/vide
 import { getMediaBlob, resolveMediaUrl, uploadMediaFile, type UploadedFile } from "@/services/file-storage";
 import { imageToDataUrl } from "@/services/image-storage";
 import { boolConfig, buildApiUrl, modelOptionName, resolveModelRequestConfig, resolveModelScript, withLocalProxy, type AiConfig } from "@/stores/use-config-store";
+import { lookupProjectWanFileTask, rememberProjectWanFileTask } from "@/lib/canvas/wan-file-task-project";
+import { toLegacyPayload } from "@/lib/canvas/wan-file-task-map";
 import { runModelPlugin } from "./model-plugin";
 import { sdgfClampDuration, sdgfRatioFields, sdgfSoundFields } from "./sdgf-payload";
 import type { VideoTaskProvider } from "@/types/canvas";
@@ -305,9 +307,13 @@ const wanVideoFileTasks = new Map<string, string>(); // job → taskId
 function rememberWanFileTask(job: string, taskId: string) {
     if (!job || !taskId) return;
     wanVideoFileTasks.set(job, taskId);
+    // S2（P6）：随项目持久化（真源）。写不进去要看得见——映射丢了等于成片查不回来。
+    const persisted = rememberProjectWanFileTask({ job, fileTaskId: taskId });
+    if (!persisted.ok) console.warn(`[wan] job→成片 taskId 未能随项目持久化：${persisted.reason}（本会话仍可用）`);
     try {
         if (typeof localStorage === "undefined") return;
-        localStorage.setItem(WAN_FILE_TASK_STORE_KEY, JSON.stringify(Object.fromEntries([...wanVideoFileTasks.entries()].slice(-200))));
+        // 兼容口径不变：仍是 {job: taskId}、仍按 200 条截断（老数据/老键继续可读可写）
+        localStorage.setItem(WAN_FILE_TASK_STORE_KEY, JSON.stringify(toLegacyPayload([...wanVideoFileTasks.entries()])));
     } catch {
         // 隐私模式等存不进就算了——本会话 Map 仍可用
     }
@@ -315,6 +321,13 @@ function rememberWanFileTask(job: string, taskId: string) {
 
 function recallWanFileTask(job: string): string {
     if (wanVideoFileTasks.has(job)) return wanVideoFileTasks.get(job) || "";
+    // ① 项目登记表（S2 真源：刷新/换机/导入后仍可查，不受 200 条限制）
+    const fromProject = lookupProjectWanFileTask(job);
+    if (fromProject) {
+        wanVideoFileTasks.set(job, fromProject);
+        return fromProject;
+    }
+    // ② 老 localStorage（兼容：老数据仍可读）
     try {
         if (typeof localStorage !== "undefined") {
             const raw = localStorage.getItem(WAN_FILE_TASK_STORE_KEY);

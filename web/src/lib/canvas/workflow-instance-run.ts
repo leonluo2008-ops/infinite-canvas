@@ -24,6 +24,7 @@ import { CanvasNodeType, type CanvasConnection, type CanvasNodeData } from "@/ty
 import type { CanvasAgentOp } from "@/lib/canvas/canvas-agent-ops";
 import { lapianOptionalLetters, renderLapianProjection, type LapianProjectionFetch } from "@/lib/canvas/lapian-projection";
 import { buildBatchMember, type WorkflowBatchMember } from "@/lib/canvas/workflow-batch";
+import { classifyChannelFailure, type ChannelFailureClass } from "@/lib/canvas/workflow-channel-failure";
 import { stableDigest } from "@/lib/canvas/workflow-template";
 import { templateInstanceConnectionId } from "@/lib/canvas/workflow-template-ids";
 import type { WorkflowInstancePlan, WorkflowInstanceMaterials } from "@/lib/canvas/workflow-instance";
@@ -468,6 +469,8 @@ export type InstanceRunDeps = {
     saveIdentity?: (record: WorkflowInstanceIdentityRecord) => void | Promise<void>;
     /** 批次成员入册（P5；只写身份，状态派生层现查）。缺省 = 不记批次（P4 行为不变）。 */
     saveBatchMember?: (member: WorkflowBatchMember) => void | Promise<void>;
+    /** Wan 成片映射现查（S2：job→成片 taskId；入册时写成批次成员外键）。缺省 = 不写该外键。 */
+    wanFileTasks?: () => Map<string, string> | Record<string, string> | undefined;
     /** 立即落盘（页面 = `useCanvasStore.flushProjects`）。缺省 = 不 flush（只走防抖）。 */
     flush?: (stage: InstanceFlushStage) => void | Promise<void | { ok?: boolean; error?: string }>;
     newRunToken?: () => string;
@@ -508,7 +511,7 @@ export type InstanceRunResult = {
     generationCalls: { mode: string; nodeId: string }[];
     appliedOps: CanvasAgentOp[];
     warnings: string[];
-    failure?: { stage: WorkflowInstanceRunError["stage"] | "projection"; reason: string; details?: Record<string, unknown> };
+    failure?: { stage: WorkflowInstanceRunError["stage"] | "projection"; reason: string; details?: Record<string, unknown>; channel?: ChannelFailureClass };
 };
 
 /**
@@ -538,6 +541,12 @@ export async function runWorkflowInstance(input: { plan: WorkflowInstancePlan; m
         result.appliedOps.push(...ops);
     };
 
+    /**
+     * 渠道失败分类（P6）：编排器自己**不判断**「能不能自动重试」——队列才是唯一裁决点。
+     * 这里只把结构化分类（429/409 拥塞 vs 未知提交）带进 failure，供 P6 队列分派（审计 §5.2）。
+     */
+    const channelOf = (error: unknown): ChannelFailureClass | undefined => classifyChannelFailure(error) || undefined;
+
     // 关键节点立即落盘（P5 / A8-G14）：失败一律可见（warnings + flushes），绝不静默。
     const flushAt = async (stage: InstanceFlushStage) => {
         if (!deps.flush) return;
@@ -563,6 +572,7 @@ export async function runWorkflowInstance(input: { plan: WorkflowInstancePlan; m
             nodes: deps.nodes(),
             connections: deps.connections(),
             lapian: { taskId: String(input.lapian.taskId || ""), jobId: String(input.lapian.jobId || "") },
+            wanFileTasks: deps.wanFileTasks?.(),
             createdAt: now(),
         });
         result.batchMember = member;
@@ -584,7 +594,7 @@ export async function runWorkflowInstance(input: { plan: WorkflowInstancePlan; m
             if (!rendered.text.trim()) throw new WorkflowInstanceRunError("assembly_plan", "拉片投影正文为空（可选段渲染没出正文）", { url: rendered.url });
             if (projection.changed) await apply([{ type: "update_node", id: input.plan.lapianNodeId, metadata: { content: rendered.text } }]);
         } catch (error) {
-            result.failure = { stage: "projection", reason: (error as Error).message, details: (error as WorkflowInstanceRunError).details };
+            result.failure = { stage: "projection", reason: (error as Error).message, details: (error as WorkflowInstanceRunError).details, channel: channelOf(error) };
             return result;
         }
     } else {
@@ -599,7 +609,7 @@ export async function runWorkflowInstance(input: { plan: WorkflowInstancePlan; m
         assembly = planInstanceAssembly({ plan: input.plan, nodes: deps.nodes(), connections: deps.connections() });
         slotChecks = verifySlotSubstitution({ plan: input.plan, materials: input.materials, nodes: deps.nodes(), connections: deps.connections(), assembly, lapianText });
     } catch (error) {
-        result.failure = { stage: (error as WorkflowInstanceRunError).stage || "assembly_plan", reason: (error as Error).message, details: (error as WorkflowInstanceRunError).details };
+        result.failure = { stage: (error as WorkflowInstanceRunError).stage || "assembly_plan", reason: (error as Error).message, details: (error as WorkflowInstanceRunError).details, channel: channelOf(error) };
         return result;
     }
     result.slotChecks = slotChecks;
@@ -616,7 +626,7 @@ export async function runWorkflowInstance(input: { plan: WorkflowInstancePlan; m
         result.generationCalls.push({ mode: "text", nodeId: assembly.assemblyConfigId });
         childNodeId = String(generated?.childNodeId || "").trim();
     } catch (error) {
-        result.failure = { stage: "generation", reason: (error as Error).message };
+        result.failure = { stage: "generation", reason: (error as Error).message, channel: channelOf(error) };
         return result;
     }
     if (!childNodeId) {
@@ -690,7 +700,7 @@ export async function runWorkflowInstance(input: { plan: WorkflowInstancePlan; m
             );
             result.hub = binding;
         } catch (error) {
-            result.failure = { stage: "hub_bind", reason: (error as Error).message, details: (error as WorkflowInstanceRunError).details };
+            result.failure = { stage: "hub_bind", reason: (error as Error).message, details: (error as WorkflowInstanceRunError).details, channel: channelOf(error) };
             return result;
         }
         if (binding.selfcheckFailures) result.warnings.push(`hub 自检有 ${binding.selfcheckFailures} 项未通过（如实回传，不阻断批准）`);

@@ -52,6 +52,7 @@ import { CanvasSidePanel } from "@/components/canvas/canvas-side-panel";
 import { CanvasZoomControls } from "@/components/canvas/canvas-zoom-controls";
 import { useAgentStore } from "@/stores/use-agent-store";
 import { useCanvasStore } from "@/stores/canvas/use-canvas-store";
+import { bindWanFileTaskProject } from "@/lib/canvas/wan-file-task-project";
 import { useAgentBridge } from "@/pages/canvas/hooks/use-agent-bridge";
 import { usePluginHost } from "@/pages/canvas/hooks/use-plugin-host";
 import { buildNodeMentionReferences, getGenerationResourceNodes, getGroupResourceNodes, isCanvasReferenceNode, type CanvasResourceReference } from "@/lib/canvas/canvas-resource-references";
@@ -631,6 +632,13 @@ function InfiniteCanvasPage() {
             if (viewportSaveTimerRef.current) clearTimeout(viewportSaveTimerRef.current);
         };
     }, [projectId, projectLoaded, updateProject, viewport]);
+
+    // S2（P6）：Wan job→成片 taskId 随**当前项目**持久化（此前只落 localStorage 且仅留 200 条、导出不带）。
+    // 这里只绑项目，不新增任何 UI；未绑时 video.ts 会打警告并退回旧行为，不静默丢。
+    useEffect(() => {
+        if (!projectLoaded) return;
+        return bindWanFileTaskProject(projectId);
+    }, [projectId, projectLoaded]);
 
     useLayoutEffect(() => {
         nodesRef.current = nodes;

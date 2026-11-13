@@ -1,0 +1,626 @@
+{
+  "pass": 78,
+  "fail": 0,
+  "unitTotal": 76,
+  "unit": [
+    {
+      "label": "P6 队列/对账/恢复",
+      "tests": 29,
+      "fail": 0,
+      "failed": false
+    },
+    {
+      "label": "P6/S2 成片映射",
+      "tests": 11,
+      "fail": 0,
+      "failed": false
+    },
+    {
+      "label": "P5 回归",
+      "tests": 21,
+      "fail": 0,
+      "failed": false
+    },
+    {
+      "label": "P4 回归",
+      "tests": 10,
+      "fail": 0,
+      "failed": false
+    },
+    {
+      "label": "P5 落盘队列回归",
+      "tests": 5,
+      "fail": 0,
+      "failed": false
+    }
+  ],
+  "concurrency": {
+    "peak": 3,
+    "curve": [
+      {
+        "active": 1,
+        "running": 1
+      },
+      {
+        "active": 2,
+        "running": 2
+      },
+      {
+        "active": 3,
+        "running": 3
+      },
+      {
+        "active": 2,
+        "running": 2
+      },
+      {
+        "active": 1,
+        "running": 1
+      },
+      {
+        "active": 0,
+        "running": 0
+      }
+    ]
+  },
+  "batchB": {
+    "batchId": "batch-092a0f6a",
+    "members": 3,
+    "perInstance": [
+      {
+        "instanceId": "p6skeleton#1",
+        "instanceIndex": 1,
+        "outcome": "awaiting_approval",
+        "attempts": 1,
+        "congestionRetries": 0,
+        "resumed": false
+      },
+      {
+        "instanceId": "p6skeleton#2",
+        "instanceIndex": 2,
+        "outcome": "awaiting_approval",
+        "attempts": 1,
+        "congestionRetries": 0,
+        "resumed": false
+      },
+      {
+        "instanceId": "p6skeleton#3",
+        "instanceIndex": 3,
+        "outcome": "awaiting_approval",
+        "attempts": 1,
+        "congestionRetries": 0,
+        "resumed": false
+      }
+    ],
+    "aggregate": {
+      "attempted": 3,
+      "awaitingApproval": 3,
+      "canvasReady": 0,
+      "failed": [],
+      "heldSubmitUnknown": [],
+      "skippedDone": [],
+      "congestionRequeues": 0,
+      "concurrencyPeak": 3
+    }
+  },
+  "derived": {
+    "counts": {
+      "pending": 0,
+      "running": 0,
+      "assembled": 0,
+      "awaiting_approval": 3,
+      "approved": 0,
+      "generating": 0,
+      "done": 0,
+      "failed": 0,
+      "unknown": 0
+    },
+    "outcome": "in_progress",
+    "members": [
+      {
+        "instanceId": "p6skeleton#1",
+        "status": "awaiting_approval",
+        "rule": "R4"
+      },
+      {
+        "instanceId": "p6skeleton#2",
+        "status": "awaiting_approval",
+        "rule": "R4"
+      },
+      {
+        "instanceId": "p6skeleton#3",
+        "status": "awaiting_approval",
+        "rule": "R4"
+      }
+    ]
+  },
+  "congestion": {
+    "rateWaits": [
+      4000
+    ],
+    "slotWaits": [
+      4000,
+      8000,
+      16000,
+      32000
+    ],
+    "rate": {
+      "instanceId": "p6skeleton#4",
+      "instanceIndex": 4,
+      "outcome": "awaiting_approval",
+      "attempts": 2,
+      "congestionRetries": 1,
+      "resumed": false
+    },
+    "slot": {
+      "instanceId": "p6skeleton#5",
+      "instanceIndex": 5,
+      "outcome": "failed",
+      "stage": "generation",
+      "reason": "渠道持续拥塞（409 单槽忙）已退避重排 4 次仍失败：停住交人（调低并发或稍后重跑）",
+      "attempts": 5,
+      "congestionRetries": 5,
+      "resumed": false
+    },
+    "requeues": 5
+  },
+  "unknownSubmit": {
+    "resolved": [
+      {
+        "instanceId": "p6skeleton#6",
+        "verdict": "resolved",
+        "taskId": "tp6skeleton-6-config-1793903256858-naerp",
+        "reason": "对账第 1 轮命中 13 条既有后端任务：按 taskId 续查，不重建"
+      }
+    ],
+    "explicitUnknown": [
+      {
+        "instanceId": "p6skeleton#7",
+        "verdict": "explicit_unknown",
+        "reason": "对账 2 轮均未找到该提交对应的后端任务（节点 p6skeleton#7）：标 explicit-unknown 交人裁决，自动层不重发"
+      }
+    ],
+    "guardOnDisk": true
+  },
+  "isolation": [
+    {
+      "instanceId": "p6skeleton#9",
+      "stage": "generation",
+      "reason": "本实例没有文本组装 Config（模板冻结件缺失）"
+    }
+  ],
+  "resume": {
+    "phaseBefore": "paused",
+    "done": [
+      "p6skeleton#11",
+      "p6skeleton#12",
+      "p6skeleton#13"
+    ],
+    "plan": {
+      "run": [
+        "p6skeleton#14",
+        "p6skeleton#15"
+      ],
+      "skippedDone": [
+        "p6skeleton#11",
+        "p6skeleton#12",
+        "p6skeleton#13"
+      ],
+      "prepareNeeded": [
+        "p6skeleton#14",
+        "p6skeleton#15"
+      ]
+    },
+    "lapianCalls": {
+      "before": 13,
+      "after": 15
+    },
+    "reloaded": {
+      "batches": 6,
+      "wanTasks": 0
+    }
+  },
+  "s2": {
+    "record": {
+      "job": "wan-job-s2",
+      "fileTaskId": "wan-file-s2",
+      "provider": "wan",
+      "recordedAt": "2026-11-13T15:48:09.586Z"
+    },
+    "legacyCount": 200,
+    "merged": 251,
+    "exported": 1
+  },
+  "results": [
+    {
+      "name": "A 单测（P6 队列/对账/恢复）进程零失败",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "A 单测（P6 队列/对账/恢复）用例数 > 0",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "A 单测（P6 队列/对账/恢复）fail 计数 0",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "A 单测（P6/S2 成片映射）进程零失败",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "A 单测（P6/S2 成片映射）用例数 > 0",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "A 单测（P6/S2 成片映射）fail 计数 0",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "A 单测（P5 回归）进程零失败",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "A 单测（P5 回归）用例数 > 0",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "A 单测（P5 回归）fail 计数 0",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "A 单测（P4 回归）进程零失败",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "A 单测（P4 回归）用例数 > 0",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "A 单测（P4 回归）fail 计数 0",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "A 单测（P5 落盘队列回归）进程零失败",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "A 单测（P5 落盘队列回归）用例数 > 0",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "A 单测（P5 落盘队列回归）fail 计数 0",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "A 单测总数 ≥ 60（P6 新增 39 + P5/P4 回归）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "B store 模块可加载（真 zustand persist）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "B 找到真实样本项目",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "B 找到已跑通的拉片链根",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "B 骨架齐全（video→lapian→config text→占位终稿→config video + 固定参考图）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "B 模板自足（无悬空引用）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "B store 载入真实项目（importProject）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "B 并发峰值 ≤ 3（实例级编排并发）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "B 3 实例全部到待批",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "B 付费视频创建 = 0（终点=待批）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "B 队列相位=finished + 并发上限落盘为 3",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "B 批次记录 3 成员 + 排队簿记 3 条目",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "B 排队簿记已落盘（磁盘 payload 含 batchId 与队列条目）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "B 每次实例都只落一次盘（flush 记录 = 3 实例 × 关键节点）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "B per-instance 派生状态：3 个全在待批（R4）且无未知",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "B 批次聚合结论 = in_progress（待批不是完成）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "B 成员四层关联齐（batchId↔实例↔节点↔hub）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "C 429 实例退避重排后最终到待批",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "C 429 退避等待 = 4000ms（指数退避起点）且只退一次",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "C 一直 409 的实例：退避 4 次后如实失败并给可读上限文案",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "C 409 退避序列 4s→8s→16s→32s",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "C 拥塞路径没有被误判成未知提交",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "D 未知提交实例先落库（P3 materialize）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "D 回执丢失：实例只跑一次（禁自动重发）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "D 对账命中既有后端任务 → resolved（按 taskId 续查不重建）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "D 无回执时不造 receipt（禁止假装有回执）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "D 对账确实走了生产查询口径（至少一次）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "D 对账查无 → explicit_unknown 停住交人",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "D 查无时同样只跑一次（零重复付费）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "D 守卫式提交：先落盘守卫再发请求",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "D 守卫式提交：回执丢失 → 分类 submit_unknown 且守卫留盘无 receipt",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "D 守卫已随项目落盘（刷新后仍能知道「可能发过一次」）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "E 中间实例失败、其余两实例照常到待批",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "E 聚合带 per-instance 失败原因（可定位到实例与阶段）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "F 中途暂停：只完成部分实例、队列相位 paused",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "F 排队簿记随项目落盘（刷新前磁盘上就有尝试次数）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "F 新进程真 rehydrate：store 已水合、项目还在",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "F 刷新后队列簿记恢复（相位/并发/条目数）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "F 续跑计划：已完成实例跳过、剩余实例待跑",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "F 续跑计划：已落库实例不需要再 materialize（不重建节点/不重拉片）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "F 续跑后剩余实例全部到待批（整批 5 个）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "F 续跑不重拉片（已落库实例的 lapian /run 调用数不变）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "F 续跑不重建已完成实例的节点（画布节点数不减少）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "F 续跑时已完成实例零重跑（其生成调用次数不变）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "G 生产创建函数走通（axios adapter 替身，零真实网络）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "G job→成片 taskId 已写进项目登记表",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "G 生产查找口径可查回（video.ts recall 走的就是它）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "G 老 localStorage 键仍被写入（兼容不破坏）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "G 成片映射已随项目落盘",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "G 导出携带成片映射（v3 信封里的 project 字段）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "G 导入后成片映射仍在（显式透传）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "G 导入后按 job 可查成片 taskId",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "G 导入同时带回批次/队列/实例记录（同族透传零丢失）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "G 老 localStorage 250 条仍可读（老数据不丢可解析）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "G 老载荷回写仍按 200 条截断（旧行为一致）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "G 新进程真刷新后：成片映射随项目恢复且可查",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "G 项目登记表与老 localStorage 可合并成一张视图（>200 条不丢）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "H store 既有方法面零破坏（7 个方法都在）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "H store 新增只加不改（flushProjects / lastFlush / workflowWanFileTasks 落点）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "H C5：节点 metadata 里没有被塞入队列/批次字段",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "H P0b 闸复验：本卡全部 ops（含队列批跑/对账/恢复）过付费提取 = 0 条付费动作",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "H 本轮确实应用过 ops（付费闸检查不是空集）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "H 真实样本项目零改动（只读：内存副本上操作）",
+      "ok": true,
+      "detail": ""
+    }
+  ]
+}

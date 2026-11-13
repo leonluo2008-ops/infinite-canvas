@@ -15,6 +15,7 @@
 import type { CanvasConnection, CanvasNodeData } from "@/types/canvas";
 import type { WorkflowInstanceMaterials, WorkflowInstancePlan } from "@/lib/canvas/workflow-instance";
 import type { WorkflowInstanceIdentityRecord } from "@/lib/canvas/workflow-instance-run";
+import type { WorkflowBatchQueueRecord } from "@/lib/canvas/workflow-batch-queue";
 import { stableDigest } from "@/lib/canvas/workflow-template";
 
 export const WORKFLOW_BATCH_SCHEMA_VERSION = 1;
@@ -64,6 +65,13 @@ export type WorkflowBatchBackendTaskRef = {
     lapianJobId: string;
     videoTaskId?: string;
     videoProvider?: string;
+    /**
+     * Wan 成片文件任务号（S2，P6）：job（= videoTaskId）→ 成片 taskId 的持久归属点之一。
+     * 旧行为只落 localStorage 且仅留 200 条、导出不带（`services/api/video.ts:302-310` 亲读）；
+     * P6 起项目级登记表 `CanvasProject.workflowWanFileTasks` 是真源，这里是批次成员侧的**外键**，
+     * 让「哪个成片属于哪个实例」随批次记录一起导出。
+     */
+    wanFileTaskId?: string;
 };
 
 export type WorkflowBatchMember = {
@@ -89,6 +97,12 @@ export type WorkflowBatchRecord = {
     createdAt: string;
     updatedAt: string;
     members: WorkflowBatchMember[];
+    /**
+     * 排队簿记（P6）：并发上限、队列相位、每实例尝试/退避/提交守卫。
+     * 与成员同族落在批次记录里（随项目持久化 + 导出同路），但它**只记排队过程**，
+     * 实例当前状态仍由 `workflow-batch-status.ts` 派生（C5/§5.3）。
+     */
+    queue?: WorkflowBatchQueueRecord;
 };
 
 /** 素材组摘要：只收「这批用的什么素材」的身份字段。 */
@@ -126,6 +140,8 @@ export function buildBatchMember(input: {
     connections?: CanvasConnection[];
     /** 拉片后端任务号（P3 落库时即可知；缺省取身份记录）。 */
     lapian?: { taskId: string; jobId: string };
+    /** Wan 成片映射（S2）：job → 成片 taskId（项目级登记表现查；缺省=不写外键）。 */
+    wanFileTasks?: Map<string, string> | Record<string, string>;
     createdAt?: string;
 }): WorkflowBatchMember {
     const { plan } = input;
@@ -151,6 +167,13 @@ export function buildBatchMember(input: {
         .filter((connection) => [product, ...retired].filter(Boolean).includes(connection.fromNodeId))
         .map((connection) => connection.toNodeId)
         .filter((id, index, list) => list.indexOf(id) === index);
+    const videoTaskId = String(videoTarget?.metadata?.videoTaskId || "");
+    const wanLookup = (job: string): string => {
+        if (!job) return "";
+        const table = input.wanFileTasks;
+        if (!table) return "";
+        return table instanceof Map ? String(table.get(job) || "") : String((table as Record<string, string>)[job] || "");
+    };
 
     // all = **现存**节点 id 全集（已退役的模板占位产物在 G18 绑定后被删，单独记在 retiredPlaceholders 里，
     // 不能混进 all：否则每个完成实例都会被判成「节点缺失」）。
@@ -188,8 +211,9 @@ export function buildBatchMember(input: {
         backend: {
             lapianTaskId: String(identity?.canvas.lapianTaskId || input.lapian?.taskId || ""),
             lapianJobId: String(identity?.canvas.lapianJobId || input.lapian?.jobId || ""),
-            videoTaskId: String(videoTarget?.metadata?.videoTaskId || "") || undefined,
+            videoTaskId: videoTaskId || undefined,
             videoProvider: String(videoTarget?.metadata?.videoTaskProvider || "") || undefined,
+            wanFileTaskId: wanLookup(videoTaskId) || undefined,
         },
         createdAt: input.createdAt || identity?.createdAt || new Date().toISOString(),
     };
