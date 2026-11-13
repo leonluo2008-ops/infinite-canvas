@@ -82,6 +82,36 @@ function panelState() {
     };
 }
 
+/** 第 3 批（切片词折叠）页面内取证：可见区一句话里的『词』、保留按钮、折叠区「种切法」块。 */
+function foldState() {
+    const cards = [...document.querySelectorAll("[data-hub-selfcheck-card]")].map((card) => {
+        const words = card.querySelector("[data-hub-selfcheck-words]");
+        const text = words ? (words.textContent || "").trim() : "";
+        const quoted = [...text.matchAll(/『([^』]+)』/g)].map((match) => match[1]);
+        const keeps = [...card.querySelectorAll("[data-hub-selfcheck-keep]")]
+            .map((node) => node.getAttribute("data-hub-selfcheck-keep") || "");
+        const clone = card.cloneNode(true);
+        clone.querySelectorAll("[data-hub-selfcheck-fold]").forEach((node) => node.remove());
+        const visible = (clone.textContent || "").replace(/\s+/g, "");
+        return { text, quoted, keeps, visibleQuoted: [...visible.matchAll(/『([^』]+)』/g)].map((m) => m[1]) };
+    });
+    const blocks = [...document.querySelectorAll("[data-hub-fold-block]")]
+        .map((node) => ({
+            title: node.getAttribute("data-hub-fold-block") || "",
+            lines: [...node.children].slice(1).map((child) => (child.textContent || "").trim()).filter(Boolean),
+        }))
+        .filter((block) => block.title.includes("种切法"));
+    // 整项可见区（去掉折叠区子树）里的『』——验收 5 的「可见区不出现切片词」按这个口径判。
+    const items = [...document.querySelectorAll("[data-hub-selfcheck-item]")].map((item) => {
+        const clone = item.cloneNode(true);
+        clone.querySelectorAll("[data-hub-selfcheck-fold]").forEach((node) => node.remove());
+        const visible = (clone.textContent || "").replace(/\s+/g, "");
+        return { quoted: [...visible.matchAll(/『([^』]+)』/g)].map((match) => match[1]), visible };
+    });
+    const keepCount = document.querySelectorAll("[data-hub-selfcheck-keep]").length;
+    return { cards, blocks, items, keepCount };
+}
+
 async function shot(name) {
     try {
         console.log(`[shot] ${await page.screenshot({ path: `${SHOT_DIR}/${name}.png` })}`);
@@ -337,6 +367,58 @@ const doneAfter = await detailOf(picked.done);
 check("[C] 已交付态只读：状态与提示词零变化",
     doneAfter.state === doneBefore.state && (doneAfter.prompt_md || "") === (doneBefore.prompt_md || ""));
 check("[C] 全程 0 条 Toast", afterHit.toasts === 0, String(afterHit.toasts));
+
+// ════════════════════════════════════════════════ [E] 第 3 批：切片词折叠成完整原词
+console.log("3b) 第 3 批：红字行只出现 1 个完整原词、「保留这个词」1 个、折叠区列出 5 种切法（只读）");
+const SLICES = ["裹亮橙", "亮橙色", "橙色标", "色标签", "标签款"];
+const FULL_WORD = "裹亮橙色标签款";
+
+async function foldChecks(label, localId, state) {
+    const fold = await page.evaluate(foldState);
+    const detail = await detailOf(localId);
+    const residue = (detail.自检 || []).find((item) => item.项 === "绑图行残留") || {};
+    const found = ((residue.说明 || {}).发现 || []).filter((f) => f.词);
+    const stats = (residue.说明 || {}).统计 || {};
+    const folded = found.find((f) => f.词 === FULL_WORD) || {};
+    check(`[E] ${label}（${localId}）数据层：1 条命中 finding，词＝7 字完整原词`,
+        found.length === 1 && folded.词 === FULL_WORD,
+        JSON.stringify(found.map((f) => f.词)));
+    check(`[E] ${label}：切片 5 个且逐字与 residue_words 一致（${SLICES.join("/")}）`,
+        Array.isArray(folded.切片) && folded.切片.length === 5
+        && SLICES.every((word) => folded.切片.includes(word)) && folded.切片.length === new Set(folded.切片).size,
+        JSON.stringify(folded.切片));
+    check(`[E] ${label}：判定口径留痕（统计.判定词数=6、展示 词数=1）`,
+        stats.判定词数 === 6 && stats.词数 === 1, JSON.stringify(stats));
+    check(`[E] ${label} 验收 1：每张卡的红字句只出现 1 个『词』，且＝「${FULL_WORD}」`,
+        fold.cards.length > 0 && fold.cards.every((card) => card.quoted.length === 1 && card.quoted[0] === FULL_WORD),
+        JSON.stringify(fold.cards.map((card) => card.quoted)));
+    check(`[E] ${label} 验收 1：每张卡「保留这个词」按钮数＝1，对象＝完整原词`,
+        fold.cards.length > 0 && fold.cards.every((card) => card.keeps.length === 1 && card.keeps[0] === FULL_WORD),
+        JSON.stringify(fold.cards.map((card) => card.keeps)));
+    check(`[E] ${label} 验收 2：折叠区可见「同一个词的 6 种切法」，5 个切片逐字列出`,
+        fold.blocks.length === 1 && /同一个词的\s*6\s*种切法/.test(fold.blocks[0].title)
+        && fold.blocks[0].lines.length === 1 && SLICES.every((word) => fold.blocks[0].lines[0].includes(word)),
+        JSON.stringify(fold.blocks));
+    check(`[E] ${label} 验收 5：可见区（去掉折叠区）没有任何 3 字切片被当词呈现`,
+        fold.items.length > 0 && fold.items.every((item) => item.quoted.every((word) => !SLICES.includes(word))),
+        JSON.stringify(fold.items.map((item) => item.quoted)));
+    check(`[E] ${label}：正文常驻高亮不回归（命中段 mark 仍只包完整原词）`,
+        fold.cards.length > 0 && state.marks >= 1 && state.markText.every((text) => text.includes(FULL_WORD)),
+        JSON.stringify(state.markText));
+    return fold;
+}
+
+const doneFold = await foldChecks("已交付态", picked.done, afterHit);
+check("[E] 已交付态：页面上一共只有 1 个「保留这个词」（不是 6 个）", doneFold.keepCount === doneFold.cards.length,
+    `keep=${doneFold.keepCount} cards=${doneFold.cards.length}`);
+await shot("at23-b1-done-folded");
+
+await openTask(picked.editable);
+const editState = await page.evaluate(panelState);
+const editFold = await foldChecks("待审批态", picked.editable, editState);
+check("[E] 待审批态：页面上一共只有 1 个「保留这个词」（不是 6 个）",
+    editFold.keepCount === editFold.cards.length, `keep=${editFold.keepCount} cards=${editFold.cards.length}`);
+await shot("at23-b1-editable-folded");
 
 // ════════════════════════════════════════════════ [D] Toast 防抖（浏览器里跑同一份包装代码）
 console.log("4) Toast 防抖：同文案 1s 内只出一条，>1s 可再弹（真机浏览器内、打生产包装函数）");

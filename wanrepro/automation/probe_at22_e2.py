@@ -244,11 +244,19 @@ def schema_phase(items: list[dict]) -> bool:
     ok &= check("`片段` 拼起来还原 `上下文`（原文一字不改）", cover_ok)
     ok &= check("`片段` 的 起/止 与 `上下文` 下标逐段对齐", segments_ok)
     ok &= check("`片段` 至少一段 高亮=true（前端按偏移上色，不解析文字）", highlight_ok)
-    ok &= check("同一句的多条 finding 共享 行号+句序（渲染层并卡的唯一依据）",
-                len({(f.get("行号"), f.get("句序")) for f in found}) == 1 and len(found) >= 2,
+    ok &= check("同一句的命中 finding 共享 行号+句序（渲染层并卡的唯一依据；AT-23 B1 折叠后同句只剩完整原词）",
+                len({(f.get("行号"), f.get("句序")) for f in found}) == 1 and bool(found),
                 str(sorted({(f.get("行号"), f.get("句序")) for f in found})))
-    ok &= check("同句多词在数据层仍是「一词一条」（E4 逐词保留的前提）",
-                len({f.get("词") for f in found}) == len(found), str([f.get("词") for f in found]))
+    # AT-23 B1（质检面板就地处理闭环 第 3 批）：判定集仍是一词一条，**展示集**按同一「行×句」的
+    # 包含关系折叠成完整原词、切片进 `切片`。原断言「数据层仍是同句多词（一词一条，≥2 条）」
+    # 描述的是折叠前的口径，B1 落地后必红——改成同时锁「判定数没少 + 展示收口 + 切片留全」。
+    stats_row = (residue.get("说明") or {}).get("统计") or {}
+    ok &= check("AT-23 B1：判定集一个不少（统计.判定词数 > 展示条数）、展示收口成完整原词、切片进 `切片`",
+                len({f.get("词") for f in found}) == len(found)
+                and int(stats_row.get("判定词数") or 0) > len(found)
+                and all(f.get("切片") for f in found),
+                f"判定词数={stats_row.get('判定词数')} 展示={[f.get('词') for f in found]} "
+                f"切片={[len(f.get('切片') or []) for f in found]}")
     return ok
 
 
@@ -326,7 +334,10 @@ def dedupe_phase(items: list[dict]) -> bool:
                 isinstance(stats.get("词表行数"), int) and isinstance(stats.get("正文字数"), int),
                 json.dumps(stats, ensure_ascii=False)[:200])
     words = {f.get("词") for f in found}
-    ok &= check("同句多词 ≥3（并卡收益真实存在）", len(words) >= 3, str(sorted(words)))
+    # AT-23 B1：原断言「同句多词 ≥3」是折叠前的展示口径；现锁「判定 ≥3 个词、展示折叠后更少」。
+    ok &= check("判定 ≥3 个词、展示按包含关系折叠成完整原词（AT-23 B1：判定不动、展示收口）",
+                int(stats.get("判定词数") or 0) >= 3 and 0 < len(words) < int(stats["判定词数"]),
+                f"判定词数={stats.get('判定词数')} 展示={sorted(words)}")
     legacy = legacy_baseline()
     print(f"      真实历史载荷（pre-B2）：{legacy['file']} 承载位={legacy['carriers']} {legacy['fields']}")
     ok &= check("真实历史载荷里同一命中句被 ≥3 个可见位承载（基线可量化）",

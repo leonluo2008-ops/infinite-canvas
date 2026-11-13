@@ -2460,7 +2460,7 @@ export function PromptSection({
  *       **不解析「证据」字符串、不拼业务话术**（红线 25）。旧数据（无 v2 槽位）走降级分支。 */
 const SELFCHECK_STAT_INSIDE = new Set([
     "词表行数", "正文字数", "要发张数", "提交张数", "必换行", "已传", "未换",
-    "通过", "没通过", "提醒", "已重拆", "上限", "共检查",
+    "通过", "没通过", "提醒", "已重拆", "上限", "共检查", "判定词数",
 ]);
 
 /** 命中窗口半径/上限（E2 §8.1：命中句前后各 ≤12 字，整串 ≤60 字）。 */
@@ -2558,6 +2558,9 @@ function selfCheckStatText(key: string, value: unknown): string {
             return `上限 ${String(value)} 次`;
         case "共检查":
             return `共检查 ${String(value)} 项`;
+        case "判定词数":
+            // AT-23 B1：判定集比展示集多出的部分（同一个词的切法）——只在折叠区可见。
+            return `判定命中 ${String(value)} 个词`;
         default:
             return `${key} ${list || String(value)}`;
     }
@@ -2588,6 +2591,19 @@ function SelfCheckFold({ item }: { item: HubSelfCheckItem }) {
         .map(([key, value]) => `${key} ${Array.isArray(value) ? JSON.stringify(value) : String(value)}`);
     const 清单行 = Object.entries(say?.清单行 ?? {}).map(([row, line]) => `第 ${row} 行：${line}`);
     const 原句 = say?.原句 ? [`第 ${say.原句.句序} 段：${say.原句.段}`] : [];
+    // AT-23 B1（质检面板就地处理闭环 第 3 批）：可见区一句只出现完整原词，被折叠的切片留在这里。
+    // 数据源＝生产者 finding 上的 `切片`（同一「行×句」的包含关系已在生产侧折叠，前端不重算）。
+    const 切法 = (say?.发现 ?? [])
+        .map((finding) => {
+            const word = finding.词 ?? "";
+            const slices = finding.切片 ?? [];
+            return word && slices.length
+                ? { title: 1 + slices.length, line: `『${word}』的另外 ${slices.length} 种切法：${slices.join("、")}` }
+                : null;
+        })
+        .filter((entry): entry is { title: number; line: string } => entry !== null);
+    const 切法标题 = 切法.length === 1 ? `同一个词的 ${切法[0].title} 种切法`
+        : 切法.length > 1 ? "同一个词的切法" : "";
     return (
         <details className="w-full min-w-0" data-hub-selfcheck-fold>
             <summary className="cursor-pointer list-none text-[11px] text-stone-400 [&::-webkit-details-marker]:hidden dark:text-stone-500">
@@ -2598,6 +2614,7 @@ function SelfCheckFold({ item }: { item: HubSelfCheckItem }) {
                 <SelfCheckFoldBlock title="机器键值" lines={machine} />
                 <SelfCheckFoldBlock title="这一行的清单原文" lines={清单行} />
                 <SelfCheckFoldBlock title="提示词里的原句" lines={原句} />
+                <SelfCheckFoldBlock title={切法标题} lines={切法.map((entry) => entry.line)} />
                 <SelfCheckFoldBlock title="检查器原始输出" lines={item.证据 ? [item.证据] : []} />
             </div>
         </details>
@@ -2629,6 +2646,8 @@ function SelfCheckCardView({ card, itemKey, wordRows }: {
     const others = (first.组 ?? []).filter((no) => no !== rowNo);
     const words = [...new Set(card.findings.map((finding) => finding.词).filter((word): word is string => Boolean(word)))]
         .sort((a, b) => b.length - a.length);
+    // AT-23 B1：同一「行×句」的命中词已在生产者侧按包含关系折叠成完整原词，被折叠的切片只挂在
+    // finding 的 `切片` 上、只进折叠区（「同一个词的 N 种切法」）。此卡不再做包含计算。
     const groups = card.findings.map((finding) => finding.片段 ?? []).filter((pieces) => pieces.length > 0);
     const context = card.findings.map((finding) => finding.上下文).find((text): text is string => Boolean(text)) ?? "";
     const runs = context ? selfCheckWindow(context, groups) : [];
@@ -2652,8 +2671,11 @@ function SelfCheckCardView({ card, itemKey, wordRows }: {
             + (others.length && first.图号 ? ` · 这一张也用在第 ${others.join("、")} 行` : "")
             + (first.图引用 ? "" : "（这行还没绑图）");
     const state = first.图引用 ? assetStates[first.图引用] : "";
+    // 红字一句（AT-23 B1）：正常路径下同一「行×句」的命中词已在生产侧折叠成**一个完整原词**
+    // （§3.4「这一行的原物描述词『裹亮橙色标签款』还在提示词里」）；多词分支只留给没重跑自检的
+    // 旧载荷（旧 自检.json 里仍是切片词组）——降级照旧能看，不造假。
     const hit = words.length > 1 ? `这句里的${words.map((word) => `『${word}』`).join("")}还在提示词里：`
-        : words.length === 1 ? `『${words[0]}』还在提示词里：` : "";
+        : words.length === 1 ? `这一行的原物描述词『${words[0]}』还在提示词里` : "";
 
     const keepWord = async (word: string, rows: number[]) => {
         if (!whitelist) return;

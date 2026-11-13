@@ -109,7 +109,7 @@ KIND_WORD = {"主体": "产品图", "人物": "人物图", "道具": "道具图"
 
 # 透出给前端的 v2 字段（真值才带；None/空串/空列表/空对象不落盘，前端按缺省降级）。
 SHOWN_V2_KEYS = ("行称呼", "类别", "组", "图称呼", "图引用", "词", "句序",
-                 "上下文", "片段", "原文", "人话", "可修")
+                 "上下文", "片段", "原文", "人话", "可修", "切片")
 
 
 def _finding(kind: str, text: str, row: int | None = None, no: int | None = None, **v2) -> dict:
@@ -830,6 +830,56 @@ def _own_label_line(line: str, names: set[str]) -> bool:
     return False
 
 
+def _fold_contained_words(hits: list[dict]) -> list[dict]:
+    """把同一「行×句」的命中词按**包含关系折叠**成展示集（AT-23 B1：判定集不动，展示集取最大词）。
+
+    病根：`residue_words()` 为了**匹配**把原词展开成 core ∪ 2/3 字组（只留 ≥3 字）——7 字原词
+    必然产出 5 个 3 字切片（「裹亮橙色标签款」→ 亮橙色/橙色标/裹亮橙/标签款/色标签）。判定用完整
+    集合是对的（AT-22 B1 基线：命中 214 / 真残留 213 / 误报 ≤1），错在把它原样当**展示集**透出：
+    一句话里冒出 6 个『』、6 个「保留这个词」，其中 5 个是同一个残留的另外 5 种切法。
+
+    做法：只在**报告层**折叠——同一 行×句 内保留「不被其他命中词包含」的词（=完整原词），
+    被折叠的切片按「包含它的最短保留词」归属，写进该条 finding 的 `切片`（只进折叠区
+    「同一个词的 N 种切法」）。判定侧一行不动（`residue_words` 一个词不少），命中/漏报与
+    AT-22 B1 基线逐字一致；`selfcheck_whitelist` 的键仍是 行×词键，合并后写的是完整原词
+    （服务端闭包校验走 `residue_words`，完整原词∈集合 → E4 语义零变化）。
+
+    切片的排列按它在完整原词里的**起始位置**定序——`residue_words` 里等长词的先后来自 set 迭代，
+    展示口径不能跟着 Python 哈希漂；按起始位置排也正是人读「滑窗切法」时的顺序。
+    """
+    groups: dict[tuple[int, int], list[tuple[int, dict]]] = {}
+    for index, hit in enumerate(hits):
+        key = (int(hit.get("行号") or 0), int(hit.get("句序") or 0))
+        groups.setdefault(key, []).append((index, hit))
+    folded: dict[int, list[str]] = {}          # 保留词的 hits 下标 → 被折叠的切片
+    dropped: set[int] = set()                  # 被折叠掉的 hits 下标
+    for group in groups.values():
+        words = [str(hit.get("词") or "") for _, hit in group]
+        keep = [pos for pos, word in enumerate(words)
+                if not any(other != word and word in other for other in words)]
+        kept = set(keep)
+        hosts: dict[int, list[str]] = {}
+        for pos, word in enumerate(words):
+            if pos in kept or not word:
+                continue
+            candidates = [at for at in keep if word in words[at]]
+            if not candidates:
+                continue                        # 理论上不会（包含链的终点必是保留词），防御性跳过
+            hosts.setdefault(min(candidates, key=lambda at: (len(words[at]), at)), []).append(word)
+        for at, slices in hosts.items():
+            folded[group[at][0]] = sorted(set(slices), key=lambda w: (words[at].find(w), w))
+        dropped.update(group[pos][0] for pos in range(len(group)) if pos not in kept)
+    out: list[dict] = []
+    for index, hit in enumerate(hits):
+        if index in dropped:
+            continue
+        item = dict(hit)
+        if folded.get(index):
+            item["切片"] = folded[index]
+        out.append(item)
+    return out
+
+
 def _check_residue(body: str, ents, render, bridge_id: str = "",
                    labels: dict[int, dict] | None = None,
                    lines: dict[int, str] | None = None,
@@ -887,6 +937,11 @@ def _check_residue(body: str, ents, render, bridge_id: str = "",
                                               可修={"类型": "改描述"})))
                 break
     ledger = _exempt_ledger(entries, ents, render, {int(e.row_no) for e in bound}, body)
+    # AT-23 B1（质检面板就地处理闭环 第 3 批）：判定集 → 展示集只在**这里**收口。
+    # 上面 `hits` 是按完整 `residue_words()` 逐词命中（判定口径，一个词不少）；这里按同一
+    # 「行×句」的包含关系折叠成完整原词 + `切片`（判定数留进统计，证据可复核）。
+    judgment_words = len(hits)
+    hits = _fold_contained_words(hits)
     active = [it for it in ledger if it["状态"] == "生效"]
     stale = [it for it in ledger if it["状态"] != "生效"]
     note = _exempt_note(active, stale)
@@ -908,6 +963,7 @@ def _check_residue(body: str, ents, render, bridge_id: str = "",
     shown = "；".join(str(h["文字"]) for h in hits[:5])
     rows = list(dict.fromkeys(h["行号"] for h in hits if h.get("行号")))
     stats["词数"] = len(hits)
+    stats["判定词数"] = judgment_words
     stats["句数"] = len({(h.get("行号"), h.get("句序")) for h in hits})
     head = (f"提示词里还留着 {len(hits)} 个要换掉的原物词，都在{_row_phrase(rows[0], labels)}里"
             if len(rows) == 1 else

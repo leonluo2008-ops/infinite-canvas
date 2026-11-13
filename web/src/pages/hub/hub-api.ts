@@ -293,6 +293,9 @@ export type HubSelfCheckFinding = {
     图引用?: string;
     /** 命中词（一个 finding 一个词，与 E4 逐词粒度对齐）。 */
     词?: string;
+    /** AT-23 B1：被折叠掉的切片（同一个词的另外 N 种切法）——生产者按同一「行×句」的包含关系
+     *  折叠后的**证据**，只进「展开看证据（内部明细）」，可见区一句只出现完整原词。 */
+    切片?: string[];
     /** 命中句在正文里的句序（同「行号+句序」= 同一句 → 渲染层并成一张卡）。 */
     句序?: number;
     /** 命中句原文（不改字，含 @图片N）。 */
@@ -920,6 +923,12 @@ function normalizeSelfCheckRows(value: unknown): number[] | undefined {
     return rows.length ? rows.sort((a, b) => a - b) : undefined;
 }
 
+/** 词表归一（AT-23 B1 折叠切片）：只收非空字符串，保持生产者给的顺序（定序在生产侧）。 */
+function normalizeSelfCheckWords(value: unknown): string[] {
+    if (!Array.isArray(value)) return [];
+    return value.map((item) => hubText(item)).filter((word): word is string => Boolean(word));
+}
+
 /** 说明归一：只搬生产者字段 + 结构化发现；一个真字段都没有 → undefined（=旧结构）。 */
 function normalizeSelfCheckExplain(value: unknown): HubSelfCheckExplain | undefined {
     if (!value || typeof value !== "object") return undefined;
@@ -940,6 +949,10 @@ function normalizeSelfCheckExplain(value: unknown): HubSelfCheckExplain | undefi
             }
             const rows = normalizeSelfCheckRows(entry["组"]);
             if (rows) finding.组 = rows;
+            // AT-23 B1：折叠切片（同一个词的另外 N 种切法）——只搬字符串数组，不做二次包含计算
+            // （折叠是生产者的活，前端不许自己重算判定/展示口径）。
+            const 切片 = normalizeSelfCheckWords(entry["切片"]);
+            if (切片.length) finding.切片 = 切片;
             const order = selfCheckOffset(entry["句序"], 1);
             if (order !== null) finding.句序 = order;
             const segments = normalizeSelfCheckSegments(entry["片段"]);

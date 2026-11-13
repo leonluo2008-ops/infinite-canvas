@@ -283,13 +283,17 @@ def cmd_assert() -> int:
         ok = ok and cond
         print(f"  [{'PASS' if cond else 'FAIL'}] {name}" + (f" —— {detail}" if detail else ""))
 
-    print("[1] 全量 66 任务重放（实际实现）")
+    # 语料是活的（每建一条新任务，analysis/reverse 里就多一份提示词），所以 E1 红线写成
+    # **不变量**而不是某一刻的快照数字：真残留「不得下降」（≥ 基线 213）、误报「不涨」（≤1 已认账）。
+    # 逐字快照数字（== 213 / == 36）会在任何新任务落地时假红——2026-11-13 新增任务
+    # video-0d294878（auto-0068）就带来 +8 真残留 / +1 绑图行，与取词口径无关。
+    print("[1] 全量任务重放（实际实现）")
     hits = scan_impl()
     cls = collections.Counter(h["cls"] for h in hits)
     tp, fp = cls.get("T", 0), len(hits) - cls.get("T", 0)
     fps = [h for h in hits if h["cls"] != "T"]
     print(f"      命中={len(hits)} 真残留={tp} 误报={fp} 明细={dict(cls)}")
-    check("真残留 213 条零损失（E1 验收红线，不得下降）", tp == 213, f"实测 {tp}")
+    check("真残留 ≥213 条零损失（E1 验收红线：既有基线一条不丢）", tp >= 213, f"实测 {tp}")
     # E1 §七.2 已认账的残余：品类泛化词「外包装」撞拍摄手法句，靠 E4 行×词白名单兜底。
     known = [h for h in fps if h["bridge"] == "1-103" and h["word"] == "外包装"]
     check("误报 19→0（允许 ±2 边界，须逐条解释）",
@@ -313,8 +317,8 @@ def cmd_assert() -> int:
             tables.append((bridge, e.row_no, core_core, core_r3, len(words)))
             if not words:
                 empty.append((bridge, e.row_no, core_core))
-    check("绑图行 36 / 空表 6（5 行通用占位名 + 1 行纯动作名）",
-          len(tables) == 36 and len(empty) == 6,
+    check("绑图行 ≥36 / 空表 6（5 行通用占位名 + 1 行纯动作名）",
+          len(tables) >= 36 and len(empty) == 6,
           f"绑图行={len(tables)} 空表={len(empty)}：{empty}")
     check("通用占位名不进表（我们的产品 ×5）",
           sum(1 for _b, _r, n in empty if n in GENERIC_NAMES) == 5, str(empty))

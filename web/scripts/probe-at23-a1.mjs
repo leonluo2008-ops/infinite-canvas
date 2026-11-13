@@ -369,6 +369,48 @@ check("[C] done 的原因文案＝「已完成：成片已出，这条不能再�
 const reasonsMissing = STATES.filter((s) => !hubApi.hubDescEditGate(s).enabled && !hubApi.hubDescEditGate(s).reason);
 check("[C] 每个不可编辑态都有人话原因（置灰不是哑巴）", reasonsMissing.length === 0, JSON.stringify(reasonsMissing));
 
+console.log("9) 第 3 批（切片词折叠）：一句 1 个完整原词、1 个「保留这个词」、折叠区列 5 种切法");
+{
+    // 生产者在同一「行×句」按包含关系折叠后的载荷：1 条 finding + `切片`（证据）+ 判定词数留痕。
+    const FOLDED = [{
+        项: "绑图行残留", 项显示名: "提示词里的老词", 结论: "FAIL", 证据: "#1 的「裹亮橙色标签款」残留于正文…",
+        说明: {
+            结论人话: "提示词里还留着 1 个要换掉的原物词，都在第 1 行「本品主体」里",
+            发现: [{
+                类型: "残留", 文字: "#1 的「裹亮橙色标签款」残留于正文", 行号: 1, 图号: 1,
+                行称呼: "本品主体", 图称呼: "产品图", 图引用: "@图片1", 词: "裹亮橙色标签款",
+                句序: 1, 原文: "#1 的「裹亮橙色标签款」残留于正文", 可修: true,
+                上下文: CONTEXT,
+                片段: [{ 起: 20, 止: 28, 文: "裹亮橙色标签款", 高亮: true }],
+                切片: ["裹亮橙", "亮橙色", "橙色标", "色标签", "标签款"],
+            }],
+            处理: "在下面这条发现上点「改这一行的描述」，写完点「保存并重渲染」",
+            统计: { 词表行数: 1, 正文字数: 448, 词数: 1, 判定词数: 6, 句数: 1 },
+        },
+    }];
+    const html = ssr.renderPrompt({ ...DETAIL("awaiting_approval"), 自检: FOLDED });
+    const hitLine = (html.match(/data-hub-selfcheck-words="true">([\s\S]*?)<\/div>/) || ["", ""])[1];
+    const quoted = [...hitLine.matchAll(/『([^』]+)』/g)].map((m) => m[1]);
+    check("[C] 红字一句只出现 1 个『词』，且＝完整原词（切片不上红字行）",
+        quoted.length === 1 && quoted[0] === "裹亮橙色标签款", JSON.stringify(quoted));
+    check("[C] 红字一句是设计 §3.4 的措辞（「这一行的原物描述词『…』还在提示词里」）",
+        html.includes("这一行的原物描述词『裹亮橙色标签款』还在提示词里"));
+    check("[C] 「保留这个词」只剩 1 个，且 data-hub-selfcheck-keep＝完整原词",
+        (html.match(/data-hub-selfcheck-keep=/g) || []).length === 1
+        && html.includes('data-hub-selfcheck-keep="裹亮橙色标签款"'),
+        String((html.match(/data-hub-selfcheck-keep=/g) || []).length));
+    const foldBlock = (html.match(/data-hub-fold-block="同一个词的 6 种切法"[\s\S]*?<\/div><\/div>/) || [""])[0];
+    check("[C] 折叠区新增「同一个词的 6 种切法」，5 个切片逐字列出",
+        Boolean(foldBlock) && ["裹亮橙", "亮橙色", "橙色标", "色标签", "标签款"].every((word) => foldBlock.includes(word)),
+        foldBlock.slice(0, 200));
+    const visible = html.replace(/<details[\s\S]*?<\/details>/g, "");
+    check("[C] 验收 5：可见区（去掉折叠区）没有任何 3 字切片被当词呈现",
+        ["裹亮橙", "亮橙色", "橙色标", "色标签", "标签款"].every((word) => !visible.includes(`『${word}』`)));
+    const foldArea = (html.match(/<details[^>]*data-hub-selfcheck-fold[\s\S]*?<\/details>/) || [""])[0];
+    check("[C] 判定口径在折叠区留痕（内部统计写「判定命中 6 个词」）",
+        foldArea.includes("判定命中 6 个词") && !visible.includes("判定命中 6 个词"), foldArea.slice(0, 120));
+}
+
 console.log("");
 console.log(`[probe-at23-a1.mjs] ${pass}/${pass + fails.length} PASS`);
 if (fails.length) {
