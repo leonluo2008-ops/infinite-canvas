@@ -6,6 +6,7 @@ import { Streamdown } from "streamdown";
 import { approveHubTask, confirmHubReplace, errorText, forceFinishHubTask, getHubTask, hubOutputUrl, postHubAsset, renderHubTask, retryHubTask, submitHubTask, uploadHubAssets, uploadHubImage, type HubActivity, type HubAssetCard, type HubFailedView, type HubHeartbeat, type HubLostRun, type HubPairLine, type HubRemoteWait, type HubRenderPreview, type HubTaskDetail, type HubTaskSummary } from "./hub-api";
 import { forceFinishGuard } from "./hub-status";
 import { TaskDeleteButton } from "./task-delete-confirm";
+import { useHubMessage } from "./use-hub-message";
 
 const STATE_META: Record<string, { label: string; dot: string; pill: string }> = {
     ingested: { label: "已建任务", dot: "bg-stone-400", pill: "bg-stone-100 text-stone-600 dark:bg-stone-800 dark:text-stone-300" },
@@ -426,7 +427,7 @@ export function CloudFailurePanel({ failed, fallbackError = "" }: { failed?: Hub
 }
 
 export function TaskCard({ task, onStateChange, onRefresh }: { task: HubTaskSummary; onStateChange: (localId: string, state: string) => void; onRefresh: () => void }) {
-    const { message } = App.useApp();
+    const message = useHubMessage();
     const fileInputRef = useRef<HTMLInputElement>(null);
     const assetDragDepthRef = useRef(0);
     const renderJobRef = useRef<Promise<void> | null>(null);
@@ -1056,7 +1057,7 @@ function AdviceBadge({ advice }: { advice: string }) {
  * 品牌视觉卡（类别含「品牌视觉」）：品牌文字输入为主，logo 图可选。
  */
 function AssetReplaceCard({ card, taskId, onWritten }: { card: HubAssetCard; taskId: string; onWritten: () => void }) {
-    const { message } = App.useApp();
+    const message = useHubMessage();
     const fileInputRef = useRef<HTMLInputElement>(null);
     const dragDepthRef = useRef(0);
     const [frameIdx, setFrameIdx] = useState(0);

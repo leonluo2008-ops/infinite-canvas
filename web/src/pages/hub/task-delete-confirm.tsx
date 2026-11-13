@@ -3,6 +3,7 @@ import { useState } from "react";
 
 import { deleteHubTask, errorText, type HubTaskSummary } from "./hub-api";
 import { deleteGuard, HubStateTag } from "./hub-status";
+import { useHubMessage } from "./use-hub-message";
 
 /**
  * 删除确认（AT-16 B6 / 缺陷 D7：删除任务不再手输任务名）。
@@ -42,7 +43,7 @@ export function TaskDeleteButton({
      */
     onError?: (message: string) => void;
 }) {
-    const { message } = App.useApp();
+    const message = useHubMessage();
     const [busy, setBusy] = useState(false);
     const guard = deleteGuard(task);
     const blocked = guard.disabled || disabled || busy;

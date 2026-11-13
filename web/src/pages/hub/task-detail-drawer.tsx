@@ -39,6 +39,7 @@ import {
     type GenDraft,
 } from "@/lib/hub/gen-settings";
 import { mergeBadge, mergeBarText, mergeImageBranch, mergeMembershipChanged, mergeSelectable, mergeShotUnion, groupBoxRow, pruneSelection, toggleMergeRow } from "@/lib/hub/merge-mode";
+import { flashPromptHit } from "@/lib/hub/prompt-anchor";
 import { activeCards, decisionBadgeText, decisionErrorText, decisionFeedback, lockCounters, lockRows, originRowNumbers, originStripLabel, rowDecisionAction, type RowDecisionAction } from "@/lib/hub/row-decision";
 import { useConfigStore, type AiConfig } from "@/stores/use-config-store";
 
@@ -99,6 +100,7 @@ import {
 import { GenClearedBar, hubClearedDirect } from "./gen-cleared";
 import { HubTextEditor, type SaveResult } from "./hub-text-editor";
 import { lapianClockTexts, lapianStageName, useLapianClock } from "./lapian-clock";
+import { useHubMessage } from "./use-hub-message";
 import { HubStateTag, SubmitResultLine, forceFinishGuard } from "./hub-status";
 import { CloudFailurePanel, FORCE_FINISH_CONFIRM_TITLE, ForceFinishButton, ForceFinishConfirmBody, RemoteWaitLine } from "./task-card";
 import { TaskDeleteButton } from "./task-delete-confirm";
@@ -146,7 +148,7 @@ export function TaskDetailDrawer({
     /** AT-21 B0：派生成功（父级刷新列表后再打开新任务，避免「列表里还没有这条」白屏）。 */
     onForked?: (newId: string, out: HubForkResult) => void;
 }) {
-    const { message } = App.useApp();
+    const message = useHubMessage();
     const [detail, setDetail] = useState<HubTaskDetail | null>(null);
     const [loadError, setLoadError] = useState("");
     const [lastUpdated, setLastUpdated] = useState<number | null>(null);
@@ -516,7 +518,7 @@ export function DrawerForceFinishEntry({
     onRefresh: () => void;
     onError: (text: string) => void;
 }) {
-    const { message } = App.useApp();
+    const message = useHubMessage();
     const [forceOpen, setForceOpen] = useState(false);
     const [forceBusy, setForceBusy] = useState(false);
     const guard = forceFinishGuard(task);
@@ -769,7 +771,8 @@ function AssetSection({
     onWritten: () => void;
     onConfirmed: () => void;
 }) {
-    const { message, modal } = App.useApp();
+    const { modal } = App.useApp();
+    const message = useHubMessage();
     const taskId = detail.local_id;
     const allCards = [...detail.asset_cards].sort((a, b) => a.n - b.n);
     // 影响镜次（AT-10 C05 信息下沉）：意图建议的镜次，纯透出，不新增识别调用。
@@ -1405,7 +1408,7 @@ function AssetCardUnit({
     checkDisabledReason?: string;
     onToggleCheck?: () => void;
 }) {
-    const { message } = App.useApp();
+    const message = useHubMessage();
     const [brandText, setBrandText] = useState("");
     const brand = card.类别.includes("品牌视觉");
     // AT-12 N1 决策菜单项（§2.2）：仅必换/建议准备行显示「移除（不需要替换，按原片处理）」；
@@ -1558,7 +1561,7 @@ function MergeConfirmModal({
     const [name, setName] = useState(sortedRows[0]?.短名 || "");
     const [keepN, setKeepN] = useState<number | null>(branch.branch === "multi" ? branch.candidates[0].n : null);
     const [error, setError] = useState("");
-    const { message } = App.useApp();
+    const message = useHubMessage();
 
     // AT-11 M5 缺陷修复：本组件在 AssetSection 里常驻挂载（只靠 open 控显隐），
     // Modal 的 destroyOnHidden 只销毁子 DOM、不重置组件 state——上面的 useState
@@ -1987,6 +1990,8 @@ type DescEditApi = {
     cardsByNo: Record<number, HubAssetCard>;
     gate: { enabled: boolean; reason: string };
     busy: boolean;
+    /** 草稿暂存作用域（=任务号）：编辑器收起再展开时按 `作用域#行号` 找回未保存的字。 */
+    scope: string;
     /** 当前打开着行内编辑块的行号（**行级互斥**：同时只允许一个，切换时不会静默丢草稿）。 */
     editingRow: number | null;
     setEditingRow: (n: number | null) => void;
@@ -2010,6 +2015,15 @@ type WhitelistApi = {
     removeAll: () => Promise<void>;
 };
 const WhitelistContext = createContext<WhitelistApi | null>(null);
+
+/** 质检卡 → 提示词正文的**只读定位**（交互设计 §2.4 不可编辑态的「看正文里的这一句」）。
+ *
+ *  为什么经由 context 而不是卡里自己 `querySelector`：正文可能正被「收起」（容器不在 DOM），
+ *  也可能正停在「手改正文」态（编辑器替掉了正文容器）——展开状态与容器都归 PromptSection 持有，
+ *  卡片只发「看这一句」的意图，由本段决定先展开再定位。**这条路径永不要求用户退状态**。
+ */
+type PromptAnchorApi = { reveal: (candidates: string[]) => void };
+const PromptAnchorContext = createContext<PromptAnchorApi | null>(null);
 
 /* hub-asset-exit:begin —— 受控资产出口（AT-16 B1a）。
    全 drawer **唯一**允许把资产引用赋给 <img src> / <a href> 的地方：只收 ref 原串，
@@ -2076,7 +2090,7 @@ function AssetUploadZone({
     onWritten: () => void;
     hint?: string;
 }) {
-    const { message } = App.useApp();
+    const message = useHubMessage();
     const fileInputRef = useRef<HTMLInputElement>(null);
     const dragDepthRef = useRef(0);
     const [dragActive, setDragActive] = useState(false);
@@ -2221,11 +2235,13 @@ export function PromptSection({
     onWritten?: () => void;
 }) {
     const prompt = detail.prompt_md || "";
-    const { message } = App.useApp();
+    const message = useHubMessage();
     const [collapsed, setCollapsed] = useState(false);          // 正文默认展开（折叠改成可选收起）
     const [editingRow, setEditingRow] = useState<number | null>(null);
     /** AT-21 B0 D3-②：手改提示词正文（直写 提示词.md；awaiting_approval 才可编辑）。 */
     const [editingPrompt, setEditingPrompt] = useState(false);
+    /** 正文容器（**所有状态恒渲染**的那一块）：只读定位滚它、在它里面临时高亮。 */
+    const promptBodyRef = useRef<HTMLDivElement | null>(null);
     // AT-15 R2：拆解门禁条目从自检束里拆出来单独渲染（绿Tag=绿项数摘要；FAIL/WARN 红条=缺项+重拆轮次）。
     const gateItem = detail.自检?.find((item) => item.项 === GATE_ITEM_NAME) ?? null;
     const checkItems = detail.自检?.filter((item) => item.项 !== GATE_ITEM_NAME) ?? null;
@@ -2238,6 +2254,27 @@ export function PromptSection({
     const descGate = useMemo(() => hubDescEditGate(detail.state || ""), [detail.state]);
     // AT-21 B0：手改正文起态门（与后端 PROMPT_EDIT_REFUSALS 同序；不可改时按钮置灰 + tooltip 给出口）
     const promptGate = useMemo(() => hubPromptEditGate(detail.state || ""), [detail.state]);
+    /** 只读定位（交互设计 §2.4）：不可编辑态下「看正文里的这一句」——滚到命中句 + 临时高亮 2 秒。
+     *  简版：不改正文渲染路径、不常驻（常驻/字符级高亮是第 2 批）。**永不弹「先退回置换」**。 */
+    const promptAnchor = useMemo<PromptAnchorApi>(() => ({
+        reveal: (candidates: string[]) => {
+            const wants = (candidates || [])
+                .map((text) => String(text ?? "").trim())
+                .filter((text) => text.length >= 2);
+            if (!wants.length) return;
+            if (editingPrompt) {
+                message.info("正在手改正文：先点右上角「退出编辑」，再定位这一句");
+                return;
+            }
+            setCollapsed(false);                     // 正文可能处于收起态：先让它出现在 DOM 里
+            const attempt = (left: number) => {
+                if (flashPromptHit(promptBodyRef.current, wants)) return;
+                if (left > 0) window.setTimeout(() => attempt(left - 1), 80);
+                else message.info("正文里没找到这一句：提示词可能已经被改过了");
+            };
+            attempt(6);
+        },
+    }), [editingPrompt, message]);
     const saveDesc = useCallback(
         async (n: number, next: string, expect: string) =>
             postHubAsset(localId, { n, desc: next, expect_desc: expect }),
@@ -2246,9 +2283,10 @@ export function PromptSection({
     const descApi = useMemo<DescEditApi>(
         () => ({
             cardsByNo, gate: descGate, busy: Boolean(busy), editingRow, setEditingRow,
+            scope: localId,
             save: saveDesc, onSaved: onWritten || (() => undefined),
         }),
-        [cardsByNo, descGate, busy, editingRow, saveDesc, onWritten],
+        [cardsByNo, descGate, busy, editingRow, saveDesc, onWritten, localId],
     );
     // AT-22 E4：豁免台账优先取生产者台账（自检②的「豁免」，带状态/原因），回落任务.json 原样透出。
     const residueItem = detail.自检?.find((item) => item.项 === "绑图行残留") ?? null;
@@ -2278,6 +2316,7 @@ export function PromptSection({
     return (
         <DescEditContext.Provider value={descApi}>
         <WhitelistContext.Provider value={whitelistApi}>
+        <PromptAnchorContext.Provider value={promptAnchor}>
         <section className="rounded-lg border border-stone-200 bg-card p-4 dark:border-stone-800" data-hub-prompt-section>
             <div className="flex min-w-0 flex-wrap items-center gap-2" data-hub-prompt-head>
                 <h2 className="flex min-w-0 items-center gap-1.5 text-sm font-semibold">
@@ -2348,6 +2387,7 @@ export function PromptSection({
             ) : prompt ? (
                 collapsed ? null : (
                     <div
+                        ref={promptBodyRef}
                         className="agent-streamdown thin-scrollbar mt-3 max-h-96 w-full overflow-auto rounded-md border border-stone-200 px-3 py-2 text-sm dark:border-stone-800"
                         data-hub-prompt-body
                         data-expanded="1"
@@ -2361,6 +2401,7 @@ export function PromptSection({
                 </div>
             )}
         </section>
+        </PromptAnchorContext.Provider>
         </WhitelistContext.Provider>
         </DescEditContext.Provider>
     );
@@ -2530,7 +2571,7 @@ function SelfCheckCardView({ card, itemKey, wordRows }: {
      *  只用于「保留第 6 行 / 几行一起保留」的选择，**不参与判定**。 */
     wordRows: Record<string, number[]>;
 }) {
-    const { message } = App.useApp();
+    const message = useHubMessage();
     const assetStates = useContext(AssetStateContext);
     const descApi = useContext(DescEditContext);
     const whitelist = useContext(WhitelistContext);
@@ -2553,27 +2594,15 @@ function SelfCheckCardView({ card, itemKey, wordRows }: {
     const 人话 = card.findings.map((finding) => finding.人话).find((text): text is string => Boolean(text)) ?? "";
     const fixable = card.findings.some((finding) => finding.可修);
 
-    const locate = () => {
-        if (rowNo === null || typeof document === "undefined") return;
-        const single = document.querySelector(`[data-hub-asset-row="${rowNo}"]`) as HTMLElement | null;
-        let target: HTMLElement | null = single;
-        if (!target) {
-            for (const node of Array.from(document.querySelectorAll("[data-hub-asset-rows]"))) {
-                const rows = (node.getAttribute("data-hub-asset-rows") || "").split(",").map((value) => value.trim());
-                if (rows.includes(String(rowNo))) {
-                    target = node as HTMLElement;
-                    break;
-                }
-            }
-        }
-        if (!target) {
-            message.info("先点「退回置换」回到资产置换区，再点这里");
-            return;
-        }
-        target.scrollIntoView({ block: "center" });
-        target.classList.add("ring-2", "ring-indigo-400");
-        window.setTimeout(() => target?.classList.remove("ring-2", "ring-indigo-400"), 2000);
-    };
+    // 交互设计 §2.4（A1）：动作位只留两条，分工由**状态**显式决定，不再靠「DOM 找不找得到」推：
+    //  · 可编辑（awaiting_assets / awaiting_approval，判据 hubDescEditGate）＝就地展开编辑器；
+    //  · 不可编辑（approved/generating/rendering/done/failed/...）＝「改这一行」置灰 + 真实原因，
+    //    旁边给一条只读的「看正文里的这一句」——正文容器所有状态恒渲染，所以这条路径永远成立，
+    //    **永不要求用户退回置换**（旧的假定位按钮绑的是只在待置换态渲染的资产行，故必然失败）。
+    const anchorApi = useContext(PromptAnchorContext);
+    const editGate = descApi?.gate ?? { enabled: false, reason: "这条详情还没接上自检面板" };
+    const locateCandidates = [...new Set([context, ...words].filter((text): text is string => Boolean(text)))];
+    const canLocate = Boolean(anchorApi) && locateCandidates.length > 0;
 
     const position = rowNo === null
         ? "这次整体对不上，不是某一行的问题"
@@ -2622,11 +2651,6 @@ function SelfCheckCardView({ card, itemKey, wordRows }: {
                     {hit ? <div className="break-words font-medium text-red-700 dark:text-red-300" data-hub-selfcheck-words>{hit}</div> : null}
                     {人话 ? <div className="break-words text-stone-700 dark:text-stone-200" data-hub-selfcheck-say>{人话}</div> : null}
                 </div>
-                {rowNo !== null ? (
-                    <Button size="small" type="text" className="shrink-0" onClick={locate} data-hub-selfcheck-locator={rowNo}>
-                        去这一行
-                    </Button>
-                ) : null}
             </div>
             {runs.length ? (
                 <div className="break-words text-stone-600 dark:text-stone-300" data-hub-selfcheck-context>
@@ -2641,23 +2665,40 @@ function SelfCheckCardView({ card, itemKey, wordRows }: {
                     ))}
                 </div>
             ) : null}
-            {fixable || words.length ? (
+            {fixable || words.length || canLocate ? (
                 <div className="flex flex-wrap items-center gap-1.5" data-hub-selfcheck-actions>
                     {fixable && rowNo !== null && descApi ? (
                         <Tooltip
-                            title={descApi.gate.enabled
+                            title={editGate.enabled
                                 ? (otherEditorOpen
                                     ? "先把上面那个编辑器收起来（同一个任务同时只改一行）"
                                     : "在本页改这一行的描述：保存后自动重出提示词、重跑自检（不离开这页）")
-                                : descApi.gate.reason}
+                                : editGate.reason}
                         >
+                            {/* 置灰按钮自身不派发鼠标事件——Tooltip 必须挂在可悬停的壳上，
+                                否则「为什么不能改」的真实原因永远显示不出来（等于又变成哑巴）。 */}
+                            <span className="inline-flex shrink-0">
+                                <Button
+                                    size="small"
+                                    disabled={!editGate.enabled || descApi.busy || otherEditorOpen}
+                                    onClick={() => descApi.setEditingRow(editing ? null : rowNo)}
+                                    data-hub-selfcheck-fix
+                                    data-hub-selfcheck-fix-gate={editGate.enabled ? "enabled" : "disabled"}
+                                >
+                                    改这一行的描述
+                                </Button>
+                            </span>
+                        </Tooltip>
+                    ) : null}
+                    {canLocate && !editGate.enabled ? (
+                        <Tooltip title="只读：把正文滚到这一句、高亮 2 秒——不改任何东西，也不换状态">
                             <Button
                                 size="small"
-                                disabled={!descApi.gate.enabled || descApi.busy || otherEditorOpen}
-                                onClick={() => descApi.setEditingRow(editing ? null : rowNo)}
-                                data-hub-selfcheck-fix
+                                type="text"
+                                data-hub-selfcheck-locate
+                                onClick={() => anchorApi?.reveal(locateCandidates)}
                             >
-                                改这一行的描述
+                                看正文里的这一句
                             </Button>
                         </Tooltip>
                     ) : null}
@@ -2695,6 +2736,7 @@ function SelfCheckCardView({ card, itemKey, wordRows }: {
             {editing && rowNo !== null && descApi ? (
                 <HubTextEditor
                     variant="cell"
+                    draftKey={descApi.scope ? `${descApi.scope}#${rowNo}` : undefined}
                     value={assetCard?.我的描述 || ""}
                     baseline={assetCard?.我的描述 || ""}
                     placeholder="留空＝沿用原物描述（原物词会被带回正文）"
@@ -2850,7 +2892,7 @@ function SelfCheckItemView({ item }: { item: HubSelfCheckItem }) {
  *  （老/异常态）。失效条目不自动删：灰显 + 原因 + 撤销，决定权留在人手里（方案 §3.3/§4.3）。
  */
 function WhitelistPanel() {
-    const { message } = App.useApp();
+    const message = useHubMessage();
     const whitelist = useContext(WhitelistContext);
     if (!whitelist || !whitelist.entries.length) return null;
     const entries = whitelist.entries;
@@ -3323,7 +3365,8 @@ export function AudioModeSection({
  *  - 批准带 config（无 key）；提交带 key（一次性）；改配置＝快照失效需重批（撤销批准）
  */
 function GenSettingsSection({ detail, busy, act }: { detail: HubTaskDetail; busy: BusyKind; act: (kind: Exclude<BusyKind, null>, run: () => Promise<void>, okText?: string) => Promise<void> }) {
-    const { message, modal } = App.useApp();
+    const { modal } = App.useApp();
+    const message = useHubMessage();
     const config = useConfigStore((state) => state.config);
     const localId = detail.local_id;
     const state = detail.state;
@@ -3985,7 +4028,7 @@ export function VersionSection({
     onOpenTask?: (localId: string) => void;
     onForked?: (newId: string, out: HubForkResult) => void;
 }) {
-    const { message } = App.useApp();
+    const message = useHubMessage();
     const [ask, setAsk] = useState(false);
     const [busy, setBusy] = useState(false);
     const [error, setError] = useState("");

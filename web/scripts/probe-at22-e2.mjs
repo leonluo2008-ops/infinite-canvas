@@ -241,8 +241,9 @@ check("[B] 上下文按偏移高亮：每个命中词都落在某个 <mark> 里�
         return marks.length > 0 && words.every((word) => marks.some((mark) => mark.includes(word)));
     })(),
     (cards[0] ?? "").slice(0, 300));
-check("[B] 每条命中都能跳到那一行（data-hub-selfcheck-locator=行号）",
-    (cards[0] ?? "").includes(`data-hub-selfcheck-locator="${rawHit.行号}"`));
+check("[B] 每条命中都能在正文里定位（data-hub-selfcheck-locate；假动作 data-hub-selfcheck-locator 已删）",
+    (cards[0] ?? "").includes("data-hub-selfcheck-locate") && !htmlV2.includes("data-hub-selfcheck-locator")
+    && !htmlV2.includes("去这一行"));
 check("[B] 结论人话在可见区只出现 1 次（不再「结论/原因/发现/证据」各说一遍）",
     countOf(residueVisible, residueRaw.说明.结论人话) === 1,
     String(countOf(residueVisible, residueRaw.说明.结论人话)));

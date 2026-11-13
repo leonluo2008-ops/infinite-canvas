@@ -5,13 +5,14 @@ import { useRef, useState, type DragEvent } from "react";
 import { formatBytes } from "@/lib/image-utils";
 import { ingestCreatedMessage, ingestHitMessage, isIngestHit } from "@/lib/hub/ingest-hit";
 import { errorText, ingestVideo, startLapianRun, type HubTaskSummary } from "./hub-api";
+import { useHubMessage } from "./use-hub-message";
 
 const VIDEO_PATTERN = /\.(mp4|mov|webm|mkv|avi|m4v)$/i;
 
 /** 顶部新建卡片：拖参考视频 + 写意图 → 建任务并触发拆解。
  *  AT-10 C5：幂等命中已有任务时点名提示并刷新列表（不重触发拆解、不重复插卡）。 */
 export function NewTaskCard({ onCreated, onSubmitted }: { onCreated: (task: HubTaskSummary) => void; onSubmitted: () => void }) {
-    const { message } = App.useApp();
+    const message = useHubMessage();
     const inputRef = useRef<HTMLInputElement>(null);
     const dragDepthRef = useRef(0);
     const [file, setFile] = useState<File | null>(null);

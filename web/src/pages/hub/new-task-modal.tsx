@@ -5,6 +5,7 @@ import { useRef, useState, type DragEvent } from "react";
 import { formatBytes } from "@/lib/image-utils";
 import { ingestCreatedMessage, ingestHitMessage, isIngestHit } from "@/lib/hub/ingest-hit";
 import { errorText, ingestVideo, startLapianRun } from "./hub-api";
+import { useHubMessage } from "./use-hub-message";
 
 const VIDEO_PATTERN = /\.(mp4|mov|webm|mkv|avi|m4v)$/i;
 
@@ -15,7 +16,7 @@ const VIDEO_PATTERN = /\.(mp4|mov|webm|mkv|avi|m4v)$/i;
  * 弹「该视频已有任务 auto-00xx」并让上层直接打开该任务详情（onCreated(localId, hit=true)）。
  */
 export function NewTaskModal({ open, onClose, onCreated }: { open: boolean; onClose: () => void; onCreated: (localId: string, hit: boolean) => void }) {
-    const { message } = App.useApp();
+    const message = useHubMessage();
     const inputRef = useRef<HTMLInputElement>(null);
     const dragDepthRef = useRef(0);
     const [file, setFile] = useState<File | null>(null);

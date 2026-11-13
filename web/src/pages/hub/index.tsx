@@ -27,6 +27,7 @@ import { NewTaskModal } from "./new-task-modal";
 import { FORCE_FINISH_CONFIRM_TITLE, FailedReasonLine, ForceFinishButton, ForceFinishConfirmBody, RunningActivityLine } from "./task-card";
 import { TaskDeleteButton } from "./task-delete-confirm";
 import { TaskDetailDrawer } from "./task-detail-drawer";
+import { useHubMessage } from "./use-hub-message";
 
 /**
  * 自动化工作台 · 表格主视图（AT-9 B3/B4）：
@@ -41,7 +42,7 @@ export default function HubPage() {
 }
 
 function HubTableView() {
-    const { message } = App.useApp();
+    const message = useHubMessage();
     const config = useConfigStore((state) => state.config);
     const channels = useMemo(() => hubQuickChannels(config), [config]);
     const [tasks, setTasks] = useState<HubTaskSummary[]>([]);

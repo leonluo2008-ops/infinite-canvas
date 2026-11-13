@@ -10,6 +10,13 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Button, Input, Tooltip } from "antd";
 
+/** 未保存草稿的暂存位（键 = `任务号#行号`）。
+ *
+ *  为什么需要它：质检卡上的「改这一行」是**开关**（展开/收起）——收起会把编辑器卸载，组件内的
+ *  draft 随之消失，用户打了半天的字就这么没了。开关的语义是「收放」，不是「放弃」，所以按行暂存、
+ *  再展开时接着写；**只有点「取消」或保存成功**才真的清掉（显式放弃）。 */
+const DRAFT_CACHE = new Map<string, string>();
+
 export type SavePhase = "idle" | "dirty" | "saving" | "rendering" | "checking" | "done" | "failed";
 
 /** 保存结果（两处同形）：`unchanged`=值没变、什么都没做；`重渲染`=服务端这次真做了没有。 */
@@ -193,6 +200,7 @@ export function HubTextEditor({
     softMax = 200,
     saveLabel,
     cancelLabel = "取消",
+    draftKey,
     onSave,
     onCancel,
     disabled = false,
@@ -210,6 +218,9 @@ export function HubTextEditor({
     softMax?: number;
     saveLabel: string;
     cancelLabel?: string;
+    /** 未保存草稿的暂存键（如 `任务#行号`）：**收起再展开不丢已输入的字**。
+     *  不带键＝不留暂存（doc 全文编辑走自己的取消语义）。 */
+    draftKey?: string;
     onSave: (next: string, expect: string) => Promise<SaveResult>;
     onCancel: () => void;
     disabled?: boolean;
@@ -222,14 +233,19 @@ export function HubTextEditor({
     const [escWarn, setEscWarn] = useState(false);
 
     useEffect(() => {
-        begin(baseline, value);
+        // 有暂存草稿就接着写（开关编辑器=收放，不是放弃）；显式「取消」或保存成功才清。
+        const cached = draftKey ? DRAFT_CACHE.get(draftKey) : undefined;
+        begin(baseline, cached ?? value);
         setEscWarn(false);
         // 只在打开/基线变化时重置草稿（轮询回填不该冲掉正在编辑的草稿，见 dirty 判断）
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [baseline]);
 
     useEffect(() => {
-        if (phase === "done" && result) onSaved?.(result, draft);
+        if (phase === "done" && result) {
+            if (draftKey) DRAFT_CACHE.delete(draftKey);       // 已落库：暂存位不再需要
+            onSaved?.(result, draft);
+        }
         // 只在进入 done 的这一跳回调一次
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [phase]);
@@ -248,7 +264,10 @@ export function HubTextEditor({
             ) : null}
             <Input.TextArea
                 value={draft}
-                onChange={(event) => setDraft(event.target.value)}
+                onChange={(event) => {
+                    setDraft(event.target.value);
+                    if (draftKey) DRAFT_CACHE.set(draftKey, event.target.value);
+                }}
                 placeholder={placeholder}
                 autoFocus={autoFocus}
                 autoSize={variant === "cell" ? { minRows: 3, maxRows: 8 } : { minRows: 6, maxRows: 18 }}
@@ -271,6 +290,7 @@ export function HubTextEditor({
                             setEscWarn(true);
                             return;
                         }
+                        if (draftKey) DRAFT_CACHE.delete(draftKey);   // Esc 二次确认＝显式放弃
                         cancel();
                         onCancel();
                     }
@@ -291,7 +311,7 @@ export function HubTextEditor({
                         {draft.length}/{maxLength}
                     </span>
                 </Tooltip>
-                <Button size="small" onClick={() => { cancel(); onCancel(); }} disabled={busy} data-hub-desc-cancel>
+                <Button size="small" onClick={() => { if (draftKey) DRAFT_CACHE.delete(draftKey); cancel(); onCancel(); }} disabled={busy} data-hub-desc-cancel>
                     {cancelLabel}
                 </Button>
                 <Button
