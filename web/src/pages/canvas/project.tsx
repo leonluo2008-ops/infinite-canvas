@@ -20,6 +20,12 @@ import { useThemeStore } from "@/stores/use-theme-store";
 import { cropDataUrl, splitDataUrl, upscaleDataUrl } from "@/lib/canvas/canvas-image-data";
 import { fitNodeSize, nodeSizeFromRatio } from "@/lib/canvas/canvas-node-size";
 import { captureVideoFrame, type VideoFramePosition } from "@/lib/canvas/canvas-video-frame";
+import { registerWorkflowBatchRuntime } from "@/lib/canvas/workflow-batch-runtime";
+import { setBatchQueue } from "@/lib/canvas/workflow-batch-queue";
+import { upsertBatchMember } from "@/lib/canvas/workflow-batch";
+import { upsertInstanceIdentity } from "@/lib/canvas/workflow-instance-identity";
+import { createHubIdentityClient } from "@/lib/canvas/workflow-instance-hub";
+import { toLegacyPayload } from "@/lib/canvas/wan-file-task-map";
 import { cameraCoverage } from "@/lib/canvas/camera-coverage";
 import { App, Button, Modal } from "antd";
 import { NODE_DEFAULT_SIZE, getNodeSpec } from "@/constant/canvas";
@@ -973,6 +979,59 @@ function InfiniteCanvasPage() {
         setViewport,
         setContextMenu,
     });
+
+    /**
+     * P8：批次运行时注册（待审批侧栏的「开始/续跑」「暂停」「重跑」入口）。
+     *
+     * 只把页面**已有**能力接给 `workflow-batch-runtime`：ops 应用走 `applyAgentOps`（`useAgentBridge`
+     * 导出的那一个）、生成链走 `generateNodeRef`、落盘走 `updateProject`/`flushProjects`、
+     * hub 读走 `createHubIdentityClient`。**不改任何既有行为**：没有批次时这些回调永不触发。
+     */
+    const flushProjects = useCanvasStore((state) => state.flushProjects);
+    const batchRuntimeProject = useRef(currentProject);
+    batchRuntimeProject.current = currentProject;
+    useEffect(() => {
+        const unregister = registerWorkflowBatchRuntime({
+            applyOps: (ops) => {
+                applyAgentOps(ops);
+            },
+            runGeneration: async ({ nodeId, mode, prompt }) => {
+                let childNodeId = "";
+                await generateNodeRef.current?.(nodeId, mode, prompt, {
+                    onChildNodeCreated: (id) => {
+                        childNodeId = id;
+                    },
+                });
+                return { childNodeId };
+            },
+            hub: createHubIdentityClient(),
+            getBlob: getMediaBlob,
+            saveIdentity: (record) => {
+                const project = batchRuntimeProject.current;
+                if (!project) return;
+                updateProject(projectId, { workflowInstances: upsertInstanceIdentity(project.workflowInstances, record) });
+            },
+            saveBatchMember: (member) => {
+                const project = batchRuntimeProject.current;
+                if (!project) return;
+                // 成员不带 batchId（身份侧只有实例键）→ 按「哪个批次含这个实例」定位；找不到就不写（不编批次）。
+                const batch = (project.workflowBatches || []).find((item) => (item.members || []).some((row) => row.instanceId === member.instanceId));
+                if (!batch) return;
+                updateProject(projectId, { workflowBatches: upsertBatchMember(project.workflowBatches, { templateId: batch.templateId, batchId: batch.batchId, title: batch.title }, member) });
+            },
+            saveBatchQueue: (batchId, queue) => {
+                const project = batchRuntimeProject.current;
+                if (!project) return;
+                updateProject(projectId, { workflowBatches: setBatchQueue(project.workflowBatches, batchId, queue) });
+            },
+            flush: (reason) => flushProjects(reason),
+            vetoes: () => batchRuntimeProject.current?.workflowAssetVetoes,
+            wanFileTasks: () => toLegacyPayload(batchRuntimeProject.current?.workflowWanFileTasks || []),
+            project: () => batchRuntimeProject.current,
+            lapianConfig: { lapianDefaultModel: effectiveConfig.lapianDefaultModel, channels: effectiveConfig.channels },
+        });
+        return unregister;
+    }, [applyAgentOps, effectiveConfig.channels, effectiveConfig.lapianDefaultModel, flushProjects, projectId, updateProject]);
 
     const { pluginHost, renderPluginPanel, buildNodeToolbarItems } = usePluginHost({
         effectiveConfig,
