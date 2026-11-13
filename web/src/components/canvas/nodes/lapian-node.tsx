@@ -7,6 +7,7 @@ import { useEffect, useRef, useState } from "react";
 
 import { canvasThemes } from "@/lib/canvas-theme";
 import { decodeChannelModelRef } from "@/lib/canvas/lapian-model";
+import { fetchLapianMarkdown, LapianProjectionError } from "@/lib/canvas/lapian-execute";
 import type { CanvasNodeData } from "@/types/canvas";
 
 const BRIDGE = ""; // 同域相对路径：本地 dev 由 vite proxy 转发，公网由隧道同域转发
@@ -46,19 +47,28 @@ export function LapianNodeContent({ node, onContentChange }: { node: CanvasNodeD
             try {
                 const r = await fetch(`${BRIDGE}/api/job/${jobId}`);
                 if (r.status === 404) {
-                    // bridge 重启过：job 查不到。任务可能已完成——按 taskId 重查。
-                    const lp = await fetch(`${BRIDGE}/api/lapian/${encodeURIComponent(taskId)}`).then((x) => x.json());
-                    if (lp && !lp.error) { setMarkdown(lp.markdown || ""); setPhase("done"); onContentChange?.(node.id, lp.markdown || ""); return; }
-                    setPhase("lost"); setMessage("任务状态查不到（服务可能重启过）。可按任务号重查，或重新拉片。");
-                    return;
+                    // bridge 重启过：job 查不到。任务可能已完成——按 taskId 重查（正文取值走 lapian-execute 同源实现）。
+                    try {
+                        const markdown = await fetchLapianMarkdown(taskId, { fetch: (url, init) => fetch(url, init) });
+                        setMarkdown(markdown); setPhase("done"); onContentChange?.(node.id, markdown); return;
+                    } catch (error) {
+                        // 投影错误 = 任务确实查不到；网络异常抛回外层走重试（与改造前一致）。
+                        if (!(error instanceof LapianProjectionError)) throw error;
+                        setPhase("lost"); setMessage("任务状态查不到（服务可能重启过）。可按任务号重查，或重新拉片。");
+                        return;
+                    }
                 }
                 const d = await r.json();
                 netErrRef.current = 0;
                 if (d.status === "done") {
-                    const lp = await fetch(`${BRIDGE}/api/lapian/${encodeURIComponent(taskId)}`).then((x) => x.json());
-                    if (lp && !lp.error) { setMarkdown(lp.markdown || ""); setPhase("done"); onContentChange?.(node.id, lp.markdown || ""); return; }
-                    setPhase("error"); setMessage(lp?.error || "拉片投影失败");
-                    return;
+                    try {
+                        const markdown = await fetchLapianMarkdown(taskId, { fetch: (url, init) => fetch(url, init) });
+                        setMarkdown(markdown); setPhase("done"); onContentChange?.(node.id, markdown); return;
+                    } catch (error) {
+                        if (!(error instanceof LapianProjectionError)) throw error;
+                        setPhase("error"); setMessage((error as Error).message || "拉片投影失败");
+                        return;
+                    }
                 }
                 if (d.status === "error") {
                     setPhase("error"); setMessage(d.error || "拆解失败（见服务端日志）");
@@ -90,11 +100,12 @@ export function LapianNodeContent({ node, onContentChange }: { node: CanvasNodeD
     const requery = async () => {
         setPhase("loading"); setElapsed(0); setStage(""); startedRef.current = Date.now();
         try {
-            const lp = await fetch(`${BRIDGE}/api/lapian/${encodeURIComponent(taskId)}`).then((x) => x.json());
-            if (lp && !lp.error) { setMarkdown(lp.markdown || ""); setPhase("done"); onContentChange?.(node.id, lp.markdown || ""); return; }
-            setPhase("error"); setMessage(lp?.error || "重查失败");
-        } catch (e) {
-            setPhase("error"); setMessage(`重查失败：${(e as Error).message}`);
+            const markdown = await fetchLapianMarkdown(taskId, { fetch: (url, init) => fetch(url, init) });
+            setMarkdown(markdown); setPhase("done"); onContentChange?.(node.id, markdown); return;
+        } catch (error) {
+            // 原文案两种来源保留：投影错误原样显示，网络/其它异常带「重查失败：」前缀。
+            setPhase("error");
+            setMessage(error instanceof LapianProjectionError ? (error as Error).message : `重查失败：${(error as Error).message}`);
         }
     };
 

@@ -1,0 +1,813 @@
+{
+  "nodes": [
+    {
+      "id": "tpop3full-1-video-1793901289325-25d4s",
+      "type": "video",
+      "title": "新素材-F.mp4",
+      "position": {
+        "x": 2287.8728813559323,
+        "y": 157
+      },
+      "width": 240.25423728813558,
+      "height": 420,
+      "metadata": {
+        "storageKey": "video:new-F",
+        "content": "blob:http://127.0.0.1:3000/new-F",
+        "mimeType": "video/mp4",
+        "bytes": 5001,
+        "durationMs": 12000
+      }
+    },
+    {
+      "id": "tpop3full-1-lapian-1793901293075-gl4cw",
+      "type": "lapian",
+      "title": "拉片 · pop-3",
+      "position": {
+        "x": 2625.127118644068,
+        "y": 49.0000000000001
+      },
+      "width": 400,
+      "height": 560,
+      "metadata": {
+        "lapianModel": "default::gemini-3.8-flash"
+      }
+    },
+    {
+      "id": "tpop3full-1-text-1793901665795-amrfn",
+      "type": "text",
+      "title": "转换指令 · 单段流式",
+      "position": {
+        "x": 6127.127118644068,
+        "y": -17.99999999999966
+      },
+      "width": 400,
+      "height": 360,
+      "metadata": {
+        "content": "# 任务\n你会收到这段拉片正文：目标片子的十层拆解（场景 / 产品 / 光影 / 镜头 / 运动 / 意境 / 分镜表 / 声音 / 资产）。\n把它改写成一条可直接提交给视频生成模型的提示词：保留原片的创意与镜头语言，主体换成我们自己的产品与人物。\n骨架按「单段流式」写，段落顺序与标题不要改。\n\n# 结构（整篇一段话：不换行、不加标题、不加附注）\n1. 全局设定与主体指认：一句开场给画幅 + 影像质感 + 主体指认——每个人物、产品、场景各给一个图号与 2–6 字短说明，一句到底，外形细节不写。\n2. 时段连续推进：按「N-M秒」一段一句推进，先说景别与场景，再说主体（@图片N 紧跟主体）与动作朝向，接镜头状态（每个时段句必带：运动方式+方向或速度；原片机位不动就写机位固定），最后是画面内容与转场；句与句直接相接成一段，中间不空行。\n3. 全程一致性收尾：末尾一句收尾——运镜平滑流畅、转场自然、色调过渡连贯、人物形象与所引图一致、产品外观全程不变形。\n\n# 参考图怎么用\n- 用 @图片1 @图片2 … 指代参考图，编号就是「本次参考图」清单里的编号，从 1 连续排到 N；清单里没有的号不写。\n- 每个实体跟一个 2–6 字的固定短说明，例如 @图片1 香水、@图片2 女性、@图片3 洗手台——让模型一眼认出这是谁、这是什么。\n- 外形、颜色、材质、发型、服装只写一次，由参考图定住；后面一律用短说明指代，不逐镜重复描写细节。\n\n# 写的时候\n- 陈述句、现在时、动词驱动；只写看得见的东西，看不见的不猜。\n- 一条动作一句话，句子连着写，不写「很震撼」「极具冲击力」这类评价。\n- 不用 JSON、不用表格、不回显字段名（不写「站位：」「运动形态：」）。\n- 要约束就写成一句看得见的指令（「全程机位不动，只有瓶身在画面中央旋转」），不列禁止清单。\n\n# 输出\n只输出提示词正文。不解释、不加「以下是」、不写附注、不写参数位。\n输入里的「# 附注」小节、模板依据说明、字段名回显都只当背景，不写进输出。\n\n# 镜头语言\n镜头运动用词沿用拉片「镜头调度」行的标准镜头语言（推、拉、摇、移、跟、升、降、环绕、甩镜、变焦、旋转、固定机位，及推近/拉远/上摇/横移/跟拍/后退/升起等复合方向词），不自创同义说法。\n拉片与这里用的是同一张表：词对词写下来，覆盖度才对得上，模型也才认得出这一镜机器在怎么动。\n\n# 用户意图\n输入里会有一段「用户意图」（正文以【文本N】开头）：写的是这次要改成什么样——换角色、换产品、换图、改台词、改节奏。\n- 有意图就按意图改写，意图优先级最高：拉片和意图冲突时以意图为准（拉片写黑裙、意图写换红裙，就写红裙）。\n- 意图只交代了一部分，其余照拉片改写，不要把没提到的也一起改掉。\n- 意图为空、或者只有「（可选）写你的改造意图…」这句占位提示，就当从来没写过意图，完全照拉片改写。\n\n# 图号纪律\n参考图在输入里以「本次参考图：图片1=香水、图片2=女性」这种清单给出：清单里有几个号，请求里就有几张图，号从 1 连续到 N。\n- 只准用清单里出现过的图号：写到 @图片N 就回头对一遍清单，清单里没有这个号，就改成文字描述。\n- 没有清单、或清单是空的，正文一个 @图片N 都不写：没挂图就用文字写主体长什么样、场景是什么样。\n- 清单里没有对应图号的实体（场景、陈设、光线、道具）一律文字描述，不编号、不借用别人的号。\n- 清单里有几个号就用到几号，不越过最后一位；清单外的号一个都不发明。",
+        "fontSize": 14,
+        "prompt": "# 任务\n你会收到这段拉片正文：目标片子的十层拆解（场景 / 产品 / 光影 / 镜头 / 运动 / 意境 / 分镜表 / 声音 / 资产）。\n把它改写成一条可直接提交给视频生成模型的提示词：保留原片的创意与镜头语言，主体换成我们自己的产品与人物。\n骨架按「单段流式」写，段落顺序与标题不要改。\n\n# 结构（整篇一段话：不换行、不加标题、不加附注）\n1. 全局设定与主体指认：一句开场给画幅 + 影像质感 + 主体指认——每个人物、产品、场景各给一个图号与 2–6 字短说明，一句到底，外形细节不写。\n2. 时段连续推进：按「N-M秒」一段一句推进，先说景别与场景，再说主体（@图片N 紧跟主体）与动作朝向，接镜头状态（每个时段句必带：运动方式+方向或速度；原片机位不动就写机位固定），最后是画面内容与转场；句与句直接相接成一段，中间不空行。\n3. 全程一致性收尾：末尾一句收尾——运镜平滑流畅、转场自然、色调过渡连贯、人物形象与所引图一致、产品外观全程不变形。\n\n# 参考图怎么用\n- 用 @图片1 @图片2 … 指代参考图，编号就是「本次参考图」清单里的编号，从 1 连续排到 N；清单里没有的号不写。\n- 每个实体跟一个 2–6 字的固定短说明，例如 @图片1 香水、@图片2 女性、@图片3 洗手台——让模型一眼认出这是谁、这是什么。\n- 外形、颜色、材质、发型、服装只写一次，由参考图定住；后面一律用短说明指代，不逐镜重复描写细节。\n\n# 写的时候\n- 陈述句、现在时、动词驱动；只写看得见的东西，看不见的不猜。\n- 一条动作一句话，句子连着写，不写「很震撼」「极具冲击力」这类评价。\n- 不用 JSON、不用表格、不回显字段名（不写「站位：」「运动形态：」）。\n- 要约束就写成一句看得见的指令（「全程机位不动，只有瓶身在画面中央旋转」），不列禁止清单。\n\n# 输出\n只输出提示词正文。不解释、不加「以下是」、不写附注、不写参数位。\n输入里的「# 附注」小节、模板依据说明、字段名回显都只当背景，不写进输出。\n\n# 镜头语言\n镜头运动用词沿用拉片「镜头调度」行的标准镜头语言（推、拉、摇、移、跟、升、降、环绕、甩镜、变焦、旋转、固定机位，及推近/拉远/上摇/横移/跟拍/后退/升起等复合方向词），不自创同义说法。\n拉片与这里用的是同一张表：词对词写下来，覆盖度才对得上，模型也才认得出这一镜机器在怎么动。\n\n# 用户意图\n输入里会有一段「用户意图」（正文以【文本N】开头）：写的是这次要改成什么样——换角色、换产品、换图、改台词、改节奏。\n- 有意图就按意图改写，意图优先级最高：拉片和意图冲突时以意图为准（拉片写黑裙、意图写换红裙，就写红裙）。\n- 意图只交代了一部分，其余照拉片改写，不要把没提到的也一起改掉。\n- 意图为空、或者只有「（可选）写你的改造意图…」这句占位提示，就当从来没写过意图，完全照拉片改写。\n\n# 图号纪律\n参考图在输入里以「本次参考图：图片1=香水、图片2=女性」这种清单给出：清单里有几个号，请求里就有几张图，号从 1 连续到 N。\n- 只准用清单里出现过的图号：写到 @图片N 就回头对一遍清单，清单里没有这个号，就改成文字描述。\n- 没有清单、或清单是空的，正文一个 @图片N 都不写：没挂图就用文字写主体长什么样、场景是什么样。\n- 清单里没有对应图号的实体（场景、陈设、光线、道具）一律文字描述，不编号、不借用别人的号。\n- 清单里有几个号就用到几号，不越过最后一位；清单外的号一个都不发明。",
+        "promptTemplate": "seedance-flow"
+      }
+    },
+    {
+      "id": "tpop3full-1-text-1793901665795-jx3cx",
+      "type": "text",
+      "title": "改造意图（可留空）",
+      "position": {
+        "x": 6225.127118644068,
+        "y": 481.0000000000001
+      },
+      "width": 340,
+      "height": 240,
+      "metadata": {
+        "content": "把主体换成客户模特（F）",
+        "fontSize": 14,
+        "prompt": "把主体换成客户模特（F）",
+        "lapianIntent": true
+      }
+    },
+    {
+      "id": "tpop3full-1-config-1793901665795-kooye",
+      "type": "config",
+      "title": "提示词生成配置",
+      "position": {
+        "x": 6682.063748644068,
+        "y": 88.21175000000036
+      },
+      "width": 340,
+      "height": 240,
+      "metadata": {
+        "content": "",
+        "generationMode": "text",
+        "model": "default::f-text-model",
+        "count": 1,
+        "composerContent": "拉片正文：@[node:tpop3full-1-lapian-1793901293075-gl4cw]\n任务说明：@[node:tpop3full-1-text-1793901665795-amrfn]\n用户意图：@[node:tpop3full-1-text-1793901665795-jx3cx]\n\n本次参考图：@[node:tpop3full-1-image-1793901490523-chxhe]=客户模特、@[node:tpop3full-1-image-1793901490618-p42to]=服装B、@[node:tpop3full-1-image-1793901493028-xpa34]=道具A、@[node:tpop3full-1-image-1793901316874-tfjaz]=道具B、@[node:tpop3full-1-image-1793901333240-smntt]=道具C、@[node:tpop3full-1-image-1793901447125-74tq3]=品牌视觉·置",
+        "lapianSourceId": "tpop3full-1-lapian-1793901293075-gl4cw"
+      }
+    },
+    {
+      "id": "tpop3full-1-jERtWnPXyzFhmbUxLLM4G",
+      "type": "text",
+      "title": "拉片正文：【文本1】\n任务说明：【文本2】\n用户意图：【文本3】",
+      "position": {
+        "x": 8715.877118644068,
+        "y": 209.0000000000001
+      },
+      "width": 761,
+      "height": 404,
+      "metadata": {
+        "fontSize": 14,
+        "model": "default::deepseek-v4-flash-0731",
+        "reasoningEffort": "auto",
+        "textCount": 1
+      }
+    },
+    {
+      "id": "tpop3full-1-config-1793903256858-naerp",
+      "type": "config",
+      "title": "视频生成配置",
+      "position": {
+        "x": 9572.877118644068,
+        "y": 291.0000000000001
+      },
+      "width": 340,
+      "height": 240,
+      "metadata": {
+        "content": "",
+        "generationMode": "video",
+        "model": "kXPsFLhz0hadRynalZN3E::sd2.5-720p-ap",
+        "videoMode": "reference",
+        "seconds": "15",
+        "size": "720x1280",
+        "composerContent": "参考图：@[node:tpop3full-1-image-1793901490523-chxhe]、@[node:tpop3full-1-image-1793901490618-p42to]、@[node:tpop3full-1-image-1793901493028-xpa34]、@[node:tpop3full-1-image-1793901316874-tfjaz]、@[node:tpop3full-1-image-1793901333240-smntt]、@[node:tpop3full-1-image-1793901447125-74tq3]\n提示词：@[node:tpop3full-1-jERtWnPXyzFhmbUxLLM4G]"
+      }
+    },
+    {
+      "id": "tpop3full-1-image-1793901490523-chxhe",
+      "type": "image",
+      "title": "1.png",
+      "position": {
+        "x": 2452.399078213089,
+        "y": 2507.694111958336
+      },
+      "width": 239.42977348802577,
+      "height": 425.4267601190001,
+      "metadata": {
+        "content": "blob:http://localhost:3000/8d66e5e0-7df5-4c38-9295-d0e76a39d91b",
+        "storageKey": "image:46vam8wgxO7q3F5bl4ALL",
+        "naturalWidth": 941,
+        "naturalHeight": 1672,
+        "bytes": 1745146,
+        "mimeType": "image/png",
+        "images": []
+      }
+    },
+    {
+      "id": "tpop3full-1-image-1793901490618-p42to",
+      "type": "image",
+      "title": "3.png",
+      "position": {
+        "x": 2485.495456634089,
+        "y": 2003.1784168313363
+      },
+      "width": 220,
+      "height": 390.90329436769395,
+      "metadata": {
+        "content": "blob:http://localhost:3000/28aa58be-0f4b-43f2-a76c-702916713da9",
+        "storageKey": "image:5k59oqXUS-I-UQhA1rjV6",
+        "naturalWidth": 941,
+        "naturalHeight": 1672,
+        "bytes": 1737818,
+        "mimeType": "image/png",
+        "images": []
+      }
+    },
+    {
+      "id": "tpop3full-1-image-1793901493028-xpa34",
+      "type": "image",
+      "title": "手机.png",
+      "position": {
+        "x": 1921.1605660339933,
+        "y": 1923.0081953373362
+      },
+      "width": 309.88732326000013,
+      "height": 309.88732326000013,
+      "metadata": {
+        "content": "blob:http://localhost:3000/ab7734b8-bc88-42a0-9c01-a575a1ef4f01",
+        "storageKey": "image:VBLbfN8m0OkbuFdmaXypc",
+        "naturalWidth": 640,
+        "naturalHeight": 640,
+        "bytes": 205964,
+        "mimeType": "image/png",
+        "images": []
+      }
+    },
+    {
+      "id": "tpop3full-1-image-1793901316874-tfjaz",
+      "type": "image",
+      "title": "白底图23.png",
+      "position": {
+        "x": 1836.3516286884546,
+        "y": 1173.394323923182
+      },
+      "width": 274.4142299999999,
+      "height": 274.4142299999999,
+      "metadata": {
+        "content": "blob:http://localhost:3000/9fa9c1ae-2b1f-404f-833d-2415590fe21b",
+        "storageKey": "image:VjENaeDwKEuwx__OCMi5F",
+        "naturalWidth": 1254,
+        "naturalHeight": 1254,
+        "bytes": 1523735,
+        "mimeType": "image/png",
+        "images": []
+      }
+    },
+    {
+      "id": "tpop3full-1-image-1793901333240-smntt",
+      "type": "image",
+      "title": "白底单瓶香水-浅绿.png",
+      "position": {
+        "x": 1900.615506584637,
+        "y": 1544.690215195
+      },
+      "width": 240.5935199999999,
+      "height": 240.5935199999999,
+      "metadata": {
+        "content": "blob:http://localhost:3000/f253a3e8-a55b-4b56-b84c-1c4287ad3964",
+        "storageKey": "image:6MdQ7mfhcAJB6_LZvZOgW",
+        "naturalWidth": 1254,
+        "naturalHeight": 1254,
+        "bytes": 1480992,
+        "mimeType": "image/png",
+        "images": []
+      }
+    },
+    {
+      "id": "tpop3full-1-image-1793901447125-74tq3",
+      "type": "image",
+      "title": "lockup_magenta.png",
+      "position": {
+        "x": 2489.394271822993,
+        "y": 1641.6213470663365
+      },
+      "width": 640,
+      "height": 383.4817813765182,
+      "metadata": {
+        "content": "blob:http://localhost:3000/a0288ef7-22dd-4a7f-83c4-cc90bdf92685",
+        "storageKey": "image:cRPi79ZXvLBWcr_k-85ae",
+        "naturalWidth": 1976,
+        "naturalHeight": 1184,
+        "bytes": 660609,
+        "mimeType": "image/png",
+        "images": [],
+        "freeResize": false
+      }
+    },
+    {
+      "id": "tpop3full-1-image-1793901538358-h020v",
+      "type": "image",
+      "title": "资产位·人物/动物·人物",
+      "position": {
+        "x": 3120.127118644068,
+        "y": 49.000000000000114
+      },
+      "width": 340,
+      "height": 240,
+      "metadata": {
+        "content": "/api/asset-frame/pop-3?name=%E4%BA%BA%E7%89%A9&raw=1",
+        "assetSlotSourceId": "tpop3full-1-lapian-1793901293075-gl4cw",
+        "assetSlotOrder": 0,
+        "assetSlotName": "人物",
+        "assetSlotType": "人物/动物",
+        "assetSlot": {
+          "desc": "（出现于：全片）：约 20-25 岁混血女性，小麦色紧致肌肤，微卷齐肩发带有红棕色渐变挑染，五官立体，鼻翼佩戴小鼻环，身材匀称健美。",
+          "span": "全片",
+          "frameAt": 14.5,
+          "approxFrame": false,
+          "attachedImageId": "tpop3full-1-image-1793901490523-chxhe",
+          "caption": "客户模特"
+        },
+        "naturalWidth": 960,
+        "naturalHeight": 1678,
+        "mimeType": "image/jpeg",
+        "attachedImageId": "tpop3full-1-image-1793901490523-chxhe",
+        "attachedImageDesc": "客户模特"
+      }
+    },
+    {
+      "id": "tpop3full-1-image-1793901538358-c3dhh",
+      "type": "image",
+      "title": "资产位·人物/动物·服装A",
+      "position": {
+        "x": 3485.127118644068,
+        "y": 49.000000000000114
+      },
+      "width": 340,
+      "height": 240,
+      "metadata": {
+        "content": "/api/asset-frame/pop-3?name=%E6%9C%8D%E8%A3%85A&raw=1",
+        "assetSlotSourceId": "tpop3full-1-lapian-1793901293075-gl4cw",
+        "assetSlotOrder": 1,
+        "assetSlotName": "服装A",
+        "assetSlotType": "人物/动物",
+        "assetSlot": {
+          "desc": "（出现于：00:00-00:02）：黑色贴身工字运动背心 + 黑色高腰骑行短裤 + 白色平底运动鞋。",
+          "span": "00:00-00:02",
+          "frameAt": 1,
+          "approxFrame": false
+        },
+        "naturalWidth": 960,
+        "naturalHeight": 1678,
+        "mimeType": "image/jpeg"
+      }
+    },
+    {
+      "id": "tpop3full-1-image-1793901538358-vskz4",
+      "type": "image",
+      "title": "资产位·人物/动物·服装B",
+      "position": {
+        "x": 3849.127118644068,
+        "y": 49.000000000000114
+      },
+      "width": 340,
+      "height": 240,
+      "metadata": {
+        "content": "/api/asset-frame/pop-3?name=%E6%9C%8D%E8%A3%85B&raw=1",
+        "assetSlotSourceId": "tpop3full-1-lapian-1793901293075-gl4cw",
+        "assetSlotOrder": 2,
+        "assetSlotName": "服装B",
+        "assetSlotType": "人物/动物",
+        "assetSlot": {
+          "desc": "（出现于：00:03-00:15）：铁锈橙色方领无袖修身中长款连衣裙，搭配细带高跟凉鞋，佩戴细金手镯与小巧金属耳圈。",
+          "span": "00:03-00:15",
+          "frameAt": 9,
+          "approxFrame": false,
+          "attachedImageId": "tpop3full-1-image-1793901490618-p42to"
+        },
+        "naturalWidth": 960,
+        "naturalHeight": 1678,
+        "mimeType": "image/jpeg",
+        "attachedImageId": "tpop3full-1-image-1793901490618-p42to"
+      }
+    },
+    {
+      "id": "tpop3full-1-image-1793901538358-w6yss",
+      "type": "image",
+      "title": "资产位·人物/动物·道具A",
+      "position": {
+        "x": 3121.127118644068,
+        "y": 313.0000000000001
+      },
+      "width": 340,
+      "height": 240,
+      "metadata": {
+        "content": "/api/asset-frame/pop-3?name=%E9%81%93%E5%85%B7A&raw=1",
+        "assetSlotSourceId": "tpop3full-1-lapian-1793901293075-gl4cw",
+        "assetSlotOrder": 3,
+        "assetSlotName": "道具A",
+        "assetSlotType": "人物/动物",
+        "assetSlot": {
+          "desc": "（出现于：00:00-00:05）：深灰色金属中框智能手机，正面显示屏可发光并播放预设橙裙女性走动素材，用于抛出与穿屏媒介。",
+          "span": "00:00-00:05",
+          "frameAt": 2.5,
+          "approxFrame": false,
+          "attachedImageId": "tpop3full-1-image-1793901493028-xpa34"
+        },
+        "naturalWidth": 960,
+        "naturalHeight": 1678,
+        "mimeType": "image/jpeg",
+        "attachedImageId": "tpop3full-1-image-1793901493028-xpa34"
+      }
+    },
+    {
+      "id": "tpop3full-1-image-1793901538358-ad6d4",
+      "type": "image",
+      "title": "资产位·人物/动物·道具B",
+      "position": {
+        "x": 3485.127118644068,
+        "y": 313.0000000000001
+      },
+      "width": 340,
+      "height": 240,
+      "metadata": {
+        "content": "/api/asset-frame/pop-3?name=%E9%81%93%E5%85%B7B&raw=1",
+        "assetSlotSourceId": "tpop3full-1-lapian-1793901293075-gl4cw",
+        "assetSlotOrder": 4,
+        "assetSlotName": "道具B",
+        "assetSlotType": "人物/动物",
+        "assetSlot": {
+          "desc": "（出现于：00:05-00:15）：核心圆柱形便携玻璃香水瓶，银色金属盖，带有橙底红字「POP!」标签；及配套橙色长方体包装纸盒，用于手持与悬浮陈列。",
+          "span": "00:05-00:15",
+          "frameAt": 10,
+          "approxFrame": false,
+          "attachedImageId": "tpop3full-1-image-1793901316874-tfjaz"
+        },
+        "naturalWidth": 960,
+        "naturalHeight": 1678,
+        "mimeType": "image/jpeg",
+        "attachedImageId": "tpop3full-1-image-1793901316874-tfjaz"
+      }
+    },
+    {
+      "id": "tpop3full-1-image-1793901538358-v9489",
+      "type": "image",
+      "title": "资产位·人物/动物·道具C",
+      "position": {
+        "x": 3849.127118644068,
+        "y": 313.0000000000001
+      },
+      "width": 340,
+      "height": 240,
+      "metadata": {
+        "content": "/api/asset-frame/pop-3?name=%E9%81%93%E5%85%B7C&raw=1",
+        "assetSlotSourceId": "tpop3full-1-lapian-1793901293075-gl4cw",
+        "assetSlotOrder": 5,
+        "assetSlotName": "道具C",
+        "assetSlotType": "人物/动物",
+        "assetSlot": {
+          "desc": "（出现于：00:07-00:09）：从画面底侧边缘入画接取香水的右手，浅肤色、指甲修剪整齐，截取至手腕处，用于完成互动交接。",
+          "span": "00:07-00:09",
+          "frameAt": 8,
+          "approxFrame": false,
+          "attachedImageId": "tpop3full-1-image-1793901333240-smntt"
+        },
+        "naturalWidth": 960,
+        "naturalHeight": 1678,
+        "mimeType": "image/jpeg",
+        "attachedImageId": "tpop3full-1-image-1793901333240-smntt"
+      }
+    },
+    {
+      "id": "tpop3full-1-image-1793901538358-dqum1",
+      "type": "image",
+      "title": "资产位·人物/动物·场景A",
+      "position": {
+        "x": 3121.127118644068,
+        "y": 577.0000000000001
+      },
+      "width": 340,
+      "height": 240,
+      "metadata": {
+        "content": "/api/asset-frame/pop-3?name=%E5%9C%BA%E6%99%AFA&raw=1",
+        "assetSlotSourceId": "tpop3full-1-lapian-1793901293075-gl4cw",
+        "assetSlotOrder": 6,
+        "assetSlotName": "场景A",
+        "assetSlotType": "人物/动物",
+        "assetSlot": {
+          "desc": "（出现于：00:00-00:05）：暖黄色对称式地铁车厢，橙色排椅，白色发光灯板，金属封闭式车门。",
+          "span": "00:00-00:05",
+          "frameAt": 2.5,
+          "approxFrame": false
+        },
+        "naturalWidth": 960,
+        "naturalHeight": 1678,
+        "mimeType": "image/jpeg"
+      }
+    },
+    {
+      "id": "tpop3full-1-image-1793901538358-ay2b4",
+      "type": "image",
+      "title": "资产位·人物/动物·场景B",
+      "position": {
+        "x": 3485.127118644068,
+        "y": 577.0000000000001
+      },
+      "width": 340,
+      "height": 240,
+      "metadata": {
+        "content": "/api/asset-frame/pop-3?name=%E5%9C%BA%E6%99%AFB&raw=1",
+        "assetSlotSourceId": "tpop3full-1-lapian-1793901293075-gl4cw",
+        "assetSlotOrder": 7,
+        "assetSlotName": "场景B",
+        "assetSlotType": "人物/动物",
+        "assetSlot": {
+          "desc": "（出现于：00:05-00:15）：现代极简全白空间，哑光白色立柱天花结构，嵌有隐形冷白氛围灯带。",
+          "span": "00:05-00:15",
+          "frameAt": 10,
+          "approxFrame": false
+        },
+        "naturalWidth": 960,
+        "naturalHeight": 1678,
+        "mimeType": "image/jpeg"
+      }
+    },
+    {
+      "id": "tpop3full-1-image-1793901538358-804w8",
+      "type": "image",
+      "title": "资产位·品牌·品牌视觉·置换位",
+      "position": {
+        "x": 3846.647779801093,
+        "y": 586.917355371901
+      },
+      "width": 340,
+      "height": 240,
+      "metadata": {
+        "content": "/api/asset-frame/pop-3?name=%E5%8C%85%E8%A3%85%E5%AD%97&raw=1",
+        "assetSlotSourceId": "tpop3full-1-lapian-1793901293075-gl4cw",
+        "assetSlotOrder": 8,
+        "assetSlotName": "品牌视觉·置换位",
+        "assetSlotType": "品牌",
+        "assetSlot": {
+          "desc": "包装字（出现于：00:05-00:08）：「POP!」纵向大写加粗无衬线字体，橙底红字｜瓶身正中偏上；部分可辨：「18」「VANILLE DES ILES」「EAU DE PARFUM」「MADE IN FRANCE」居于标签下方；随手部推近放大，无额外特效\n包装字（出现于：00:13-00:14）：「POP!」红色粗体无衬线字体，字号中等｜瓶身正面纵向；下方「部分可辨：VANILLE」浅色细小无衬线字体\n包装字（出现于：00:14-00:15）：「部分可辨：P.O.P!」纵向印刷文字，深橙红色｜人物右手中瓶身表面\n品牌字（出现于：00:14-00:15）：「P.O.P!」暗橙黄色特粗无衬线特大字｜画面正中偏中上，半透明叠加在人物胸前与空间中央｜淡入定格",
+          "span": "00:05-00:08",
+          "frameAt": 6.5,
+          "approxFrame": false,
+          "attachedImageId": "tpop3full-1-image-1793901447125-74tq3"
+        },
+        "naturalWidth": 960,
+        "naturalHeight": 1678,
+        "mimeType": "image/jpeg",
+        "attachedImageId": "tpop3full-1-image-1793901447125-74tq3"
+      }
+    },
+    {
+      "id": "tpop3full-1-image-1793901590315-gi82n",
+      "type": "image",
+      "title": "挂图 · 客户模特",
+      "position": {
+        "x": 4237.127118644068,
+        "y": 49.000000000000114
+      },
+      "width": 340,
+      "height": 240,
+      "metadata": {
+        "content": "blob:http://localhost:3000/8d66e5e0-7df5-4c38-9295-d0e76a39d91b",
+        "storageKey": "image:46vam8wgxO7q3F5bl4ALL",
+        "naturalWidth": 941,
+        "naturalHeight": 1672,
+        "bytes": 1745146,
+        "mimeType": "image/png",
+        "assetGraftForSlotId": "tpop3full-1-image-1793901538358-h020v",
+        "assetGraftOfImageId": "tpop3full-1-image-1793901490523-chxhe",
+        "images": [],
+        "status": "success"
+      }
+    },
+    {
+      "id": "tpop3full-1-image-1793901608610-4jw4n",
+      "type": "image",
+      "title": "挂图·服装B",
+      "position": {
+        "x": 4625.127118644068,
+        "y": 49.000000000000114
+      },
+      "width": 340,
+      "height": 240,
+      "metadata": {
+        "content": "blob:http://localhost:3000/c87f3db4-8fb8-4e83-944b-cd716d0b1172",
+        "storageKey": "image:5k59oqXUS-I-UQhA1rjV6",
+        "naturalWidth": 941,
+        "naturalHeight": 1672,
+        "bytes": 1737818,
+        "mimeType": "image/png",
+        "assetGraftForSlotId": "tpop3full-1-image-1793901538358-vskz4",
+        "assetGraftOfImageId": "tpop3full-1-image-1793901490618-p42to",
+        "images": []
+      }
+    },
+    {
+      "id": "tpop3full-1-image-1793901615579-3sknz",
+      "type": "image",
+      "title": "挂图·道具A",
+      "position": {
+        "x": 5013.127118644068,
+        "y": 313.0000000000001
+      },
+      "width": 340,
+      "height": 240,
+      "metadata": {
+        "content": "blob:http://localhost:3000/feee2511-9d60-4bf2-8ee6-2715c8136707",
+        "storageKey": "image:VBLbfN8m0OkbuFdmaXypc",
+        "naturalWidth": 640,
+        "naturalHeight": 640,
+        "bytes": 205964,
+        "mimeType": "image/png",
+        "assetGraftForSlotId": "tpop3full-1-image-1793901538358-w6yss",
+        "assetGraftOfImageId": "tpop3full-1-image-1793901493028-xpa34",
+        "images": []
+      }
+    },
+    {
+      "id": "tpop3full-1-image-1793901630803-ezmen",
+      "type": "image",
+      "title": "挂图·道具B",
+      "position": {
+        "x": 5401.127118644068,
+        "y": 313.0000000000001
+      },
+      "width": 340,
+      "height": 240,
+      "metadata": {
+        "content": "blob:http://localhost:3000/71851e6a-373a-476e-b24a-8ae320c8809c",
+        "storageKey": "image:VjENaeDwKEuwx__OCMi5F",
+        "naturalWidth": 1254,
+        "naturalHeight": 1254,
+        "bytes": 1523735,
+        "mimeType": "image/png",
+        "assetGraftForSlotId": "tpop3full-1-image-1793901538358-ad6d4",
+        "assetGraftOfImageId": "tpop3full-1-image-1793901316874-tfjaz",
+        "images": []
+      }
+    },
+    {
+      "id": "tpop3full-1-image-1793901643258-gnj0d",
+      "type": "image",
+      "title": "挂图·道具C",
+      "position": {
+        "x": 5789.127118644068,
+        "y": 313.0000000000001
+      },
+      "width": 340,
+      "height": 240,
+      "metadata": {
+        "content": "blob:http://localhost:3000/6a20f872-f1e5-49c5-97f2-219d2127e98a",
+        "storageKey": "image:6MdQ7mfhcAJB6_LZvZOgW",
+        "naturalWidth": 1254,
+        "naturalHeight": 1254,
+        "bytes": 1480992,
+        "mimeType": "image/png",
+        "assetGraftForSlotId": "tpop3full-1-image-1793901538358-v9489",
+        "assetGraftOfImageId": "tpop3full-1-image-1793901333240-smntt",
+        "images": []
+      }
+    },
+    {
+      "id": "tpop3full-1-image-1793902957746-mmuf5",
+      "type": "image",
+      "title": "挂图·品牌视觉·置换位",
+      "position": {
+        "x": 4237.127118644068,
+        "y": 586.917355371901
+      },
+      "width": 340,
+      "height": 240,
+      "metadata": {
+        "content": "blob:http://localhost:3000/3d72534e-7e69-4b6a-96a2-9b962a7b9da1",
+        "storageKey": "image:cRPi79ZXvLBWcr_k-85ae",
+        "naturalWidth": 1976,
+        "naturalHeight": 1184,
+        "bytes": 660609,
+        "mimeType": "image/png",
+        "assetGraftForSlotId": "tpop3full-1-image-1793901538358-804w8",
+        "assetGraftOfImageId": "tpop3full-1-image-1793901447125-74tq3",
+        "images": []
+      }
+    }
+  ],
+  "connections": [
+    {
+      "id": "cpop3full-1-krQ5rPL7r123Hm8SjuAdm",
+      "fromNodeId": "tpop3full-1-video-1793901289325-25d4s",
+      "toNodeId": "tpop3full-1-lapian-1793901293075-gl4cw"
+    },
+    {
+      "id": "cpop3full-1-e_DZ_xKc2XKlnZF_FpI5Z",
+      "fromNodeId": "tpop3full-1-lapian-1793901293075-gl4cw",
+      "toNodeId": "tpop3full-1-image-1793901538358-h020v"
+    },
+    {
+      "id": "cpop3full-1-EnHOy7xrU9wE0VRPyYdkH",
+      "fromNodeId": "tpop3full-1-lapian-1793901293075-gl4cw",
+      "toNodeId": "tpop3full-1-image-1793901538358-c3dhh"
+    },
+    {
+      "id": "cpop3full-1-WscF1f9QmzaiD38PDBqsj",
+      "fromNodeId": "tpop3full-1-lapian-1793901293075-gl4cw",
+      "toNodeId": "tpop3full-1-image-1793901538358-vskz4"
+    },
+    {
+      "id": "cpop3full-1-zkorfErKteb1dPw1PoPMt",
+      "fromNodeId": "tpop3full-1-lapian-1793901293075-gl4cw",
+      "toNodeId": "tpop3full-1-image-1793901538358-w6yss"
+    },
+    {
+      "id": "cpop3full-1-5dULmmOtvuKxv8axIPSi-",
+      "fromNodeId": "tpop3full-1-lapian-1793901293075-gl4cw",
+      "toNodeId": "tpop3full-1-image-1793901538358-ad6d4"
+    },
+    {
+      "id": "cpop3full-1-mzvR8iBqVQwV_ebchM4Kr",
+      "fromNodeId": "tpop3full-1-lapian-1793901293075-gl4cw",
+      "toNodeId": "tpop3full-1-image-1793901538358-v9489"
+    },
+    {
+      "id": "cpop3full-1-B3_32dUVzPJ4Ncn2iiTeQ",
+      "fromNodeId": "tpop3full-1-lapian-1793901293075-gl4cw",
+      "toNodeId": "tpop3full-1-image-1793901538358-dqum1"
+    },
+    {
+      "id": "cpop3full-1-GMHd-3R89DGiv13k7G4ze",
+      "fromNodeId": "tpop3full-1-lapian-1793901293075-gl4cw",
+      "toNodeId": "tpop3full-1-image-1793901538358-ay2b4"
+    },
+    {
+      "id": "cpop3full-1-LtOXu3O5sOyvZxYsF0Rmg",
+      "fromNodeId": "tpop3full-1-lapian-1793901293075-gl4cw",
+      "toNodeId": "tpop3full-1-image-1793901538358-804w8"
+    },
+    {
+      "id": "cpop3full-1-VnjEl9PjJxtFOd31Dj4J3",
+      "fromNodeId": "tpop3full-1-image-1793901538358-h020v",
+      "toNodeId": "tpop3full-1-image-1793901590315-gi82n"
+    },
+    {
+      "id": "cpop3full-1-LQQagrSnJhQiWe-Z0yMOJ",
+      "fromNodeId": "tpop3full-1-image-1793901538358-vskz4",
+      "toNodeId": "tpop3full-1-image-1793901608610-4jw4n"
+    },
+    {
+      "id": "cpop3full-1-B_G9TWQcNYosK-21xUEjp",
+      "fromNodeId": "tpop3full-1-image-1793901538358-w6yss",
+      "toNodeId": "tpop3full-1-image-1793901615579-3sknz"
+    },
+    {
+      "id": "cpop3full-1-x-Jbe9v-Xpid3tKDvAQw4",
+      "fromNodeId": "tpop3full-1-image-1793901538358-ad6d4",
+      "toNodeId": "tpop3full-1-image-1793901630803-ezmen"
+    },
+    {
+      "id": "cpop3full-1-zK9UTdzeNyB2_R4GHikWB",
+      "fromNodeId": "tpop3full-1-image-1793901538358-v9489",
+      "toNodeId": "tpop3full-1-image-1793901643258-gnj0d"
+    },
+    {
+      "id": "cpop3full-1-WOyERT5oyJr1f8-7yknQf",
+      "fromNodeId": "tpop3full-1-lapian-1793901293075-gl4cw",
+      "toNodeId": "tpop3full-1-config-1793901665795-kooye"
+    },
+    {
+      "id": "cpop3full-1-RDjIDXOk4YYamIlLfyC9B",
+      "fromNodeId": "tpop3full-1-text-1793901665795-amrfn",
+      "toNodeId": "tpop3full-1-config-1793901665795-kooye"
+    },
+    {
+      "id": "cpop3full-1-YJweBgusHiVb2obZMj3TM",
+      "fromNodeId": "tpop3full-1-text-1793901665795-jx3cx",
+      "toNodeId": "tpop3full-1-config-1793901665795-kooye"
+    },
+    {
+      "id": "cpop3full-1-cVpUhGrjbCzN7pBrVEmhx",
+      "fromNodeId": "tpop3full-1-image-1793901490523-chxhe",
+      "toNodeId": "tpop3full-1-config-1793901665795-kooye"
+    },
+    {
+      "id": "cpop3full-1-4on7uP3WmCjKoiBTG-IL1",
+      "fromNodeId": "tpop3full-1-image-1793901490618-p42to",
+      "toNodeId": "tpop3full-1-config-1793901665795-kooye"
+    },
+    {
+      "id": "cpop3full-1-P_PQJiCgmSS5utPLqQ-Ii",
+      "fromNodeId": "tpop3full-1-image-1793901493028-xpa34",
+      "toNodeId": "tpop3full-1-config-1793901665795-kooye"
+    },
+    {
+      "id": "cpop3full-1-1C_u4X_PCw9zYc4Lbvv6b",
+      "fromNodeId": "tpop3full-1-image-1793901316874-tfjaz",
+      "toNodeId": "tpop3full-1-config-1793901665795-kooye"
+    },
+    {
+      "id": "cpop3full-1-ijJvJVvVfe4w1zUdINcTg",
+      "fromNodeId": "tpop3full-1-image-1793901333240-smntt",
+      "toNodeId": "tpop3full-1-config-1793901665795-kooye"
+    },
+    {
+      "id": "cpop3full-1-r3DSN_uM1XKKE_AtzKF3A",
+      "fromNodeId": "tpop3full-1-image-1793901447125-74tq3",
+      "toNodeId": "tpop3full-1-config-1793901665795-kooye"
+    },
+    {
+      "id": "cpop3full-1-RSfdqhF6_CQSQxYhWXk5V",
+      "fromNodeId": "tpop3full-1-image-1793901538358-804w8",
+      "toNodeId": "tpop3full-1-image-1793902957746-mmuf5"
+    },
+    {
+      "id": "cpop3full-1-Q2m-GjR027hjV1V2UjFZK",
+      "fromNodeId": "tpop3full-1-config-1793901665795-kooye",
+      "toNodeId": "tpop3full-1-jERtWnPXyzFhmbUxLLM4G"
+    },
+    {
+      "id": "cpop3full-1-K3Tigc4mSuGQYUfY_2jpm",
+      "fromNodeId": "tpop3full-1-jERtWnPXyzFhmbUxLLM4G",
+      "toNodeId": "tpop3full-1-config-1793903256858-naerp"
+    },
+    {
+      "id": "cpop3full-1-5bbVJ6xIzCfrExVyfwEt9",
+      "fromNodeId": "tpop3full-1-image-1793901490523-chxhe",
+      "toNodeId": "tpop3full-1-config-1793903256858-naerp"
+    },
+    {
+      "id": "cpop3full-1-XIWVeRv38jR2WllHHhg4I",
+      "fromNodeId": "tpop3full-1-image-1793901490618-p42to",
+      "toNodeId": "tpop3full-1-config-1793903256858-naerp"
+    },
+    {
+      "id": "cpop3full-1-AZEikz0hF4GuIiLY4KGHY",
+      "fromNodeId": "tpop3full-1-image-1793901493028-xpa34",
+      "toNodeId": "tpop3full-1-config-1793903256858-naerp"
+    },
+    {
+      "id": "cpop3full-1-cESICBXoWvpeuhzyH1avW",
+      "fromNodeId": "tpop3full-1-image-1793901316874-tfjaz",
+      "toNodeId": "tpop3full-1-config-1793903256858-naerp"
+    },
+    {
+      "id": "cpop3full-1-w9hI0XXYaVP3fYOxwWgex",
+      "fromNodeId": "tpop3full-1-image-1793901333240-smntt",
+      "toNodeId": "tpop3full-1-config-1793903256858-naerp"
+    },
+    {
+      "id": "cpop3full-1-drFEk4nWqiqEE63TT5kWb",
+      "fromNodeId": "tpop3full-1-image-1793901447125-74tq3",
+      "toNodeId": "tpop3full-1-config-1793903256858-naerp"
+    }
+  ],
+  "assetAttaches": [
+    {
+      "slotNodeId": "tpop3full-1-image-1793901538358-h020v",
+      "slotTemplateNodeId": "image-1793901538358-h020v",
+      "imageNodeId": "tpop3full-1-image-1793901490523-chxhe",
+      "caption": "客户模特",
+      "graftNodeId": "tpop3full-1-image-1793901590315-gi82n"
+    }
+  ]
+}

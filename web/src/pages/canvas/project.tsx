@@ -57,7 +57,8 @@ import { buildNodeMentionReferences, getGenerationResourceNodes, getGroupResourc
 import { exportCanvasProjects } from "@/lib/canvas/canvas-export";
 import { applyNodeConfigPatch, audioMetadata, buildAudioGenerationMetadata, buildImageGenerationMetadata, createCanvasNode, imageMetadata, videoMetadata } from "@/lib/canvas/canvas-node-factory";
 import { DEFAULT_LAPIAN_PROMPT_TEMPLATE_ID, LAPIAN_INTENT_PLACEHOLDER, getLapianPromptTemplate, type LapianPromptTemplateId } from "@/lib/canvas/lapian-prompt-templates";
-import { buildLapianRunBody, decodeChannelModelRef, lapianModelGroups, resolveEffectiveLapianModel } from "@/lib/canvas/lapian-model";  // M6-T7-R：全局拉片模型清单/默认传导/请求体装配（纯逻辑层）
+import { executeLapianChain } from "@/lib/canvas/lapian-execute";  // 红线 25：上传+发起拉片的唯一实现（实例化器槽①同源）
+import { decodeChannelModelRef, lapianModelGroups } from "@/lib/canvas/lapian-model";  // M6-T7-R：全局拉片模型清单/默认传导/请求体装配（纯逻辑层）
 import { attachedImageIdOf, buildLapianAssetManifest, buildLapianAssetSlots, collectLapianAssetReferences, parseLapianAssetBlocks, truncateAssetCaption, upsertLapianAssetManifest, type LapianAssetLabels, type LapianBlock } from "@/lib/canvas/lapian-assets";
 import { DERIVED_GAP, nudgeIntoFree, placeGridRightOf, placeRightOf, placeRowRightOf, rectOfNode } from "@/lib/canvas/derived-layout";
 import { extractVideoParams } from "@/lib/canvas/video-params";
@@ -982,29 +983,17 @@ function InfiniteCanvasPage() {
             if (!key) throw new Error("这个视频节点没有本地字节（可能是外部链接）——重新把视频文件拖进画布再试");
             setLapianBusy(true);
             try {
-                LOG("getting blob");
-                const blob = await getMediaBlob(key);
-                LOG(`blob=${blob ? blob.size : "null"}`);
-                if (!blob) throw new Error("视频字节取不回（浏览器存储里没有这个文件）——重新拖入视频");
-                const filename = encodeURIComponent(videoNode.title || "canvas-video.mp4");
-                const up = await fetch(`/api/video/upload`, {
-                    method: "POST",
-                    headers: { "X-Filename": filename, "Content-Type": "application/octet-stream" },
-                    body: blob,
-                }).then((r) => r.json());
-                LOG(`upload=${JSON.stringify(up).slice(0, 120)}`);
-                if (up.error) throw new Error(up.error);
-                // M6-T7-R：默认传导——执行时用全局默认拉片模型（设置 → 拉片模型；节点创建后可在节点上单独换）。
-                // 未设默认/引用失效时 runBody 与现状逐字节一致（只 {id,intent}，走 bridge 默认，旧链路零回归）。
-                const effectiveModel = resolveEffectiveLapianModel(undefined, effectiveConfig.lapianDefaultModel);
-                const runBody = buildLapianRunBody(up.id, intent, effectiveModel, effectiveConfig.channels);
-                const run = await fetch(`/api/lapian/run`, {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify(runBody),
-                }).then((r) => r.json());
-                LOG(`run=${JSON.stringify(run).slice(0, 120)}`);
-                if (run.error) throw new Error(run.error);
+                // 红线 25：上传 + 发起拉片走 `lib/canvas/lapian-execute`（实例化器槽①同一入口），
+                // 本处只负责落节点/连线/视口。URL、请求头体、错误文案与 LOG 全部由公共实现保持原样。
+                const chain = await executeLapianChain(
+                    {
+                        storageKey: key,
+                        title: videoNode.title,
+                        intent,
+                        config: { lapianDefaultModel: effectiveConfig.lapianDefaultModel, channels: effectiveConfig.channels },
+                    },
+                    { getBlob: getMediaBlob, fetch: (url, init) => fetch(url, init), log: LOG },
+                );
                 const size = { width: 400, height: 560 };
                 const lapId = `lapian-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
                 setNodes((prev) => [
@@ -1012,12 +1001,12 @@ function InfiniteCanvasPage() {
                     {
                         id: lapId,
                         type: CanvasNodeType.Lapian,
-                        title: `拉片 · ${up.id}`,
+                        title: `拉片 · ${chain.taskId}`,
                         position: dropPosition ?? { x: videoNode.position.x + (videoNode.width || 240) + 96, y: videoNode.position.y },  // 拉线落点优先；默认视频右侧（从左到右规范）
                         width: size.width,
                         height: size.height,
                         // 不用 status（二开仓通用 loading/error 分支会拦截内容渲染）；lapianModel 只在实际随请求发出时落盘（节点上可见，透明）
-                        metadata: { taskId: up.id, jobId: String(run.job || ""), intent, lapPhase: "loading", ...(runBody.channel ? { lapianModel: effectiveModel } : {}) },
+                        metadata: { taskId: chain.taskId, jobId: chain.jobId, intent, lapPhase: "loading", ...(chain.runBody.channel ? { lapianModel: chain.lapianModel } : {}) },
                     },
                 ]);
                 setConnections((prev) => [...prev, { id: nanoid(), fromNodeId: videoNode.id, toNodeId: lapId }]);

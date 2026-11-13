@@ -1,0 +1,336 @@
+{
+  "checkedAt": "2026-11-13T13:44:10.289Z",
+  "store": "C:\\Users\\leon3\\AppData\\Local\\hermes\\cache\\scratch\\p2-ego\\real-canvas-store.json",
+  "project": {
+    "id": "6UMuzT8Fo9JwD4XDCfOOu",
+    "title": "无限画布 3",
+    "nodes": 66
+  },
+  "template": {
+    "skeleton": {
+      "templateId": "pop3skeleton",
+      "nodes": 13,
+      "connections": 18,
+      "externalReferences": 22
+    },
+    "full": {
+      "templateId": "pop3full",
+      "nodes": 28,
+      "connections": 33,
+      "slots": 9
+    }
+  },
+  "instanceA": {
+    "nodes": 13,
+    "connections": 18,
+    "templateId": "pop3skeleton",
+    "instanceIndex": 1,
+    "lapian": {
+      "taskId": "task-new-A",
+      "jobId": "job-new-A",
+      "contentLength": 39
+    }
+  },
+  "instanceB": {
+    "nodes": 13,
+    "connections": 18,
+    "lapian": {
+      "taskId": "task-new-B",
+      "contentLength": 39
+    }
+  },
+  "networkCalls": {
+    "A": [
+      "POST /api/video/upload",
+      "POST /api/lapian/run",
+      "GET /api/job/job-new-A",
+      "GET /api/lapian/task-new-A"
+    ],
+    "B": [
+      "POST /api/video/upload",
+      "POST /api/lapian/run",
+      "GET /api/job/job-new-B",
+      "GET /api/lapian/task-new-B"
+    ],
+    "replay": 0
+  },
+  "pass": 55,
+  "fails": [],
+  "results": [
+    {
+      "name": "A 单测进程零失败",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "A 单测用例数 ≥ 30",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "A 单测 fail 计数为 0",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "B 找到真实样本项目",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "B 找到已跑通的拉片链根",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "B 骨架边界齐全",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "B 全量边界含真实资产位",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "B 全量模板自足（无悬空引用）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "B 原链拉片正文存在（用于「旧正文零残留」断言）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "C 两次实例化 id 交集为空（节点）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "C 两次实例化 id 交集为空（连线）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "C 实例 id 与模板 id 零交集",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "C 拓扑逐边同构（F1）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "C 两次实例化的拓扑 digest 各自等于冻结值（B 亦然）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "C 模板零改动（两次实例化前后 JSON 全等）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "C 实例 2 不引用实例 1 任何节点",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "C 七类①：组装串 token 全部指向本实例节点",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "C 七类⑤：Config→拉片 lapianSourceId 重绑",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "C 七类⑦：连线端点全部落在本实例节点",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "D 槽①：源视频写新材料 storageKey/content（旧字节无残留）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "D 拉片节点模板运行态已清空（等受控入口回填）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "D 槽②：意图正文写入",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "D 槽④：生成参数只写值（config text 模型覆盖，video 参数保持模板值）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "D 槽⑤：可选段写入",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "D 首放：节点/连线数 = 计划数",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "D 重放：节点数不翻倍、全部幂等跳过",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "D 同 id 形态不一致 → 冲突报错（不静默 append）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "E 实例化成功（created）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "E 触发上传：X-Filename/octet-stream 合同",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "E 触发拉片：请求体 {id,intent}（未配模型不发半截请求）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "E 回填**本次**正文",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "E 回填 taskId/jobId = 本次任务",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "E 旧正文零残留（原链正文不进实例）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "E 零付费创建：提交的 ops 无 run_generation",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "E 第二组实例化成功",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "E 两组实例 id 零交集（含连线）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "E 第二组回填自己那份正文",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "E 画布累计节点数 = 两实例之和（无覆盖/无翻倍）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "E 重放 → already_present 且零网络调用（不重复拉片）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "E 重放后画布节点数不变",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "F 素材缺失 → 计划期拒绝（material_missing）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "F 素材缺失 → 画布零写入",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "F 上传失败 → incomplete(lapian_chain) 且画布零写入",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "F 上传失败后未发起拉片（不产生拆解费用）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "F 正文没回来 → incomplete(lapian_content)，显式标记不冒充完整",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "F incomplete 实例的拉片节点带 taskId 但正文为空（可重查续）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "F 落库失败 → incomplete(apply_ops) + 已回滚",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "F 回滚后画布零残留（节点/连线）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "G 槽③：扁平真源与 assetSlot 镜像同批双写",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "G 槽③：短说明写入（attachedImageDesc + 镜像 caption）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "G 槽③：清单行按本实例挂图重算（token 指向新图 id + 短说明）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "G 槽③：挂图对照节点 + 双向引用",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "G 槽③：伴生边（图→Config）补齐",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "G 七类⑥：模板自带对照图的嫁接引用重绑到本实例 id",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "G 槽③：派生槽模板（骨架模板）挂图被拒（P4 范围）",
+      "ok": true,
+      "detail": ""
+    }
+  ]
+}
