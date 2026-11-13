@@ -1,0 +1,484 @@
+{
+  "pass": 72,
+  "fail": 0,
+  "unitTotal": 36,
+  "batch": {
+    "batchId": "batch-8f108e15",
+    "members": [
+      {
+        "instanceId": "p5skeleton#1",
+        "instanceIndex": 1,
+        "localId": "auto-9510",
+        "nodeCount": 13,
+        "materialsDigest": "f1cf9478"
+      },
+      {
+        "instanceId": "p5skeleton#2",
+        "instanceIndex": 2,
+        "localId": "auto-9520",
+        "nodeCount": 13,
+        "materialsDigest": "dc1edf49"
+      },
+      {
+        "instanceId": "p5skeleton#3",
+        "instanceIndex": 3,
+        "localId": "auto-9530",
+        "nodeCount": 13,
+        "materialsDigest": "9590d496"
+      }
+    ]
+  },
+  "statusView": {
+    "counts": {
+      "pending": 0,
+      "running": 0,
+      "assembled": 0,
+      "awaiting_approval": 3,
+      "approved": 0,
+      "generating": 0,
+      "done": 0,
+      "failed": 0,
+      "unknown": 0
+    },
+    "outcome": "in_progress",
+    "members": [
+      {
+        "instanceId": "p5skeleton#1",
+        "status": "awaiting_approval",
+        "rule": "R4",
+        "missing": []
+      },
+      {
+        "instanceId": "p5skeleton#2",
+        "status": "awaiting_approval",
+        "rule": "R4",
+        "missing": []
+      },
+      {
+        "instanceId": "p5skeleton#3",
+        "status": "awaiting_approval",
+        "rule": "R4",
+        "missing": []
+      }
+    ]
+  },
+  "coverage": {
+    "naiveTotal": 39,
+    "naiveReturned": 20,
+    "groupedComplete": true,
+    "groupedQueries": 1,
+    "manyCovered": 390,
+    "manyRequested": 390
+  },
+  "flush": [
+    {
+      "instanceIndex": 1,
+      "stage": "instance_persisted",
+      "ok": true,
+      "written": true,
+      "bytes": 121712
+    },
+    {
+      "instanceIndex": 1,
+      "stage": "awaiting_approval",
+      "ok": true,
+      "written": true,
+      "bytes": 123114
+    },
+    {
+      "instanceIndex": 2,
+      "stage": "instance_persisted",
+      "ok": true,
+      "written": true,
+      "bytes": 138573
+    },
+    {
+      "instanceIndex": 2,
+      "stage": "awaiting_approval",
+      "ok": true,
+      "written": true,
+      "bytes": 139976
+    },
+    {
+      "instanceIndex": 3,
+      "stage": "instance_persisted",
+      "ok": true,
+      "written": true,
+      "bytes": 155438
+    },
+    {
+      "instanceIndex": 3,
+      "stage": "awaiting_approval",
+      "ok": true,
+      "written": true,
+      "bytes": 156841
+    }
+  ],
+  "reloaded": {
+    "hydrated": true,
+    "members": 3,
+    "instances": 3
+  },
+  "results": [
+    {
+      "name": "A 单测（P5 批次/派生/查询）进程零失败",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "A 单测（P5 批次/派生/查询）用例数 > 0",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "A 单测（P5 批次/派生/查询）fail 计数 0",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "A 单测（P5 落盘队列）进程零失败",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "A 单测（P5 落盘队列）用例数 > 0",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "A 单测（P5 落盘队列）fail 计数 0",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "A 单测（P4 回归）进程零失败",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "A 单测（P4 回归）用例数 > 0",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "A 单测（P4 回归）fail 计数 0",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "A 单测总数 ≥ 26（P5 新增 26 + P4 回归）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "B store 模块可加载（真 zustand persist）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "B store 暴露 flushProjects（P5 新 API）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "B 找到真实样本项目",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "B 找到已跑通的拉片链根",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "B 骨架齐全（video→lapian→config text→占位终稿→config video + 固定参考图）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "B 模板自足（无悬空引用）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "B store 载入真实项目（importProject）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "B 实例 1 落库（P3 materialize）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "B 实例 1 全链到待批（P4 编排 + 批次入册）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "B 实例 1 付费视频创建 = 0",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "B 实例 1 关键节点 flush 两次（落库 + 待批）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "B 实例 1 flush 全部成功且真的写了盘",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "B 实例 2 落库（P3 materialize）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "B 实例 2 全链到待批（P4 编排 + 批次入册）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "B 实例 2 付费视频创建 = 0",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "B 实例 2 关键节点 flush 两次（落库 + 待批）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "B 实例 2 flush 全部成功且真的写了盘",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "B 实例 3 落库（P3 materialize）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "B 实例 3 全链到待批（P4 编排 + 批次入册）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "B 实例 3 付费视频创建 = 0",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "B 实例 3 关键节点 flush 两次（落库 + 待批）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "B 实例 3 flush 全部成功且真的写了盘",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "B 批次记录 1 个 / 成员 3 个",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "B 四层关联齐（batchId↔实例↔节点↔hub）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "B 成员 hub 外键来自真 ingest 回执",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "B 成员节点骨架 id 全部落在画布上",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "B 磁盘 payload 含 3 个实例与批次号（flush 已落盘）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "B 每次 flush 回来时磁盘已含本条实例（不等防抖）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "B 后一次 flush 回来时磁盘已含前面全部实例",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "F 防抖窗口内磁盘不含最新改动（正是需要 flush 的原因）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "F flush 后磁盘立即含最新改动",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "F flush 结果写进 store（lastFlush 可见）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "C 刷新后 store 已水合",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "C 刷新后项目还在（1 个）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "C 刷新后批次成员完整恢复（3 个）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "C 刷新后四层关联仍齐（节点 id 全部能在恢复的节点表里找到）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "C 刷新后 hub 外键原样恢复",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "C 刷新后实例身份记录（P4）也恢复",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "E B5 陷阱复现：裸查按默认 20 条被截断（total > 实际返回）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "E 分组查询覆盖 3 个成员的全部节点（无静默截断）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "E 分组查询按成员节点分块下发（块 ≤ 上限 100）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "E 构造 >100 规模（成员 30 / 节点 >200）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "E >100 规模全覆盖（分块 + 二分，零静默截断）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "E >100 规模确实分多块下发",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "E 查不全时显式报「部分未知」（覆盖率不足 ≠ 成功）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "D 真实批次：3 实例都在待批（Config success 不改判完成）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "D 真实批次：成员状态带命中规则（可复核）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "D 真实批次：计数汇总口径完整（9 种状态都有计数）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "D 矩阵①：Config success + 视频 running → 进行中非完成",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "D 矩阵②：后端任务 failed → 实例失败",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "D 矩阵③：任务缺失 → 显式未知不计成功",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "D 矩阵④：产物 + 视频任务 succeeded → 完成",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "D 矩阵⑤：成员节点缺失 → 未知（缺失≠成功）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "D 批次聚合：未知成员 → partial_unknown（不算成功）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "F 写盘失败：flush 返回 ok=false（不静默）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "F 写盘失败：store.lastFlush 可见错误",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "F 编排器：flush 失败如实回报（flushes.ok=false）且实例不因此判失败",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "G store 既有方法面零破坏（7 个方法都在）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "G store 新增只加不改（flushProjects/lastFlush/workflowBatches）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "G 导入透传：workflowBatches / workflowTemplate / workflowInstances 都不丢",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "G C5：节点 metadata 里没有批次/审批字段（身份只存项目字段）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "G P0b 闸复验：P5 全部 ops 过付费提取 = 0 条付费动作",
+      "ok": true,
+      "detail": ""
+    }
+  ]
+}

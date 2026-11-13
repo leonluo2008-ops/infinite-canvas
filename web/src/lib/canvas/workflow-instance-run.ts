@@ -23,6 +23,7 @@ import { CanvasNodeType, type CanvasConnection, type CanvasNodeData } from "@/ty
 
 import type { CanvasAgentOp } from "@/lib/canvas/canvas-agent-ops";
 import { lapianOptionalLetters, renderLapianProjection, type LapianProjectionFetch } from "@/lib/canvas/lapian-projection";
+import { buildBatchMember, type WorkflowBatchMember } from "@/lib/canvas/workflow-batch";
 import { stableDigest } from "@/lib/canvas/workflow-template";
 import { templateInstanceConnectionId } from "@/lib/canvas/workflow-template-ids";
 import type { WorkflowInstancePlan, WorkflowInstanceMaterials } from "@/lib/canvas/workflow-instance";
@@ -443,6 +444,12 @@ export function buildIdentityRecord(input: {
 
 // ─────────────────────────────────────────────── 编排器
 
+/** 落盘关键节点（P5 flush）：实例入册（画布侧落库）与停在待批。 */
+export type InstanceFlushStage = "instance_persisted" | "awaiting_approval";
+
+/** flush 结果（失败如实记，绝不静默）。 */
+export type InstanceFlushOutcome = { stage: InstanceFlushStage; ok: boolean; error?: string };
+
 export type InstanceRunDeps = {
     nodes: () => CanvasNodeData[];
     connections: () => CanvasConnection[];
@@ -459,6 +466,10 @@ export type InstanceRunDeps = {
     hub?: WorkflowInstanceHubClient;
     getBlob?: (storageKey: string) => Promise<Blob | null>;
     saveIdentity?: (record: WorkflowInstanceIdentityRecord) => void | Promise<void>;
+    /** 批次成员入册（P5；只写身份，状态派生层现查）。缺省 = 不记批次（P4 行为不变）。 */
+    saveBatchMember?: (member: WorkflowBatchMember) => void | Promise<void>;
+    /** 立即落盘（页面 = `useCanvasStore.flushProjects`）。缺省 = 不 flush（只走防抖）。 */
+    flush?: (stage: InstanceFlushStage) => void | Promise<void | { ok?: boolean; error?: string }>;
     newRunToken?: () => string;
     now?: () => string;
     log?: (message: string) => void;
@@ -488,6 +499,10 @@ export type InstanceRunResult = {
     };
     identity?: WorkflowInstanceIdentityRecord;
     hub?: Omit<InstanceHubBinding, "assets"> & { assets: InstanceHubBinding["assets"] };
+    /** 批次成员（P5；入册后的身份记录，随项目持久化）。 */
+    batchMember?: WorkflowBatchMember;
+    /** 关键节点 flush 结果（失败如实回传，见 warnings）。 */
+    flushes: InstanceFlushOutcome[];
     /** 付费视频创建调用次数（本编排器恒 0；探针据此断言 P0b 闸前置）。 */
     paidVideoCreations: number;
     generationCalls: { mode: string; nodeId: string }[];
@@ -502,7 +517,7 @@ export type InstanceRunResult = {
  *
  * 全程零付费视频创建：`runGeneration` 只会以 `mode:"text"` 调用一次；任何失败都如实返回 failed。
  */
-export async function runWorkflowInstance(input: { plan: WorkflowInstancePlan; materials: WorkflowInstanceMaterials; lapian: { taskId: string; jobId: string } }, deps: InstanceRunDeps): Promise<InstanceRunResult> {
+export async function runWorkflowInstance(input: { plan: WorkflowInstancePlan; materials: WorkflowInstanceMaterials; lapian: { taskId: string; jobId: string }; batchId?: string }, deps: InstanceRunDeps): Promise<InstanceRunResult> {
     const now = deps.now || (() => new Date().toISOString());
     const newRunToken = deps.newRunToken || (() => `run-${Math.random().toString(36).slice(2, 10)}`);
     const result: InstanceRunResult = {
@@ -515,11 +530,44 @@ export async function runWorkflowInstance(input: { plan: WorkflowInstancePlan; m
         generationCalls: [],
         appliedOps: [],
         warnings: [],
+        flushes: [],
     };
     const apply = async (ops: CanvasAgentOp[]) => {
         if (!ops.length) return;
         await deps.applyOps(ops);
         result.appliedOps.push(...ops);
+    };
+
+    // 关键节点立即落盘（P5 / A8-G14）：失败一律可见（warnings + flushes），绝不静默。
+    const flushAt = async (stage: InstanceFlushStage) => {
+        if (!deps.flush) return;
+        try {
+            const outcome = await deps.flush(stage);
+            // flush 依赖可以回 {ok:false,error}（页面 = store.flushProjects 的返回值）：不静默吞掉。
+            if (outcome && typeof outcome === "object" && outcome.ok === false) throw new Error(outcome.error || "flush 返回失败（存储写入未成功）");
+            result.flushes.push({ stage, ok: true });
+        } catch (error) {
+            const message = error instanceof Error ? error.message : String(error ?? "未知错误");
+            result.flushes.push({ stage, ok: false, error: message });
+            result.warnings.push(`落盘 flush 失败（${stage}）：${message}——最新状态可能停在 400ms 防抖窗口里，需重试 flush`);
+        }
+    };
+    // 批次成员入册（只写身份；状态派生层现查 —— C5）。identity 缺省 = 画布侧刚落库。
+    const batchId = String(input.batchId || "").trim();
+    const saveMember = async (identity: WorkflowInstanceIdentityRecord | null) => {
+        if (!batchId) return null;
+        const member = buildBatchMember({
+            plan: input.plan,
+            materials: input.materials,
+            identity,
+            nodes: deps.nodes(),
+            connections: deps.connections(),
+            lapian: { taskId: String(input.lapian.taskId || ""), jobId: String(input.lapian.jobId || "") },
+            createdAt: now(),
+        });
+        result.batchMember = member;
+        if (deps.saveBatchMember) await deps.saveBatchMember(member);
+        return member;
     };
 
     // ① 可选段投影刷新（槽⑤真实生效的唯一入口：正文必须换成「按本次可选段渲染的投影」）
@@ -618,6 +666,10 @@ export async function runWorkflowInstance(input: { plan: WorkflowInstancePlan; m
         projection,
     };
 
+    // ④′ 批次成员入册（画布侧已落库）+ **立即落盘**：防抖窗口崩溃也不丢成员关系（P5 / A8-G14）。
+    await saveMember(null);
+    await flushAt("instance_persisted");
+
     // ⑤ hub 身份绑定（ingest → 资产 → 正文保存（自带自检）→ 身份记录）
     let binding: InstanceHubBinding | null = null;
     if (deps.hub) {
@@ -660,6 +712,9 @@ export async function runWorkflowInstance(input: { plan: WorkflowInstancePlan; m
     });
     result.identity = identity;
     if (deps.saveIdentity) await deps.saveIdentity(identity);
+    // ⑤⑥ 身份 + 批次成员（含 hub 外键）落库后**立即落盘**：停在待批那一刻磁盘上就是最新身份。
+    await saveMember(identity);
+    await flushAt(binding ? "awaiting_approval" : "instance_persisted");
 
     result.status = binding ? "awaiting_approval" : "canvas_ready";
     return result;

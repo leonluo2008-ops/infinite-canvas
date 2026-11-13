@@ -1,0 +1,119 @@
+{
+  "batch": {
+    "batchId": "batch-8f108e15",
+    "members": [
+      {
+        "instanceId": "p5skeleton#1",
+        "instanceIndex": 1,
+        "localId": "auto-9510",
+        "nodeCount": 13,
+        "materialsDigest": "f1cf9478"
+      },
+      {
+        "instanceId": "p5skeleton#2",
+        "instanceIndex": 2,
+        "localId": "auto-9520",
+        "nodeCount": 13,
+        "materialsDigest": "dc1edf49"
+      },
+      {
+        "instanceId": "p5skeleton#3",
+        "instanceIndex": 3,
+        "localId": "auto-9530",
+        "nodeCount": 13,
+        "materialsDigest": "9590d496"
+      }
+    ]
+  },
+  "statusView": {
+    "counts": {
+      "pending": 0,
+      "running": 0,
+      "assembled": 0,
+      "awaiting_approval": 3,
+      "approved": 0,
+      "generating": 0,
+      "done": 0,
+      "failed": 0,
+      "unknown": 0
+    },
+    "outcome": "in_progress",
+    "members": [
+      {
+        "instanceId": "p5skeleton#1",
+        "status": "awaiting_approval",
+        "rule": "R4",
+        "missing": []
+      },
+      {
+        "instanceId": "p5skeleton#2",
+        "status": "awaiting_approval",
+        "rule": "R4",
+        "missing": []
+      },
+      {
+        "instanceId": "p5skeleton#3",
+        "status": "awaiting_approval",
+        "rule": "R4",
+        "missing": []
+      }
+    ]
+  },
+  "coverage": {
+    "naiveTotal": 39,
+    "naiveReturned": 20,
+    "groupedComplete": true,
+    "groupedQueries": 1,
+    "manyCovered": 390,
+    "manyRequested": 390
+  },
+  "flush": [
+    {
+      "instanceIndex": 1,
+      "stage": "instance_persisted",
+      "ok": true,
+      "written": true,
+      "bytes": 121712
+    },
+    {
+      "instanceIndex": 1,
+      "stage": "awaiting_approval",
+      "ok": true,
+      "written": true,
+      "bytes": 123114
+    },
+    {
+      "instanceIndex": 2,
+      "stage": "instance_persisted",
+      "ok": true,
+      "written": true,
+      "bytes": 138573
+    },
+    {
+      "instanceIndex": 2,
+      "stage": "awaiting_approval",
+      "ok": true,
+      "written": true,
+      "bytes": 139976
+    },
+    {
+      "instanceIndex": 3,
+      "stage": "instance_persisted",
+      "ok": true,
+      "written": true,
+      "bytes": 155438
+    },
+    {
+      "instanceIndex": 3,
+      "stage": "awaiting_approval",
+      "ok": true,
+      "written": true,
+      "bytes": 156841
+    }
+  ],
+  "reloaded": {
+    "hydrated": true,
+    "members": 3,
+    "instances": 3
+  }
+}

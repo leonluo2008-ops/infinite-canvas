@@ -5,6 +5,8 @@ import { nanoid } from "nanoid";
 import i18n from "@/i18n";
 import { localForageStorage } from "@/lib/localforage-storage";
 import type { CanvasBackgroundMode } from "@/lib/canvas-theme";
+import { createPersistQueue, type FlushResult } from "@/lib/canvas/canvas-persist-queue";
+import { acceptWorkflowBatches, type WorkflowBatchRecord } from "@/lib/canvas/workflow-batch";
 import { acceptWorkflowInstances } from "@/lib/canvas/workflow-instance-identity";
 import type { WorkflowInstanceIdentityRecord } from "@/lib/canvas/workflow-instance-run";
 import type { CanvasWorkflowTemplate } from "@/lib/canvas/workflow-template";
@@ -33,6 +35,12 @@ export type CanvasProject = {
      * 产物节点 id）↔ 后端任务号 ↔ 正文修订。随项目持久化/导出同路，只存身份不存状态（§5.3）。
      */
     workflowInstances?: WorkflowInstanceIdentityRecord[];
+    /**
+     * 批次身份记录（P5，P0a §5.1/§5.3）：batchId ↔ 实例 ↔ 节点骨架 id ↔ hub/后端任务外键。
+     * 与 `workflowInstances` 同一种落点（项目显式扩展字段，随项目持久化 + 导出同路），
+     * 只存身份不存状态：状态一律由 `workflow-batch-status.ts` 现查派生。
+     */
+    workflowBatches?: WorkflowBatchRecord[];
 };
 
 /** 导入侧校验：只要形如模板声明就透传（版本号留给后续迁移，不静默丢未知新版本）。 */
@@ -49,42 +57,68 @@ export type CanvasDeletedProject = {
     deletedAt: string;
 };
 
+/** 最近一次显式 flush 的结果（只在内存里，不进持久化载荷——它不是画布数据）。 */
+export type CanvasFlushStamp = {
+    at: string;
+    ok: boolean;
+    bytes: number;
+    reason?: string;
+    error?: string;
+};
+
 type CanvasStore = {
     hydrated: boolean;
     projects: CanvasProject[];
     deletedProjects: CanvasDeletedProject[];
+    /** 最近一次 flush 结果：失败时 UI/编排层看得见（不静默）。 */
+    lastFlush: CanvasFlushStamp | null;
     createProject: (title?: string) => string;
     importProject: (project: Partial<CanvasProject>) => string;
     openProject: (id: string) => CanvasProject | null;
     renameProject: (id: string, title: string) => void;
     deleteProjects: (ids: string[]) => void;
     replaceProjects: (projects: CanvasProject[], deletedProjects?: CanvasDeletedProject[]) => void;
-    updateProject: (id: string, patch: Partial<Pick<CanvasProject, "nodes" | "connections" | "chatSessions" | "activeChatId" | "backgroundMode" | "showImageInfo" | "viewport" | "workflowTemplate" | "workflowInstances">>) => void;
+    updateProject: (id: string, patch: Partial<Pick<CanvasProject, "nodes" | "connections" | "chatSessions" | "activeChatId" | "backgroundMode" | "showImageInfo" | "viewport" | "workflowTemplate" | "workflowInstances" | "workflowBatches">>) => void;
+    /**
+     * 立即落盘当前 projects（不等 400ms 防抖窗口）。编排器在实例关键节点（落库/待批）调用；
+     * 失败结果同时写进 `lastFlush` 并原样返回，绝不静默吞掉。
+     */
+    flushProjects: (reason?: string) => Promise<FlushResult>;
 };
 
 const initialViewport: ViewportTransform = { x: 0, y: 0, k: 1 };
 const CANVAS_STORE_KEY = "infinite-canvas:canvas_store";
 type PersistedCanvasState = Pick<CanvasStore, "projects" | "deletedProjects">;
-let saveTimer: ReturnType<typeof setTimeout> | null = null;
-let queuedPersistState: PersistedCanvasState | null = null;
+/** 落盘载荷就是 zustand persist 的 StorageValue（`{state, version}`）——不能只存 state，否则恢复时无处可取。 */
+type PersistedCanvasValue = { state: PersistedCanvasState; version?: number };
+
+/**
+ * 持久化队列（P5 / 收敛裁决 A8-G14）：set 后 400ms 防抖合并写，`flushProjects` 可立即落盘。
+ * 去重口径与改造前一致：projects/deletedProjects 引用都没变 → 不入队（zustand 每次 set 都会交同一份）。
+ */
+const persistQueue = createPersistQueue<PersistedCanvasValue>({
+    name: CANVAS_STORE_KEY,
+    storage: localForageStorage,
+    delayMs: 400,
+    isEqual: (previous, next) => previous?.state?.projects === next?.state?.projects && previous?.state?.deletedProjects === next?.state?.deletedProjects,
+    onError: (error) => {
+        // 写盘失败可见：lastFlush 不在 partialize 里，所以这次 set 不会把错误本身再写回盘。
+        useCanvasStore.setState({ lastFlush: { at: new Date().toISOString(), ok: false, bytes: 0, error: error.message } });
+    },
+});
 
 const canvasStorage: PersistStorage<CanvasStore> = {
     getItem: async (name) => {
         const value = await localForageStorage.getItem(name);
         if (!value) return null;
         const parsed = JSON.parse(value) as StorageValue<CanvasStore>;
-        queuedPersistState = parsed.state as PersistedCanvasState;
+        // 恢复基线：这份刚从盘上读上来，已知在盘上——不排队、不重写。
+        persistQueue.prime({ state: parsed.state as PersistedCanvasState, version: parsed.version });
         return parsed;
     },
     setItem: (name, value) => {
-        const nextState = value.state as PersistedCanvasState;
-        if (queuedPersistState && queuedPersistState.projects === nextState.projects && queuedPersistState.deletedProjects === nextState.deletedProjects) return;
-        queuedPersistState = nextState;
-        if (saveTimer) clearTimeout(saveTimer);
-        saveTimer = setTimeout(() => {
-            saveTimer = null;
-            void localForageStorage.setItem(name, JSON.stringify(value));
-        }, 400);
+        void name;
+        persistQueue.setItem({ state: value.state as PersistedCanvasState, version: value.version });
     },
     removeItem: (name) => localForageStorage.removeItem(name),
 };
@@ -95,6 +129,7 @@ export const useCanvasStore = create<CanvasStore>()(
             hydrated: false,
             projects: [],
             deletedProjects: [],
+            lastFlush: null,
             createProject: (title = i18n.t("canvas.project.untitled")) => {
                 const now = new Date().toISOString();
                 const id = nanoid();
@@ -132,6 +167,8 @@ export const useCanvasStore = create<CanvasStore>()(
                     workflowTemplate: acceptWorkflowTemplate(source.workflowTemplate),
                     // P4：实例身份记录随项目走（导入显式透传，理由同上）。
                     workflowInstances: acceptWorkflowInstances(source.workflowInstances),
+                    // P5：批次身份记录随项目走（导入显式透传，理由同上）。
+                    workflowBatches: acceptWorkflowBatches(source.workflowBatches),
                 };
                 set((state) => ({ projects: [project, ...state.projects] }));
                 return project.id;
@@ -156,6 +193,13 @@ export const useCanvasStore = create<CanvasStore>()(
                 set((state) => ({
                     projects: state.projects.map((project) => (project.id === id ? { ...project, ...patch, updatedAt: new Date().toISOString() } : project)),
                 })),
+            flushProjects: async (reason) => {
+                const result = await persistQueue.flush(reason);
+                set({
+                    lastFlush: { at: new Date().toISOString(), ok: result.ok, bytes: result.bytes, reason, ...(result.error ? { error: result.error } : {}) },
+                });
+                return result;
+            },
         }),
         {
             name: CANVAS_STORE_KEY,
