@@ -36,6 +36,7 @@ const SITE_TOOLS = new Set<ToolName>([
     "assets_list",
     "assets_add",
     "generation_get_status",
+    "read_node_text",
 ]);
 
 /** 管理网页画布连接、状态、附件和工具请求。 */

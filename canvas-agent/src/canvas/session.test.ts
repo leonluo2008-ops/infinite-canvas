@@ -146,6 +146,26 @@ test("生成状态查询由当前激活网页返回", async (t) => {
     assert.deepEqual(await result, { total: 1, tasks: [{ id: "image-1", status: "running" }] });
 });
 
+test("节点全文读取由当前激活网页返回（read_node_text 走页面通道）", async (t) => {
+    const session = new CanvasSession();
+    const first = connect(session, "first");
+    const second = connect(session, "second");
+    t.after(() => {
+        first.close();
+        second.close();
+    });
+    session.activateClient("second");
+
+    const result = session.callTool("read_node_text", { nodeId: "text-1" });
+    const call = second.event("tool_call");
+    assert.equal(first.event("tool_call"), undefined);
+    assert.equal(field(call, "name"), "read_node_text");
+    assert.deepEqual(field(call, "input"), { nodeId: "text-1" });
+    const fullText = { nodeId: "text-1", projectId: "canvas-second", content: "TAILMARK-9f3e", contentLength: 13, length: 13, field: "content" };
+    session.resolveResult("second", { requestId: String(field(call, "requestId")), result: fullText });
+    assert.deepEqual(await result, fullText);
+});
+
 test("活动网页关闭后回退到仍连接的画布", async (t) => {
     const session = new CanvasSession();
     const first = connect(session, "first");

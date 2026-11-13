@@ -541,6 +541,7 @@ function toolHistorySummary(tool: string, item: unknown, input: unknown) {
     if (tool === "prompts_search") return `找到 ${numberValue(field(result, "total"))} 条提示词`;
     if (tool === "assets_list") return `共 ${numberValue(field(result, "total"))} 个资产`;
     if (tool === "assets_add") return "已加入我的素材";
+    if (tool === "read_node_text") return `已读取节点全文（${numberValue(field(result, "length"))} 字）`;
     if (tool === "generation_get_status") {
         const summary = field(result, "summary");
         return `共 ${numberValue(field(result, "total"))} 个任务，排队 ${numberValue(field(summary, "queued"))}，运行中 ${numberValue(field(summary, "running"))}，成功 ${numberValue(field(summary, "succeeded"))}，失败 ${numberValue(field(summary, "failed"))}`;
@@ -593,6 +594,7 @@ function toolInputRows(tool: string, input: unknown) {
     if (tool === "canvas_create_text_node") return [textRow("文本内容", field(input, "text"))].filter(Boolean);
     if (tool === "canvas_apply_ops") return [textRow("操作内容", summarizeCanvasOps(arrayValue(field(input, "ops"))))].filter(Boolean);
     if (tool === "canvas_create_attachment_nodes") return [textRow("图片数量", arrayValue(field(input, "attachmentIds")).length)].filter(Boolean);
+    if (tool === "read_node_text") return [textRow("节点", field(input, "nodeId"))].filter(Boolean);
     return [];
 }
 
@@ -736,5 +738,6 @@ function toolName(name: string) {
     if (name === "assets_list") return "资产列表";
     if (name === "assets_add") return "添加资产";
     if (name === "generation_get_status") return "生成任务状态";
+    if (name === "read_node_text") return "读取节点全文";
     return name ? `调用工具：${name}` : "工具操作";
 }

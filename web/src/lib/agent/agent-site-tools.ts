@@ -5,6 +5,7 @@ import { fetchPrompts } from "@/services/api/prompts";
 import { uploadImage } from "@/services/image-storage";
 import { imageAspectOptions, imageQualityOptions, imageScaleOptions } from "@/components/image-settings-panel";
 import { videoResolutionOptions, videoSecondsRange, videoSizeOptions } from "@/components/video-settings-panel";
+import { buildGenerationStatus, readNodeFullText } from "@/lib/agent/agent-node-text";
 import type { CanvasAgentSnapshot } from "@/lib/canvas/canvas-agent-ops";
 import { clampVideoSeconds } from "@/lib/media-size";
 import { useCanvasStore } from "@/stores/canvas/use-canvas-store";
@@ -18,6 +19,7 @@ import { useWorkbenchAgentStore } from "@/stores/use-workbench-agent-store";
 export const SITE_TOOL_NAMES = [
     "canvas_list_projects",
     "generation_get_status",
+    "read_node_text",
     "workbench_image_get_config",
     "workbench_image_generate",
     "workbench_video_get_config",
@@ -40,6 +42,7 @@ function siteText(key: string, options?: Record<string, unknown>) {
 export const SITE_TOOL_LABELS: Record<SiteToolName, string> = {
     get canvas_list_projects() { return siteText("canvasList"); },
     get generation_get_status() { return siteText("generationStatus"); },
+    get read_node_text() { return siteText("readNodeText"); },
     get workbench_image_get_config() { return siteText("imageConfig"); },
     get workbench_image_generate() { return siteText("imageGenerate"); },
     get workbench_video_get_config() { return siteText("videoConfig"); },
@@ -51,8 +54,6 @@ export const SITE_TOOL_LABELS: Record<SiteToolName, string> = {
 
 type SiteToolInput = Record<string, unknown>;
 type SiteToolContext = { canvasSnapshot?: CanvasAgentSnapshot | null };
-type GenerationStatus = "idle" | "queued" | "running" | "succeeded" | "failed";
-type GenerationStatusItem = { id: string; source: "canvas" | "image" | "video"; status: GenerationStatus; kind?: string; title?: string; prompt?: string; projectId?: string; createdAt?: string; updatedAt?: string; successCount?: number; failCount?: number; error?: string };
 
 export async function runSiteTool(name: SiteToolName, input: SiteToolInput, navigate: NavigateFunction, context: SiteToolContext = {}): Promise<unknown> {
     switch (name) {
@@ -60,6 +61,8 @@ export async function runSiteTool(name: SiteToolName, input: SiteToolInput, navi
             return listCanvasProjects(input);
         case "generation_get_status":
             return getGenerationStatus(input, context.canvasSnapshot);
+        case "read_node_text":
+            return readNodeTextTool(input, context.canvasSnapshot);
         case "workbench_image_get_config":
             return getImageConfig();
         case "workbench_image_generate":
@@ -80,53 +83,16 @@ export async function runSiteTool(name: SiteToolName, input: SiteToolInput, navi
 }
 
 function getGenerationStatus(input: SiteToolInput, canvasSnapshot?: CanvasAgentSnapshot | null) {
-    const scope = input.scope === "canvas" || input.scope === "image" || input.scope === "video" ? input.scope : "all";
-    const taskId = typeof input.taskId === "string" ? input.taskId : "";
-    const nodeIds = new Set(Array.isArray(input.nodeIds) ? input.nodeIds.filter((id): id is string => typeof id === "string") : []);
-    const limit = Math.max(1, Math.min(100, Math.floor(Number(input.limit)) || 20));
-    const tasks: GenerationStatusItem[] = [];
-    const includeCanvas = (scope === "all" || scope === "canvas") && (!taskId || nodeIds.size > 0);
-    const includeWorkbench = !nodeIds.size || Boolean(taskId);
-
-    if (includeCanvas && canvasSnapshot) {
-        canvasSnapshot.nodes.forEach((node) => {
-            const status = normalizeCanvasGenerationStatus(node.metadata?.status);
-            if (!status || (nodeIds.size && !nodeIds.has(node.id))) return;
-            const metadata = node.metadata || {};
-            if (!nodeIds.size && node.type !== "config" && status !== "running" && status !== "failed" && !metadata.generationMode && !metadata.generationType && !metadata.model) return;
-            tasks.push({ id: node.id, source: "canvas", status, kind: metadata.generationMode || node.type, title: node.title, prompt: compactPrompt(metadata.prompt || metadata.composerContent), projectId: canvasSnapshot.projectId, error: metadata.errorDetails });
-        });
-    }
-
-    if (includeWorkbench) {
-        useWorkbenchAgentStore.getState().tasks.forEach((task) => {
-            if ((scope === "image" || scope === "video") && task.kind !== scope) return;
-            if (scope === "canvas" || (taskId && task.id !== taskId)) return;
-            tasks.push({ ...task, source: task.kind, prompt: compactPrompt(task.prompt) });
-        });
-    }
-
-    tasks.sort((a, b) => generationStatusOrder(a.status) - generationStatusOrder(b.status) || (b.updatedAt || "").localeCompare(a.updatedAt || ""));
-    const summary: Record<GenerationStatus, number> = { idle: 0, queued: 0, running: 0, succeeded: 0, failed: 0 };
-    tasks.forEach((task) => (summary[task.status] += 1));
-    return { total: tasks.length, summary, tasks: tasks.slice(0, limit) };
+    return buildGenerationStatus(input, canvasSnapshot, useWorkbenchAgentStore.getState().tasks);
 }
 
-function generationStatusOrder(status: GenerationStatus) {
-    return status === "running" ? 0 : status === "queued" ? 1 : 2;
-}
-
-function normalizeCanvasGenerationStatus(status: unknown): GenerationStatus | null {
-    if (status === "idle") return "idle";
-    if (status === "loading") return "running";
-    if (status === "success") return "succeeded";
-    if (status === "error") return "failed";
-    return null;
-}
-
-function compactPrompt(prompt: unknown) {
-    const value = typeof prompt === "string" ? prompt.trim() : "";
-    return value ? `${value.slice(0, 200)}${value.length > 200 ? "..." : ""}` : undefined;
+/** read_node_text：把节点正文/提示词逐字全文回给 Agent（批量执行与自修的唯一全文通道）。 */
+function readNodeTextTool(input: SiteToolInput, canvasSnapshot?: CanvasAgentSnapshot | null) {
+    const nodeId = typeof input.nodeId === "string" ? input.nodeId.trim() : "";
+    if (!nodeId) throw new Error(siteText("nodeIdRequired"));
+    const text = readNodeFullText({ nodeId, canvasSnapshot, projects: useCanvasStore.getState().projects });
+    if (!text) throw new Error(siteText("nodeNotFound", { nodeId }));
+    return text;
 }
 
 function listCanvasProjects(input: SiteToolInput) {
