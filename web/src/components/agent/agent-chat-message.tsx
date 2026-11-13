@@ -7,7 +7,7 @@ import { useTranslation } from "react-i18next";
 import i18n from "@/i18n";
 import { useCopyText } from "@/hooks/use-copy-text";
 import { canvasThemes } from "@/lib/canvas-theme";
-import { useAgentStore, type AgentCanvasReference, type AgentPendingApproval, type AgentSkillReference } from "@/stores/use-agent-store";
+import { useAgentStore, type AgentCanvasReference, type AgentPaidConfirmation, type AgentPendingApproval, type AgentSkillReference } from "@/stores/use-agent-store";
 import { resolveAgentMessageAssetUrl, revealAgentLocalFile } from "@/services/api/canvas-agent";
 import { AgentCanvasReferencePreview, canvasReferenceIcon, canvasReferenceKindLabel } from "./agent-canvas-reference-preview";
 import { agentInlineTokenClass, agentInlineTokenIconClass, agentInlineTokenMediaClass, agentReferenceMarker, parseAgentInlineTokens } from "./agent-chat-inline-tokens";
@@ -210,6 +210,53 @@ export function AgentPendingToolCard({ summary, detail, theme, onReject, onAppro
                     </Button>
                 </div>
             ) : null}
+        </div>
+    );
+}
+
+export function AgentPaidConfirmationCard({ confirmation, theme, onDecide }: { confirmation: AgentPaidConfirmation; theme: (typeof canvasThemes)[keyof typeof canvasThemes]; onDecide: (approvedActionIds: string[]) => void }) {
+    const { t } = useTranslation();
+    const [selected, setSelected] = useState<string[]>(() => confirmation.actions.map((action) => action.id));
+    useEffect(() => {
+        setSelected(confirmation.actions.map((action) => action.id));
+    }, [confirmation.requestId]);
+    const toggle = (id: string) => setSelected((current) => (current.includes(id) ? current.filter((item) => item !== id) : [...current, id]));
+    const total = confirmation.actions.reduce((sum, action) => sum + (action.count || 1), 0);
+    return (
+        <div className="min-w-0 rounded-xl border px-3 py-3" style={{ borderColor: "rgba(217,119,6,.35)", background: "rgba(217,119,6,.03)", color: theme.node.text }}>
+            <div className="flex min-w-0 items-center gap-2 text-sm font-medium leading-5">
+                <CircleAlert className="size-4 shrink-0 text-amber-600" />
+                <span className="min-w-0 flex-1">{t("agent.message.paidConfirmTitle")}</span>
+                <span className="shrink-0 rounded-md px-1.5 py-0.5 text-[11px] font-medium" style={{ background: "rgba(217,119,6,.12)", color: "#b45309" }}>{t("agent.message.paidConfirmBadge")}</span>
+            </div>
+            <div className="mt-1 pl-6 text-xs leading-5" style={{ color: theme.node.muted }}>{t("agent.message.paidConfirmCount", { count: confirmation.actions.length, total })}</div>
+            <div className="mt-2 space-y-1.5">
+                {confirmation.actions.map((action, index) => (
+                    <label key={action.id} className="flex cursor-pointer items-start gap-2 rounded-lg px-2 py-1.5" style={{ background: theme.toolbar.panel }}>
+                        <input
+                            type="checkbox"
+                            className="mt-0.5 size-3.5 shrink-0 accent-amber-600"
+                            checked={selected.includes(action.id)}
+                            onChange={() => toggle(action.id)}
+                            aria-label={t("agent.message.paidActionToggle", { index: index + 1 })}
+                        />
+                        <span className="min-w-0 flex-1 text-xs leading-5">
+                            <span className="font-medium">{t("agent.message.paidActionLine", { index: index + 1, mode: t(`agent.message.paidMode.${action.mode}`) })}</span>
+                            <span style={{ color: theme.node.muted }}> · {action.nodeId || t("agent.message.paidNoNode")} · {action.channel || t("agent.message.paidChannelUnknown")} · ×{action.count || 1}</span>
+                            {action.prompt ? <span className="mt-0.5 block truncate" style={{ color: theme.node.muted }} title={action.prompt}>{action.prompt}</span> : null}
+                        </span>
+                    </label>
+                ))}
+            </div>
+            <div className="mt-2 pl-6 text-[11px] leading-4" style={{ color: theme.node.muted }}>{t("agent.message.paidEstimate")}</div>
+            <div className="mt-3 flex justify-end gap-2 border-t pt-3" style={{ borderColor: theme.node.stroke }}>
+                <Button danger type="text" className="!h-8" icon={<XCircle className="size-3.5" />} onClick={() => onDecide([])}>
+                    {t("agent.message.paidRejectAll")}
+                </Button>
+                <Button type="text" className="!h-8" disabled={!selected.length} icon={<CheckCircle2 className="size-3.5" />} style={{ color: "#16a34a" }} onClick={() => onDecide(selected)}>
+                    {t("agent.message.paidApprove", { count: selected.length })}
+                </Button>
+            </div>
         </div>
     );
 }

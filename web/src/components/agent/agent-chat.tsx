@@ -4,8 +4,8 @@ import { useTranslation } from "react-i18next";
 
 import { canvasThemes } from "@/lib/canvas-theme";
 import { summarizeCanvasAgentOps } from "@/lib/canvas/canvas-agent-ops";
-import { useAgentStore, type AgentChatItem, type AgentPendingApproval, type AgentPendingToolCall, type AgentTokenUsage } from "@/stores/use-agent-store";
-import { AgentApprovalCard, AgentChatMessage, AgentCommandGroup, AgentPendingToolCard, AgentToolCard, AgentWorkingMessage } from "./agent-chat-message";
+import { useAgentStore, type AgentChatItem, type AgentPaidConfirmation, type AgentPendingApproval, type AgentPendingToolCall, type AgentTokenUsage } from "@/stores/use-agent-store";
+import { AgentApprovalCard, AgentChatMessage, AgentCommandGroup, AgentPaidConfirmationCard, AgentPendingToolCard, AgentToolCard, AgentWorkingMessage } from "./agent-chat-message";
 import { agentMessageToChatMessage, currentPlanMessage, isPlanMessage, latestPlanMessage, toolCallDetail, toolName, workingActivity } from "./agent-event-formatters";
 import { AgentScrollToBottom } from "./agent-scroll-to-bottom";
 
@@ -15,20 +15,24 @@ const historyMessageStyle = { contentVisibility: "auto", containIntrinsicSize: "
 export function AgentChatTimeline({
     theme,
     pendingTool,
+    pendingPaidConfirmation,
     pendingApprovals,
     sending,
     waiting,
     onRejectTool,
     onApproveTool,
+    onPaidDecision,
     onApprovalDecision,
 }: {
     theme: (typeof canvasThemes)[keyof typeof canvasThemes];
     pendingTool: AgentPendingToolCall | null;
+    pendingPaidConfirmation: AgentPaidConfirmation | null;
     pendingApprovals: AgentPendingApproval[];
     sending: boolean;
     waiting: boolean;
     onRejectTool: () => void;
     onApproveTool: () => void;
+    onPaidDecision: (confirmation: AgentPaidConfirmation, approvedActionIds: string[]) => void;
     onApprovalDecision: (approval: AgentPendingApproval, decision: "accept" | "acceptForSession" | "decline") => void;
 }) {
     const { t } = useTranslation();
@@ -91,6 +95,7 @@ export function AgentChatTimeline({
                             onApprove={onApproveTool}
                         />
                     ) : null}
+                    {pendingPaidConfirmation ? <AgentPaidConfirmationCard confirmation={pendingPaidConfirmation} theme={theme} onDecide={(approvedActionIds) => onPaidDecision(pendingPaidConfirmation, approvedActionIds)} /> : null}
                     {pendingApprovals.map((approval) => <AgentApprovalCard key={approval.requestId} approval={approval} theme={theme} onDecision={(decision) => onApprovalDecision(approval, decision)} />)}
                     {(sending || waiting || showBootstrap) && !streaming && !pendingTool && !pendingApprovals.length ? <AgentWorkingMessage text={working.text} detail={"detail" in working && typeof working.detail === "string" ? working.detail : undefined} status={showBootstrap ? bootstrapStatus?.status : undefined} mcpStatuses={showBootstrap ? Object.entries(mcpStartupStatuses).map(([name, item]) => ({ name, ...item })) : []} activityKey={working.key} theme={theme} /> : null}
                 </div>

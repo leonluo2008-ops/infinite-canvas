@@ -64,6 +64,30 @@ export async function postToolResult(endpoint: string, token: string, clientId: 
     await fetchAgentJson(endpoint, token, `/canvas/result?clientId=${encodeURIComponent(clientId)}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
 }
 
+/** 告知 Agent「付费请求已挂起给人工确认」：Agent 收到后不再按超时丢弃回执。 */
+export async function ackCanvasToolRequest(endpoint: string, token: string, clientId: string, requestId: string) {
+    try {
+        await fetchAgentJson(endpoint, token, `/canvas/ack?clientId=${encodeURIComponent(clientId)}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ requestId }) });
+    } catch {
+        // ack 失败不阻塞确认卡展示；超时后 Agent 会下发 tool_cancel 撤销本次请求。
+    }
+}
+
+export type AgentPaidDecisionResponse = {
+    ok?: boolean;
+    executed?: boolean;
+    name?: string;
+    input?: { ops?: unknown[] } & Record<string, unknown>;
+    approved?: Array<{ id: string; nodeId?: string; mode?: string; channel?: string; count?: number }>;
+    rejected?: Array<{ id: string; nodeId?: string; mode?: string; channel?: string; count?: number }>;
+    error?: string;
+};
+
+/** 回传人工确认结果：只有勾选条目会被 Agent 放行，返回本次实际下发的输入。 */
+export async function confirmCanvasPaidActions(endpoint: string, token: string, clientId: string, requestId: string, approvedActionIds: string[]) {
+    return await fetchAgentJson<AgentPaidDecisionResponse>(endpoint, token, `/canvas/confirm?clientId=${encodeURIComponent(clientId)}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ requestId, approvedActionIds }) });
+}
+
 export async function postCodexApproval(endpoint: string, token: string, requestId: string, decision: "accept" | "acceptForSession" | "decline") {
     await fetchAgentJson(endpoint, token, "/agent/codex/approval", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ requestId, decision }) });
 }

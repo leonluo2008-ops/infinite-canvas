@@ -143,6 +143,14 @@ export function startHttpServer() {
         const ok = session.resolveResult(String(req.query.clientId || ""), req.body);
         res.status(ok ? 200 : 409).json({ ok });
     });
+    app.post("/canvas/ack", (req, res) => {
+        const ok = session.ackToolRequest(String(req.query.clientId || ""), req.body);
+        res.status(ok ? 200 : 409).json({ ok });
+    });
+    app.post("/canvas/confirm", (req, res) => {
+        const result = session.confirmPaidActions(String(req.query.clientId || ""), req.body);
+        res.status(result.ok ? 200 : 409).json(result);
+    });
     app.get("/agent/attachments/:attachmentId", route(async (req, res) => {
         const attachment = session.getTurnAttachment(String(req.query.clientId || ""), routeParam(req.params.attachmentId));
         const data = attachment.dataUrl.split(",", 2)[1];

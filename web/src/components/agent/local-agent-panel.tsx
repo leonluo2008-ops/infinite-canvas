@@ -18,10 +18,10 @@ import { uploadImage } from "@/services/image-storage";
 import { useThemeStore } from "@/stores/use-theme-store";
 import { useAgentSkillStore } from "@/stores/use-agent-skill-store";
 import { useShallow } from "zustand/react/shallow";
-import { useAgentStore, type AgentAttachment, type AgentBootstrapStatus, type AgentCanvasContext, type AgentCanvasReference, type AgentChatItem, type AgentConversationState, type AgentModel, type AgentPendingApproval, type AgentPendingToolCall, type AgentPermissionMode, type AgentReasoningEffort, type AgentThreadSummary } from "@/stores/use-agent-store";
+import { useAgentStore, type AgentAttachment, type AgentBootstrapStatus, type AgentCanvasContext, type AgentCanvasReference, type AgentChatItem, type AgentConversationState, type AgentModel, type AgentPaidConfirmation, type AgentPendingApproval, type AgentPendingToolCall, type AgentPermissionMode, type AgentReasoningEffort, type AgentThreadSummary } from "@/stores/use-agent-store";
 import { type CanvasAgentOp, type CanvasAgentSnapshot } from "@/lib/canvas/canvas-agent-ops";
 import { isSiteTool, runSiteTool } from "@/lib/agent/agent-site-tools";
-import { acknowledgeCodexHistory, activateAgentClient, AgentApiError, discoverAgentConfig, fetchAgentJson, interruptAgentTurn, interruptCodexTurn, postCodexApproval, postState, postToolResult } from "@/services/api/canvas-agent";
+import { acknowledgeCodexHistory, activateAgentClient, AgentApiError, ackCanvasToolRequest, confirmCanvasPaidActions, discoverAgentConfig, fetchAgentJson, interruptAgentTurn, interruptCodexTurn, postCodexApproval, postState, postToolResult } from "@/services/api/canvas-agent";
 import { AgentChatTimeline, AgentTaskProgress, AgentUsageBar } from "./agent-chat";
 import { AgentChatComposer } from "./agent-chat-composer";
 import { AgentConnectView } from "./agent-connect-view";
@@ -180,7 +180,7 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
     // canvasContext is intentionally excluded because project updates it every frame during dragging and resizing.
     // The panel uses it only for ref synchronization and debounced postState calls, never during rendering.
     // Subscribing here would rerender the panel every frame and amplify the #185 crash, so it is observed imperatively below.
-    const { width, url, token, connected, enabled, prompt, attachments, sending, waiting, tokenUsage, eventLogs, threads, activeThreadId, workspacePath, loadingThreads, activeTab, confirmTools, permissionMode, models, model, reasoningEffort, activity, conversation, connectError, pendingTool, pendingApprovals } = useAgentStore(
+    const { width, url, token, connected, enabled, prompt, attachments, sending, waiting, tokenUsage, eventLogs, threads, activeThreadId, workspacePath, loadingThreads, activeTab, confirmTools, permissionMode, models, model, reasoningEffort, activity, conversation, connectError, pendingTool, pendingPaidConfirmation, pendingApprovals } = useAgentStore(
         useShallow((state) => ({
             width: state.width,
             url: state.url,
@@ -207,6 +207,7 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
             conversation: state.conversation,
             connectError: state.connectError,
             pendingTool: state.pendingTool,
+            pendingPaidConfirmation: state.pendingPaidConfirmation,
             pendingApprovals: state.pendingApprovals,
         })),
     );
@@ -316,6 +317,7 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
             messages,
             tokenUsage: threadChanged || emptyThread ? null : current.tokenUsage,
             pendingTool: null,
+            pendingPaidConfirmation: threadChanged || emptyThread ? null : current.pendingPaidConfirmation,
             pendingApprovals: threadChanged || emptyThread ? [] : current.pendingApprovals,
         });
         return loadThreadsSequenceRef.current;
@@ -485,6 +487,29 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
             const data = parseEventData<AgentPendingToolCall>(event);
             if (data) void handleToolCall(endpoint, token, data);
         });
+        source.addEventListener("paid_confirmation", (event) => {
+            if (!isCurrentConnection()) return;
+            const data = parseEventData<AgentPaidConfirmation>(event);
+            if (!data?.requestId || !Array.isArray(data.actions)) return;
+            // 付费动作：页面此刻只拿到清单，没拿到可执行 ops；确认结果由 /canvas/confirm 回传。
+            setAgentState({ pendingPaidConfirmation: data });
+            addEventLog(rt("awaitingPaidConfirmation"), rt("paidActionCount", { count: data.actions.length }), data);
+            // 立刻回执「已挂起」：Agent 收到后不再按超时丢弃本次请求。
+            void ackCanvasToolRequest(endpoint, token, clientIdRef.current, data.requestId);
+        });
+        source.addEventListener("tool_cancel", (event) => {
+            if (!isCurrentConnection()) return;
+            const data = parseEventData<{ requestId?: string; reason?: string }>(event);
+            if (!data?.requestId) return;
+            const current = useAgentStore.getState();
+            // Agent 撤销本次请求：页面不得再执行，也不重发。
+            if (current.pendingPaidConfirmation?.requestId === data.requestId) setAgentState({ pendingPaidConfirmation: null });
+            if (current.pendingTool?.requestId === data.requestId) {
+                pendingToolRef.current = null;
+                setAgentState({ pendingTool: null });
+            }
+            addEventLog(t("agent.message.canvasToolCanceled"), data.reason || "", data);
+        });
         source.addEventListener("codex_approval", (event) => {
             if (!isCurrentConnection()) return;
             const data = parseEventData<AgentPendingApproval>(event);
@@ -610,6 +635,7 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
                 silentConnect: false,
                 fragmentBootstrap: false,
                 pendingTool: null,
+                pendingPaidConfirmation: null,
                 pendingApprovals: [],
             });
             useAgentSkillStore.getState().reset();
@@ -946,6 +972,25 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
         await runToolCall(endpoint, token, tool);
     };
 
+    /** 付费确认：只放行勾选条目，被拒条目由 Agent 侧从 ops 中剔除，零调用。 */
+    const decidePaidActions = async (confirmation: AgentPaidConfirmation, approvedActionIds: string[]) => {
+        const known = new Set(confirmation.actions.map((action) => action.id));
+        const approved = approvedActionIds.filter((id) => known.has(id));
+        setAgentState({ pendingPaidConfirmation: null });
+        try {
+            const decision = await confirmCanvasPaidActions(endpoint, token, clientIdRef.current, confirmation.requestId, approved);
+            if (!decision?.executed || !decision.input) {
+                addEventLog(rt("paidGenerationCanceled"), rt("paidActionCount", { count: decision?.rejected?.length || 0 }), decision);
+                return;
+            }
+            addEventLog(rt("paidGenerationApproved"), rt("paidActionCount", { count: decision.approved?.length || approved.length }), decision);
+            await runToolCall(endpoint, token, { requestId: confirmation.requestId, name: decision.name || confirmation.name, input: decision.input as AgentPendingToolCall["input"] });
+        } catch (error) {
+            addEventLog(rt("paidGenerationFailed"), error);
+            message.error(error instanceof Error ? error.message : rt("paidGenerationFailed"));
+        }
+    };
+
     const decideApproval = async (approval: AgentPendingApproval, decision: "accept" | "acceptForSession" | "decline") => {
         const current = useAgentStore.getState();
         const pending = current.pendingApprovals.find((item) => item.requestId === approval.requestId);
@@ -1075,6 +1120,7 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
             sending: false,
             fragmentBootstrap: false,
             pendingTool: null,
+            pendingPaidConfirmation: null,
             pendingApprovals: [],
             conversation: { revision: 0, conversationId: "", threadId: "", status: "idle", mcpStatuses: {} },
             bootstrapStatus: null,
@@ -1478,7 +1524,7 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
                 />
             ) : (
                 <>
-                    <AgentChatTimeline theme={theme} pendingTool={pendingTool} pendingApprovals={pendingApprovals} sending={sending} waiting={waiting} onRejectTool={rejectPendingTool} onApproveTool={approvePendingTool} onApprovalDecision={decideApproval} />
+                    <AgentChatTimeline theme={theme} pendingTool={pendingTool} pendingPaidConfirmation={pendingPaidConfirmation} pendingApprovals={pendingApprovals} sending={sending} waiting={waiting} onRejectTool={rejectPendingTool} onApproveTool={approvePendingTool} onPaidDecision={decidePaidActions} onApprovalDecision={decideApproval} />
                     <AgentTaskProgress theme={theme} busy={sending || waiting} />
                     {tokenUsage ? <AgentUsageBar usage={tokenUsage} theme={theme} /> : null}
                     <AgentChatComposer

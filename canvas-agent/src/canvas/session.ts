@@ -4,11 +4,32 @@ import type { ServerResponse } from "node:http";
 import type { AgentAttachment } from "../agent/types.js";
 import { logger } from "../utils/logger.js";
 import { buildCanvasToolRequest, fitAttachmentNodeSize } from "./operations.js";
+import { applyPaidDecision, collectPaidActions, type PaidAction, type PaidDecision } from "./paid-actions.js";
 import type { ToolName } from "./schemas.js";
 import { compactCanvasState, compactNode, isToolName, nextCanvasX, parseToolInput } from "./tools.js";
 import type { CanvasSnapshot } from "./types.js";
 
-type PendingRequest = { clientId: string; resolve: (value: unknown) => void; reject: (error: Error) => void };
+/** 付费动作挂起人工确认时，等页面「已挂起」回执的上限；收到回执即撤销计时。 */
+const PAID_CONFIRMATION_ACK_TIMEOUT_MS = 30000;
+/** 普通画布工具请求等页面回执的上限（原有 30s 语义，未改动）。 */
+const CANVAS_TOOL_TIMEOUT_MS = 30000;
+
+/** 待人工确认的付费请求。phase=confirming 期间页面回传的执行结果一律拒收。 */
+type PaidPending = {
+    name: ToolName;
+    input: Record<string, unknown>;
+    actions: PaidAction[];
+    phase: "confirming" | "approved";
+    decision?: PaidDecision;
+};
+type PendingRequest = {
+    clientId: string;
+    name: ToolName;
+    resolve: (value: unknown) => void;
+    reject: (error: Error) => void;
+    timer: ReturnType<typeof setTimeout> | null;
+    paid: PaidPending | null;
+};
 type TurnAttachment = { clientId: string; id: string; name: string; type: string; size: number; width: number; height: number; dataUrl: string };
 type ReplayEvent = { type: string; payload: Record<string, unknown> };
 export type CodexState = { busy: boolean; threadId: string; turnId: string };
@@ -57,8 +78,12 @@ export class CanvasSession {
     private conversationState: ConversationState;
     private conversationInventoryComplete = false;
     private preparedConversationThreadId = "";
+    private canvasToolTimeoutMs: number;
+    private paidAckTimeoutMs: number;
 
-    constructor(activeThreadId = "") {
+    constructor(activeThreadId = "", options: { canvasToolTimeoutMs?: number; paidAckTimeoutMs?: number } = {}) {
+        this.canvasToolTimeoutMs = options.canvasToolTimeoutMs ?? CANVAS_TOOL_TIMEOUT_MS;
+        this.paidAckTimeoutMs = options.paidAckTimeoutMs ?? PAID_CONFIRMATION_ACK_TIMEOUT_MS;
         this.conversationState = {
             revision: 1,
             conversationId: activeThreadId || crypto.randomUUID(),
@@ -376,10 +401,52 @@ export class CanvasSession {
     resolveResult(clientId: string, body: { requestId?: string; error?: string; result?: unknown }) {
         const item = body.requestId ? this.pending.get(body.requestId) : null;
         if (!item || !body.requestId || item.clientId !== clientId) return false;
+        // 付费动作未获人工放行前，页面回传的执行结果一律拒收：杜绝「未确认先执行」。
+        if (item.paid && item.paid.phase !== "approved") return false;
         this.pending.delete(body.requestId);
-        logger.debug("Canvas tool result received", { clientId, requestId: body.requestId, error: body.error, result: body.result });
-        body.error ? item.reject(new Error(body.error)) : item.resolve(body.result);
+        const paid = item.paid?.decision ? paidResultSummary(item.paid.decision) : undefined;
+        logger.debug("Canvas tool result received", { clientId, requestId: body.requestId, error: body.error, result: body.result, paid: Boolean(paid) });
+        const result = paid ? withPaidResult(body.result, paid) : body.result;
+        body.error ? item.reject(new Error(body.error)) : item.resolve(result);
         return true;
+    }
+
+    /**
+     * 页面确认「付费请求已挂起给人工确认」：撤销 ack 计时。
+     * 撤销之后该请求不再按超时丢弃回执，避免「Agent 视角超时失败 + 页面事后仍执行」双态。
+     */
+    ackToolRequest(clientId: string, body: { requestId?: string }) {
+        const requestId = String(body.requestId || "");
+        const item = requestId ? this.pending.get(requestId) : null;
+        if (!item || !requestId || item.clientId !== clientId) return false;
+        this.clearPendingTimer(item);
+        logger.debug("Canvas tool request parked for confirmation", { clientId, requestId });
+        return true;
+    }
+
+    /**
+     * 人工确认结果：勾选项放行、其余条目拒付。
+     * 返回本次实际要下发的输入；全拒时 executed=false 且调用方不得向页面下发任何动作。
+     * 不做自动重试：拒绝/取消只结束本次调用，重试只能由人再次确认。
+     */
+    confirmPaidActions(clientId: string, body: { requestId?: string; approvedActionIds?: unknown }) {
+        const requestId = String(body.requestId || "");
+        const item = requestId ? this.pending.get(requestId) : null;
+        if (!item || !requestId || item.clientId !== clientId || !item.paid) return { ok: false, error: "没有待确认的付费动作" };
+        if (item.paid.phase !== "confirming") return { ok: false, error: "该付费请求已处理" };
+        const approvedIds = Array.isArray(body.approvedActionIds) ? body.approvedActionIds.filter((id): id is string => typeof id === "string") : [];
+        const decision = applyPaidDecision(item.paid.name, item.paid.input, item.paid.actions, approvedIds);
+        this.clearPendingTimer(item);
+        item.paid.phase = "approved";
+        if (!decision.dispatchName || !decision.dispatchInput) {
+            this.pending.delete(requestId);
+            item.reject(new Error("用户取消了付费生成（未执行）"));
+            logger.info("Paid canvas action rejected", { requestId, rejected: decision.rejected.length });
+            return { ok: true, executed: false, name: item.paid.name, approved: [], rejected: decision.rejected.map(actionBrief) };
+        }
+        item.paid.decision = decision;
+        logger.info("Paid canvas action approved", { requestId, approved: decision.approved.length, rejected: decision.rejected.length });
+        return { ok: true, executed: true, name: decision.dispatchName, input: decision.dispatchInput, approved: decision.approved.map(actionBrief), rejected: decision.rejected.map(actionBrief) };
     }
 
     /** 向全部已连接网页广播事件。 */
@@ -488,20 +555,78 @@ export class CanvasSession {
 
     /** 向目标网页发送工具请求并等待调用结果。 */
     private async requestCanvasTool(name: ToolName, input: Record<string, unknown>) {
+        const paidActions = collectPaidActions(name, input, this.canvasState);
+        // 付费动作一律走人工确认队列，与页面的 confirmTools 开关、自动连接路径无关。
+        if (paidActions.length) return await this.requestPaidConfirmation(name, input, paidActions);
+        return await this.dispatchCanvasTool(name, input, null, this.canvasToolTimeoutMs);
+    }
+
+    /** 把含付费动作的请求挂起，等页面回执 + 人工确认；确认结果回传后才允许执行。 */
+    private async requestPaidConfirmation(name: ToolName, input: Record<string, unknown>, actions: PaidAction[]) {
         const requestId = crypto.randomUUID();
         const clientId = this.targetClientId;
         const client = this.clients.get(clientId);
         if (!client) throw new Error("当前没有已连接画布");
+        const paid: PaidPending = { name, input, actions, phase: "confirming" };
+        // 先登记再发事件：页面可能立刻回 ack，登记晚到会把 ack 丢掉。
+        const result = this.waitForCanvasResult(requestId, clientId, name, paid, this.paidAckTimeoutMs);
+        sendEvent(client, "paid_confirmation", { requestId, name, actions, estimate: null, ackTimeoutMs: this.paidAckTimeoutMs });
+        logger.info("Paid canvas action awaiting confirmation", { requestId, name, actions: actions.length, clientId });
+        return await result;
+    }
+
+    /** 下发一次画布工具请求并登记待回执。 */
+    private async dispatchCanvasTool(name: ToolName, input: Record<string, unknown>, paid: PaidPending | null, timeoutMs: number | null) {
+        const requestId = crypto.randomUUID();
+        const clientId = this.targetClientId;
+        const client = this.clients.get(clientId);
+        if (!client) throw new Error("当前没有已连接画布");
+        const result = this.waitForCanvasResult(requestId, clientId, name, paid, timeoutMs);
         sendEvent(client, "tool_call", { requestId, name, input });
         logger.debug("Canvas tool request sent", { requestId, name, input, clientId });
-        return await new Promise((resolve, reject) => {
-            const timer = setTimeout(() => {
-                this.pending.delete(requestId);
-                logger.warn("Canvas tool request timed out", { requestId, name, clientId });
-                reject(new Error("画布操作超时"));
-            }, 30000);
-            this.pending.set(requestId, { clientId, resolve: (value) => (clearTimeout(timer), resolve(value)), reject: (error) => (clearTimeout(timer), reject(error)) });
+        return await result;
+    }
+
+    /** 登记待回执并等待页面返回；超时则撤销页面侧动作并显式失败（不自动重试）。 */
+    private waitForCanvasResult(requestId: string, clientId: string, name: ToolName, paid: PaidPending | null, timeoutMs: number | null) {
+        return new Promise<unknown>((resolve, reject) => {
+            const item: PendingRequest = {
+                clientId,
+                name,
+                paid,
+                timer: null,
+                resolve: (value) => {
+                    this.clearPendingTimer(item);
+                    resolve(value);
+                },
+                reject: (error) => {
+                    this.clearPendingTimer(item);
+                    reject(error);
+                },
+            };
+            if (timeoutMs) {
+                item.timer = setTimeout(() => {
+                    this.pending.delete(requestId);
+                    // 超时即向页面发撤销信号：页面收到后不得再执行该请求。
+                    this.cancelCanvasRequest(clientId, requestId);
+                    logger.warn("Canvas tool request timed out", { requestId, name, clientId });
+                    item.reject(new Error("画布操作超时"));
+                }, timeoutMs);
+                item.timer.unref?.();
+            }
+            this.pending.set(requestId, item);
         });
+    }
+
+    private clearPendingTimer(item: PendingRequest) {
+        if (!item.timer) return;
+        clearTimeout(item.timer);
+        item.timer = null;
+    }
+
+    private cancelCanvasRequest(clientId: string, requestId: string) {
+        const client = this.clients.get(clientId);
+        if (client) sendEvent(client, "tool_cancel", { requestId, reason: "timeout" });
     }
 }
 
@@ -538,4 +663,25 @@ function sendEvent(res: ServerResponse, type: string, payload: unknown) {
 function positiveNumber(value: unknown, fallback: number) {
     const number = Number(value);
     return Number.isFinite(number) && number > 0 ? number : fallback;
+}
+
+/** 确认卡片/回执里对外暴露的付费条目摘要（不含 prompt 全文）。 */
+function actionBrief(action: PaidAction) {
+    return { id: action.id, nodeId: action.nodeId || "", mode: action.mode, channel: action.channel, count: action.count };
+}
+
+/** 回给 Agent 的付费结果摘要：放行了哪些、拒了哪些、费用口径。 */
+function paidResultSummary(decision: PaidDecision) {
+    return {
+        executed: decision.approved.map(actionBrief),
+        rejected: decision.rejected.map(actionBrief),
+        // 无渠道报价能力：estimate 恒为 null，Agent 不得据此宣称费用。
+        estimate: null,
+    };
+}
+
+/** 把付费摘要附加到页面回传结果上，保持原有结果字段不变。 */
+function withPaidResult(result: unknown, paid: unknown) {
+    if (result && typeof result === "object" && !Array.isArray(result)) return { ...(result as Record<string, unknown>), paidActions: paid };
+    return { result, paidActions: paid };
 }

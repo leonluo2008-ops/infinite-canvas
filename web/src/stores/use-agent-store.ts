@@ -12,6 +12,10 @@ export type AgentSkillReference = { name: string; path: string; displayName?: st
 export type AgentChatItem = { id: string; itemId?: string; clientMessageId?: string; threadId?: string; turnId?: string; role: AgentChatRole; title?: string; text: string; meta?: string; detail?: unknown; attachments?: AgentMessageAttachment[]; canvasReferences?: AgentCanvasReference[]; skill?: AgentSkillReference; streamId?: string; activityItems?: Record<string, string> };
 export type AgentEventLog = { id: string; time: string; title: string; text: string; raw?: unknown };
 export type AgentPendingToolCall = { requestId: string; name: string; input?: { ops?: CanvasAgentOp[]; path?: string } & Record<string, unknown> };
+/** 单条付费动作（确认卡逐条展示，一次确认只放行勾选项）。 */
+export type AgentPaidAction = { id: string; tool?: string; kind?: string; nodeId?: string; mode: string; channel?: string; prompt?: string; count?: number; estimate?: null };
+/** 服务端挂起的付费确认：拿到它时页面还没收到可执行 ops，确认后才回传。 */
+export type AgentPaidConfirmation = { requestId: string; name: string; actions: AgentPaidAction[]; ackTimeoutMs?: number };
 export type AgentPermissionMode = "request" | "automatic" | "full";
 export type AgentReasoningEffort = "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
 export type AgentModel = {
@@ -80,6 +84,7 @@ type AgentStore = {
     mcpStartupStatuses: Record<string, AgentBootstrapStatus>;
     connectError: string;
     pendingTool: AgentPendingToolCall | null;
+    pendingPaidConfirmation: AgentPaidConfirmation | null;
     pendingApprovals: AgentPendingApproval[];
     setAgentState: (patch: Partial<Omit<AgentStore, "setAgentState" | "connectAgent" | "disconnectAgent" | "addMessage" | "addEventLog" | "clearEventLogs" | "openPanel" | "closePanel" | "togglePanel" | "setCanvasContext">>) => void;
     openPanel: () => void;
@@ -132,6 +137,7 @@ export const useAgentStore = create<AgentStore>((set, get) => ({
     mcpStartupStatuses: {},
     connectError: "",
     pendingTool: null,
+    pendingPaidConfirmation: null,
     pendingApprovals: [],
     setAgentState: (patch) => set(patch),
     openPanel: () => set({ panelOpen: true, panelMounted: true, panelClosing: false }),
