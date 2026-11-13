@@ -20,7 +20,7 @@
  * 失败 rc=1（禁降级：任何断言失败如实计入 fails，不跳过）。
  */
 import { execFileSync } from "node:child_process";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -35,6 +35,8 @@ const projectKey = argOf("project", "无限画布 3");
 const outDir = path.resolve(argOf("out", "C:/Users/leon3/AppData/Local/hermes/cache/scratch/p6-out"));
 const PAYLOAD = path.join(outDir, "persisted-store.json");
 mkdirSync(outDir, { recursive: true });
+// 开工先删上一次的 payload：否则任何「读错目录」的子进程都会读到陈旧状态，rehydrate 断言会假绿。
+if (!args.includes("--reload")) rmSync(PAYLOAD, { force: true });
 const bundleDir = path.resolve("node_modules/.probe-p6");
 mkdirSync(bundleDir, { recursive: true });
 
@@ -76,7 +78,8 @@ if (args.includes("--reload")) {
     const mod = await import(pathToFileURL(out).href);
     const store = mod.store.useCanvasStore;
     for (let attempt = 0; attempt < 200 && !store.getState().hydrated; attempt += 1) await new Promise((resolve) => setTimeout(resolve, 25));
-    const project = store.getState().projects[0];
+    // 取「带批次记录的项目」= 本探针项目；projects[0] 会随 importProject 的插入位置漂移，不能当锚点。
+    const project = store.getState().projects.find((item) => (item.workflowBatches || []).length) || store.getState().projects[0];
     mod.wanProjects.bindWanFileTaskProject(project?.id || "");
     const job = String(process.env.P6_RELOAD_JOB || "");
     console.log(
@@ -605,8 +608,19 @@ const nodeCountBeforeResume = canvas.nodes().length;
 syncProject();
 await useCanvasStore.getState().flushProjects("p6-resume-final");
 writeFileSync(PAYLOAD, readPersisted(), "utf8");
-const reloadRaw = execFileSync(process.execPath, [path.resolve("scripts/probe-p6-batch-queue.mjs"), "--reload"], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, P6_RELOAD_JOB: "none" } });
-const reloaded = JSON.parse(reloadRaw.trim().split("\n").at(-1));
+// 子进程必须继承 --out/--store：否则它会读默认 outDir 里上一次的陈旧 payload（rehydrate 断言就会「假绿」）。
+const reloadChild = (job) =>
+    JSON.parse(
+        execFileSync(process.execPath, [path.resolve("scripts/probe-p6-batch-queue.mjs"), "--reload", "--out", outDir, "--store", storePath], {
+            encoding: "utf8",
+            stdio: ["ignore", "pipe", "pipe"],
+            env: { ...process.env, P6_RELOAD_JOB: job },
+        })
+            .trim()
+            .split("\n")
+            .at(-1),
+    );
+const reloaded = reloadChild("none");
 check("F 新进程真 rehydrate：store 已水合、项目还在", reloaded.hydrated === true && reloaded.projectId === projectId, JSON.stringify(reloaded));
 const reloadedResume = (reloaded.batches || []).find((item) => item.batchId === "batch-p6-resume");
 check("F 刷新后队列簿记恢复（相位/并发/条目数）", reloadedResume?.queue?.concurrency === 3 && reloadedResume?.queue?.entries === jobsF.length, JSON.stringify({ reloadedResume, expectedEntries: jobsF.length }));
@@ -690,8 +704,7 @@ check("G 老载荷回写仍按 200 条截断（旧行为一致）", Object.keys(
 // 真刷新一次：新进程 rehydrate 后，成片映射仍可查（这是 S2 的最终判据：映射活在项目里，不是内存 Map）
 await useCanvasStore.getState().flushProjects("p6-s2-reload");
 writeFileSync(PAYLOAD, readPersisted(), "utf8");
-const reloadRawS2 = execFileSync(process.execPath, [path.resolve("scripts/probe-p6-batch-queue.mjs"), "--reload"], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, P6_RELOAD_JOB: "wan-job-s2" } });
-const reloadedS2 = JSON.parse(reloadRawS2.trim().split("\n").at(-1));
+const reloadedS2 = reloadChild("wan-job-s2");
 check("G 新进程真刷新后：成片映射随项目恢复且可查", reloadedS2.hydrated === true && reloadedS2.wanTasks >= 1 && reloadedS2.wanLookup === "wan-file-s2", JSON.stringify(reloadedS2));
 
 const mergedView = wanMap.mergeWanFileTasks(parsedLegacy, projectAfterCreate?.workflowWanFileTasks);
@@ -729,6 +742,8 @@ writeFileSync(path.join(outDir, "probe-summary.json"), JSON.stringify(summary, n
 finish();
 
 function finish() {
+    // 探针自建自清：临时打包目录（node_modules/.probe-p6）不留残余。
+    rmSync(bundleDir, { recursive: true, force: true });
     console.log(`\nP6 队列批跑+恢复探针：${pass} 通过 / ${fails.length} 失败（单测 ${unitTotal} 例）`);
     fails.forEach((item) => console.log(`  FAIL ${item}`));
     process.exit(fails.length ? 1 : 0);

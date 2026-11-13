@@ -7,7 +7,7 @@
       "job": "wan-job-s2",
       "fileTaskId": "wan-file-s2",
       "provider": "wan",
-      "recordedAt": "2026-11-13T15:48:09.586Z"
+      "recordedAt": "2026-11-13T15:54:18.958Z"
     }
   ],
   "batches": [
@@ -72,23 +72,13 @@
       "batchId": "batch-p6-slot",
       "title": null,
       "members": 2,
-      "queue": {
-        "concurrency": null,
-        "phase": null,
-        "summary": null,
-        "entries": []
-      }
+      "queue": null
     },
     {
       "batchId": "batch-p6-rate",
       "title": null,
       "members": 1,
-      "queue": {
-        "concurrency": null,
-        "phase": null,
-        "summary": null,
-        "entries": []
-      }
+      "queue": null
     },
     {
       "batchId": "batch-p6-unknown",
@@ -109,11 +99,7 @@
             "submitGuard": {
               "nodeId": "tp6skeleton-6-lapian-1793901293075-gl4cw",
               "receipt": null,
-              "reconcile": {
-                "verdict": null,
-                "rounds": null,
-                "reason": null
-              }
+              "reconcile": null
             }
           }
         ]
@@ -123,12 +109,7 @@
       "batchId": "batch-p6-isolate",
       "title": null,
       "members": 3,
-      "queue": {
-        "concurrency": null,
-        "phase": null,
-        "summary": null,
-        "entries": []
-      }
+      "queue": null
     },
     {
       "batchId": "batch-p6-resume",
