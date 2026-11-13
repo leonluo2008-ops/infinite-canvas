@@ -104,6 +104,16 @@ export type WorkflowInstanceMaterials = {
     optionalSegments?: string;
 };
 
+/**
+ * 所有者否决过的匹配（P7a）：最小结构口径（`workflow-asset-match.ts` 的 `WorkflowAssetVetoRecord`
+ * 结构兼容）。**只做类型占位**，避免与匹配模块形成 import 环。
+ */
+export type WorkflowInstanceAssetVeto = {
+    instanceId: string;
+    slotNodeId: string;
+    rejectedImageId: string;
+};
+
 export type PlanWorkflowInstanceInput = {
     template: CanvasWorkflowTemplate;
     /** 模板项目节点/连线（P2 `extractWorkflowTemplate().project`）。 */
@@ -112,6 +122,12 @@ export type PlanWorkflowInstanceInput = {
     materials: WorkflowInstanceMaterials;
     /** 实例序号（1-based，确定性 id 的一部分；同序号重放 = 幂等）。 */
     instanceIndex: number;
+    /**
+     * 所有者否决记录（P7a）：**否决过的图不得再次进入请求**，这里是唯一收口点——
+     * 无论挂图材料来自自动匹配还是人指定/重放旧材料，命中否决就丢弃该挂图（记 `vetoedAttaches`
+     * + warning），绝不悄悄套用旧匹配。
+     */
+    vetoes?: WorkflowInstanceAssetVeto[];
     /** 实例整体平移（新链落在画布何处）；缺省 0,0。 */
     origin?: { x: number; y: number };
     /** 清单行前缀（与 i18n `canvas.lapianAsset.manifestPrefix` 同值；缺省 P2 默认）。 */
@@ -149,6 +165,8 @@ export type WorkflowInstancePlan = {
     assetAttaches: WorkflowInstanceAssetAttachRecord[];
     /** 槽③派生模式（模板不含资产位）：P4 按新拉片派生资产位后再挂图。 */
     assetAttachPendingDerivation: boolean;
+    /** 被所有者否决而丢掉的挂图（P7a：否决不复用的可见痕迹；不进清单/不走请求）。 */
+    vetoedAttaches: { slotNodeId: string; slotTemplateNodeId: string; imageNodeId: string; note: string }[];
     topologyDigest: string;
     /** 槽①落点（源视频节点新 id）与拉片节点新 id（受控入口的写入目标）。 */
     sourceVideoNodeId: string;
@@ -234,6 +252,14 @@ function metaOf(node: CanvasNodeData): CanvasNodeMetadata {
 /** 清单行之外的组装串骨架（F4 比对口径：剔除清单行后逐字节 digest）。 */
 function composerSkeleton(composer: string, manifestPrefixes: string[]): string {
     return manifestPrefixes.reduce((text, prefix) => upsertLapianAssetManifest(text, "", prefix), String(composer || ""));
+}
+
+/**
+ * 组装串骨架 digest（对外版本，与 F4 冻结校验同一实现）：剔除清单行后逐字节 digest。
+ * 自修闭环用它做「没碰 composerContent 骨架」的冻结快照（红线 25：不另写第二份骨架算法）。
+ */
+export function composerSkeletonDigest(composer: string, manifestPrefixes?: string[]): string {
+    return stableDigest(composerSkeleton(String(composer || ""), manifestPrefixes?.length ? manifestPrefixes : DEFAULT_MANIFEST_PREFIXES));
 }
 
 /** token id 段按「新 → 旧」映射归一（F4 比的是骨架结构，id 重绑定属 M1/M4 允许项）。 */
@@ -405,7 +431,11 @@ export function planWorkflowInstance(input: PlanWorkflowInstanceInput): Workflow
         if (!attach.image) continue;
         const imageId = nodeIdMap[attach.image.id] || templateInstanceNodeId(template.templateId, instanceIndex, attach.image.id);
         if (nodes.some((node) => node.id === imageId)) continue;
-        nodes.push({ ...attach.image, id: imageId, position: { ...attach.image.position }, metadata: JSON.parse(JSON.stringify(attach.image.metadata || {})) as CanvasNodeMetadata });
+        const copy: CanvasNodeData = { ...attach.image, id: imageId, position: { ...attach.image.position }, metadata: JSON.parse(JSON.stringify(attach.image.metadata || {})) as CanvasNodeMetadata };
+        // P7a 溯源：副本记住「我是资产库哪张图」（所有者否决的是资产库那张，判据要能对上副本）
+        if (!copy.metadata) copy.metadata = {};
+        copy.metadata.assetLibrarySourceId = attach.image.id;
+        nodes.push(copy);
         nodeIdMap[attach.image.id] = imageId;
     }
 
@@ -414,7 +444,19 @@ export function planWorkflowInstance(input: PlanWorkflowInstanceInput): Workflow
     const lapianSlot = template.slots.find((item) => item.kind === "optionalSegments");
     const lapianNodeId = lapianSlot?.targets[0] ? nodeIdMap[lapianSlot.targets[0].nodeId] : "";
     const assetAttaches: WorkflowInstanceAssetAttachRecord[] = [];
+    const vetoedAttaches: WorkflowInstancePlan["vetoedAttaches"] = [];
     const attachList = input.materials?.assetAttach || [];
+    /** 否决判定（P7a）：实例内槽 id 与模板槽 id 两种形态都认；图的两种形态也认（资产库原图 id / 实例副本 id）。 */
+    const vetoedImageFor = (templateSlotId: string, imageId: string): boolean => {
+        if (!imageId) return false;
+        const instanceSlotId = nodeIdMap[templateSlotId] || templateSlotId;
+        const ids = new Set([imageId]);
+        for (const node of nodes) {
+            if (node.id === imageId && String(node.metadata?.assetLibrarySourceId || "")) ids.add(String(node.metadata?.assetLibrarySourceId));
+            if (String(node.metadata?.assetLibrarySourceId || "") === imageId) ids.add(node.id);
+        }
+        return (input.vetoes || []).some((veto) => ids.has(veto.rejectedImageId) && (veto.slotNodeId === instanceSlotId || veto.slotNodeId === templateSlotId));
+    };
     /** 模板不含资产位（P0a §1.1）：槽③必须由 P4 按新拉片派生资产位后再挂图，本卡不发明资产位。 */
     const assetAttachPendingDerivation = assetSlot.targets.length === 0;
     if (attachList.length && assetAttachPendingDerivation) {
@@ -424,10 +466,17 @@ export function planWorkflowInstance(input: PlanWorkflowInstanceInput): Workflow
         const templateSlotId = String(attach.slotNodeId || "").trim();
         if (!templateSlotId) throw new WorkflowInstanceError("slot_target_missing", "槽③挂图必须给 slotNodeId（模板内资产位 id）", { order: attach.order });
         if (!assetSlot.targets.some((item) => item.nodeId === templateSlotId)) throw new WorkflowInstanceError("slot_target_missing", `槽③没有可写目标 ${templateSlotId}；可写目标=${assetSlot.targets.map((item) => item.nodeId).join(",")}`, { templateSlotId });
-        const slotNode = byTemplateId.get(templateSlotId);
-        if (!slotNode) throw new WorkflowInstanceError("slot_target_missing", `资产位 ${templateSlotId} 不在模板里`, { templateSlotId });
         const imageId = String(attach.imageNodeId || (attach.image ? nodeIdMap[attach.image.id] : "") || "").trim();
         const resolvedImageId = nodeIdMap[imageId] || imageId;
+        // P7a 否决收口：否决过的图**不进请求**（含重放旧材料/续跑把旧匹配再送一遍的场景）。
+        // 丢弃而不是抛错：卡面判据是「替代匹配或留空交人」，留空即可继续，绝不硬挂。
+        if (resolvedImageId && vetoedImageFor(templateSlotId, resolvedImageId)) {
+            const instanceSlotId = nodeIdMap[templateSlotId] || templateSlotId;
+            vetoedAttaches.push({ slotNodeId: instanceSlotId, slotTemplateNodeId: templateSlotId, imageNodeId: resolvedImageId, note: "所有者已否决：本实例该槽留空，不套用旧匹配" });
+            continue;
+        }
+        const slotNode = byTemplateId.get(templateSlotId);
+        if (!slotNode) throw new WorkflowInstanceError("slot_target_missing", `资产位 ${templateSlotId} 不在模板里`, { templateSlotId });
         const image = nodes.find((node) => node.id === resolvedImageId && node.type === CanvasNodeType.Image && Boolean(node.metadata?.content));
         if (!image) throw new WorkflowInstanceError("asset_image_missing", `槽③挂图目标图不存在或无内容：${imageId}`, { slotNodeId: templateSlotId, imageId });
         const caption = truncateAssetCaption(attach.caption || "") || String(slotNode.metadata?.assetSlotName || "");
@@ -519,6 +568,7 @@ export function planWorkflowInstance(input: PlanWorkflowInstanceInput): Workflow
     if (focusNodeId) ops.push({ type: "select_nodes", ids: [focusNodeId] });
 
     if (assetAttachPendingDerivation) warnings.push("槽③挂图组非空但模板为派生槽：P4 派生资产位后再挂（本实例未挂图）");
+    if (vetoedAttaches.length) warnings.push(`槽③有 ${vetoedAttaches.length} 条挂图被所有者否决：本实例相应槽留空，不套用旧匹配（${vetoedAttaches.map((item) => `${item.slotNodeId}←${item.imageNodeId}`).join("；")}）`);
     if (template.externalReferences?.length) warnings.push(`模板携带 ${template.externalReferences.length} 条图外引用（抽取期报告）：实例不自动补，交 P4/P5 复核`);
 
     return {
@@ -533,6 +583,7 @@ export function planWorkflowInstance(input: PlanWorkflowInstanceInput): Workflow
         slotWrites,
         assetAttaches,
         assetAttachPendingDerivation,
+        vetoedAttaches,
         topologyDigest: rewritten.topologyDigest,
         sourceVideoNodeId,
         lapianNodeId,

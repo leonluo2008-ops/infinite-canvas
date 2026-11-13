@@ -31,9 +31,9 @@ import type { CanvasNodeData } from "@/types/canvas";
 import { batchMemberRequiredNodeIds, type WorkflowBatchMember, type WorkflowBatchRecord } from "@/lib/canvas/workflow-batch";
 
 /** 实例派生状态（全部是算出来的，项目里没有任何字段存它）。 */
-export type InstanceStatus = "pending" | "running" | "assembled" | "awaiting_approval" | "approved" | "generating" | "done" | "failed" | "unknown";
+export type InstanceStatus = "pending" | "running" | "assembled" | "awaiting_approval" | "needs_human" | "approved" | "generating" | "done" | "failed" | "unknown";
 
-export const INSTANCE_STATUSES: InstanceStatus[] = ["pending", "running", "assembled", "awaiting_approval", "approved", "generating", "done", "failed", "unknown"];
+export const INSTANCE_STATUSES: InstanceStatus[] = ["pending", "running", "assembled", "awaiting_approval", "needs_human", "approved", "generating", "done", "failed", "unknown"];
 
 export type BackendTaskStatus = "queued" | "running" | "succeeded" | "failed" | "unknown";
 
@@ -156,6 +156,13 @@ export function deriveInstanceStatus(input: {
         return view("unknown", "R3", "组装产物已就位但视频后端任务状态查不到：不判完成（B5：缺失≠成功）", { productNodeId: member.nodes.product, videoTaskId: member.backend.videoTaskId });
     }
 
+    // R4a 自修升级给人（P7b/D11）：自修 2 轮仍 FAIL → 需人工，**不是**「待批可批准」
+    // 判据=hub 停在待审批 + 成员上带自修升级痕迹（痕迹是事件记录，状态仍是这里算出来的）。
+    const repairEscalated = member.repair?.outcome === "escalated";
+    if (repairEscalated && hubState === "awaiting_approval") {
+        return view("needs_human", "R4a", `自修 ${member.repair?.rounds.length ?? 0} 轮仍 FAIL（${member.repair?.escalation?.code || "U5"}：${member.repair?.escalation?.detail || ""}）：需人工处理，不自动豁免、不进下一步`, { repairEscalation: member.repair?.escalation });
+    }
+
     // R4 待批（P4 正常终点；Config success 不改判完成）
     if (hubState === "awaiting_approval") return view("awaiting_approval", "R4", "hub 任务在待审批：等人审，不是完成", { configSucceeded: nodeStatuses.some((item) => item.status === "success") });
 
@@ -194,8 +201,8 @@ export type BatchStatusView = {
     counts: Record<InstanceStatus, number>;
     /** 覆盖率：不足即「部分未知」，不算成功。 */
     coverage: { complete: boolean; partialUnknownMembers: string[]; missingEvidence: string[] };
-    /** 批次结论：任何失败→failed；全完成→done；有未知→partial_unknown；否则 in_progress。 */
-    outcome: "done" | "in_progress" | "failed" | "partial_unknown";
+    /** 批次结论：任何失败→failed；有人待处理→needs_human；全完成→done；有未知→partial_unknown；否则 in_progress。 */
+    outcome: "done" | "in_progress" | "failed" | "needs_human" | "partial_unknown";
 };
 
 /** 批次聚合视图（纯函数）：N 个实例各自状态 + 计数汇总 + 覆盖率。 */
@@ -214,7 +221,7 @@ export function deriveBatchStatus(input: {
     const partialUnknownMembers = members.filter((member) => member.status === "unknown" || member.missing.length > 0).map((member) => member.instanceId);
     const missingEvidence = members.flatMap((member) => member.missing.map((item) => `${member.instanceId}: ${item}`));
     const complete = members.length > 0 && partialUnknownMembers.length === 0;
-    const outcome: BatchStatusView["outcome"] = counts.failed > 0 ? "failed" : !complete ? "partial_unknown" : counts.done === members.length ? "done" : "in_progress";
+    const outcome: BatchStatusView["outcome"] = counts.failed > 0 ? "failed" : counts.needs_human > 0 ? "needs_human" : !complete ? "partial_unknown" : counts.done === members.length ? "done" : "in_progress";
     return {
         batchId: input.batch.batchId,
         templateId: input.batch.templateId,

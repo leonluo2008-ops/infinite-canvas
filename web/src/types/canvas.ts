@@ -95,6 +95,12 @@ export type CanvasNodeMetadata = {
     assetGraftOfImageId?: string;
     /** 挂图对照节点归属的资产位 id。 */
     assetGraftForSlotId?: string;
+    /**
+     * 资产库原图溯源（P7a）：实例挂图副本记住「我是资产库里哪张图」。
+     * 所有者否决的是库里的那张图，而实例里挂的是它的副本——否决判据靠这个字段把副本对回原图
+     * （否决过的匹配无论以库图 id、副本 id、挂图材料还是槽上已挂形态出现都要被拦下）。
+     */
+    assetLibrarySourceId?: string;
     /** 意图节点标记（T3-G3a）：不是终稿，不给【生成视频】。 */
     lapianIntent?: boolean;
     /** 拉片派生节点的来源拉片 id（T3-G1）：挂图/摘图时据此重算清单行。 */

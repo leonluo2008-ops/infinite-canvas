@@ -7,6 +7,7 @@ import { localForageStorage } from "@/lib/localforage-storage";
 import type { CanvasBackgroundMode } from "@/lib/canvas-theme";
 import { createPersistQueue, type FlushResult } from "@/lib/canvas/canvas-persist-queue";
 import { acceptWorkflowBatches, type WorkflowBatchRecord } from "@/lib/canvas/workflow-batch";
+import { acceptWorkflowAssetVetoes, type WorkflowAssetVetoRecord } from "@/lib/canvas/workflow-asset-match";
 import { acceptWorkflowInstances } from "@/lib/canvas/workflow-instance-identity";
 import { acceptWanFileTasks, type WanFileTaskRecord } from "@/lib/canvas/wan-file-task-map";
 import type { WorkflowInstanceIdentityRecord } from "@/lib/canvas/workflow-instance-run";
@@ -47,6 +48,12 @@ export type CanvasProject = {
      * 且仅留 200 条、导出不带；这里是**真源**（随项目持久化 + 随 v3 导出同路），老 localStorage 仍可读。
      */
     workflowWanFileTasks?: WanFileTaskRecord[];
+    /**
+     * 资产否决记录（P7a）：所有者「一键否决」掉某实例某槽的某张匹配图。
+     * 与上面同族落点（项目显式扩展字段：随项目持久化 + 随 v3 导出同路）；它是**人工决策的身份侧事实**
+     * （谁在哪一槽拒了哪张图），不是状态位。匹配与实例化都会读它——否决过的旧匹配不得再次进请求。
+     */
+    workflowAssetVetoes?: WorkflowAssetVetoRecord[];
 };
 
 /** 导入侧校验：只要形如模板声明就透传（版本号留给后续迁移，不静默丢未知新版本）。 */
@@ -84,7 +91,7 @@ type CanvasStore = {
     renameProject: (id: string, title: string) => void;
     deleteProjects: (ids: string[]) => void;
     replaceProjects: (projects: CanvasProject[], deletedProjects?: CanvasDeletedProject[]) => void;
-    updateProject: (id: string, patch: Partial<Pick<CanvasProject, "nodes" | "connections" | "chatSessions" | "activeChatId" | "backgroundMode" | "showImageInfo" | "viewport" | "workflowTemplate" | "workflowInstances" | "workflowBatches" | "workflowWanFileTasks">>) => void;
+    updateProject: (id: string, patch: Partial<Pick<CanvasProject, "nodes" | "connections" | "chatSessions" | "activeChatId" | "backgroundMode" | "showImageInfo" | "viewport" | "workflowTemplate" | "workflowInstances" | "workflowBatches" | "workflowWanFileTasks" | "workflowAssetVetoes">>) => void;
     /**
      * 立即落盘当前 projects（不等 400ms 防抖窗口）。编排器在实例关键节点（落库/待批）调用；
      * 失败结果同时写进 `lastFlush` 并原样返回，绝不静默吞掉。
@@ -177,6 +184,8 @@ export const useCanvasStore = create<CanvasStore>()(
                     workflowBatches: acceptWorkflowBatches(source.workflowBatches),
                     // P6/S2：Wan 成片映射随项目走（导入显式透传，理由同上）。
                     workflowWanFileTasks: acceptWanFileTasks(source.workflowWanFileTasks),
+                    // P7a：资产否决记录随项目走（导入显式透传，理由同上：否决不复用必须跨导入/刷新成立）。
+                    workflowAssetVetoes: acceptWorkflowAssetVetoes(source.workflowAssetVetoes),
                 };
                 set((state) => ({ projects: [project, ...state.projects] }));
                 return project.id;

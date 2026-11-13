@@ -15,6 +15,7 @@
 import type { CanvasConnection, CanvasNodeData } from "@/types/canvas";
 import type { WorkflowInstanceMaterials, WorkflowInstancePlan } from "@/lib/canvas/workflow-instance";
 import type { WorkflowInstanceIdentityRecord } from "@/lib/canvas/workflow-instance-run";
+import { repairIdentityOf, type InstanceRepairIdentity, type InstanceRepairRecord } from "@/lib/canvas/workflow-instance-repair";
 import type { WorkflowBatchQueueRecord } from "@/lib/canvas/workflow-batch-queue";
 import { stableDigest } from "@/lib/canvas/workflow-template";
 
@@ -83,6 +84,12 @@ export type WorkflowBatchMember = {
     nodes: WorkflowBatchMemberNodes;
     hub: WorkflowBatchMemberHub | null;
     backend: WorkflowBatchBackendTaskRef;
+    /**
+     * 自修痕迹（P7b，D11）：每实例「修改→重检」闭环轮次与每轮改了什么/为什么/结果。
+     * 这是**事件痕迹**（身份侧事实记录，供 P8 侧栏展示），不是状态位：实例现在是否待人处理
+     * 仍由 `workflow-batch-status.ts` 从 hub 现查 + 本痕迹派生（C5 / §5.3）。
+     */
+    repair?: InstanceRepairIdentity;
     /** 入册时刻（= 画布侧落库那一刻，不是状态时间戳）。 */
     createdAt: string;
 };
@@ -142,6 +149,8 @@ export function buildBatchMember(input: {
     lapian?: { taskId: string; jobId: string };
     /** Wan 成片映射（S2）：job → 成片 taskId（项目级登记表现查；缺省=不写外键）。 */
     wanFileTasks?: Map<string, string> | Record<string, string>;
+    /** 自修痕迹（P7b）：编排器跑完自修闭环后传进来，压缩成成员身份字段。 */
+    repair?: InstanceRepairRecord | InstanceRepairIdentity | null;
     createdAt?: string;
 }): WorkflowBatchMember {
     const { plan } = input;
@@ -208,6 +217,7 @@ export function buildBatchMember(input: {
             downstream,
         },
         hub,
+        repair: normalizeRepairIdentity(input.repair),
         backend: {
             lapianTaskId: String(identity?.canvas.lapianTaskId || input.lapian?.taskId || ""),
             lapianJobId: String(identity?.canvas.lapianJobId || input.lapian?.jobId || ""),
@@ -217,6 +227,16 @@ export function buildBatchMember(input: {
         },
         createdAt: input.createdAt || identity?.createdAt || new Date().toISOString(),
     };
+}
+
+/**
+ * 自修痕迹归一：编排器给的是完整 `InstanceRepairRecord`（含 schemaVersion/frozen/finalSelfcheck），
+ * 成员侧只留事件痕迹投影（`InstanceRepairIdentity`）；已经是投影就直接用。
+ */
+function normalizeRepairIdentity(value?: InstanceRepairRecord | InstanceRepairIdentity | null): InstanceRepairIdentity | undefined {
+    if (!value) return undefined;
+    if (!("schemaVersion" in value)) return value as InstanceRepairIdentity;
+    return repairIdentityOf(value as InstanceRepairRecord);
 }
 
 /** 批次签名（模板 + 成员素材组摘要；批次身份的一部分，不含运行态）。 */

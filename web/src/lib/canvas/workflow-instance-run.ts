@@ -19,15 +19,18 @@
  */
 
 import { buildNodeGenerationContext } from "@/components/canvas/canvas-node-generation";
+import { readNodeFullText } from "@/lib/agent/agent-node-text";
 import { CanvasNodeType, type CanvasConnection, type CanvasNodeData } from "@/types/canvas";
 
 import type { CanvasAgentOp } from "@/lib/canvas/canvas-agent-ops";
 import { lapianOptionalLetters, renderLapianProjection, type LapianProjectionFetch } from "@/lib/canvas/lapian-projection";
 import { buildBatchMember, type WorkflowBatchMember } from "@/lib/canvas/workflow-batch";
 import { classifyChannelFailure, type ChannelFailureClass } from "@/lib/canvas/workflow-channel-failure";
+import { frozenSnapshotOf, repairIdentityOf, repairNeeded, runInstanceSelfRepair, type FrozenSnapshot, type InstanceRepairRecord, type InstanceRepairer } from "@/lib/canvas/workflow-instance-repair";
 import { stableDigest } from "@/lib/canvas/workflow-template";
 import { templateInstanceConnectionId } from "@/lib/canvas/workflow-template-ids";
 import type { WorkflowInstancePlan, WorkflowInstanceMaterials } from "@/lib/canvas/workflow-instance";
+import type { WorkflowAssetVetoRecord } from "@/lib/canvas/workflow-asset-match";
 
 /** 实例运行错误（预期内失败：一律带 stage，不靠解析文案）。 */
 export class WorkflowInstanceRunError extends Error {
@@ -192,6 +195,11 @@ export function verifySlotSubstitution(input: {
     assembly: InstanceAssemblyPlan;
     /** 本次拉片正文（投影后；缺省用拉片节点现正文）。 */
     lapianText: string;
+    /**
+     * 所有者否决记录（P7a）：否决过的匹配**不得再进请求**。这里做请求前的最后一道核对
+     * （挂图材料 / 槽上已挂图 / 本次计划三处任一命中否决 → 槽③判 FAIL，不静默放行）。
+     */
+    vetoes?: WorkflowAssetVetoRecord[];
 }): InstanceSlotCheck[] {
     const { plan, materials, nodes, connections, assembly } = input;
     const checks: InstanceSlotCheck[] = [];
@@ -221,6 +229,28 @@ export function verifySlotSubstitution(input: {
         if (slotNode && String(slotNode.metadata?.assetSlot?.attachedImageId || "") !== attach.imageNodeId) attachProblems.push(`资产位 ${attach.slotNodeId} assetSlot 镜像不是本次挂图`);
         if (!graftNode || String(graftNode.metadata?.assetGraftForSlotId || "") !== attach.slotNodeId) attachProblems.push(`资产位 ${attach.slotNodeId} 缺挂图对照节点`);
         if (!String(assembly.composerContent).includes(`@[node:${attach.imageNodeId}]`)) attachProblems.push(`组装串里没有本次挂图 token ${attach.imageNodeId}`);
+    }
+    const vetoedInRequest: string[] = [];
+    {
+        const vetoes = input.vetoes || [];
+        const vetoHit = (slotNodeId: string, imageNodeId: string) => {
+            if (!imageNodeId) return false;
+            const ids = new Set([imageNodeId]);
+            const librarySource = String(nodes.find((node) => node.id === imageNodeId)?.metadata?.assetLibrarySourceId || "");
+            if (librarySource) ids.add(librarySource);
+            return vetoes.some((veto) => veto.instanceId === plan.instanceId && veto.slotNodeId === slotNodeId && ids.has(veto.rejectedImageId));
+        };
+        for (const attach of attaches) if (vetoHit(attach.slotNodeId, attach.imageNodeId)) vetoedInRequest.push(`计划挂图 ${attach.slotNodeId}←${attach.imageNodeId}`);
+        for (const attach of materials.assetAttach || []) {
+            const slotNodeId = plan.nodeIdMap[String(attach.slotNodeId || "")] || String(attach.slotNodeId || "");
+            const imageId = String(attach.imageNodeId || attach.image?.id || "");
+            if (slotNodeId && imageId && vetoHit(slotNodeId, imageId)) vetoedInRequest.push(`挂图材料 ${slotNodeId}←${imageId}`);
+        }
+        for (const slotNode of nodes.filter((node) => String(node.metadata?.assetSlotSourceId || "") === plan.lapianNodeId)) {
+            const attached = String(slotNode.metadata?.attachedImageId || "");
+            if (attached && vetoHit(slotNode.id, attached)) vetoedInRequest.push(`槽上已挂 ${slotNode.id}←${attached}`);
+        }
+        if (vetoedInRequest.length) attachProblems.push(`否决过的匹配又出现在请求里（否决不复用被破坏）：${vetoedInRequest.slice(0, 4).join("；")}`);
     }
     if (plan.assetAttachPendingDerivation && (materials.assetAttach || []).length) attachProblems.push("模板槽③为派生槽：挂图未派生即视为未生效（P4 派生范围外）");
     // 图序的真源 = 组装串里 token 的**出现序**（buildComposerGenerationContext 就是按 token 序取用），
@@ -445,8 +475,8 @@ export function buildIdentityRecord(input: {
 
 // ─────────────────────────────────────────────── 编排器
 
-/** 落盘关键节点（P5 flush）：实例入册（画布侧落库）与停在待批。 */
-export type InstanceFlushStage = "instance_persisted" | "awaiting_approval";
+/** 落盘关键节点（P5 flush）：实例入册（画布侧落库）、停在待批、自修升级给人。 */
+export type InstanceFlushStage = "instance_persisted" | "awaiting_approval" | "needs_human";
 
 /** flush 结果（失败如实记，绝不静默）。 */
 export type InstanceFlushOutcome = { stage: InstanceFlushStage; ok: boolean; error?: string };
@@ -471,6 +501,22 @@ export type InstanceRunDeps = {
     saveBatchMember?: (member: WorkflowBatchMember) => void | Promise<void>;
     /** Wan 成片映射现查（S2：job→成片 taskId；入册时写成批次成员外键）。缺省 = 不写该外键。 */
     wanFileTasks?: () => Map<string, string> | Record<string, string> | undefined;
+    /**
+     * 自修闭环（P7b）：给了执行体才自修，缺省 = 不自修（P4/P5/P6 行为不变）。
+     * 自修只走文本链（既有保存+重检入口），不发起任何付费生成。
+     */
+    repair?: {
+        /** 自修执行体（生产 = 画布对话 Agent；探针 = `createTermStrippingRepairer`）。 */
+        repairer: InstanceRepairer;
+        /** 上限（D11 固定 2；传更大值会被夹回 2）。 */
+        maxRounds?: number;
+        /** 读正文全文（缺省 = `readNodeFullText`（read_node_text 同一实现））。 */
+        readText?: (nodeId: string) => string | null;
+        /** 冻结项快照（缺省 = `frozenSnapshotOf(画布, 实例拓扑 digest)`）。 */
+        frozen?: () => FrozenSnapshot;
+    };
+    /** 所有者否决记录（P7a）：槽③请求前核对「否决过的匹配不得再进请求」。 */
+    vetoes?: () => WorkflowAssetVetoRecord[] | undefined;
     /** 立即落盘（页面 = `useCanvasStore.flushProjects`）。缺省 = 不 flush（只走防抖）。 */
     flush?: (stage: InstanceFlushStage) => void | Promise<void | { ok?: boolean; error?: string }>;
     newRunToken?: () => string;
@@ -481,8 +527,11 @@ export type InstanceRunDeps = {
 export type AssemblyProjection = { url: string; optional: string; changed: boolean; chars: number };
 
 export type InstanceRunResult = {
-    /** awaiting_approval = 已绑 hub 且停在待批；canvas_ready = 画布侧完成但未绑 hub；failed = 中止。 */
-    status: "awaiting_approval" | "canvas_ready" | "failed";
+    /**
+     * awaiting_approval = 已绑 hub 且停在待批；needs_human = 自修 2 轮仍 FAIL（升级给人，不自动豁免、
+     * 不自动通过、不进下一步）；canvas_ready = 画布侧完成但未绑 hub；failed = 中止。
+     */
+    status: "awaiting_approval" | "needs_human" | "canvas_ready" | "failed";
     instanceId: string;
     templateId: string;
     instanceIndex: number;
@@ -502,6 +551,8 @@ export type InstanceRunResult = {
     };
     identity?: WorkflowInstanceIdentityRecord;
     hub?: Omit<InstanceHubBinding, "assets"> & { assets: InstanceHubBinding["assets"] };
+    /** 自修闭环痕迹（P7b；未启用或首检就干净时缺省）。 */
+    repair?: InstanceRepairRecord;
     /** 批次成员（P5；入册后的身份记录，随项目持久化）。 */
     batchMember?: WorkflowBatchMember;
     /** 关键节点 flush 结果（失败如实回传，见 warnings）。 */
@@ -573,6 +624,7 @@ export async function runWorkflowInstance(input: { plan: WorkflowInstancePlan; m
             connections: deps.connections(),
             lapian: { taskId: String(input.lapian.taskId || ""), jobId: String(input.lapian.jobId || "") },
             wanFileTasks: deps.wanFileTasks?.(),
+            repair: result.repair,
             createdAt: now(),
         });
         result.batchMember = member;
@@ -607,7 +659,7 @@ export async function runWorkflowInstance(input: { plan: WorkflowInstancePlan; m
     let slotChecks: InstanceSlotCheck[];
     try {
         assembly = planInstanceAssembly({ plan: input.plan, nodes: deps.nodes(), connections: deps.connections() });
-        slotChecks = verifySlotSubstitution({ plan: input.plan, materials: input.materials, nodes: deps.nodes(), connections: deps.connections(), assembly, lapianText });
+        slotChecks = verifySlotSubstitution({ plan: input.plan, materials: input.materials, nodes: deps.nodes(), connections: deps.connections(), assembly, lapianText, vetoes: deps.vetoes?.() });
     } catch (error) {
         result.failure = { stage: (error as WorkflowInstanceRunError).stage || "assembly_plan", reason: (error as Error).message, details: (error as WorkflowInstanceRunError).details, channel: channelOf(error) };
         return result;
@@ -708,11 +760,60 @@ export async function runWorkflowInstance(input: { plan: WorkflowInstancePlan; m
         result.warnings.push("未提供 hub 客户端：本实例未绑 hub 身份（画布侧已完成）");
     }
 
+    // ⑤′ 自修闭环（P7b）：首检有未通过项 → 读全文 → 限定范围改正文 → 既有保存+重检（同一修订），
+    // 最多 2 轮（D11）；2 轮仍 FAIL → 升级给人（needs_human），不豁免、不通过、不进下一步。
+    let finalText = String(productText || "").trim();
+    if (binding && deps.repair && repairNeeded(binding.selfcheck)) {
+        const repairDeps = deps.repair;
+        const readText = repairDeps.readText || ((nodeId: string) => {
+            const snapshot = { projectId: "", title: "", nodes: deps.nodes(), connections: deps.connections(), selectedNodeIds: [] as string[], viewport: { x: 0, y: 0, k: 1 } };
+            return readNodeFullText({ nodeId, canvasSnapshot: snapshot })?.content ?? null;
+        });
+        const record = await runInstanceSelfRepair(
+            {
+                plan: { instanceId: input.plan.instanceId, templateId: input.plan.templateId, instanceIndex: input.plan.instanceIndex },
+                productNodeId: childNodeId,
+                localId: binding.localId,
+                findings: binding.selfcheck,
+                maxRounds: repairDeps.maxRounds,
+            },
+            {
+                readText,
+                // 画布=唯一操作面：改好的正文先落回产物节点，再走 hub 保存（两处同一份字节 = 同一修订）
+                writeCanvasText: async ({ nodeId, text }) => {
+                    await apply([{ type: "update_node", id: nodeId, metadata: { content: text, prompt: text } }]);
+                },
+                // **既有**保存+重检入口（写正文 → 重算审批快照 → 重跑自检）；不另写评分器（G16）
+                saveRevision: (payload) => deps.hub!.saveRevision(payload),
+                repairer: repairDeps.repairer,
+                frozen: repairDeps.frozen || (() => frozenSnapshotOf(deps.nodes(), input.plan.topologyDigest)),
+                now,
+                log: deps.log,
+            },
+        );
+        result.repair = record;
+        // 自检结论回到「最后一版修订」上呈现（同修订可见）：不再用首检结果
+        binding.selfcheck = record.finalSelfcheck;
+        binding.selfcheckFailures = record.finalFindings;
+        const lastRound = record.rounds[record.rounds.length - 1];
+        if (lastRound) {
+            finalText = String(readText(childNodeId) || "").trim() || finalText;
+            binding.revision = { digest: lastRound.digestAfter, chars: finalText.length, approvalSnapshot: lastRound.approvalSnapshot, promptEditedAt: lastRound.at };
+        }
+        if (record.outcome === "passed") {
+            result.warnings.push(`自修 ${record.rounds.length} 轮修好（${record.rounds.map((round) => `${round.findingsBefore}→${round.findingsAfter}`).join("，")}）：同一修订上重检通过，可正常待批`);
+        } else if (record.outcome === "escalated") {
+            const code = record.escalation?.code || "U5";
+            result.warnings.push(`自修未修好：${code} ${record.escalation?.detail || ""}——实例交人处理（不自动豁免、不自动通过）`);
+        }
+        result.hub = binding;
+    }
+
     // ⑥ 身份记录（随项目持久化；状态不落这里——待批/已批一律现查 hub）
     const identity = buildIdentityRecord({
         plan: input.plan,
         assembly,
-        assemblyText: String(productText || "").trim(),
+        assemblyText: finalText,
         productNodeId: childNodeId,
         retiredPlaceholderNodeIds: assembly.staleOutputNodeIds,
         lapian: { taskId: String(lapianNode?.metadata?.taskId || input.lapian.taskId), jobId: String(lapianNode?.metadata?.jobId || input.lapian.jobId) },
@@ -724,8 +825,9 @@ export async function runWorkflowInstance(input: { plan: WorkflowInstancePlan; m
     if (deps.saveIdentity) await deps.saveIdentity(identity);
     // ⑤⑥ 身份 + 批次成员（含 hub 外键）落库后**立即落盘**：停在待批那一刻磁盘上就是最新身份。
     await saveMember(identity);
-    await flushAt(binding ? "awaiting_approval" : "instance_persisted");
+    const escalated = result.repair?.outcome === "escalated";
+    await flushAt(binding ? (escalated ? "needs_human" : "awaiting_approval") : "instance_persisted");
 
-    result.status = binding ? "awaiting_approval" : "canvas_ready";
+    result.status = binding ? (escalated ? "needs_human" : "awaiting_approval") : "canvas_ready";
     return result;
 }
