@@ -1,0 +1,45 @@
+{
+  "summary": {
+    "project": "无限画布 3 (6UMuzT8Fo9JwD4XDCfOOu)",
+    "chainRoot": "lapian-1793901293075-gl4cw",
+    "skeletonIds": [
+      "video-1793901289325-25d4s",
+      "lapian-1793901293075-gl4cw",
+      "text-1793901665795-amrfn",
+      "text-1793901665795-jx3cx",
+      "config-1793901665795-kooye",
+      "jERtWnPXyzFhmbUxLLM4G",
+      "config-1793903256858-naerp",
+      "image-1793901490523-chxhe",
+      "image-1793901490618-p42to",
+      "image-1793901493028-xpa34",
+      "image-1793901316874-tfjaz",
+      "image-1793901333240-smntt",
+      "image-1793901447125-74tq3"
+    ],
+    "fixedAssetKeys": [
+      "image:46vam8wgxO7q3F5bl4ALL",
+      "image:5k59oqXUS-I-UQhA1rjV6",
+      "image:VBLbfN8m0OkbuFdmaXypc",
+      "image:VjENaeDwKEuwx__OCMi5F",
+      "image:6MdQ7mfhcAJB6_LZvZOgW",
+      "image:cRPi79ZXvLBWcr_k-85ae"
+    ],
+    "externalReferenceKinds": [
+      "connection"
+    ],
+    "externalReferenceCount": 22,
+    "coverageMatrix": {
+      "1 composerToken": 10,
+      "2 attachedImageId": 0,
+      "3 assetSlot.attachedImageId": 0,
+      "4 assetSlotSourceId": 0,
+      "5 lapianSourceId": 1,
+      "6 assetGraft*": 0,
+      "7 connections+groupId": 18
+    },
+    "outDir": "C:\\Users\\leon3\\AppData\\Local\\hermes\\cache\\scratch\\p2-ego\\out"
+  },
+  "pass": 84,
+  "fails": []
+}

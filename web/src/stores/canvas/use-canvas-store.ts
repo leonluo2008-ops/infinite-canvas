@@ -5,6 +5,7 @@ import { nanoid } from "nanoid";
 import i18n from "@/i18n";
 import { localForageStorage } from "@/lib/localforage-storage";
 import type { CanvasBackgroundMode } from "@/lib/canvas-theme";
+import type { CanvasWorkflowTemplate } from "@/lib/canvas/workflow-template";
 import type { CanvasAssistantSession, CanvasConnection, CanvasNodeData, ViewportTransform } from "@/types/canvas";
 
 export type CanvasProject = {
@@ -19,7 +20,22 @@ export type CanvasProject = {
     backgroundMode: CanvasBackgroundMode;
     showImageInfo: boolean;
     viewport: ViewportTransform;
+    /**
+     * 工作流模板声明（P2，方案A 批量代办）：五槽参数声明 + 冻结项 + 图外引用报告。
+     * 落点为 CanvasProject 显式扩展字段（P0a §3.2）：随项目持久化（IndexedDB）与 v3 导出同路，
+     * 不建第二份图 DSL、不进节点 metadata。创建项目时缺省不存在；导入/更新必须透传（逐字段构造会丢未知顶层字段）。
+     */
+    workflowTemplate?: CanvasWorkflowTemplate;
 };
+
+/** 导入侧校验：只要形如模板声明就透传（版本号留给后续迁移，不静默丢未知新版本）。 */
+function acceptWorkflowTemplate(value: unknown): CanvasWorkflowTemplate | undefined {
+    if (!value || typeof value !== "object") return undefined;
+    const candidate = value as Partial<CanvasWorkflowTemplate>;
+    if (!candidate.templateId || !Array.isArray(candidate.slots) || !candidate.frozen) return undefined;
+    return candidate as CanvasWorkflowTemplate;
+}
+
 
 export type CanvasDeletedProject = {
     id: string;
@@ -36,7 +52,7 @@ type CanvasStore = {
     renameProject: (id: string, title: string) => void;
     deleteProjects: (ids: string[]) => void;
     replaceProjects: (projects: CanvasProject[], deletedProjects?: CanvasDeletedProject[]) => void;
-    updateProject: (id: string, patch: Partial<Pick<CanvasProject, "nodes" | "connections" | "chatSessions" | "activeChatId" | "backgroundMode" | "showImageInfo" | "viewport">>) => void;
+    updateProject: (id: string, patch: Partial<Pick<CanvasProject, "nodes" | "connections" | "chatSessions" | "activeChatId" | "backgroundMode" | "showImageInfo" | "viewport" | "workflowTemplate">>) => void;
 };
 
 const initialViewport: ViewportTransform = { x: 0, y: 0, k: 1 };
@@ -105,6 +121,8 @@ export const useCanvasStore = create<CanvasStore>()(
                     backgroundMode: source.backgroundMode || "lines",
                     showImageInfo: source.showImageInfo || false,
                     viewport: source.viewport || initialViewport,
+                    // P2：模板声明随项目走（导入逐字段构造，显式透传，否则未知顶层字段会被丢——Codex §3.3）。
+                    workflowTemplate: acceptWorkflowTemplate(source.workflowTemplate),
                 };
                 set((state) => ({ projects: [project, ...state.projects] }));
                 return project.id;

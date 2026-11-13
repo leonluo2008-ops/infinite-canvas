@@ -1,0 +1,447 @@
+{
+  "schemaVersion": 1,
+  "templateId": "pop3",
+  "name": "无限画布 3 · 模板（pop-3 链）",
+  "createdAt": "2026-11-13T00:00:00.000Z",
+  "sourceProjectId": "6UMuzT8Fo9JwD4XDCfOOu",
+  "sourceProjectTitle": "无限画布 3",
+  "sourceNodeIds": [
+    "video-1793901289325-25d4s",
+    "lapian-1793901293075-gl4cw",
+    "text-1793901665795-amrfn",
+    "text-1793901665795-jx3cx",
+    "config-1793901665795-kooye",
+    "jERtWnPXyzFhmbUxLLM4G",
+    "config-1793903256858-naerp",
+    "image-1793901490523-chxhe",
+    "image-1793901490618-p42to",
+    "image-1793901493028-xpa34",
+    "image-1793901316874-tfjaz",
+    "image-1793901333240-smntt",
+    "image-1793901447125-74tq3"
+  ],
+  "slots": [
+    {
+      "kind": "sourceVideo",
+      "label": "①源视频",
+      "required": true,
+      "targets": [
+        {
+          "nodeId": "video-1793901289325-25d4s",
+          "fields": [
+            "content",
+            "storageKey",
+            "mimeType",
+            "bytes",
+            "durationMs",
+            "naturalWidth",
+            "naturalHeight"
+          ]
+        }
+      ],
+      "note": "槽①待注入：模板内源视频节点已剥字节，实例化时写新视频媒体字段并重跑拉片"
+    },
+    {
+      "kind": "intentText",
+      "label": "②意图文本",
+      "required": false,
+      "targets": [
+        {
+          "nodeId": "text-1793901665795-jx3cx",
+          "fields": [
+            "content",
+            "prompt"
+          ]
+        }
+      ],
+      "note": "槽②：意图正文（lapianIntent 标记节点的 content/prompt，合同 X1 口径修正）"
+    },
+    {
+      "kind": "assetAttach",
+      "label": "③资产位挂图",
+      "required": false,
+      "targets": [],
+      "derived": true,
+      "note": "槽③：资产位不进模板（P0a §1.1），实例期按新拉片派生资产位后挂图；清单行由挂图副作用重算"
+    },
+    {
+      "kind": "generationParams",
+      "label": "④生成参数",
+      "required": false,
+      "targets": [
+        {
+          "nodeId": "config-1793901665795-kooye",
+          "fields": [
+            "model",
+            "count",
+            "reasoningEffort"
+          ]
+        },
+        {
+          "nodeId": "config-1793903256858-naerp",
+          "fields": [
+            "model",
+            "size",
+            "seconds",
+            "vquality"
+          ]
+        }
+      ],
+      "note": "槽④：model/size/seconds/vquality（文本配置另带 count/reasoningEffort）；值来自模板默认值"
+    },
+    {
+      "kind": "optionalSegments",
+      "label": "⑤可选段",
+      "required": false,
+      "targets": [
+        {
+          "nodeId": "lapian-1793901293075-gl4cw",
+          "fields": [
+            "lapianOptional"
+          ]
+        }
+      ],
+      "note": "槽⑤：lapianOptional 渲染可选段字母（空/缺省 = 全关）；默认值随模板携带"
+    }
+  ],
+  "frozen": {
+    "instructions": [
+      {
+        "nodeId": "text-1793901665795-amrfn",
+        "promptTemplate": "seedance-flow",
+        "contentDigest": "3809e09a",
+        "contentLength": 1471
+      }
+    ],
+    "generationModes": [
+      {
+        "nodeId": "config-1793901665795-kooye",
+        "mode": "text"
+      },
+      {
+        "nodeId": "config-1793903256858-naerp",
+        "mode": "video"
+      }
+    ],
+    "composerSkeletons": [
+      {
+        "nodeId": "config-1793901665795-kooye",
+        "digest": "8c06589f",
+        "length": 115
+      },
+      {
+        "nodeId": "config-1793903256858-naerp",
+        "digest": "0ebb2eba",
+        "length": 241
+      }
+    ],
+    "topology": {
+      "edgeCount": 18,
+      "digest": "3a5eb765",
+      "nodeIds": [
+        "video-1793901289325-25d4s",
+        "lapian-1793901293075-gl4cw",
+        "text-1793901665795-amrfn",
+        "text-1793901665795-jx3cx",
+        "config-1793901665795-kooye",
+        "jERtWnPXyzFhmbUxLLM4G",
+        "config-1793903256858-naerp",
+        "image-1793901490523-chxhe",
+        "image-1793901490618-p42to",
+        "image-1793901493028-xpa34",
+        "image-1793901316874-tfjaz",
+        "image-1793901333240-smntt",
+        "image-1793901447125-74tq3"
+      ]
+    }
+  },
+  "externalReferences": [
+    {
+      "kind": "connection",
+      "fromNodeId": "image-1793901316874-tfjaz",
+      "field": "connection",
+      "targetId": "XmyReMCn39jeGPGD7-QWi",
+      "reason": "边界内节点 → 图外节点的出边（目标未纳入模板）",
+      "edgeId": "_8MPzzySo1BOGtAVTWbK5"
+    },
+    {
+      "kind": "connection",
+      "fromNodeId": "image-1793901316874-tfjaz",
+      "field": "connection",
+      "targetId": "_bSSLPTYcp5GkOdrYu5nE",
+      "reason": "边界内节点 → 图外节点的出边（目标未纳入模板）",
+      "edgeId": "1-MqcvkokhJUKId8ZX3GN"
+    },
+    {
+      "kind": "connection",
+      "fromNodeId": "lapian-1793901293075-gl4cw",
+      "field": "connection",
+      "targetId": "image-1793901538358-h020v",
+      "reason": "边界内节点 → 图外节点的出边（目标未纳入模板）",
+      "edgeId": "e_DZ_xKc2XKlnZF_FpI5Z"
+    },
+    {
+      "kind": "connection",
+      "fromNodeId": "lapian-1793901293075-gl4cw",
+      "field": "connection",
+      "targetId": "image-1793901538358-c3dhh",
+      "reason": "边界内节点 → 图外节点的出边（目标未纳入模板）",
+      "edgeId": "EnHOy7xrU9wE0VRPyYdkH"
+    },
+    {
+      "kind": "connection",
+      "fromNodeId": "lapian-1793901293075-gl4cw",
+      "field": "connection",
+      "targetId": "image-1793901538358-vskz4",
+      "reason": "边界内节点 → 图外节点的出边（目标未纳入模板）",
+      "edgeId": "WscF1f9QmzaiD38PDBqsj"
+    },
+    {
+      "kind": "connection",
+      "fromNodeId": "lapian-1793901293075-gl4cw",
+      "field": "connection",
+      "targetId": "image-1793901538358-w6yss",
+      "reason": "边界内节点 → 图外节点的出边（目标未纳入模板）",
+      "edgeId": "zkorfErKteb1dPw1PoPMt"
+    },
+    {
+      "kind": "connection",
+      "fromNodeId": "lapian-1793901293075-gl4cw",
+      "field": "connection",
+      "targetId": "image-1793901538358-ad6d4",
+      "reason": "边界内节点 → 图外节点的出边（目标未纳入模板）",
+      "edgeId": "5dULmmOtvuKxv8axIPSi-"
+    },
+    {
+      "kind": "connection",
+      "fromNodeId": "lapian-1793901293075-gl4cw",
+      "field": "connection",
+      "targetId": "image-1793901538358-v9489",
+      "reason": "边界内节点 → 图外节点的出边（目标未纳入模板）",
+      "edgeId": "mzvR8iBqVQwV_ebchM4Kr"
+    },
+    {
+      "kind": "connection",
+      "fromNodeId": "lapian-1793901293075-gl4cw",
+      "field": "connection",
+      "targetId": "image-1793901538358-dqum1",
+      "reason": "边界内节点 → 图外节点的出边（目标未纳入模板）",
+      "edgeId": "B3_32dUVzPJ4Ncn2iiTeQ"
+    },
+    {
+      "kind": "connection",
+      "fromNodeId": "lapian-1793901293075-gl4cw",
+      "field": "connection",
+      "targetId": "image-1793901538358-ay2b4",
+      "reason": "边界内节点 → 图外节点的出边（目标未纳入模板）",
+      "edgeId": "GMHd-3R89DGiv13k7G4ze"
+    },
+    {
+      "kind": "connection",
+      "fromNodeId": "lapian-1793901293075-gl4cw",
+      "field": "connection",
+      "targetId": "image-1793901538358-804w8",
+      "reason": "边界内节点 → 图外节点的出边（目标未纳入模板）",
+      "edgeId": "LtOXu3O5sOyvZxYsF0Rmg"
+    },
+    {
+      "kind": "connection",
+      "fromNodeId": "config-1793903256858-naerp",
+      "field": "connection",
+      "targetId": "CzLTVkv5bNVYctV8xSRUQ",
+      "reason": "边界内节点 → 图外节点的出边（目标未纳入模板）",
+      "edgeId": "S2TtbmrjnqBYrUQDRDZPT"
+    },
+    {
+      "kind": "connection",
+      "fromNodeId": "image-1793901490618-p42to",
+      "field": "connection",
+      "targetId": "config-1793933450642-6bedm",
+      "reason": "边界内节点 → 图外节点的出边（目标未纳入模板）",
+      "edgeId": "dibGkQkmpxM3gvshe04mx"
+    },
+    {
+      "kind": "connection",
+      "fromNodeId": "image-1793901316874-tfjaz",
+      "field": "connection",
+      "targetId": "config-1793933450642-6bedm",
+      "reason": "边界内节点 → 图外节点的出边（目标未纳入模板）",
+      "edgeId": "OE1RmV0GEq3nwtJP7WLld"
+    },
+    {
+      "kind": "connection",
+      "fromNodeId": "image-1793901333240-smntt",
+      "field": "connection",
+      "targetId": "config-1793933450642-6bedm",
+      "reason": "边界内节点 → 图外节点的出边（目标未纳入模板）",
+      "edgeId": "LiDVIp4ljV1se2bH8keC5"
+    },
+    {
+      "kind": "connection",
+      "fromNodeId": "image-1793901490618-p42to",
+      "field": "connection",
+      "targetId": "config-1793933592355-56lnn",
+      "reason": "边界内节点 → 图外节点的出边（目标未纳入模板）",
+      "edgeId": "f7CJ-7qVDzKwvK_m6sTae"
+    },
+    {
+      "kind": "connection",
+      "fromNodeId": "image-1793901316874-tfjaz",
+      "field": "connection",
+      "targetId": "config-1793933592355-56lnn",
+      "reason": "边界内节点 → 图外节点的出边（目标未纳入模板）",
+      "edgeId": "gsDO_o3Nvy5mbuqrE0A7P"
+    },
+    {
+      "kind": "connection",
+      "fromNodeId": "image-1793901333240-smntt",
+      "field": "connection",
+      "targetId": "config-1793933592355-56lnn",
+      "reason": "边界内节点 → 图外节点的出边（目标未纳入模板）",
+      "edgeId": "HN9UfY97Le7-DI9WEdKH9"
+    },
+    {
+      "kind": "connection",
+      "fromNodeId": "image-1793901316874-tfjaz",
+      "field": "connection",
+      "targetId": "config-1793935231291-rbd05",
+      "reason": "边界内节点 → 图外节点的出边（目标未纳入模板）",
+      "edgeId": "8VJJ3nHMhLykdRNWPsBnC"
+    },
+    {
+      "kind": "connection",
+      "fromNodeId": "image-1793901333240-smntt",
+      "field": "connection",
+      "targetId": "config-1793935231291-rbd05",
+      "reason": "边界内节点 → 图外节点的出边（目标未纳入模板）",
+      "edgeId": "Cze_W_n5UTnMVJO_Ei3Ws"
+    },
+    {
+      "kind": "connection",
+      "fromNodeId": "image-1793901316874-tfjaz",
+      "field": "connection",
+      "targetId": "config-1793935291099-93umz",
+      "reason": "边界内节点 → 图外节点的出边（目标未纳入模板）",
+      "edgeId": "Q3z_1WAsoXT4Ice7-T5Eo"
+    },
+    {
+      "kind": "connection",
+      "fromNodeId": "image-1793901333240-smntt",
+      "field": "connection",
+      "targetId": "config-1793935291099-93umz",
+      "reason": "边界内节点 → 图外节点的出边（目标未纳入模板）",
+      "edgeId": "Qkxw4ZlDV5HQ09t42w2P2"
+    }
+  ],
+  "stripped": [
+    {
+      "nodeId": "video-1793901289325-25d4s",
+      "role": "sourceVideo",
+      "fields": [
+        "content",
+        "storageKey",
+        "bytes",
+        "mimeType",
+        "durationMs",
+        "naturalWidth",
+        "naturalHeight",
+        "status"
+      ]
+    },
+    {
+      "nodeId": "lapian-1793901293075-gl4cw",
+      "role": "lapian",
+      "fields": [
+        "taskId",
+        "jobId",
+        "content",
+        "intent",
+        "lapPhase"
+      ]
+    },
+    {
+      "nodeId": "text-1793901665795-amrfn",
+      "role": "instruction",
+      "fields": [
+        "status"
+      ]
+    },
+    {
+      "nodeId": "text-1793901665795-jx3cx",
+      "role": "intent",
+      "fields": [
+        "content->placeholder",
+        "status"
+      ]
+    },
+    {
+      "nodeId": "config-1793901665795-kooye",
+      "role": "configText",
+      "fields": [
+        "status",
+        "composerContent.manifest"
+      ]
+    },
+    {
+      "nodeId": "jERtWnPXyzFhmbUxLLM4G",
+      "role": "finalText",
+      "fields": [
+        "content",
+        "prompt",
+        "status",
+        "texts",
+        "primaryTextId",
+        "cameraCoverage"
+      ]
+    },
+    {
+      "nodeId": "config-1793903256858-naerp",
+      "role": "configVideo",
+      "fields": [
+        "status"
+      ]
+    },
+    {
+      "nodeId": "image-1793901490523-chxhe",
+      "role": "fixedAsset",
+      "fields": [
+        "status"
+      ]
+    },
+    {
+      "nodeId": "image-1793901490618-p42to",
+      "role": "fixedAsset",
+      "fields": [
+        "status"
+      ]
+    },
+    {
+      "nodeId": "image-1793901493028-xpa34",
+      "role": "fixedAsset",
+      "fields": [
+        "status"
+      ]
+    },
+    {
+      "nodeId": "image-1793901316874-tfjaz",
+      "role": "fixedAsset",
+      "fields": [
+        "status"
+      ]
+    },
+    {
+      "nodeId": "image-1793901333240-smntt",
+      "role": "fixedAsset",
+      "fields": [
+        "status"
+      ]
+    },
+    {
+      "nodeId": "image-1793901447125-74tq3",
+      "role": "fixedAsset",
+      "fields": [
+        "status"
+      ]
+    }
+  ]
+}

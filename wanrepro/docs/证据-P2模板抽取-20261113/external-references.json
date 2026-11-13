@@ -1,0 +1,178 @@
+[
+  {
+    "kind": "connection",
+    "fromNodeId": "image-1793901316874-tfjaz",
+    "field": "connection",
+    "targetId": "XmyReMCn39jeGPGD7-QWi",
+    "reason": "边界内节点 → 图外节点的出边（目标未纳入模板）",
+    "edgeId": "_8MPzzySo1BOGtAVTWbK5"
+  },
+  {
+    "kind": "connection",
+    "fromNodeId": "image-1793901316874-tfjaz",
+    "field": "connection",
+    "targetId": "_bSSLPTYcp5GkOdrYu5nE",
+    "reason": "边界内节点 → 图外节点的出边（目标未纳入模板）",
+    "edgeId": "1-MqcvkokhJUKId8ZX3GN"
+  },
+  {
+    "kind": "connection",
+    "fromNodeId": "lapian-1793901293075-gl4cw",
+    "field": "connection",
+    "targetId": "image-1793901538358-h020v",
+    "reason": "边界内节点 → 图外节点的出边（目标未纳入模板）",
+    "edgeId": "e_DZ_xKc2XKlnZF_FpI5Z"
+  },
+  {
+    "kind": "connection",
+    "fromNodeId": "lapian-1793901293075-gl4cw",
+    "field": "connection",
+    "targetId": "image-1793901538358-c3dhh",
+    "reason": "边界内节点 → 图外节点的出边（目标未纳入模板）",
+    "edgeId": "EnHOy7xrU9wE0VRPyYdkH"
+  },
+  {
+    "kind": "connection",
+    "fromNodeId": "lapian-1793901293075-gl4cw",
+    "field": "connection",
+    "targetId": "image-1793901538358-vskz4",
+    "reason": "边界内节点 → 图外节点的出边（目标未纳入模板）",
+    "edgeId": "WscF1f9QmzaiD38PDBqsj"
+  },
+  {
+    "kind": "connection",
+    "fromNodeId": "lapian-1793901293075-gl4cw",
+    "field": "connection",
+    "targetId": "image-1793901538358-w6yss",
+    "reason": "边界内节点 → 图外节点的出边（目标未纳入模板）",
+    "edgeId": "zkorfErKteb1dPw1PoPMt"
+  },
+  {
+    "kind": "connection",
+    "fromNodeId": "lapian-1793901293075-gl4cw",
+    "field": "connection",
+    "targetId": "image-1793901538358-ad6d4",
+    "reason": "边界内节点 → 图外节点的出边（目标未纳入模板）",
+    "edgeId": "5dULmmOtvuKxv8axIPSi-"
+  },
+  {
+    "kind": "connection",
+    "fromNodeId": "lapian-1793901293075-gl4cw",
+    "field": "connection",
+    "targetId": "image-1793901538358-v9489",
+    "reason": "边界内节点 → 图外节点的出边（目标未纳入模板）",
+    "edgeId": "mzvR8iBqVQwV_ebchM4Kr"
+  },
+  {
+    "kind": "connection",
+    "fromNodeId": "lapian-1793901293075-gl4cw",
+    "field": "connection",
+    "targetId": "image-1793901538358-dqum1",
+    "reason": "边界内节点 → 图外节点的出边（目标未纳入模板）",
+    "edgeId": "B3_32dUVzPJ4Ncn2iiTeQ"
+  },
+  {
+    "kind": "connection",
+    "fromNodeId": "lapian-1793901293075-gl4cw",
+    "field": "connection",
+    "targetId": "image-1793901538358-ay2b4",
+    "reason": "边界内节点 → 图外节点的出边（目标未纳入模板）",
+    "edgeId": "GMHd-3R89DGiv13k7G4ze"
+  },
+  {
+    "kind": "connection",
+    "fromNodeId": "lapian-1793901293075-gl4cw",
+    "field": "connection",
+    "targetId": "image-1793901538358-804w8",
+    "reason": "边界内节点 → 图外节点的出边（目标未纳入模板）",
+    "edgeId": "LtOXu3O5sOyvZxYsF0Rmg"
+  },
+  {
+    "kind": "connection",
+    "fromNodeId": "config-1793903256858-naerp",
+    "field": "connection",
+    "targetId": "CzLTVkv5bNVYctV8xSRUQ",
+    "reason": "边界内节点 → 图外节点的出边（目标未纳入模板）",
+    "edgeId": "S2TtbmrjnqBYrUQDRDZPT"
+  },
+  {
+    "kind": "connection",
+    "fromNodeId": "image-1793901490618-p42to",
+    "field": "connection",
+    "targetId": "config-1793933450642-6bedm",
+    "reason": "边界内节点 → 图外节点的出边（目标未纳入模板）",
+    "edgeId": "dibGkQkmpxM3gvshe04mx"
+  },
+  {
+    "kind": "connection",
+    "fromNodeId": "image-1793901316874-tfjaz",
+    "field": "connection",
+    "targetId": "config-1793933450642-6bedm",
+    "reason": "边界内节点 → 图外节点的出边（目标未纳入模板）",
+    "edgeId": "OE1RmV0GEq3nwtJP7WLld"
+  },
+  {
+    "kind": "connection",
+    "fromNodeId": "image-1793901333240-smntt",
+    "field": "connection",
+    "targetId": "config-1793933450642-6bedm",
+    "reason": "边界内节点 → 图外节点的出边（目标未纳入模板）",
+    "edgeId": "LiDVIp4ljV1se2bH8keC5"
+  },
+  {
+    "kind": "connection",
+    "fromNodeId": "image-1793901490618-p42to",
+    "field": "connection",
+    "targetId": "config-1793933592355-56lnn",
+    "reason": "边界内节点 → 图外节点的出边（目标未纳入模板）",
+    "edgeId": "f7CJ-7qVDzKwvK_m6sTae"
+  },
+  {
+    "kind": "connection",
+    "fromNodeId": "image-1793901316874-tfjaz",
+    "field": "connection",
+    "targetId": "config-1793933592355-56lnn",
+    "reason": "边界内节点 → 图外节点的出边（目标未纳入模板）",
+    "edgeId": "gsDO_o3Nvy5mbuqrE0A7P"
+  },
+  {
+    "kind": "connection",
+    "fromNodeId": "image-1793901333240-smntt",
+    "field": "connection",
+    "targetId": "config-1793933592355-56lnn",
+    "reason": "边界内节点 → 图外节点的出边（目标未纳入模板）",
+    "edgeId": "HN9UfY97Le7-DI9WEdKH9"
+  },
+  {
+    "kind": "connection",
+    "fromNodeId": "image-1793901316874-tfjaz",
+    "field": "connection",
+    "targetId": "config-1793935231291-rbd05",
+    "reason": "边界内节点 → 图外节点的出边（目标未纳入模板）",
+    "edgeId": "8VJJ3nHMhLykdRNWPsBnC"
+  },
+  {
+    "kind": "connection",
+    "fromNodeId": "image-1793901333240-smntt",
+    "field": "connection",
+    "targetId": "config-1793935231291-rbd05",
+    "reason": "边界内节点 → 图外节点的出边（目标未纳入模板）",
+    "edgeId": "Cze_W_n5UTnMVJO_Ei3Ws"
+  },
+  {
+    "kind": "connection",
+    "fromNodeId": "image-1793901316874-tfjaz",
+    "field": "connection",
+    "targetId": "config-1793935291099-93umz",
+    "reason": "边界内节点 → 图外节点的出边（目标未纳入模板）",
+    "edgeId": "Q3z_1WAsoXT4Ice7-T5Eo"
+  },
+  {
+    "kind": "connection",
+    "fromNodeId": "image-1793901333240-smntt",
+    "field": "connection",
+    "targetId": "config-1793935291099-93umz",
+    "reason": "边界内节点 → 图外节点的出边（目标未纳入模板）",
+    "edgeId": "Qkxw4ZlDV5HQ09t42w2P2"
+  }
+]
