@@ -357,7 +357,7 @@ function InfiniteCanvasPage() {
     const focusAnimRef = useRef<number | null>(null);
     // P4（G18）：生成链必须能回报「本次新建的输出节点 id」——编排器据此绑定产物，禁按「最新节点」猜。
     // 可选参数，旧调用方（面板/连线/Agent ops）签名不变。
-    const generateNodeRef = useRef<((nodeId: string, mode: CanvasNodeGenerationMode, prompt: string, options?: { onChildNodeCreated?: (childNodeId: string) => void }) => Promise<void>) | null>(null);
+    const generateNodeRef = useRef<((nodeId: string, mode: CanvasNodeGenerationMode, prompt: string, options?: { onChildNodeCreated?: (childNodeId: string) => void; source?: "user" | "programmatic" }) => Promise<void>) | null>(null);
     const connectingParamsRef = useRef(connectingParams);
     const connectionTargetNodeIdRef = useRef(connectionTargetNodeId);
     const selectionBoxRef = useRef(selectionBox);
@@ -980,6 +980,13 @@ function InfiniteCanvasPage() {
         setContextMenu,
     });
 
+    // 仅 DOM 探针用：开发模式下把 ops 应用挂到 window，方便控制台手工验证 Agent ops。
+    if (import.meta.env.DEV) {
+        (window as unknown as { __probeApplyOps?: (ops: unknown) => void }).__probeApplyOps = (ops: unknown) => {
+            applyAgentOps(ops as Parameters<typeof applyAgentOps>[0]);
+        };
+    }
+
     /**
      * P8：批次运行时注册（待审批侧栏的「开始/续跑」「暂停」「重跑」入口）。
      *
@@ -998,6 +1005,7 @@ function InfiniteCanvasPage() {
             runGeneration: async ({ nodeId, mode, prompt }) => {
                 let childNodeId = "";
                 await generateNodeRef.current?.(nodeId, mode, prompt, {
+                    source: "programmatic",
                     onChildNodeCreated: (id) => {
                         childNodeId = id;
                     },
@@ -3324,7 +3332,7 @@ function InfiniteCanvasPage() {
     }, []);
 
     const handleGenerateNode = useCallback(
-        async (nodeId: string, mode: CanvasNodeGenerationMode, prompt: string, options?: { onChildNodeCreated?: (childNodeId: string) => void }) => {
+        async (nodeId: string, mode: CanvasNodeGenerationMode, prompt: string, options?: { onChildNodeCreated?: (childNodeId: string) => void; source?: "user" | "programmatic" }) => {
             // P4（G18）：本次新建的输出节点 id 是「产物身份」的唯一真源——在**建节点那一刻**回报，
             // 不在生成完成后按「最新节点/最大 id」反猜（Config 每次生成都是新 nanoid，反猜必错）。
             const notifyChildCreated = (childId: string) => {
@@ -3333,6 +3341,11 @@ function InfiniteCanvasPage() {
             const sourceNode = nodesRef.current.find((node) => node.id === nodeId);
             const generationConfig = buildGenerationConfig(effectiveConfig, sourceNode, mode);
             if (!isAiConfigReady(generationConfig, generationConfig.model)) {
+                // 程序化来源（批次/Agent）失败时不弹全局配置弹窗，只把错误写回节点，避免反复轰炸用户。
+                if (options?.source === "programmatic") {
+                    setNodes((prev) => prev.map((node) => (node.id === nodeId ? { ...node, metadata: { ...node.metadata, status: NODE_STATUS_ERROR, errorDetails: t("canvas.generation.channelMissing", { model: generationConfig.model }) } } : node)));
+                    return;
+                }
                 openConfigDialog(true);
                 return;
             }
