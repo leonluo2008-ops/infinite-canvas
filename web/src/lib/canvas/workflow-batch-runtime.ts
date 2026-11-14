@@ -29,6 +29,7 @@ import type { WorkflowAssetVetoRecord } from "@/lib/canvas/workflow-asset-match"
 import type { CanvasWorkflowTemplate } from "@/lib/canvas/workflow-template";
 import { buildMaterialsFromMember } from "@/lib/canvas/workflow-pending-review";
 import { templatePlanInput } from "@/lib/canvas/workflow-batch-entry";
+import { builtinWorkflowTemplate } from "@/lib/canvas/workflow-builtin-template";
 
 /**
  * 画布项目的结构下限（只读：运行时从不改项目对象，写一律走注入的 save* 回调）。
@@ -151,11 +152,20 @@ async function loadHubStates(deps: WorkflowBatchRuntimeDeps, batch: WorkflowBatc
     return states;
 }
 
-/** 模板重建（P3 计划入参）：只用项目里现存的模板声明 + 模板节点，不新造第二份模板。 */
+/**
+ * 模板重建（P3 计划入参）：只用项目里现存的模板声明 + 模板节点，不新造第二份模板。
+ *
+ * P12：成员模板可能是**系统内置「视频拆解」**（画布上没有 workflowTemplate）——按 id 兜到内置注册表，
+ * 其余情形（项目模板缺失 / id 不一致）仍如实报错不假跑。解析口径与 `workflow-batch-entry` 的
+ * `resolveTemplate` 同源（同一个注册表），不是第二套优先级。
+ */
 function planInputFor(project: BatchRuntimeProject, member: WorkflowBatchMember): { template: CanvasWorkflowTemplate; templateNodes: CanvasNodeData[]; templateConnections: CanvasConnection[] } | { error: string } {
-    const template = project.workflowTemplate;
-    if (!template) return { error: "项目没有工作流模板声明（workflowTemplate 缺失）：无法重建实例计划，不假跑" };
-    if (String(template.templateId) !== String(member.templateId)) return { error: `项目模板 ${template.templateId} 与成员模板 ${member.templateId} 不一致：拒绝按错模板重跑` };
+    const ownTemplate = project.workflowTemplate;
+    const template = (ownTemplate && String(ownTemplate.templateId) === String(member.templateId) ? ownTemplate : undefined) || builtinWorkflowTemplate(member.templateId);
+    if (!template) {
+        if (!ownTemplate) return { error: "项目没有工作流模板声明（workflowTemplate 缺失）：无法重建实例计划，不假跑" };
+        return { error: `项目模板 ${ownTemplate.templateId} 与成员模板 ${member.templateId} 不一致：拒绝按错模板重跑` };
+    }
     // 模板节点必须**已剥运行态**才能进计划（`validateTemplateProject` 会拦 taskId/status 残留），
     // 画布上的模板节点却是用户真节点（带拉片 taskId 等）——按冻结拓扑用 P2 同一函数重抽一次取剥离副本（纯函数）。
     try {

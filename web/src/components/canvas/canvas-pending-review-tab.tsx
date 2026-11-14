@@ -16,6 +16,7 @@ import { getWorkflowBatchRuntime, pauseBatch, rerunInstance, startBatch } from "
 import { readApprovedSignature, readGenDraft } from "@/lib/hub/gen-settings";
 import { buildRepairTimeline, buildReplaceSummary, buildReviewList, buildSlotRows, canShowRollback, chunkRows, filterReviewInstances, isReviewTabEmpty, REVIEW_FILTER_ALL, REVIEW_FILTER_REPLACED, reviewFilterIdOf, reviewReplacedCount, selfcheckItemsOf, vetoRecordForSlot, type ReviewBatchRow, type ReviewInstanceRow, type ReviewSlotRow } from "@/lib/canvas/workflow-pending-review";
 import { upsertAssetVeto, type WorkflowAssetVetoRecord } from "@/lib/canvas/workflow-asset-match";
+import { workflowTemplateDisplayName } from "@/lib/canvas/workflow-builtin-template";
 import { approveHubTask, errorText, getHubTask, hubQuickAction, hubQuickChannels, hubQuickPhaseText, rollbackHubTask, runHubQuickAction, type HubQuickPhase, type HubTaskDetail } from "@/pages/hub/hub-api";
 import { resolveMediaUrl } from "@/services/file-storage";
 import { previewUrlFor } from "@/services/image-storage";
@@ -195,9 +196,9 @@ export function useReviewBadgeCount(nodes?: CanvasNodeData[]): number {
     const { states } = useReviewHubStates(batches);
     const evidenceOf = useReviewEvidence(batches as WorkflowBatchRecord[], liveNodes, String(projectId || ""), String(project?.title || ""));
     return useMemo(() => {
-        const rows = buildReviewList({ batches: batches as WorkflowBatchRecord[], nodes: liveNodes, hubStates: states, evidenceOf, templateNameOf: () => project?.workflowTemplate?.name });
+        const rows = buildReviewList({ batches: batches as WorkflowBatchRecord[], nodes: liveNodes, hubStates: states, evidenceOf, templateNameOf: (templateId) => workflowTemplateDisplayName(project, templateId) });
         return rows.reduce((sum, row) => sum + row.badgeCount, 0);
-    }, [batches, evidenceOf, liveNodes, project?.workflowTemplate?.name, states]);
+    }, [batches, evidenceOf, liveNodes, project, states]);
 }
 
 // ---------------------------------------------------------------------------
@@ -230,7 +231,7 @@ export function CanvasPendingReviewTab({ nodes, onFocusNode, theme }: TabProps) 
         setRuntimeReady(Boolean(getWorkflowBatchRuntime()));
     }, [batches]);
 
-    const rows = useMemo(() => buildReviewList({ batches, nodes: liveNodes, hubStates: states, evidenceOf, templateNameOf: () => project?.workflowTemplate?.name }), [batches, evidenceOf, liveNodes, project?.workflowTemplate?.name, states]);
+    const rows = useMemo(() => buildReviewList({ batches, nodes: liveNodes, hubStates: states, evidenceOf, templateNameOf: (templateId) => workflowTemplateDisplayName(project, templateId) }), [batches, evidenceOf, liveNodes, project, states]);
     // 状态筛选（P0c 图2 ②）：键只是手势，行仍是派生结果；筛选只影响显示，不改批次状态。
     const filteredRows = useMemo(() => rows.map((batch) => ({ ...batch, instances: filterReviewInstances(batch.instances, filter) })), [rows, filter]);
     const flat = useMemo(() => filteredRows.flatMap((batch) => batch.instances), [filteredRows]);

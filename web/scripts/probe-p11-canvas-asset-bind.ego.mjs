@@ -13,7 +13,8 @@
  *
  * 本层能证与不能证（如实写在报告里）：
  *   能证：① **真页面 + 真 store** 里调 P11 解析层：人物图绑人物槽、产品图绑主体槽，回执带理由/命中词/分数；
- *        ② 真页面里零参形态的 run_workflow_batch 仍走 P10 语义（无模板 → 人话引导），P11 没有改变入口行为；
+ *        ② 真页面里零参形态的 run_workflow_batch：P12 起无模板缺省命中系统内置（不再引导抽模板），
+ *           解析层放行（失败只可能来自素材字节，证明模板不再是使用前提）；
  *        ③ 生产实例落到真 store 后，侧栏「待审批」渲染 1 行 + 抽屉挂图位 2 个（图名/理由可见）+ 一键否决按钮在位
  *           （DOM 断言 + 截图）；
  *        ④ 全程零生成 / 零提交请求（fetch 计数）。
@@ -181,13 +182,14 @@ check("② 真页面 + 真 store：产品图绑主体槽（带命中词/分数/�
 check("③ 回执摘要写清「图→槽」与理由（用户可核对）", /人物-女性\.png/.test(String(liveResolve.summary)) && /主体-香水\.png/.test(String(liveResolve.summary)) && /槽语义命中/.test(String(liveResolve.summary)), String(liveResolve.summary));
 check("④ 模板骨架里的图不进候选池（真页面同口径）", !(liveResolve.candidates || []).some((row) => row.imageNodeId === "ref-img"), JSON.stringify(liveResolve.candidates));
 
-// 零参入口行为不变（P10 语义零回归：项目没模板时是人话引导，不是空跑）
+// 零参入口行为（P12 起更新口径：项目没模板时缺省直接命中系统内置「视频拆解」，不再人话引导先抽模板；
+// 解析层放行后失败只可能来自素材字节——本夹具 deps 没给 getBlob 字节，走到素材/实例层即证明模板不再是使用前提）
 const zeroArg = await page.evaluate(async ({ projectId }) => {
     const entryMod = await import("/src/lib/canvas/workflow-batch-entry.ts");
     const storeMod = await import("/src/stores/canvas/use-canvas-store.ts");
     const project = storeMod.useCanvasStore.getState().projects.find((item) => item.id === projectId);
     try {
-        await entryMod.runWorkflowBatchTool({}, {
+        const result = await entryMod.runWorkflowBatchTool({}, {
             project: () => ({ ...project, workflowTemplate: undefined }),
             applyOps: () => {},
             getBlob: async () => null,
@@ -198,12 +200,12 @@ const zeroArg = await page.evaluate(async ({ projectId }) => {
             flush: () => {},
             runBatch: async () => ({ ok: false }),
         });
-        return { ok: true };
+        return { ok: true, result: { templateFrom: result.templateFrom, templateId: result.templateId } };
     } catch (error) {
         return { error: String((error && error.message) || error) };
     }
 }, { projectId: PROJECT_ID });
-check("⑤ P10 入口行为零回归：无模板时零参调用仍是人话引导（抽模板）", /画布还没有工作流模板/.test(String(zeroArg.error)) && /extract_workflow_template/.test(String(zeroArg.error)), String(zeroArg.error || zeroArg.ok));
+check("⑤ P12 入口语径：无模板时零参调用缺省命中内置（不再引导先抽模板，解析层放行）", (zeroArg.ok === true && zeroArg.result.templateFrom === "builtin" && zeroArg.result.templateId === "builtin-video-analysis") || (!/画布还没有工作流模板|先抽一次模板|抽一次模板/.test(String(zeroArg.error)) && /字节|模板节点|拉片|素材/.test(String(zeroArg.error))), String(zeroArg.error || JSON.stringify(zeroArg.result)));
 
 // ---------------------------------------------------------------- ③ 生产实例落真 store → 侧栏 DOM
 await page.evaluate(async ({ key, projectId, dump, chain }) => {

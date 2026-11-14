@@ -1,0 +1,119 @@
+{
+  "at": "2026-11-14T06:31:12.798Z",
+  "space": 12,
+  "pass": 21,
+  "fail": 0,
+  "fails": [],
+  "results": [
+    {
+      "name": "P0 真实 store 已备份原值（跑完原样写回）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "①-0 夹具确为全新空项目：无 workflowTemplate、无连线、只有 3 个素材节点",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "① 全新空项目一句话直达：模板解析直接过（不再报「先抽模板/画布还没有模板」）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "①-2 内置模板在真浏览器包里可用：id=builtin-video-analysis / 名=视频拆解 / 9 节点 / 五槽 / 零图外引用",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "①-2b 内置资产槽语义（人物/产品，序 0/1）在真浏览器里与 P11 绑定口径一致",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "①-2c 模板层已放行：失败点只在「真视频字节不在浏览器存储」（内置模板被接受、实例计划已开始执行）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "①-3 素材自动解析 1 条、实例入批 1 条（素材字节缺失导致的失败如实报出，不冒充成功）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "①-4 零付费、零生成端点（本工具内视频创建恒 0）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "①-5 画布实例节点只增不减（链路没被半途拆掉）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "② 实例链画布可见：内置模板 8 个骨架节点按确定性 id 真画在画布上（源视频/拉片/指令/意图/组装配置/视频配置/两个资产位）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "②-1b 挂图副本与对照图也在画布上（图→槽的可视实体，不是黑盒）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "②-2 实例链连线可见（源→拉片→组装→产物→视频配置等边真的画出来了）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "③-0 左侧栏「待审批」页签存在且可点，徽标=1",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "③-1 侧栏出 1 个批次 + 1 行实例（内置批次的实例真被侧栏认到）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "③ 侧栏「待审批」可见：批次头显示内置模板名「视频拆解」",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "③-2 侧栏不露内部 id（builtin-video-analysis 不出现在界面上）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "③-3 实例行状态=待审批（data-review-status=awaiting_approval，与派生层一致）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "③-4 实例行有素材缩略位（data-review-thumb 在位，不是空行）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "④ 全程零提交出片（/api/hub/submit 从未被调用）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "④-2 全程零生成/零付费端点",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "⑤ 自建夹具已清（store 原值原样写回）",
+      "ok": true,
+      "detail": ""
+    }
+  ],
+  "fixture": {
+    "batchId": "batch-52a063e2",
+    "templateId": "builtin-video-analysis",
+    "nodes": 16
+  }
+}

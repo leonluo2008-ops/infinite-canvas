@@ -67,10 +67,14 @@ test("P10 具名工作流直达：描述写死「视频拆解」话术 + 零参�
     assert.match(description, /源视频节点/, "描述缺「自动解析源视频」口径");
     assert.match(description, /逐条列出/, "描述缺「回执逐条列素材供核对」口径");
     assert.match(description, /选中/, "描述缺「选中优先」口径");
-    // 卡面要求 3/4：具名登记 + 首次使用引导抽模板
+    // 卡面要求 3/4：具名登记 + 内置模板开箱即用（P12：不再引导「先抽模板」）
     assert.match(description, /模板名/, "描述缺「回执报模板名」口径");
-    assert.match(description, /抽一次模板/, "描述缺「首次使用引导抽模板」口径");
+    assert.match(description, /系统内置工作流/, "描述缺「视频拆解是系统内置工作流」口径");
+    assert.match(description, /开箱即用/, "描述缺「开箱即用」口径");
+    assert.doesNotMatch(description, /抽一次模板/, "描述仍在引导「先抽模板」（P12 已把抽取降级为自定义能力）");
     assert.match(toolDescriptions.extract_workflow_template, /具名/, "抽模板工具描述缺「name 即具名」引导");
+    assert.match(toolDescriptions.extract_workflow_template, /高级能力|自定义/, "抽模板工具描述缺「抽取=自定义能力」定位");
+    assert.match(toolDescriptions.extract_workflow_template, /不需要先抽模板/, "抽模板工具描述缺「不需要先抽模板」口径");
 
     // zod：templateId / materials / 两者都不传 均合法（materials 空数组也按自动解析处理）
     assert.equal(toolInputSchemas.run_workflow_batch.safeParse({}).success, true);
@@ -124,6 +128,21 @@ test("P11 绑定入参原样下发页面（显式指定不被 Agent 侧改写）
     assert.deepEqual(field(call, "input"), input);
     session.resolveResult("first", { requestId: String(field(call, "requestId")), result: { ok: true, assetBindings: [], paidVideoCreations: 0 } });
     assert.deepEqual(await pending, { ok: true, assetBindings: [], paidVideoCreations: 0 });
+});
+
+test("P12 内置模板：描述写明「人物/产品」内置槽位 + 实例工具同样开箱即用", () => {
+    const batch = toolDescriptions.run_workflow_batch;
+    // 内置模板的资产槽位是语义层的唯一抓手：Agent 必须能按用户话术把它们翻成 assetBindings
+    assert.match(batch, /资产槽位是「人物」和「产品」/, "描述缺内置槽位清单");
+    assert.match(batch, /角色\/人物\/模特/, "描述缺「角色→人物槽」话术映射");
+    assert.match(batch, /产品\/商品/, "描述缺「商品→产品槽」话术映射");
+    // 回执要能区分模板来源（builtin/project），否则用户不知道这次用的是哪个模板
+    assert.match(batch, /templateFrom=explicit\/project\/builtin/, "描述缺「回执报模板来源」口径");
+    // 不完整空壳模板：显式指向时人话报错，不建批
+    assert.match(batch, /不完整空壳模板会人话报错/, "描述缺「空壳模板报错不建批」口径");
+    const single = toolDescriptions.run_workflow_instance;
+    assert.match(single, /系统内置的「视频拆解」/, "run_workflow_instance 描述缺内置模板口径");
+    assert.match(single, /内置槽位=「人物」「产品」/, "run_workflow_instance 描述缺内置槽位口径");
 });
 
 test("P9 入参校验拒绝缺 material（不把坏调用下发给页面）", async (t) => {

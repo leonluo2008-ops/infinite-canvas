@@ -77,6 +77,9 @@ async function bundle(entry, outName) {
         outfile: outFile,
         logLevel: "silent",
         alias: { "@": path.resolve("src") },
+        // P12：内置模板经 lapian-prompt-templates 取默认指令正文（`...camera-contract.md?raw`）——
+        // 探针要按 vite 的 `?raw` 语义把它当文本内联，否则打包失败
+        loader: { ".md": "text" },
         banner: { js: "globalThis.localStorage = globalThis.localStorage || { getItem: () => null, setItem: () => {}, removeItem: () => {} };" },
     });
     return outFile;
@@ -318,8 +321,10 @@ setSection("D");
 {
     project = { ...project, workflowTemplate: undefined };
     await entry.extractWorkflowTemplateTool({ name: "P9 缺省边界", templateId: "p9default" }, entryDeps());
+    // P12 D1 补差：显式指定不冻结模板（图外引用非空）仍被拒——缺省路径则因「P9 缺省边界」不含
+    // 「视频拆解」不再选中它（意图对齐：不同名模板不参与缺省采用，直接用内置）
     const refused = await entry
-        .runWorkflowBatchTool({ materials: [{ sourceVideoNodeId: VIDEO }] }, entryDeps())
+        .runWorkflowBatchTool({ templateId: "p9default", materials: [{ sourceVideoNodeId: VIDEO }] }, entryDeps())
         .then(() => null)
         .catch((error) => error);
     check("D1 不冻结模板（有图外引用）建批次被拒绝，原因写明「不冻结」", refused instanceof Error && /不冻结/.test(refused.message) && /补全/.test(refused.message), String(refused && refused.message));
@@ -330,18 +335,17 @@ setSection("D");
         .catch((error) => error);
     check("D2 跨画布模板 id 被拒绝（不串批次）", crossCanvas instanceof Error && /不一致/.test(crossCanvas.message), String(crossCanvas && crossCanvas.message));
 
-    const noTemplate = await entry
-        .runWorkflowBatchTool({ materials: [{ sourceVideoNodeId: VIDEO }] }, { ...entryDeps(), project: () => ({ ...project, workflowTemplate: undefined }) })
-        .then(() => null)
-        .catch((error) => error);
-    check("D3 没有模板时给人话指引（先抽模板）", noTemplate instanceof Error && /extract_workflow_template/.test(noTemplate.message), String(noTemplate && noTemplate.message));
+    // P12：没有项目模板不再报错引导，直接用系统内置「视频拆解」（模板=系统资产，抽取降级为自定义能力）
+    const noTemplate = await entry.runWorkflowBatchTool({ materials: [{ sourceVideoNodeId: VIDEO }] }, { ...entryDeps(), project: () => ({ ...project, workflowTemplate: undefined }) });
+    check("D3 没有项目模板时直接用系统内置「视频拆解」（templateFrom=builtin，不再引导先抽模板）", noTemplate.templateFrom === "builtin" && noTemplate.templateId === "builtin-video-analysis" && !/extract_workflow_template|先抽模板|抽一次模板/.test(String(noTemplate.next) + JSON.stringify(noTemplate.warnings)), JSON.stringify({ from: noTemplate.templateFrom, id: noTemplate.templateId }));
 }
 
 // ================================================================ B. 3 素材建批次跑到待审批
 setSection("B");
 {
     resetProject();
-    const extracted = await entry.extractWorkflowTemplateTool({ sourceNodeIds: CHAIN_IDS, name: "P9 夹具模板", templateId: "p9demo" }, entryDeps());
+    // P12 D1 补差：夹具模板名含「视频拆解」——C 段的缺省单实例要命中这份项目模板（同名完整自定义优先于内置）
+    const extracted = await entry.extractWorkflowTemplateTool({ sourceNodeIds: CHAIN_IDS, name: "P9 夹具模板·视频拆解", templateId: "p9demo" }, entryDeps());
     check("B1 前置：冻结模板就位", extracted.frozenOk === true && project.workflowTemplate?.templateId === "p9demo");
 
     // 素材来自画布（3 个源视频节点）

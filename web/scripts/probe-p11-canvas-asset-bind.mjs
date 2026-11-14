@@ -79,6 +79,9 @@ async function bundle(entry, outName) {
         outfile: outFile,
         logLevel: "silent",
         alias: { "@": path.resolve("src") },
+        // P12：内置模板经 lapian-prompt-templates 取默认指令正文（`...camera-contract.md?raw`）——
+        // 探针要按 vite 的 `?raw` 语义把它当文本内联，否则打包失败
+        loader: { ".md": "text" },
         banner: { js: "globalThis.localStorage = globalThis.localStorage || { getItem: () => null, setItem: () => {}, removeItem: () => {} };" },
     });
     return outFile;
@@ -613,17 +616,43 @@ setSection("E");
         "web/src/lib/canvas/lapian-assets.ts",
     ];
     const repoRoot = path.resolve("..");
+    const P11_COMMIT = "e894772";
     let touched = [];
+    let committed = [];
     try {
         touched = execFileSync("git", ["-C", repoRoot, "status", "--porcelain"], { encoding: "utf8" })
             .split("\n")
             .map((line) => line.slice(3).trim())
             .filter(Boolean);
+        committed = execFileSync("git", ["-C", repoRoot, "diff", "--name-only", P11_COMMIT], { encoding: "utf8" })
+            .split("\n")
+            .map((line) => line.trim())
+            .filter(Boolean);
     } catch (error) {
         touched = [`git 失败：${error.message}`];
     }
-    const engineTouched = touched.filter((file) => ENGINE_FILES.some((engine) => file.replace(/\\/g, "/") === engine));
-    check("F7 引擎文件零改动（工作区改动里没有引擎/匹配器文件）", engineTouched.length === 0, JSON.stringify({ engineTouched, touched: touched.slice(0, 20) }));
+    // 工作区未提交 + P11 交付 commit 之后的已提交改动，一起对账（探针在 P11 交付时点与之后复跑都成立）
+    const tree = [...new Set([...touched, ...committed])].map((file) => file.replace(/^"|"$/g, "").replace(/\\/g, "/"));
+    // P12（t_ff047666）放行一处：内置模板批次的**模板解析**必须能按 id 兜到内置注册表（否则内置批次的续跑/
+    // 重试会报「项目没有模板声明」）。允许改动的只有 planInputFor 的模板来源解析；队列相位/审批/付费闸
+    // 由下面 F7b 逐行核对 diff 守住，其余引擎/匹配器文件仍零改动。
+    const P12_ALLOWED = "web/src/lib/canvas/workflow-batch-runtime.ts";
+    const hardEngine = ENGINE_FILES.filter((file) => file !== P12_ALLOWED);
+    const engineTouched = tree.filter((file) => hardEngine.includes(file));
+    check("F7a 引擎/匹配器文件零改动（模板抽取·实例化·匹配·队列状态·资产清单）", engineTouched.length === 0, JSON.stringify({ engineTouched, touched: tree.slice(0, 24) }));
+
+    let runtimeDiff = "";
+    try {
+        runtimeDiff = execFileSync("git", ["-C", repoRoot, "diff", "-U0", P11_COMMIT, "--", P12_ALLOWED], { encoding: "utf8" });
+    } catch (error) {
+        runtimeDiff = "";
+    }
+    const riskyLines = runtimeDiff
+        .split("\n")
+        .filter((line) => /^[+-][^+-]/.test(line))
+        .filter((line) => !/^[+-]\s*(\/\/|\*|\/\*)/.test(line))
+        .filter((line) => /paid|waitForApproval|approve|revoke|rollback|runBatchQueue|queue\.|phase/.test(line));
+    check("F7b 放行文件的改动只在模板解析（diff 不含队列相位/审批/付费闸语句）", runtimeDiff.includes("planInputFor") && riskyLines.length === 0, JSON.stringify({ riskyLines, hasPlanInput: runtimeDiff.includes("planInputFor") }));
 
     const probeSource = readFileSync(new URL(import.meta.url), "utf8");
     check("F8 探针自身没有付费生成调用点（无 run_generation 执行体 / 无视频创建端点）", !/run_generation\s*\(/.test(probeSource) && !probeSource.includes("api/video/" + "create"));

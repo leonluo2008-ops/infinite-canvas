@@ -11,8 +11,9 @@
  * space 名：p10-named-workflow（跑完不关，便于复查；截图落 wanrepro/docs/证据-P10具名工作流-20261114/）。
  *
  * 本层能证与不能证（如实写在报告里）：
- *   能证：① 页面侧 `run_workflow_batch` 在**零参形态**下真跑：无模板 → 人话引导抽模板；有模板但素材没字节 →
- *        人话报素材问题（证明「一句话直达」的语义解析真的跑在真页面真 store 上，不是空壳）；
+ *   能证：① 页面侧 `run_workflow_batch` 在**零参形态**下真跑：无模板 → P12 起缺省命中系统内置「视频拆解」
+ *        （不再引导先抽模板）；有模板但素材没字节 → 人话报素材问题（证明「一句话直达」的语义解析真的跑在
+ *        真页面真 store 上，不是空壳）；
  *        ② 真页面里抽模板并起名「视频拆解」→ 模板真落盘（刷新后仍在）；
  *        ③ 零参真调产出的批次在侧栏「待审批」页签渲染 3 行、全为待审批、徽标=3（DOM 断言）+ 截图；
  *        ④ 全程零生成/零提交请求（fetch 计数）。
@@ -146,16 +147,18 @@ await page.waitForLoadState("load");
 await page.waitForTimeout(2500);
 
 // ---------------------------------------------------------------- ① 零参直达的两条人话路径（真页面真 store）
+// P12 起：无模板不再人话引导「先抽模板」——缺省直接命中系统内置「视频拆解」，模板解析层放行，
+// 后续失败只可能来自素材字节（浏览器 IndexedDB 没有夹具视频的真字节，如实报错不冒充成功）。
 const zeroArgNoTemplate = await page.evaluate(async () => {
     const mod = await import("/src/lib/agent/agent-site-tools.ts");
     try {
-        await mod.runSiteTool("run_workflow_batch", {}, () => {});
-        return { ok: true };
+        const result = await mod.runSiteTool("run_workflow_batch", {}, () => {});
+        return { ok: true, result: { templateFrom: result.templateFrom, templateId: result.templateId, templateName: result.templateName } };
     } catch (error) {
         return { error: String((error && error.message) || error) };
     }
 });
-check("① 画布还没有模板时，零参调用给人话引导（先抽一次模板）", /画布还没有工作流模板/.test(String(zeroArgNoTemplate.error)) && /extract_workflow_template/.test(String(zeroArgNoTemplate.error)), String(zeroArgNoTemplate.error || zeroArgNoTemplate.ok));
+check("① 画布还没有模板时，零参缺省命中内置（不再报「画布还没有工作流模板/先抽模板」）", (zeroArgNoTemplate.ok === true && zeroArgNoTemplate.result.templateFrom === "builtin" && zeroArgNoTemplate.result.templateId === "builtin-video-analysis") || !/画布还没有工作流模板|先抽一次模板|抽一次模板/.test(String(zeroArgNoTemplate.error)), String(zeroArgNoTemplate.error || JSON.stringify(zeroArgNoTemplate.result)));
 
 // ---------------------------------------------------------------- ② 真页面抽模板并起名「视频拆解」
 const netBefore = await page.evaluate(() => (window.__p10Net ? window.__p10Net.requests.length : -1));

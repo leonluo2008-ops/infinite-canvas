@@ -14,6 +14,10 @@
  * 为什么是纯胶水（不 import store）：`pages/canvas/project.tsx` 把页面现状（project/applyOps/hub/落盘）
  * 通过 `registerWorkflowBatchRuntime` 注册成 deps，浏览器壳（`agent-site-tools.ts`）把它们喂进来；
  * 探针用同形状的 stub deps 跑同一份实现（P1/P8 一贯口径：探针跑生产代码本身）。
+ *
+ * P12（所有者点破的架构错误）：模板是**系统内置资产**。缺省解析=意图对齐：项目内**同名「视频拆解」且完整**的自定义模板 > 内置「视频拆解」（完整但不同名的项目模板不参与缺省采用——完整性不构成用途匹配）；
+ * 「先抽模板」不再是使用前提（抽取降级为想自定义工作流时的高级能力）。内置模板的骨架定义在
+ * `workflow-builtin-template.ts`（一份原型图 + P2 抽取函数，禁第二份骨架），本文件只负责解析优先级。
  */
 
 import type { CanvasConnection, CanvasNodeData } from "@/types/canvas";
@@ -37,6 +41,14 @@ import {
     type WorkflowAssetVetoRecord,
 } from "@/lib/canvas/workflow-asset-match";
 import { classifyTemplateRole, extractWorkflowTemplate, isSkeletonRole, stableDigest, type CanvasWorkflowTemplate } from "@/lib/canvas/workflow-template";
+import {
+    BUILTIN_VIDEO_ANALYSIS_DISPLAY_NAME,
+    BUILTIN_VIDEO_ANALYSIS_TEMPLATE_NAME,
+    assessTemplateCompleteness,
+    builtinVideoAnalysisTemplate,
+    builtinWorkflowTemplateSource,
+    isBuiltinTemplateId,
+} from "@/lib/canvas/workflow-builtin-template";
 import { templateInstanceNodeId } from "@/lib/canvas/workflow-template-ids";
 
 /** 画布项目的结构下限（**只读**：写一律走注入的 save 与 applyOps 回调）。 */
@@ -259,8 +271,11 @@ export type RunWorkflowBatchResult = {
     templateId: string;
     /** 模板具名（用户抽模板时起的名字，如「视频拆解」）——回执里报给用户核对。 */
     templateName: string;
-    /** 模板来源：explicit=用户/Agent 指定；project=画布唯一模板自动取用。 */
-    templateFrom: "explicit" | "project";
+    /**
+     * 模板来源（P12 三值）：explicit=用户/Agent 指定项目内模板；project=画布内完整模板自动取用；
+     * builtin=系统内置「视频拆解」（无模板/项目模板不完整时自动使用，开箱即用）。
+     */
+    templateFrom: "explicit" | "project" | "builtin";
     /** 素材来源：explicit=显式传入；selection=按画布选中解析；canvas=画布全部源视频。 */
     materialsFrom: MaterialSource;
     /** 本次素材清单（逐条 id+标题，供用户核对「是不是这 N 个视频」）。 */
@@ -352,7 +367,7 @@ export async function extractWorkflowTemplateTool(input: ExtractTemplateInput, d
         warnings,
         next: refs.length
             ? "模板已存到本画布但不能实例化：补全图外引用后重新抽模板（run_workflow_batch 会拒绝不冻结的模板）"
-            : `模板已装到本画布（workflowTemplate=${template.templateId}）。接着调 run_workflow_batch 建批次；终点是「待审批」，审批与提交出片在画布「待审批」侧栏操作`,
+            : `模板已装到本画布（workflowTemplate=${template.templateId}）。接着调 run_workflow_batch 建批次；终点是「待审批」，审批与提交出片在画布「待审批」侧栏操作。注意：视频拆解本身是**系统内置工作流**，不抽模板也能直接跑；抽模板只在用户想自定义工作流（换节点/换链路）时才需要`,
         paidVideoCreations: 0,
     };
 }
@@ -371,7 +386,7 @@ export function defaultTemplateScope(nodes: CanvasNodeData[]): string[] {
  */
 export async function runWorkflowBatchTool(input: RunWorkflowBatchInput, deps: WorkflowEntryDeps): Promise<RunWorkflowBatchResult> {
     const project = requireProject(deps);
-    const { template, from: templateFrom } = resolveTemplate(project, input.templateId);
+    const { template, from: templateFrom, warnings: templateWarnings } = resolveTemplate(project, input.templateId);
     // P2 契约：图外引用非空 = 模板不冻结 → 实例化器必须拒绝（不能带着断链去批量花钱）。
     if ((template.externalReferences || []).length) {
         const targets = [...new Set((template.externalReferences || []).map((reference) => reference.targetId))];
@@ -401,7 +416,7 @@ export async function runWorkflowBatchTool(input: RunWorkflowBatchInput, deps: W
             source: resolution.from,
         };
     });
-    const warnings: string[] = [...resolution.warnings];
+    const warnings: string[] = [...templateWarnings, ...resolution.warnings];
     const batchId = String(resumeId || input.batchId || "").trim() || deriveEntryBatchId(template.templateId, materialList, input.title);
 
     const templatePlan = templatePlanInput(project, template);
@@ -555,7 +570,7 @@ export async function runWorkflowBatchTool(input: RunWorkflowBatchInput, deps: W
 function buildBatchResult(input: {
     batchId: string;
     template: CanvasWorkflowTemplate;
-    templateFrom: "explicit" | "project";
+    templateFrom: "explicit" | "project" | "builtin";
     materials: ResolvedMaterialRow[];
     skipped: SkippedSourceVideo[];
     record: WorkflowBatchRecord;
@@ -571,11 +586,13 @@ function buildBatchResult(input: {
 }): RunWorkflowBatchResult {
     const { batchId, template, record, run, instances } = input;
     const awaiting = instances.filter((row) => row.status === "awaiting_approval").length;
+    // §2.6 显示名同源：内置模板回执报「视频拆解（内置）」（与侧栏/抽屉同一个 workflowTemplateDisplayName 口径）。
+    const displayName = isBuiltinTemplateId(template.templateId) ? BUILTIN_VIDEO_ANALYSIS_DISPLAY_NAME : String(template.name || "").trim() || template.templateId;
     return {
         ok: instances.length > 0,
         batchId,
         templateId: template.templateId,
-        templateName: String(template.name || "").trim() || template.templateId,
+        templateName: displayName,
         templateFrom: input.templateFrom,
         materialsFrom: input.materials[0]?.source || "explicit",
         materials: input.materials,
@@ -600,7 +617,7 @@ function buildBatchResult(input: {
         materializeFailures: input.materializeFailures,
         paidVideoCreations: 0,
         next: run.ok
-            ? `批次 ${batchId} 已用「${String(template.name || "").trim() || template.templateId}」跑到待审批（${awaiting}/${instances.length}；素材 ${input.materials.length} 条：${input.materials.map((row) => row.title).join("、")}）${input.assetBindingSummary ? `。${input.assetBindingSummary}` : ""}：审批与提交出片请到画布左侧「待审批」页签操作，付费视频生成不在本工具内发生`
+            ? `批次 ${batchId} 已用「${displayName}」${input.templateFrom === "builtin" ? "（系统内置，开箱即用）" : ""}跑到待审批（${awaiting}/${instances.length}；素材 ${input.materials.length} 条：${input.materials.map((row) => row.title).join("、")}）${input.assetBindingSummary ? `。${input.assetBindingSummary}` : ""}：审批与提交出片请到画布左侧「待审批」页签操作，付费视频生成不在本工具内发生`
             : `批次 ${batchId} 已入册但队列没跑成：${run.reason || "未给出原因"}（实例仍在，可在侧栏「待审批」页签重试）${input.assetBindingSummary ? `。${input.assetBindingSummary}` : ""}`,
         warnings: input.warnings,
     };
@@ -929,29 +946,62 @@ function requireProject(deps: WorkflowEntryDeps): EntryProject {
 }
 
 /**
- * 模板解析（P10 具名工作流直达）：显式 templateId 优先；缺省时**自动取本画布唯一模板**；
- * 无模板 → 人话引导先抽模板；多模板 → 列名字让用户选，绝不替用户乱选；跨画布一律拒绝（不串批次）。
+ * 模板解析（P10 具名工作流直达 → P12 内置模板开箱即用）：
+ *
+ * 1. 显式 templateId：内置 id 直接用内置（from="explicit"，点名要内置也是显式指定）；
+ *    项目内模板命中则用项目模板。显式指向不完整模板（如空画布上抽出的 2 节点空壳）→ 人话报错，
+ *    不建批（P12 需求 9）。
+ * 2. 缺省 = **意图对齐**（v2 §2.2.1）：用户没点名模板，说的是「视频拆解」这件事——
+ *    仅当项目内存在**同名（名字含「视频拆解」）且完整**的自定义模板才用项目内（from="project"，
+ *    用户自定义覆盖同名内置）；否则一律系统内置「视频拆解」（from="builtin"，开箱即用）。
+ *    项目内完整但**不同名**的模板不参与缺省采用——完整性不构成用途匹配（完整的「换装视频」
+ *    回答不了「执行视频拆解」）。P10 的「唯一候选自动取用」语义随之删除。
+ * 3. 项目内模板不完整时跳过并如实说明「已使用内置模板」，绝不用空壳建批次（P12 需求 8）；
+ *    同名模板多个（前向兼容多模板槽）→ 列名字让用户选，不替用户乱选（P10 语义不变）。
  */
-function resolveTemplate(project: EntryProject, templateId?: string): { template: CanvasWorkflowTemplate; from: "explicit" | "project" } {
+function resolveTemplate(project: EntryProject, templateId?: string): { template: CanvasWorkflowTemplate; from: "explicit" | "project" | "builtin"; warnings: string[] } {
     const candidates = projectTemplateCandidates(project);
     const wanted = String(templateId || "").trim();
-    if (!candidates.length) {
-        throw new Error(
-            "画布还没有工作流模板：请先在已跑通的「视频拆解→生成」链上抽一次模板（extract_workflow_template，抽的时候起个名字，比如「视频拆解」），之后说「用视频拆解工作流处理这些视频」就能直达",
-        );
-    }
     const labelOf = (template: CanvasWorkflowTemplate) => `「${String(template.name || "").trim() || template.templateId}」（${template.templateId}）`;
+    const builtin = builtinVideoAnalysisTemplate();
+    const builtinLabel = `内置模板「${BUILTIN_VIDEO_ANALYSIS_TEMPLATE_NAME}」（${BUILTIN_VIDEO_ANALYSIS_DISPLAY_NAME}）`;
+    /** 缺省采用的意图对齐判据：模板名字含「视频拆解」（用户说的就是这件事，同名自定义才算覆盖）。 */
+    const matchesIntent = (template: CanvasWorkflowTemplate) => String(template.name || "").includes(BUILTIN_VIDEO_ANALYSIS_TEMPLATE_NAME);
+
     if (wanted) {
+        if (isBuiltinTemplateId(wanted)) return { template: builtin, from: "explicit", warnings: [] };
         const hit = candidates.find((template) => String(template.templateId) === wanted);
-        if (!hit) {
-            throw new Error(`当前画布的模板是 ${candidates.map(labelOf).join("、")}，与请求的 ${wanted} 不一致：批次必须在模板所在画布上建（不跨画布串批次）`);
+        if (hit) {
+            const verdict = assessTemplateCompleteness(hit);
+            if (!verdict.ok) {
+                throw new Error(
+                    `${labelOf(hit)} 不完整（${verdict.nodeCount} 个节点：${verdict.problems.join("；")}）：不构成完整的「视频拆解→生成」工作流，拒绝建批次。` +
+                        `要么换成完整模板，要么不传 templateId —— 系统会直接用${builtinLabel}跑`,
+                );
+            }
+            return { template: hit, from: "explicit", warnings: [] };
         }
-        return { template: hit, from: "explicit" };
+        if (!candidates.length) {
+            throw new Error(
+                `当前画布没有模板 ${wanted}（也没有任何项目内模板）：不跨画布串批次。不传 templateId 就直接用${builtinLabel}（开箱即用，无需先抽模板）`,
+            );
+        }
+        throw new Error(`当前画布的模板是 ${candidates.map(labelOf).join("、")}，与请求的 ${wanted} 不一致：批次必须在模板所在画布上建（不跨画布串批次）`);
     }
-    if (candidates.length > 1) {
-        throw new Error(`画布上有 ${candidates.length} 个工作流模板（${candidates.map(labelOf).join("、")}）：请指明用哪个（把它的 templateId 传给本工具），不替用户乱选`);
+
+    // 缺省（意图对齐）：只有「同名视频拆解」的项目内模板才算用户对这件事的自定义覆盖；
+    // 其余模板（哪怕完整、哪怕唯一）都不挡内置——完整性与唯一性都不构成用途匹配。
+    const assessed = candidates.filter(matchesIntent).map((template) => ({ template, verdict: assessTemplateCompleteness(template) }));
+    const complete = assessed.filter((item) => item.verdict.ok).map((item) => item.template);
+    const warnings = assessed
+        .filter((item) => !item.verdict.ok)
+        .map((item) => `项目内模板${labelOf(item.template)}不完整（${item.verdict.nodeCount} 个节点：${item.verdict.problems.join("；")}），已跳过；本次使用${builtinLabel}`);
+    if (complete.length > 1) {
+        throw new Error(`画布上有 ${complete.length} 个同名「${BUILTIN_VIDEO_ANALYSIS_TEMPLATE_NAME}」的可用工作流模板（${complete.map(labelOf).join("、")}）：请指明用哪个（把它的 templateId 传给本工具），不替用户乱选`);
     }
-    return { template: candidates[0], from: "project" };
+    if (complete.length === 1) return { template: complete[0], from: "project", warnings };
+    // 没有同名且完整的项目内模板（0 个 / 不同名 / 全不完整）→ 系统内置模板兜底，开箱即用。
+    return { template: builtin, from: "builtin", warnings };
 }
 
 /** 画布内模板候选：`workflowTemplates`（前向兼容的多模板槽）优先，否则单槽 `workflowTemplate`。 */
@@ -1076,6 +1126,10 @@ export function sourceVideoNodes(project: EntryProject, excludeNodeIds: string[]
  * 同一函数重抽一次取「剥离后节点」——纯函数、确定性、零副作用（模板声明仍用落盘那份，不动冻结项）。
  */
 export function templatePlanInput(project: EntryProject, template: CanvasWorkflowTemplate): { nodes: CanvasNodeData[]; connections: CanvasConnection[] } {
+    // P12：内置模板的原型节点**不在画布上**（随代码分发）——直接取内置注册表里那份「已剥运行态」的原型图，
+    // 不再按「画布上找节点」的路径解析（否则会把内置模板判成「模板节点已不在画布」）。
+    const builtinSource = builtinWorkflowTemplateSource(template.templateId);
+    if (builtinSource) return builtinSource;
     const declared = template.frozen?.topology?.nodeIds || [];
     if (!declared.length) throw new Error("模板冻结拓扑没有节点 id：模板声明不完整（重新抽模板）");
     const present = new Set((project.nodes || []).map((node) => node.id));

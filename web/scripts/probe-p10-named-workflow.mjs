@@ -80,6 +80,9 @@ async function bundle(entry, outName) {
         outfile: outFile,
         logLevel: "silent",
         alias: { "@": path.resolve("src") },
+        // P12：内置模板经 lapian-prompt-templates 取默认指令正文（`...camera-contract.md?raw`）——
+        // 探针要按 vite 的 `?raw` 语义把它当文本内联，否则打包失败
+        loader: { ".md": "text" },
         banner: { js: "globalThis.localStorage = globalThis.localStorage || { getItem: () => null, setItem: () => {}, removeItem: () => {} };" },
     });
     return outFile;
@@ -378,27 +381,29 @@ setSection("B");
 // ================================================================ C. 缺省 templateId 的三态
 setSection("C");
 {
-    // 无模板
+    // 无模板（P12 起：直接用系统内置「视频拆解」，不再引导先抽模板）
     await seedProject({ withTemplate: false });
-    const noTemplate = await entry
-        .runWorkflowBatchTool({}, entryDeps())
-        .then(() => null)
-        .catch((error) => error);
-    check("C1 无模板 → 人话：先在已跑通的拆解→生成链上抽一次模板（extract_workflow_template）", noTemplate instanceof Error && /画布还没有工作流模板/.test(noTemplate.message) && /extract_workflow_template/.test(noTemplate.message), String(noTemplate && noTemplate.message));
+    const noTemplate = await entry.runWorkflowBatchTool({}, entryDeps());
+    check("C1 无模板 → 自动用系统内置「视频拆解（内置）」（templateFrom=builtin，零抽模板引导）", noTemplate.templateFrom === "builtin" && noTemplate.templateId === "builtin-video-analysis" && noTemplate.templateName === "视频拆解（内置）" && !/抽一次模板/.test(String(noTemplate.next) + JSON.stringify(noTemplate.warnings)), JSON.stringify({ from: noTemplate.templateFrom, id: noTemplate.templateId, name: noTemplate.templateName }));
 
-    // 多模板（前向兼容槽：workflowTemplates 有两条）→ 列名字让人选，不乱选
+    // 多模板（前向兼容槽：workflowTemplates 两条**同名**）→ 列名字让人选，不乱选
     await seedProject({ templateId: "wmulti-a", name: "视频拆解" });
     const first = project.workflowTemplate;
-    project = { ...project, workflowTemplates: [first, { ...first, templateId: "wmulti-b", name: "换装视频" }] };
+    project = { ...project, workflowTemplates: [first, { ...first, templateId: "wmulti-b", name: "视频拆解（B 机位）" }] };
     const multi = await entry
         .runWorkflowBatchTool({}, entryDeps())
         .then(() => null)
         .catch((error) => error);
-    check("C2 多模板 → 列名字让人选（不替用户乱选）", multi instanceof Error && /2 个工作流模板/.test(multi.message) && multi.message.includes("视频拆解") && multi.message.includes("换装视频"), String(multi && multi.message));
+    check("C2 同名多模板 → 列名字让人选（不替用户乱选）", multi instanceof Error && /个同名/.test(multi.message) && multi.message.includes("视频拆解") && multi.message.includes("wmulti-b"), String(multi && multi.message));
 
     // 多模板但显式指定 → 照常跑
     const chosen = await entry.runWorkflowBatchTool({ templateId: "wmulti-b" }, entryDeps());
     check("C3 多模板 + 显式 templateId → 按指定模板跑", chosen.templateId === "wmulti-b" && chosen.templateFrom === "explicit" && chosen.instances.length === 3, JSON.stringify({ id: chosen.templateId, from: chosen.templateFrom, instances: chosen.instances.length }));
+
+    // P12 D1 补差：多模板但**不同名**（换装视频）→ 缺省不选它，直接用内置（完整性/唯一性不构成用途匹配）
+    project = { ...project, workflowTemplates: [{ ...first, templateId: "wmulti-b", name: "换装视频" }] };
+    const byIntent = await entry.runWorkflowBatchTool({ materials: [{ sourceVideoNodeId: "m1" }] }, entryDeps());
+    check("C4 项目内完整但不同名（换装视频）→ 缺省仍用内置（意图对齐，答非所问的模板不挡内置）", byIntent.templateFrom === "builtin" && byIntent.templateId === "builtin-video-analysis" && byIntent.templateName === "视频拆解（内置）", JSON.stringify({ from: byIntent.templateFrom, id: byIntent.templateId, name: byIntent.templateName }));
 }
 
 // ================================================================ D. 缺省 materials 的边界
