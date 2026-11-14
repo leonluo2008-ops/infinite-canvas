@@ -36,6 +36,9 @@ export const toolNames = [
     "canvas_run_generation",
     "generation_get_status",
     "read_node_text",
+    "extract_workflow_template",
+    "run_workflow_batch",
+    "run_workflow_instance",
     "workbench_image_get_config",
     "workbench_image_generate",
     "workbench_video_get_config",
@@ -90,6 +93,15 @@ const generationFlowSchema = z.object({
     referenceNodeIds: z.array(z.string()).optional(),
 });
 
+/** 批量素材（槽①源视频必填其一：画布节点 id 或媒体键）。 */
+const workflowMaterialSchema = z.object({
+    sourceVideoNodeId: z.string().optional(),
+    storageKey: z.string().optional(),
+    title: z.string().optional(),
+    intentText: z.string().optional(),
+    optionalSegments: z.string().optional(),
+});
+
 export const toolInputSchemas = {
     site_navigate: z.object({ path: z.string() }),
     canvas_list_projects: z.object({ keyword: z.string().optional(), page: z.number().optional(), pageSize: z.number().optional() }),
@@ -119,6 +131,9 @@ export const toolInputSchemas = {
     canvas_run_generation: z.object({ nodeId: z.string(), mode: generationModeSchema.optional(), prompt: z.string().optional() }),
     generation_get_status: z.object({ scope: z.enum(["all", "canvas", "image", "video"]).optional(), taskId: z.string().optional(), nodeIds: z.array(z.string()).optional(), limit: z.number().optional() }),
     read_node_text: z.object({ nodeId: z.string() }),
+    extract_workflow_template: z.object({ sourceNodeIds: z.array(z.string()).optional(), name: z.string().optional(), templateId: z.string().optional() }),
+    run_workflow_batch: z.object({ templateId: z.string().optional(), materials: z.array(workflowMaterialSchema).min(1), concurrency: z.number().optional(), title: z.string().optional() }),
+    run_workflow_instance: z.object({ templateId: z.string().optional(), material: workflowMaterialSchema, title: z.string().optional() }),
     workbench_image_get_config: z.object({}).passthrough(),
     workbench_image_generate: z.object({ prompt: z.string(), model: z.string().optional(), quality: z.string().optional(), size: z.string().optional(), count: z.number().optional(), run: z.boolean().optional() }),
     workbench_video_get_config: z.object({}).passthrough(),
@@ -157,6 +172,9 @@ export const toolDescriptions: Record<ToolName, string> = {
     canvas_run_generation: "触发指定节点生成，通常用于配置节点或文本/图片/视频/音频节点。",
     generation_get_status: "查询当前活动网页的生成任务状态。默认返回画布、生图工作台和视频工作台最近任务；可用 scope 过滤来源，用 taskId 查询工作台任务，用 nodeIds 查询画布节点。返回的 prompt 只是最多 4000 字的预览，promptTruncated=true 时用 read_node_text 取全文。",
     read_node_text: "读取指定画布节点的完整文本，入参 nodeId，返回 nodeId、projectId、type、title 与 content/prompt/composerContent 全文及各自字数（length 为主文本字数）。正文与提示词逐字返回、不截断不折叠，是批量执行和自修时取完整提示词的唯一通道。图片/视频/音频节点的 content 若是内联 dataURL，只返回 contentLength 与 contentOmitted=media-data-url，不回传原始数据。",
+    extract_workflow_template: "从当前画布项目抽取可复用工作流模板（模板声明落在本项目 workflowTemplate 上，随画布保存）。sourceNodeIds 缺省 = 全项目可抽象子图（源视频/拉片/指令/意图/文本/配置等骨架节点）；要连生成产物一起抽就显式列出节点 id。返回 templateId、五槽声明（源视频/意图/资产位/生成参数/可选段）、冻结项摘要（拓扑与骨架 digest）、逐节点剥离字段与图外引用报告：图外引用非空时模板不冻结，实例化会被自足性校验拦下，需把这些节点一起选进来重抽。本工具零付费、不生成任何内容，不碰待审批队列。抽完用 run_workflow_batch 建批次；实例的终点是「待审批」，付费视频生成不在本工具内发生，审批与提交出片请在画布「待审批」侧栏操作。",
+    run_workflow_batch: "按模板批量建实例并跑到待审批：每个素材 materializeWorkflowInstance（幂等落库，同实例不重复拉片）→ 入批次 → runBatchQueue 并发编排（默认并发 3，上限 6）。materials 每项给 sourceVideoNodeId（画布上带本地字节的视频节点）或 storageKey，可带 title/intentText/optionalSegments。返回 batchId、每实例 instanceId 与节点骨架、派生状态表、队列相位；终点=待审批，付费视频生成不在本工具内发生，审批与提交出片请在画布「待审批」侧栏操作。同一批素材重复调用落在同一批次（幂等，不翻倍）。",
+    run_workflow_instance: "单素材单实例（调试用）：只给一个 material，走与 run_workflow_batch 完全相同的落库+编排路径（并发 1），返回该实例的 instanceId、节点骨架与派生状态；终点=待审批，付费视频生成不在本工具内发生，审批与提交出片请在画布「待审批」侧栏操作。同素材重复调用幂等（同实例不重建、不重复拉片）。",
     workbench_image_get_config: "读取生图工作台的当前参数和可选项（可用模型、质量、分辨率 1k/2k/4k/auto、宽高比、张数范围），在调用 workbench_image_generate 前先了解可选值。",
     workbench_image_generate: "在生图工作台填入提示词并按需设置 model、quality、size（如 16:9 或 2048x1152）、count，run 默认 true 会自动点击生成按钮。会自动跳转到生图工作台。生成为异步过程，提交后返回 taskId，可用 generation_get_status 查询状态。",
     workbench_video_get_config: "读取视频创作台的当前参数和可选项（可用模型、清晰度 480/720/1080、比例 1:1/3:4/4:3/16:9/9:16/21:9/auto、时长 4–30 秒、首尾帧或全能参考模式、是否生成声音与水印）。",

@@ -7,6 +7,17 @@ import { imageAspectOptions, imageQualityOptions, imageScaleOptions } from "@/co
 import { videoResolutionOptions, videoSecondsRange, videoSizeOptions } from "@/components/video-settings-panel";
 import { buildGenerationStatus, readNodeFullText } from "@/lib/agent/agent-node-text";
 import type { CanvasAgentSnapshot } from "@/lib/canvas/canvas-agent-ops";
+import { getWorkflowBatchRuntime, startBatch } from "@/lib/canvas/workflow-batch-runtime";
+import {
+    extractWorkflowTemplateTool,
+    runWorkflowBatchTool,
+    runWorkflowInstanceTool,
+    type ExtractTemplateInput,
+    type RunWorkflowBatchInput,
+    type RunWorkflowInstanceInput,
+    type WorkflowBatchMaterialInput,
+    type WorkflowEntryDeps,
+} from "@/lib/canvas/workflow-batch-entry";
 import { clampVideoSeconds } from "@/lib/media-size";
 import { useCanvasStore } from "@/stores/canvas/use-canvas-store";
 import { useAssetStore } from "@/stores/use-asset-store";
@@ -20,6 +31,9 @@ export const SITE_TOOL_NAMES = [
     "canvas_list_projects",
     "generation_get_status",
     "read_node_text",
+    "extract_workflow_template",
+    "run_workflow_batch",
+    "run_workflow_instance",
     "workbench_image_get_config",
     "workbench_image_generate",
     "workbench_video_get_config",
@@ -43,6 +57,9 @@ export const SITE_TOOL_LABELS: Record<SiteToolName, string> = {
     get canvas_list_projects() { return siteText("canvasList"); },
     get generation_get_status() { return siteText("generationStatus"); },
     get read_node_text() { return siteText("readNodeText"); },
+    get extract_workflow_template() { return siteText("workflowTemplate"); },
+    get run_workflow_batch() { return siteText("workflowBatch"); },
+    get run_workflow_instance() { return siteText("workflowInstance"); },
     get workbench_image_get_config() { return siteText("imageConfig"); },
     get workbench_image_generate() { return siteText("imageGenerate"); },
     get workbench_video_get_config() { return siteText("videoConfig"); },
@@ -63,6 +80,12 @@ export async function runSiteTool(name: SiteToolName, input: SiteToolInput, navi
             return getGenerationStatus(input, context.canvasSnapshot);
         case "read_node_text":
             return readNodeTextTool(input, context.canvasSnapshot);
+        case "extract_workflow_template":
+            return await extractWorkflowTemplateTool(extractTemplateInput(input), workflowEntryDeps());
+        case "run_workflow_batch":
+            return await runWorkflowBatchTool(batchInput(input), workflowEntryDeps());
+        case "run_workflow_instance":
+            return await runWorkflowInstanceTool(instanceInput(input), workflowEntryDeps());
         case "workbench_image_get_config":
             return getImageConfig();
         case "workbench_image_generate":
@@ -93,6 +116,100 @@ function readNodeTextTool(input: SiteToolInput, canvasSnapshot?: CanvasAgentSnap
     const text = readNodeFullText({ nodeId, canvasSnapshot, projects: useCanvasStore.getState().projects });
     if (!text) throw new Error(siteText("nodeNotFound", { nodeId }));
     return text;
+}
+
+// ─────────────────────────────────────────────── P9 批量入口三工具（只做「取参 → 调引擎壳」）
+
+function stringList(value: unknown): string[] {
+    return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string" && Boolean(item.trim())).map((item) => item.trim()) : [];
+}
+
+function textField(value: unknown): string | undefined {
+    return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function extractTemplateInput(input: SiteToolInput): ExtractTemplateInput {
+    const sourceNodeIds = stringList(input.sourceNodeIds);
+    const name = textField(input.name);
+    const templateId = textField(input.templateId);
+    return { ...(sourceNodeIds.length ? { sourceNodeIds } : {}), ...(name ? { name } : {}), ...(templateId ? { templateId } : {}) };
+}
+
+function materialInput(value: unknown): WorkflowBatchMaterialInput {
+    const raw = value && typeof value === "object" ? (value as SiteToolInput) : {};
+    const material: WorkflowBatchMaterialInput = {};
+    const nodeId = textField(raw.sourceVideoNodeId);
+    const storageKey = textField(raw.storageKey);
+    const title = textField(raw.title);
+    const intentText = textField(raw.intentText);
+    const optionalSegments = textField(raw.optionalSegments);
+    if (nodeId) material.sourceVideoNodeId = nodeId;
+    if (storageKey) material.storageKey = storageKey;
+    if (title) material.title = title;
+    if (intentText) material.intentText = intentText;
+    if (optionalSegments) material.optionalSegments = optionalSegments;
+    return material;
+}
+
+function batchInput(input: SiteToolInput): RunWorkflowBatchInput {
+    const materials = Array.isArray(input.materials) ? input.materials.map(materialInput) : [];
+    const templateId = textField(input.templateId);
+    const title = textField(input.title);
+    const concurrency = Number(input.concurrency);
+    return {
+        materials,
+        ...(templateId ? { templateId } : {}),
+        ...(title ? { title } : {}),
+        ...(Number.isFinite(concurrency) && concurrency > 0 ? { concurrency } : {}),
+    };
+}
+
+function instanceInput(input: SiteToolInput): RunWorkflowInstanceInput {
+    const templateId = textField(input.templateId);
+    const title = textField(input.title);
+    return { material: materialInput(input.material), ...(templateId ? { templateId } : {}), ...(title ? { title } : {}) };
+}
+
+/**
+ * 三工具的依赖：**全部**来自画布页注册的批次运行时（`registerWorkflowBatchRuntime`）。
+ * 未注册（不是画布页 / 页面还没装载）→ 人话报错，绝不假跑。
+ */
+function workflowEntryDeps(): WorkflowEntryDeps {
+    const runtime = getWorkflowBatchRuntime();
+    if (!runtime) throw new Error(siteText("workflowRuntimeMissing"));
+    return {
+        project: () => runtime.project(),
+        applyOps: (opList) => runtime.applyOps(opList),
+        getBlob: (storageKey) => runtime.getBlob(storageKey),
+        hub: runtime.hub,
+        ...(runtime.lapianConfig ? { lapianConfig: runtime.lapianConfig } : {}),
+        vetoes: () => runtime.vetoes(),
+        identities: () => {
+            const projectId = runtime.project()?.id;
+            return useCanvasStore.getState().projects.find((item) => item.id === projectId)?.workflowInstances;
+        },
+        saveTemplate: (template) => {
+            const projectId = runtime.project()?.id;
+            if (!projectId) throw new Error(siteText("workflowRuntimeMissing"));
+            useCanvasStore.getState().updateProject(projectId, { workflowTemplate: template });
+        },
+        saveBatches: (batches) => {
+            const projectId = runtime.project()?.id;
+            if (!projectId) throw new Error(siteText("workflowRuntimeMissing"));
+            useCanvasStore.getState().updateProject(projectId, { workflowBatches: batches });
+        },
+        flush: (reason) => runtime.flush(reason),
+        runBatch: (batchId) => startBatch(batchId),
+        // 素材可来自源画布：按节点 id 跨项目查找（同一个浏览器里所有画布）。
+        findNode: (nodeId) => {
+            for (const project of useCanvasStore.getState().projects) {
+                const found = project.nodes.find((node) => node.id === nodeId);
+                if (found) return found;
+            }
+            return undefined;
+        },
+        log: (message) => console.debug(`[canvas-agent] ${message}`),
+    };
 }
 
 function listCanvasProjects(input: SiteToolInput) {

@@ -1024,6 +1024,15 @@ function InfiniteCanvasPage() {
                 if (!project) return;
                 updateProject(projectId, { workflowBatches: setBatchQueue(project.workflowBatches, batchId, queue) });
             },
+            // P9 入口工具：模板声明与批次记录的唯一写通道（走既有 updateProject，不新造 store 字段）。
+            saveTemplate: (template) => {
+                if (!batchRuntimeProject.current) return;
+                updateProject(projectId, { workflowTemplate: template });
+            },
+            saveBatches: (batches) => {
+                if (!batchRuntimeProject.current) return;
+                updateProject(projectId, { workflowBatches: batches });
+            },
             flush: (reason) => flushProjects(reason),
             vetoes: () => batchRuntimeProject.current?.workflowAssetVetoes,
             wanFileTasks: () => toLegacyPayload(batchRuntimeProject.current?.workflowWanFileTasks || []),

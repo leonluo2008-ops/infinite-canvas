@@ -28,6 +28,7 @@ import type { LapianExecuteConfig } from "@/lib/canvas/lapian-execute";
 import type { WorkflowAssetVetoRecord } from "@/lib/canvas/workflow-asset-match";
 import type { CanvasWorkflowTemplate } from "@/lib/canvas/workflow-template";
 import { buildMaterialsFromMember } from "@/lib/canvas/workflow-pending-review";
+import { templatePlanInput } from "@/lib/canvas/workflow-batch-entry";
 
 /**
  * 画布项目的结构下限（只读：运行时从不改项目对象，写一律走注入的 save* 回调）。
@@ -63,6 +64,16 @@ export type WorkflowBatchRuntimeDeps = {
      * 无法成立。所以这里补一个最小写回调（页面用既有 `updateProject` 实现），不新造 store 字段。
      */
     saveBatchQueue: (batchId: string, queue: WorkflowBatchQueueRecord) => void | Promise<void>;
+    /**
+     * 模板声明落盘（P9 入口工具需要；页面 = `updateProject(projectId, { workflowTemplate })`）。
+     * 缺省时 `extract_workflow_template` 如实返回「页面未提供模板写入口」，不假存。
+     */
+    saveTemplate?: (template: CanvasWorkflowTemplate) => void | Promise<void>;
+    /**
+     * 批次记录落盘（P9 入口工具建批次时用；页面 = `updateProject(projectId, { workflowBatches })`）。
+     * 缺省时 `run_workflow_batch` 如实返回「页面未提供批次写入口」，不假跑。
+     */
+    saveBatches?: (batches: WorkflowBatchRecord[]) => void | Promise<void>;
     flush: (reason: string) => void | Promise<void | { ok?: boolean; error?: string }>;
     vetoes: () => WorkflowAssetVetoRecord[] | undefined;
     wanFileTasks: () => Map<string, string> | Record<string, string> | undefined;
@@ -145,14 +156,14 @@ function planInputFor(project: BatchRuntimeProject, member: WorkflowBatchMember)
     const template = project.workflowTemplate;
     if (!template) return { error: "项目没有工作流模板声明（workflowTemplate 缺失）：无法重建实例计划，不假跑" };
     if (String(template.templateId) !== String(member.templateId)) return { error: `项目模板 ${template.templateId} 与成员模板 ${member.templateId} 不一致：拒绝按错模板重跑` };
-    const declared = new Set<string>(template.frozen?.topology?.nodeIds || []);
-    const nodes = project.nodes || [];
-    const byId = new Map(nodes.map((node) => [node.id, node]));
-    const missing = [...declared].filter((id) => !byId.has(id));
-    if (missing.length) return { error: `模板节点已不在画布（缺 ${missing.length} 个：${missing.slice(0, 3).join(",")}）：不能重建实例计划` };
-    const templateNodes = [...declared].map((id) => byId.get(id)!).filter(Boolean);
-    const connections = project.connections || [];
-    return { template, templateNodes, templateConnections: connections.filter((edge) => declared.has(edge.fromNodeId) && declared.has(edge.toNodeId)) };
+    // 模板节点必须**已剥运行态**才能进计划（`validateTemplateProject` 会拦 taskId/status 残留），
+    // 画布上的模板节点却是用户真节点（带拉片 taskId 等）——按冻结拓扑用 P2 同一函数重抽一次取剥离副本（纯函数）。
+    try {
+        const derived = templatePlanInput({ id: project.id, title: project.title, nodes: project.nodes || [], connections: project.connections || [] }, template);
+        return { template, templateNodes: derived.nodes, templateConnections: derived.connections };
+    } catch (error) {
+        return { error: (error as Error).message };
+    }
 }
 
 function instanceRunDeps(deps: WorkflowBatchRuntimeDeps): InstanceRunDeps {

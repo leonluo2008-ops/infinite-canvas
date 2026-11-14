@@ -339,6 +339,11 @@ function siteToolSummary(name: string, result: unknown, input: unknown) {
     if (name === "assets_list") return tr("assetCount", { count: numberField(data, "total") });
     if (name === "assets_add") return tr("assetAdded");
     if (name === "read_node_text") return tr("nodeTextRead", { length: numberField(data, "length") });
+    if (name === "extract_workflow_template") return tr("workflowTemplateExtracted", { id: stringText(data.templateId) || "-", nodes: numberField(data, "nodeCount"), refs: Array.isArray(data.externalReferences) ? data.externalReferences.length : 0 });
+    if (name === "run_workflow_batch" || name === "run_workflow_instance") {
+        const rows = Array.isArray(data.instances) ? (data.instances as Record<string, unknown>[]) : [];
+        return tr("workflowBatchBuilt", { id: stringText(data.batchId) || "-", count: rows.length, awaiting: rows.filter((row) => stringText(row.status) === "awaiting_approval").length });
+    }
     if (name === "generation_get_status") {
         const summary = data.summary && typeof data.summary === "object" ? (data.summary as Record<string, unknown>) : {};
         return tr("generationStatus", { total: numberField(data, "total"), queued: numberField(summary, "queued"), running: numberField(summary, "running"), succeeded: numberField(summary, "succeeded"), failed: numberField(summary, "failed") });

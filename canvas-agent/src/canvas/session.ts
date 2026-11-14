@@ -58,6 +58,9 @@ const SITE_TOOLS = new Set<ToolName>([
     "assets_add",
     "generation_get_status",
     "read_node_text",
+    "extract_workflow_template",
+    "run_workflow_batch",
+    "run_workflow_instance",
 ]);
 
 /** 管理网页画布连接、状态、附件和工具请求。 */

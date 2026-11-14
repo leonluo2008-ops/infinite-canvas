@@ -542,6 +542,8 @@ function toolHistorySummary(tool: string, item: unknown, input: unknown) {
     if (tool === "assets_list") return `共 ${numberValue(field(result, "total"))} 个资产`;
     if (tool === "assets_add") return "已加入我的素材";
     if (tool === "read_node_text") return `已读取节点全文（${numberValue(field(result, "length"))} 字）`;
+    if (tool === "extract_workflow_template") return `已抽取模板 ${String(field(result, "templateId") || "")}（${numberValue(field(result, "nodeCount"))} 节点，图外引用 ${arrayValue(field(result, "externalReferences")).length} 条）`;
+    if (tool === "run_workflow_batch" || tool === "run_workflow_instance") return `批次 ${String(field(result, "batchId") || "")}：${arrayValue(field(result, "instances")).length} 个实例（待批 ${arrayValue(field(result, "instances")).filter((row) => field(row, "status") === "awaiting_approval").length}）`;
     if (tool === "generation_get_status") {
         const summary = field(result, "summary");
         return `共 ${numberValue(field(result, "total"))} 个任务，排队 ${numberValue(field(summary, "queued"))}，运行中 ${numberValue(field(summary, "running"))}，成功 ${numberValue(field(summary, "succeeded"))}，失败 ${numberValue(field(summary, "failed"))}`;
@@ -739,5 +741,8 @@ function toolName(name: string) {
     if (name === "assets_add") return "添加资产";
     if (name === "generation_get_status") return "生成任务状态";
     if (name === "read_node_text") return "读取节点全文";
+    if (name === "extract_workflow_template") return "抽取工作流模板";
+    if (name === "run_workflow_batch") return "批量建实例（跑到待审批）";
+    if (name === "run_workflow_instance") return "单实例调试（跑到待审批）";
     return name ? `调用工具：${name}` : "工具操作";
 }
