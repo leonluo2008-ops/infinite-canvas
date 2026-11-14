@@ -1,0 +1,364 @@
+{
+  "at": "2026-11-14T03:59:28.994Z",
+  "pass": 42,
+  "fail": 0,
+  "sections": {
+    "A": {
+      "pass": 15,
+      "fail": 0
+    },
+    "B": {
+      "pass": 6,
+      "fail": 0
+    },
+    "C": {
+      "pass": 4,
+      "fail": 0
+    },
+    "D": {
+      "pass": 3,
+      "fail": 0
+    },
+    "E": {
+      "pass": 5,
+      "fail": 0
+    },
+    "F": {
+      "pass": 9,
+      "fail": 0
+    }
+  },
+  "fails": [],
+  "results": [
+    {
+      "section": "A",
+      "name": "A1 人物图绑人物槽：回执逐条给「图→槽」",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "section": "A",
+      "name": "A2 产品图绑主体槽：回执逐条给「图→槽」",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "section": "A",
+      "name": "A3 绑定理由可核对：命中词+分数+来源（按槽语义自动匹配）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "section": "A",
+      "name": "A4 回执摘要写清绑定几个槽（含理由）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "section": "A",
+      "name": "A5 绑图落到实例槽：槽上 attachedImageId = 本实例图副本",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "section": "A",
+      "name": "A6 图副本可溯源：副本 metadata.assetLibrarySourceId = 画布原图（否决/复核判据）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "section": "A",
+      "name": "A7 挂图对照节点（P4 语义）也在画布上，且指向本次挂的图",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "section": "A",
+      "name": "A8 回执每实例列出挂图（槽←副本←原图），可逐实例核对",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "section": "A",
+      "name": "A9 实例链路画布可见 + 停待批（终点=待审批，P4 判据）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "section": "A",
+      "name": "A10 侧栏「待审批」立即出 1 行且待审批（实例链路可见）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "section": "A",
+      "name": "A11 侧栏挂图位读到的就是本次绑定（当前挂图=副本、溯源=原图、复算一致）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "section": "A",
+      "name": "A12 模板骨架图不进候选池（语义能命中也排除，带理由）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "section": "A",
+      "name": "A13 资产位节点/其它非素材图不进候选池（槽不是图，图副本不是素材）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "section": "A",
+      "name": "A14 付费口径：本工具内视频创建恒 0（paidVideoCreations=0，runGeneration 只 mode:text）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "section": "A",
+      "name": "A15 零生成端点：整段只打桥侧拉片链，无 create 类请求",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "section": "B",
+      "name": "B0 基线：不指定时自动匹配首选是 A（标题序在前）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "section": "B",
+      "name": "B1 显式优先：同槽语义下画布指定图 ≠ 自动首选 → 以指定为准（并给原话与替代候选）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "section": "B",
+      "name": "B2 自动匹配只补没指定的槽（产品槽照常自动绑）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "section": "B",
+      "name": "B3 落地断言：挂图副本来源 = 画布指定节点（B），自动首选节点（A）没被绑",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "section": "B",
+      "name": "B4 显式优先在回执里标明来源（你指定）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "section": "B",
+      "name": "B5 选中图优先于未选中的图（槽指代缺省时按语义绑选中的那张）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "section": "C",
+      "name": "C1 语义模糊图判不准 → 该槽留空 + 回执说明（不硬塞）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "section": "C",
+      "name": "C2 留空的槽真的没挂图（槽上无 attachedImageId、无挂图对照节点）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "section": "C",
+      "name": "C3 另一槽照常绑定（留空只影响判不准的那个槽）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "section": "C",
+      "name": "C4 摘要如实写「留空交人」并说明原因",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "section": "D",
+      "name": "D1 否决过的图不再被绑定（该槽留空交人）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "section": "D",
+      "name": "D2 否决的可见痕迹在回执里（否决/留空原因可查）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "section": "D",
+      "name": "D3 否决后换替代图（否决图零出现）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "section": "E",
+      "name": "E1 多视频 + 同组替换图 → 各实例同绑（每实例两条挂图）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "section": "E",
+      "name": "E2 图副本逐实例独立：三实例的副本 id 互不相同、槽上都挂自己那份",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "section": "E",
+      "name": "E3 三份副本都溯源同一张画布原图（同组替换图，一份原图三份副本）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "section": "E",
+      "name": "E4 批次回执给绑定摘要（逐槽写明图与来源，可核对）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "section": "E",
+      "name": "E5 3 实例全部到待审批（终点不变）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "section": "F",
+      "name": "F1 幂等：同一句再说一次 → 同批次、3 实例 already_present",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "section": "F",
+      "name": "F2 幂等零副作用：零新增组装、零新增节点",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "section": "F",
+      "name": "F3 续跑回执如实报既有挂图（不冒充本次重新绑定）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "section": "F",
+      "name": "F4 付费口径：批次内视频创建恒 0",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "section": "F",
+      "name": "F5 零生成端点（整段只打桥侧拉片链）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "section": "F",
+      "name": "F6 tsc 仅既有 1 条基线错误（model-script-editor.tsx）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "section": "F",
+      "name": "F7 引擎文件零改动（工作区改动里没有引擎/匹配器文件）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "section": "F",
+      "name": "F8 探针自身没有付费生成调用点（无 run_generation 执行体 / 无视频创建端点）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "section": "F",
+      "name": "F9 真实任务零接触：只操作自建夹具项目（proj-p11）",
+      "ok": true,
+      "detail": ""
+    }
+  ],
+  "evidence": {
+    "generationCalls": [
+      [
+        "twp11a-1-cfg-1",
+        "text"
+      ],
+      [
+        "twp11b1-1-cfg-1",
+        "text"
+      ],
+      [
+        "twp11b5-1-cfg-1",
+        "text"
+      ],
+      [
+        "twp11c-1-cfg-1",
+        "text"
+      ],
+      [
+        "twp11d-1-cfg-1",
+        "text"
+      ],
+      [
+        "twp11e-1-cfg-1",
+        "text"
+      ],
+      [
+        "twp11e-2-cfg-1",
+        "text"
+      ],
+      [
+        "twp11e-3-cfg-1",
+        "text"
+      ]
+    ],
+    "fetchTargets": [
+      "/api/video/upload",
+      "/api/lapian/run",
+      "/api/job/job-1",
+      "/api/lapian/task-1",
+      "/api/render/task-1/seedance-flow?optional=",
+      "/api/job/job-2",
+      "/api/lapian/task-2",
+      "/api/render/task-2/seedance-flow?optional=",
+      "/api/job/job-3",
+      "/api/lapian/task-3",
+      "/api/render/task-3/seedance-flow?optional=",
+      "/api/job/job-4",
+      "/api/lapian/task-4",
+      "/api/render/task-4/seedance-flow?optional=",
+      "/api/job/job-5",
+      "/api/lapian/task-5",
+      "/api/render/task-5/seedance-flow?optional=",
+      "/api/job/job-6",
+      "/api/lapian/task-6",
+      "/api/job/job-7",
+      "/api/lapian/task-7",
+      "/api/job/job-8",
+      "/api/lapian/task-8",
+      "/api/render/task-6/seedance-flow?optional=",
+      "/api/render/task-7/seedance-flow?optional=",
+      "/api/render/task-8/seedance-flow?optional="
+    ],
+    "hubCalls": {
+      "ingest": 8,
+      "upload": 14,
+      "getTask": 22
+    },
+    "flushes": [
+      "p9-extract-template",
+      "p9-batch-enqueue",
+      "p8-queue",
+      "p8-instance_persisted",
+      "p8-awaiting_approval"
+    ],
+    "identitySaves": 8,
+    "unexpectedFetch": 0
+  }
+}

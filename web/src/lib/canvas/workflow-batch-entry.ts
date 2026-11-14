@@ -23,10 +23,21 @@ import { buildBatchMember, batchSignature, createWorkflowBatch, findWorkflowBatc
 import { createBatchQueue, type BatchQueueRunResult, type WorkflowBatchQueueRecord } from "@/lib/canvas/workflow-batch-queue";
 import { deriveInstanceStatus, type InstanceStatus } from "@/lib/canvas/workflow-batch-status";
 import type { InstanceRunDeps, WorkflowInstanceHubClient, WorkflowInstanceIdentityRecord } from "@/lib/canvas/workflow-instance-run";
-import { materializeWorkflowInstance, type WorkflowInstanceMaterials, type WorkflowInstanceSourceVideo } from "@/lib/canvas/workflow-instance";
+import { materializeWorkflowInstance, type WorkflowInstanceAssetAttach, type WorkflowInstanceMaterials, type WorkflowInstancePlan, type WorkflowInstanceSourceVideo } from "@/lib/canvas/workflow-instance";
 import type { LapianExecuteConfig } from "@/lib/canvas/lapian-execute";
-import type { WorkflowAssetVetoRecord } from "@/lib/canvas/workflow-asset-match";
+import {
+    ASSET_MATCH_MIN_SCORE,
+    collectAssetLibraryCandidates,
+    listInstanceAssetSlots,
+    matchInstanceAssetSlots,
+    scoreAssetCandidate,
+    vetoedImagesOfSlot,
+    type AssetLibraryCandidate,
+    type InstanceAssetSlot,
+    type WorkflowAssetVetoRecord,
+} from "@/lib/canvas/workflow-asset-match";
 import { classifyTemplateRole, extractWorkflowTemplate, isSkeletonRole, stableDigest, type CanvasWorkflowTemplate } from "@/lib/canvas/workflow-template";
+import { templateInstanceNodeId } from "@/lib/canvas/workflow-template-ids";
 
 /** 画布项目的结构下限（**只读**：写一律走注入的 save 与 applyOps 回调）。 */
 export type EntryProject = {
@@ -99,6 +110,19 @@ export type WorkflowBatchMaterialInput = {
     optionalSegments?: string;
 };
 
+/**
+ * P11 · 替换图指代（**话语指代 → 槽**）：用户说「把人物换成画布上这张」时，Agent 把它翻成一条绑定。
+ * `slotNodeId`（模板资产位 id）最精确；退而用槽名/槽类型（用户口中的「人物」「香水」）。
+ */
+export type WorkflowAssetBindingInput = {
+    slotNodeId?: string;
+    slotName?: string;
+    slotType?: string;
+    imageNodeId: string;
+    /** 用户原话摘录（回执里作为「为什么绑这张」的证据）。 */
+    reason?: string;
+};
+
 export type RunWorkflowBatchInput = {
     templateId?: string;
     /**
@@ -106,6 +130,11 @@ export type RunWorkflowBatchInput = {
      * 有选中节点 → 以选中为准；否则取画布全部源视频（`type=video` 且没有任何上游输入 / 不是生成产物）。
      */
     materials?: WorkflowBatchMaterialInput[];
+    /**
+     * P11：画布替换图的**显式指定**（用户话语指代 → 槽）。缺省时按「选中图优先 → 画布图按槽语义自动匹配」。
+     * 显式指定的图**优先于**自动匹配：同槽一旦被指定，自动匹配不再动它（只补没指定的槽）。
+     */
+    assetBindings?: WorkflowAssetBindingInput[];
     concurrency?: number;
     title?: string;
     /** 批次 id 覆盖（探针用；缺省按模板+素材组确定性派生）。 */
@@ -115,6 +144,8 @@ export type RunWorkflowBatchInput = {
 export type RunWorkflowInstanceInput = {
     templateId?: string;
     material: WorkflowBatchMaterialInput;
+    /** P11：同 run_workflow_batch 的画布替换图显式指定。 */
+    assetBindings?: WorkflowAssetBindingInput[];
     title?: string;
     batchId?: string;
 };
@@ -157,6 +188,8 @@ export type InstanceRow = {
     materialTitle: string;
     sourceVideoStorageKey: string;
     nodes: { sourceVideo: string; lapian: string; all: string[]; videoConfig?: string; videoTarget?: string } | null;
+    /** P11：本实例实际挂上的图（槽 ← 图副本 ← 画布原图），每实例各自一份副本。 */
+    assetAttaches?: { slotNodeId: string; slotTemplateNodeId: string; imageNodeId: string; graftNodeId: string; sourceImageNodeId?: string; sourceImageTitle?: string }[];
     /** 派生状态（C5：现查 hub + 节点；查不到 = unknown，绝不判成功）。 */
     status: InstanceStatus | null;
     rule?: string;
@@ -181,6 +214,45 @@ export type ResolvedMaterialRow = {
 /** 被跳过的候选源视频（有人话原因，不静默丢）。 */
 export type SkippedSourceVideo = { nodeId: string; title: string; reason: string };
 
+/** 画布替换图 → 槽的绑定来源（回执逐条标：谁定的、凭什么）。 */
+export type CanvasAssetBindingSource = "owner_specified" | "canvas_selection" | "canvas_semantic" | "existing";
+
+/** 一条「图 → 槽」绑定（回执用；status=empty 时是**留空交人**的如实说明）。 */
+export type CanvasAssetBindingRow = {
+    /** 实例内资产位节点 id（P3 确定性 id）。 */
+    slotNodeId: string;
+    slotTemplateNodeId: string;
+    slotKey: string;
+    slotName: string;
+    slotType: string;
+    order: number;
+    status: "bound" | "empty";
+    /** 画布图节点 id（绑定时）/ 既有实例副本溯源 id（续跑时）。 */
+    imageNodeId?: string;
+    imageTitle?: string;
+    source: CanvasAssetBindingSource | "none";
+    /** 一句人话理由（命中词/分数/你指定/你选中/被否决/判不准）。 */
+    reason: string;
+    matchedTerms: string[];
+    score: number;
+    /** 同槽落选候选（用户可据此人工改判）。 */
+    alternatives?: { imageNodeId: string; title: string; score: number }[];
+};
+
+/** 一次「画布替换图 → 槽」解析的完整结果（纯函数产物）。 */
+export type CanvasAssetBindingPlan = {
+    instanceId: string;
+    rows: CanvasAssetBindingRow[];
+    /** 槽③挂图材料（按槽序；直接喂 materialize 的 materials.assetAttach）。 */
+    attaches: WorkflowInstanceAssetAttach[];
+    candidates: { imageNodeId: string; title: string }[];
+    excluded: { nodeId: string; title: string; reason: string }[];
+    warnings: string[];
+    /** 一句人话摘要（回执 next/summary 用）。 */
+    summary: string;
+    digest: string;
+};
+
 export type RunWorkflowBatchResult = {
     ok: boolean;
     batchId: string;
@@ -194,6 +266,13 @@ export type RunWorkflowBatchResult = {
     /** 本次素材清单（逐条 id+标题，供用户核对「是不是这 N 个视频」）。 */
     materials: ResolvedMaterialRow[];
     skippedSourceVideos: SkippedSourceVideo[];
+    /** P11：「画布替换图 → 槽」逐条绑定+理由（槽 id 取首个实例；N 实例同绑同一组画布图）。 */
+    assetBindings: CanvasAssetBindingRow[];
+    /** P11：绑定一句人话摘要（含留空交人的槽）。 */
+    assetBindingSummary?: string;
+    /** P11：画布图候选池与排除项（哪些图没资格当替换素材、为什么）。 */
+    assetCandidates?: { imageNodeId: string; title: string }[];
+    assetCandidateExclusions?: { nodeId: string; title: string; reason: string }[];
     title?: string;
     concurrency: number;
     queue?: { phase: string; concurrency: number; attempted: number; awaitingApproval: number; failed: number; skipped: number };
@@ -326,9 +405,30 @@ export async function runWorkflowBatchTool(input: RunWorkflowBatchInput, deps: W
     const batchId = String(resumeId || input.batchId || "").trim() || deriveEntryBatchId(template.templateId, materialList, input.title);
 
     const templatePlan = templatePlanInput(project, template);
+    // P11：画布替换图 → 槽。**实例落地前**一次算全（候选池不受本批次随后新建的图副本影响）；
+    // 同一组画布图对 N 个实例同绑——槽 id 逐实例不同（P3 确定性重映射）、图副本逐实例独立。
+    const selectedNodeIds = deps.selectedNodeIds ? deps.selectedNodeIds() || [] : [];
+    const bindingPlans = materialList.map((_, index) =>
+        resolveCanvasAssetBindings({
+            project,
+            template,
+            templateNodes: templatePlan.nodes,
+            instanceIndex: index + 1,
+            ...(input.assetBindings && input.assetBindings.length ? { bindings: input.assetBindings } : {}),
+            selectedNodeIds,
+            vetoes: deps.vetoes(),
+        }),
+    );
+    const bindingHead = bindingPlans[0];
+    for (const plan of bindingPlans) for (const line of plan.warnings) if (!warnings.includes(line)) warnings.push(line);
+    const assetBindingReceipt = {
+        assetBindings: bindingHead?.rows || [],
+        ...(bindingHead?.summary ? { assetBindingSummary: bindingHead.summary } : {}),
+        ...(bindingHead ? { assetCandidates: bindingHead.candidates, assetCandidateExclusions: bindingHead.excluded } : {}),
+    };
     const materializeFailures: RunWorkflowBatchResult["materializeFailures"] = [];
     const members: WorkflowBatchMember[] = [];
-    const created: { member: WorkflowBatchMember; material: WorkflowInstanceMaterials; materialized: "created" | "already_present"; nodes: CanvasNodeData[] }[] = [];
+    const created: { member: WorkflowBatchMember; material: WorkflowInstanceMaterials; materialized: "created" | "already_present"; nodes: CanvasNodeData[]; assetAttaches: WorkflowInstancePlan["assetAttaches"] }[] = [];
 
     // 幂等重放：同批次（同模板 + 同素材组 + 同标题 → 同一 batchId / 或「再说一次」命中的既有批次）已存在
     // → **不重建实例**，直接续跑队列。已到待批/已批/已完成的实例由队列按派生状态跳过（P6 planBatchResume）。
@@ -338,7 +438,20 @@ export async function runWorkflowBatchTool(input: RunWorkflowBatchInput, deps: W
             throw new Error(`批次 ${batchId} 已存在但成员数不同（现存 ${replay.members.length} / 本次 ${materialList.length}）：同批次不换成员，换素材请换 title 或用新的模板`);
         }
         const existingNodes = deps.project()?.nodes || project.nodes;
-        for (const member of replay.members) created.push({ member, material: materialOf(memberToMaterialInput(member), project, { ...deps, findNode: () => undefined }), materialized: "already_present", nodes: existingNodes });
+        for (const member of replay.members) created.push({ member, material: materialOf(memberToMaterialInput(member), project, { ...deps, findNode: () => undefined }), materialized: "already_present", nodes: existingNodes, assetAttaches: [] });
+        // P11：续跑时如实报告**既有实例上现在挂着谁**；本次指定的图不覆盖已落库挂图（P3 幂等）。
+        const existingBindings = describeExistingAssetBindings({ nodes: existingNodes, lapianNodeId: String(replay.members[0]?.nodes?.lapian || "") });
+        if (input.assetBindings?.length) {
+            const boundNow = existingBindings.filter((row) => row.status === "bound").map((row) => `${row.slotName || row.slotKey}←${row.imageNodeId}`).join("；");
+            warnings.push(`实例已落库：本次指定的替换图不会覆盖既有挂图（现挂：${boundNow || "无"}）。要换图请先在侧栏否决该挂图再重跑，或换模板/实例序号`);
+        }
+        const replayAssetReceipt = {
+            assetBindings: existingBindings,
+            ...(existingBindings.length
+                ? { assetBindingSummary: `既有实例挂图：${existingBindings.map((row) => `${row.slotName || row.slotKey}←${row.status === "bound" ? `「${row.imageTitle}」` : "（空）"}`).join("；")}（本次续跑不改挂图）` }
+                : {}),
+            ...(bindingHead ? { assetCandidates: bindingHead.candidates, assetCandidateExclusions: bindingHead.excluded } : {}),
+        };
         if (resumeId) {
             warnings.push(`画布上没有新的源视频：这些视频已经在批次 ${batchId} 里（${replay.members.length} 个实例），本次直接续跑该批次，不重复建实例`);
             for (const member of replay.members) {
@@ -353,7 +466,7 @@ export async function runWorkflowBatchTool(input: RunWorkflowBatchInput, deps: W
         deps.log?.(`p9-batch ${batchId} replay members=${replay.members.length} resume=${Boolean(resumeId)}`);
         const replayed = await deps.runBatch(batchId);
         const replayBatch = findWorkflowBatch(deps.project()?.workflowBatches, batchId) || replay;
-        return buildBatchResult({ batchId, template, templateFrom, materials: materialRows, skipped: resolution.skipped, record: replayBatch, concurrency, run: replayed, instances: await summarizeInstances(replayBatch, created, replayed, deps), materializeFailures, warnings });
+        return buildBatchResult({ batchId, template, templateFrom, materials: materialRows, skipped: resolution.skipped, record: replayBatch, concurrency, run: replayed, instances: await summarizeInstances(replayBatch, created, replayed, deps), materializeFailures, warnings, ...replayAssetReceipt });
     }
 
     // 同号实例已被别的素材占住 → 拒绝（P3 幂等键 = 模板 + 实例序号；already_present 会静默忽略新素材，不能让它发生）
@@ -370,6 +483,9 @@ export async function runWorkflowBatchTool(input: RunWorkflowBatchInput, deps: W
     for (const [index, material] of materialList.entries()) {
         const instanceIndex = index + 1;
         const title = String(material.sourceVideo.title || "").trim() || `素材 ${instanceIndex}`;
+        // P11：把本实例的画布替换图绑定落成槽③挂图材料（图副本随实例一起建，逐实例独立）。
+        const binds = bindingPlans[index];
+        const materialWithAssets: WorkflowInstanceMaterials = binds?.attaches.length ? { ...material, assetAttach: binds.attaches } : material;
         let result: Awaited<ReturnType<typeof materializeWorkflowInstance>>;
         try {
             result = await materializeWorkflowInstance(
@@ -377,7 +493,7 @@ export async function runWorkflowBatchTool(input: RunWorkflowBatchInput, deps: W
                     template,
                     templateNodes: templatePlan.nodes,
                     templateConnections: templatePlan.connections,
-                    materials: material,
+                    materials: materialWithAssets,
                     instanceIndex,
                     vetoes: deps.vetoes(),
                     lapianConfig: deps.lapianConfig || { lapianDefaultModel: "", channels: [] },
@@ -406,7 +522,7 @@ export async function runWorkflowBatchTool(input: RunWorkflowBatchInput, deps: W
         const identity = (deps.identities ? deps.identities() : undefined)?.find((record) => record.instanceId === result.plan.instanceId);
         const member = buildBatchMember({
             plan: result.plan,
-            materials: material,
+            materials: materialWithAssets,
             nodes,
             connections,
             ...(identity ? { identity } : {}),
@@ -414,7 +530,7 @@ export async function runWorkflowBatchTool(input: RunWorkflowBatchInput, deps: W
             createdAt: now,
         });
         members.push(member);
-        created.push({ member, material, materialized: result.status, nodes });
+        created.push({ member, material: materialWithAssets, materialized: result.status, nodes, assetAttaches: result.plan.assetAttaches });
     }
 
     if (!members.length) {
@@ -432,7 +548,7 @@ export async function runWorkflowBatchTool(input: RunWorkflowBatchInput, deps: W
     const liveBatch = findWorkflowBatch(deps.project()?.workflowBatches, batchId) || withQueue;
     const instances = await summarizeInstances(liveBatch, created, run, deps);
 
-    return buildBatchResult({ batchId, template, templateFrom, materials: materialRows, skipped: resolution.skipped, record: liveBatch, concurrency, run, instances, materializeFailures, warnings });
+    return buildBatchResult({ batchId, template, templateFrom, materials: materialRows, skipped: resolution.skipped, record: liveBatch, concurrency, run, instances, materializeFailures, warnings, ...assetBindingReceipt });
 }
 
 /** 回执组装（首跑与幂等重放共用一份口径）。 */
@@ -448,6 +564,10 @@ function buildBatchResult(input: {
     instances: InstanceRow[];
     materializeFailures: RunWorkflowBatchResult["materializeFailures"];
     warnings: string[];
+    assetBindings: CanvasAssetBindingRow[];
+    assetBindingSummary?: string;
+    assetCandidates?: { imageNodeId: string; title: string }[];
+    assetCandidateExclusions?: { nodeId: string; title: string; reason: string }[];
 }): RunWorkflowBatchResult {
     const { batchId, template, record, run, instances } = input;
     const awaiting = instances.filter((row) => row.status === "awaiting_approval").length;
@@ -460,6 +580,10 @@ function buildBatchResult(input: {
         materialsFrom: input.materials[0]?.source || "explicit",
         materials: input.materials,
         skippedSourceVideos: input.skipped,
+        assetBindings: input.assetBindings,
+        ...(input.assetBindingSummary ? { assetBindingSummary: input.assetBindingSummary } : {}),
+        ...(input.assetCandidates ? { assetCandidates: input.assetCandidates } : {}),
+        ...(input.assetCandidateExclusions ? { assetCandidateExclusions: input.assetCandidateExclusions } : {}),
         ...(record.title ? { title: record.title } : {}),
         concurrency: run.queue?.concurrency || input.concurrency,
         queue: run.queue
@@ -476,8 +600,8 @@ function buildBatchResult(input: {
         materializeFailures: input.materializeFailures,
         paidVideoCreations: 0,
         next: run.ok
-            ? `批次 ${batchId} 已用「${String(template.name || "").trim() || template.templateId}」跑到待审批（${awaiting}/${instances.length}；素材 ${input.materials.length} 条：${input.materials.map((row) => row.title).join("、")}）：审批与提交出片请到画布左侧「待审批」页签操作，付费视频生成不在本工具内发生`
-            : `批次 ${batchId} 已入册但队列没跑成：${run.reason || "未给出原因"}（实例仍在，可在侧栏「待审批」页签重试）`,
+            ? `批次 ${batchId} 已用「${String(template.name || "").trim() || template.templateId}」跑到待审批（${awaiting}/${instances.length}；素材 ${input.materials.length} 条：${input.materials.map((row) => row.title).join("、")}）${input.assetBindingSummary ? `。${input.assetBindingSummary}` : ""}：审批与提交出片请到画布左侧「待审批」页签操作，付费视频生成不在本工具内发生`
+            : `批次 ${batchId} 已入册但队列没跑成：${run.reason || "未给出原因"}（实例仍在，可在侧栏「待审批」页签重试）${input.assetBindingSummary ? `。${input.assetBindingSummary}` : ""}`,
         warnings: input.warnings,
     };
 }
@@ -492,12 +616,307 @@ export async function runWorkflowInstanceTool(input: RunWorkflowInstanceInput, d
         {
             ...(input.templateId ? { templateId: input.templateId } : {}),
             materials: [input.material],
+            ...(input.assetBindings && input.assetBindings.length ? { assetBindings: input.assetBindings } : {}),
             concurrency: 1,
             title: input.title || "单实例调试",
             ...(input.batchId ? { batchId: input.batchId } : {}),
         },
         deps,
     );
+}
+
+// ─────────────────────────────────────────────── 画布替换图 → 槽绑定（P11）
+
+/**
+ * 模板资产位（槽③）→ 本实例槽表。
+ *
+ * 只读模板声明（`slots[kind=assetAttach].targets`）+ 模板节点 metadata；槽 id 用 P3 同一确定性
+ * 重映射 `templateInstanceNodeId`（**实例还没落地**也能算出与落地后一致的 id）。
+ * 槽序/槽键与 `listInstanceAssetSlots` 同口径（`assetSlotOrder` + id 排序、`类型|名`），不另立标准。
+ */
+export function templateAssetSlots(input: { template: CanvasWorkflowTemplate; templateNodes: CanvasNodeData[]; instanceIndex: number }): InstanceAssetSlot[] {
+    const slot = (input.template.slots || []).find((item) => item.kind === "assetAttach");
+    if (!slot || !slot.targets.length) return [];
+    const byId = new Map((input.templateNodes || []).map((node) => [node.id, node]));
+    return slot.targets
+        .map((target) => byId.get(target.nodeId))
+        .filter((node): node is CanvasNodeData => Boolean(node))
+        .sort((left, right) => Number(left.metadata?.assetSlotOrder ?? 0) - Number(right.metadata?.assetSlotOrder ?? 0) || String(left.id).localeCompare(String(right.id)))
+        .map((node) => {
+            const name = String(node.metadata?.assetSlotName || node.title || "").trim();
+            const type = String(node.metadata?.assetSlotType || "").trim();
+            return {
+                slotNodeId: templateInstanceNodeId(input.template.templateId, input.instanceIndex, node.id),
+                slotTemplateNodeId: node.id,
+                slotKey: `${type || "未分类"}|${name || node.id}`,
+                slotOrder: Number(node.metadata?.assetSlotOrder ?? 0),
+                name,
+                type,
+                desc: String(node.metadata?.assetSlot?.desc || "").trim(),
+                currentImageId: "",
+            };
+        });
+}
+
+/**
+ * 画布图候选池 = 用户画布上的**图片节点**（能被当作替换素材的那些）。
+ *
+ * 复用 P7 `collectAssetLibraryCandidates`（同一收集器：排除挂图副本/资产位节点/别实例已占用的图），
+ * 再补三条 P11 判据：模板骨架里的图、既有批次实例里的节点、实例图副本（`assetLibrarySourceId`）都不是
+ * 「用户放进来要替换的素材」——否则同一句话说第二遍会把上一轮的副本当新素材再绑一次。
+ */
+export function canvasAssetCandidates(input: { project: EntryProject; template: CanvasWorkflowTemplate; templateNodes: CanvasNodeData[]; instanceIndex: number }): {
+    candidates: AssetLibraryCandidate[];
+    excluded: { nodeId: string; title: string; reason: string }[];
+    instanceLapianId: string;
+} {
+    const nodes = input.project.nodes || [];
+    const lapianTemplateId = (input.template.slots || []).find((slot) => slot.kind === "optionalSegments")?.targets?.[0]?.nodeId || "";
+    const instanceLapianId = lapianTemplateId ? templateInstanceNodeId(input.template.templateId, input.instanceIndex, lapianTemplateId) : "";
+    const library = collectAssetLibraryCandidates({ nodes, lapianNodeId: instanceLapianId });
+    const skeleton = new Set<string>([
+        ...(input.template.frozen?.topology?.nodeIds || []),
+        ...(input.template.sourceNodeIds || []),
+        ...(input.templateNodes || []).map((node) => node.id),
+    ]);
+    const taken = new Set<string>((input.project.workflowBatches || []).flatMap((record) => (record.members || []).flatMap((member) => member.nodes?.all || [])));
+    const candidates: AssetLibraryCandidate[] = [];
+    const excluded = library.excluded.map((item) => ({ nodeId: item.imageNodeId, title: item.title, reason: item.reason }));
+    for (const candidate of library.candidates) {
+        if (skeleton.has(candidate.imageNodeId)) {
+            excluded.push({ nodeId: candidate.imageNodeId, title: candidate.title, reason: "模板骨架里的图（抽模板时的示范链，不是本次替换素材）" });
+            continue;
+        }
+        if (taken.has(candidate.imageNodeId)) {
+            excluded.push({ nodeId: candidate.imageNodeId, title: candidate.title, reason: "既有批次实例里的节点（本批次不重复使用）" });
+            continue;
+        }
+        const source = String(candidate.node.metadata?.assetLibrarySourceId || "").trim();
+        if (source) {
+            excluded.push({ nodeId: candidate.imageNodeId, title: candidate.title, reason: `既有实例的图副本（溯源 ${source}）：用画布原图，别用副本` });
+            continue;
+        }
+        candidates.push(candidate);
+    }
+    return { candidates, excluded, instanceLapianId };
+}
+
+const BINDING_SOURCE_LABEL: Record<CanvasAssetBindingRow["source"], string> = {
+    owner_specified: "你指定",
+    canvas_selection: "你选中",
+    canvas_semantic: "按槽语义自动匹配",
+    existing: "既有实例",
+    none: "留空交人",
+};
+
+/**
+ * 画布替换图 → 槽（P11 核心，纯函数）：三级优先，打分**全部复用 P7 同源实现**（红线 25，不重写第二份）。
+ *
+ * ① 话语指代（`assetBindings`，LLM 层把「把人物换成这张」翻成槽+图）→ 直接钉住，**优先于自动匹配**；
+ * ② 画布**选中的图**：没有槽指代时按槽语义打分（`scoreAssetCandidate` 同源），命中即钉住；
+ * ③ 其余槽交给 P7 `matchInstanceAssetSlots` 自动匹配（同一份命中门槛/理由/否决排除），只补没指定的槽。
+ *
+ * 判不准就**留空交人**（P7 口径）：候选不足、语义不命中、被否决 —— 一律 status=empty + 人话理由，不硬塞。
+ */
+export function resolveCanvasAssetBindings(input: {
+    project: EntryProject;
+    template: CanvasWorkflowTemplate;
+    templateNodes: CanvasNodeData[];
+    instanceIndex: number;
+    bindings?: WorkflowAssetBindingInput[];
+    selectedNodeIds?: string[];
+    vetoes?: WorkflowAssetVetoRecord[];
+}): CanvasAssetBindingPlan {
+    const instanceId = `${input.template.templateId}#${input.instanceIndex}`;
+    const slots = templateAssetSlots(input);
+    const { candidates, excluded } = canvasAssetCandidates(input);
+    const warnings: string[] = [];
+    const candidateRows = candidates.map((candidate) => ({ imageNodeId: candidate.imageNodeId, title: candidate.title }));
+    const emptyPlan = (message: string): CanvasAssetBindingPlan => ({ instanceId, rows: [], attaches: [], candidates: candidateRows, excluded, warnings: [message], summary: message, digest: stableDigest(`${instanceId}|no-slot`) });
+    if (!slots.length) return emptyPlan("模板没有资产位（槽③为派生槽）：本次不绑画布图，等实例落地后按新拉片派生资产位再挂");
+
+    const byInstanceSlotId = new Map(slots.map((slot) => [slot.slotNodeId, slot]));
+    const byTemplateSlotId = new Map(slots.map((slot) => [slot.slotTemplateNodeId, slot]));
+    const candidateById = new Map(candidates.map((candidate) => [candidate.imageNodeId, candidate]));
+    const pinned: WorkflowInstanceAssetAttach[] = [];
+    const pinnedMeta = new Map<string, { imageNodeId: string; source: CanvasAssetBindingSource; reason: string }>();
+    const usedImageIds = new Set<string>();
+    const slotLabel = (slot: InstanceAssetSlot) => `${slot.type || "未分类"}·${slot.name || slot.slotKey}`;
+
+    /** 指代 → 槽：id 最精确；否则名字（精确→唯一包含）+ 类型；对不上/对上多个 → 不猜。 */
+    const resolveSlotRef = (binding: WorkflowAssetBindingInput): InstanceAssetSlot | null => {
+        const direct = String(binding.slotNodeId || "").trim();
+        if (direct) return byInstanceSlotId.get(direct) || byTemplateSlotId.get(direct) || null;
+        const wantedName = String(binding.slotName || "").trim();
+        const wantedType = String(binding.slotType || "").trim();
+        let matches = slots;
+        if (wantedName) {
+            const exact = matches.filter((slot) => slot.name === wantedName);
+            matches = exact.length ? exact : matches.filter((slot) => Boolean(slot.name) && (slot.name.includes(wantedName) || wantedName.includes(slot.name)));
+        }
+        if (wantedType) matches = matches.filter((slot) => slot.type === wantedType);
+        return matches.length === 1 ? matches[0] : null;
+    };
+
+    // ① 话语指代（显式指定）：最高优先，钉住就不再参与自动匹配。
+    for (const binding of input.bindings || []) {
+        const imageNodeId = String(binding.imageNodeId || "").trim();
+        const candidate = imageNodeId ? candidateById.get(imageNodeId) : undefined;
+        if (!candidate) {
+            const why = excluded.find((item) => item.nodeId === imageNodeId)?.reason || "不在画布图候选池（可能没有字节/不是图片节点）";
+            warnings.push(`指定的替换图 ${imageNodeId || "(空)"} 不能用：${why}。这条指定已忽略，该槽交给自动匹配或留空`);
+            continue;
+        }
+        const slot = resolveSlotRef(binding);
+        if (!slot) {
+            const hint = String(binding.slotNodeId || binding.slotName || binding.slotType || "").trim();
+            warnings.push(
+                `指定的替换图「${candidate.title}」对不上槽（指代=${hint || "空"}；本模板槽=${slots.map(slotLabel).join("、")}）：不猜槽，留给自动匹配`,
+            );
+            continue;
+        }
+        if (pinnedMeta.has(slot.slotNodeId)) {
+            warnings.push(`槽「${slotLabel(slot)}」被指定了多次：以第一次为准，后来的「${candidate.title}」已忽略`);
+            continue;
+        }
+        if (usedImageIds.has(imageNodeId)) {
+            warnings.push(`图「${candidate.title}」被指定给了多个槽：一张图只进一个槽，后来的槽交给自动匹配`);
+            continue;
+        }
+        const scored = scoreAssetCandidate(slot, candidate);
+        const spoken = String(binding.reason || "").trim();
+        pinned.push({ slotNodeId: slot.slotTemplateNodeId, image: candidate.node, imageNodeId, caption: candidate.caption });
+        pinnedMeta.set(slot.slotNodeId, {
+            imageNodeId,
+            source: "owner_specified",
+            reason: `你指定「${candidate.title}」→ ${slotLabel(slot)}槽${spoken ? `（原话：${spoken}）` : ""}${scored.score ? `；与槽语义也命中「${scored.matchedTerms.join("/")}」（分 ${scored.score}）` : "；与槽语义无命中，按你的指定绑"}`,
+        });
+        usedImageIds.add(imageNodeId);
+    }
+
+    // ② 画布选中的图：没有槽指代时按槽语义匹配（选中图优先于未选中的图）。
+    const selectedIds = new Set((input.selectedNodeIds || []).map((id) => String(id || "").trim()).filter(Boolean));
+    const selectedCandidates = candidates.filter((candidate) => selectedIds.has(candidate.imageNodeId) && !usedImageIds.has(candidate.imageNodeId));
+    for (const slot of slots) {
+        if (pinnedMeta.has(slot.slotNodeId)) continue;
+        let best: { candidate: AssetLibraryCandidate; score: number; terms: string[] } | null = null;
+        for (const candidate of selectedCandidates) {
+            if (usedImageIds.has(candidate.imageNodeId)) continue;
+            const scored = scoreAssetCandidate(slot, candidate);
+            if (!scored.nameHit || scored.score < ASSET_MATCH_MIN_SCORE) continue;
+            if (!best || scored.score > best.score) best = { candidate, score: scored.score, terms: scored.matchedTerms };
+        }
+        if (!best) continue;
+        pinned.push({ slotNodeId: slot.slotTemplateNodeId, image: best.candidate.node, imageNodeId: best.candidate.imageNodeId, caption: best.candidate.caption });
+        pinnedMeta.set(slot.slotNodeId, {
+            imageNodeId: best.candidate.imageNodeId,
+            source: "canvas_selection",
+            reason: `你选中的图「${best.candidate.title}」按槽语义命中「${best.terms.join("/")}」（分 ${best.score}）→ 绑 ${slotLabel(slot)}槽（选中图优先于未选中的图）`,
+        });
+        usedImageIds.add(best.candidate.imageNodeId);
+    }
+
+    // ③ 其余槽：P7 自动匹配（同一份打分/门槛/理由/否决排除），只补没指定的槽。
+    const match = matchInstanceAssetSlots({
+        slots,
+        candidates,
+        ...(input.vetoes ? { vetoes: input.vetoes } : {}),
+        instanceId,
+        templateId: input.template.templateId,
+        instanceIndex: input.instanceIndex,
+        explicit: pinned,
+    });
+    // 画布上压根没有替换图、用户也没点名要换 → 不逐槽刷「候选不足」告警（那是 P10 的零参常态，不是异常）。
+    const hasReplacementIntent = (input.bindings || []).length > 0 || candidates.length > 0;
+    if (hasReplacementIntent) warnings.push(...match.warnings);
+
+    const rows: CanvasAssetBindingRow[] = match.slots.map((slotMatch) => {
+        const slot = slots.find((item) => item.slotNodeId === slotMatch.slotNodeId)!;
+        const pinnedRow = pinnedMeta.get(slotMatch.slotNodeId);
+        const boundImageId = String(slotMatch.imageNodeId || "");
+        const pinnedCandidate = pinnedRow ? candidateById.get(pinnedRow.imageNodeId) : undefined;
+        const imageTitle = String(pinnedCandidate?.title || slotMatch.reason.candidateTitle || boundImageId);
+        const matched = slotMatch.status === "matched";
+        const semantic = matched ? scoreAssetCandidate(slot, candidateById.get(pinnedRow?.imageNodeId || boundImageId)!) : null;
+        // 显式优先的可见证据：算一遍「不指定时本来会自动选谁」，让用户看得见被覆盖了什么。
+        let pinnedAlternatives: { imageNodeId: string; title: string; score: number }[] = [];
+        let overriddenNote = "";
+        if (pinnedRow) {
+            const vetoedImages = vetoedImagesOfSlot(input.vetoes, { instanceId, slotNodeId: slot.slotNodeId });
+            pinnedAlternatives = candidates
+                .filter((candidate) => candidate.imageNodeId !== pinnedRow.imageNodeId && !usedImageIds.has(candidate.imageNodeId) && !vetoedImages.includes(candidate.imageNodeId))
+                .map((candidate) => ({ candidate, scored: scoreAssetCandidate(slot, candidate) }))
+                .filter((item) => item.scored.nameHit && item.scored.score >= ASSET_MATCH_MIN_SCORE)
+                .sort((left, right) => right.scored.score - left.scored.score || left.candidate.title.localeCompare(right.candidate.title) || left.candidate.imageNodeId.localeCompare(right.candidate.imageNodeId))
+                .slice(0, 3)
+                .map((item) => ({ imageNodeId: item.candidate.imageNodeId, title: item.candidate.title, score: item.scored.score }));
+            if (pinnedAlternatives.length && pinnedAlternatives[0].imageNodeId !== pinnedRow.imageNodeId) {
+                overriddenNote = `自动匹配本会选「${pinnedAlternatives[0].title}」（分 ${pinnedAlternatives[0].score}），已按你的指定覆盖`;
+            }
+        }
+        return {
+            slotNodeId: slot.slotNodeId,
+            slotTemplateNodeId: slot.slotTemplateNodeId,
+            slotKey: slot.slotKey,
+            slotName: slot.name,
+            slotType: slot.type,
+            order: slot.slotOrder,
+            status: matched ? "bound" : "empty",
+            ...(matched ? { imageNodeId: boundImageId, imageTitle } : {}),
+            source: matched ? pinnedRow?.source || "canvas_semantic" : "none",
+            reason: matched ? `${pinnedRow?.reason || slotMatch.reason.note}${overriddenNote ? `（${overriddenNote}）` : ""}` : pinnedRow ? `你指定的图「${imageTitle}」已被否决：该槽留空交人（不硬挂）` : slotMatch.reason.note,
+            matchedTerms: pinnedRow ? semantic?.matchedTerms || [] : slotMatch.reason.matchedTerms,
+            score: pinnedRow ? semantic?.score || 0 : slotMatch.reason.score === Number.MAX_SAFE_INTEGER ? 0 : slotMatch.reason.score,
+            ...(pinnedAlternatives.length ? { alternatives: pinnedAlternatives } : slotMatch.reason.alternatives?.length ? { alternatives: slotMatch.reason.alternatives.map((item) => ({ imageNodeId: item.imageNodeId, title: item.title, score: item.score })) } : {}),
+        } as CanvasAssetBindingRow;
+    });
+
+    const bound = rows.filter((row) => row.status === "bound");
+    const empty = rows.filter((row) => row.status === "empty");
+    const summary = !hasReplacementIntent
+        ? "画布上没有替换图（本次不挂图）：把产品图/人物图放进画布（或选中它们）再说一次，就会自动绑到对应槽位"
+        : rows.length
+        ? `画布替换图绑定 ${bound.length}/${rows.length} 个槽` +
+          (bound.length ? `：${bound.map((row) => `${row.slotName || row.slotKey} ← 「${row.imageTitle}」（${BINDING_SOURCE_LABEL[row.source]}；${row.reason}）`).join("；")}` : "") +
+          (empty.length ? `。留空交人 ${empty.length} 个槽：${empty.map((row) => `${row.slotName || row.slotKey}（${row.reason}）`).join("；")}` : "")
+        : "模板没有资产位：本次不绑画布图";
+    return {
+        instanceId,
+        rows,
+        attaches: match.attaches,
+        candidates: candidateRows,
+        excluded,
+        warnings,
+        summary,
+        digest: stableDigest(rows.map((row) => `${row.slotKey}:${row.status}:${row.imageNodeId || ""}:${row.source}`).join("|")),
+    };
+}
+
+/** 续跑/幂等重放时的绑定回执：从**既有实例节点**读出「槽上现在还挂着谁」（不改挂图）。 */
+export function describeExistingAssetBindings(input: { nodes: CanvasNodeData[]; lapianNodeId: string }): CanvasAssetBindingRow[] {
+    const lapianNodeId = String(input.lapianNodeId || "").trim();
+    if (!lapianNodeId) return [];
+    const nodes = input.nodes || [];
+    const byId = new Map(nodes.map((node) => [node.id, node]));
+    return listInstanceAssetSlots({ plan: { lapianNodeId, nodeIdMap: {} }, nodes }).map((slot) => {
+        const image = slot.currentImageId ? byId.get(slot.currentImageId) : undefined;
+        const libraryId = String(image?.metadata?.assetLibrarySourceId || slot.currentImageId || "");
+        const libraryNode = libraryId ? byId.get(libraryId) : undefined;
+        return {
+            slotNodeId: slot.slotNodeId,
+            slotTemplateNodeId: slot.slotTemplateNodeId,
+            slotKey: slot.slotKey,
+            slotName: slot.name,
+            slotType: slot.type,
+            order: slot.slotOrder,
+            status: slot.currentImageId ? "bound" : "empty",
+            ...(slot.currentImageId ? { imageNodeId: libraryId || slot.currentImageId, imageTitle: String(libraryNode?.title || image?.title || slot.currentImageId) } : {}),
+            source: slot.currentImageId ? "existing" : "none",
+            reason: slot.currentImageId ? "既有实例上已挂这张图（本次续跑不改挂图；要换图先否决再重跑）" : "既有实例该槽为空（留空交人）",
+            matchedTerms: [],
+            score: 0,
+        } as CanvasAssetBindingRow;
+    });
 }
 
 // ─────────────────────────────────────────────── 内部胶水
@@ -792,7 +1211,7 @@ function mergeConnections(left: CanvasConnection[], right: CanvasConnection[]): 
 /** 每实例回执：派生状态（现查 hub）+ 队列结论 + 节点骨架（C5：状态不算、不存）。 */
 async function summarizeInstances(
     batch: WorkflowBatchRecord,
-    created: { member: WorkflowBatchMember; material: WorkflowInstanceMaterials; materialized: "created" | "already_present"; nodes: CanvasNodeData[] }[],
+    created: { member: WorkflowBatchMember; material: WorkflowInstanceMaterials; materialized: "created" | "already_present"; nodes: CanvasNodeData[]; assetAttaches: WorkflowInstancePlan["assetAttaches"] }[],
     run: EntryBatchRunOutcome,
     deps: WorkflowEntryDeps,
 ): Promise<InstanceRow[]> {
@@ -821,6 +1240,22 @@ async function summarizeInstances(
             nodes: member.nodes?.lapian
                 ? { sourceVideo: member.nodes.sourceVideo, lapian: member.nodes.lapian, all: member.nodes.all, ...(member.nodes.videoConfig ? { videoConfig: member.nodes.videoConfig } : {}), ...(member.nodes.videoTarget ? { videoTarget: member.nodes.videoTarget } : {}) }
                 : null,
+            ...(entry.assetAttaches.length
+                ? {
+                      assetAttaches: entry.assetAttaches.map((attach) => {
+                          const copy = nodes.find((node) => node.id === attach.imageNodeId);
+                          const sourceId = String(copy?.metadata?.assetLibrarySourceId || "");
+                          const sourceNode = sourceId ? nodes.find((node) => node.id === sourceId) : undefined;
+                          return {
+                              slotNodeId: attach.slotNodeId,
+                              slotTemplateNodeId: attach.slotTemplateNodeId,
+                              imageNodeId: attach.imageNodeId,
+                              graftNodeId: attach.graftNodeId,
+                              ...(sourceId ? { sourceImageNodeId: sourceId, sourceImageTitle: String(sourceNode?.title || sourceId) } : {}),
+                          };
+                      }),
+                  }
+                : {}),
             status: derived?.status ?? null,
             ...(derived?.rule ? { rule: derived.rule } : {}),
             ...(derived?.reason ? { reason: derived.reason } : {}),

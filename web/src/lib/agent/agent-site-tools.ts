@@ -15,6 +15,7 @@ import {
     type ExtractTemplateInput,
     type RunWorkflowBatchInput,
     type RunWorkflowInstanceInput,
+    type WorkflowAssetBindingInput,
     type WorkflowBatchMaterialInput,
     type WorkflowEntryDeps,
 } from "@/lib/canvas/workflow-batch-entry";
@@ -151,14 +152,36 @@ function materialInput(value: unknown): WorkflowBatchMaterialInput {
     return material;
 }
 
+/**
+ * P11：画布替换图指代 → 绑定入参（话语指代由 Agent 翻成「槽 + 图」；字段空就不传，别塞空串）。
+ */
+function assetBindingsInput(value: unknown): WorkflowAssetBindingInput[] {
+    if (!Array.isArray(value)) return [];
+    const out: WorkflowAssetBindingInput[] = [];
+    for (const item of value) {
+        const raw = item && typeof item === "object" ? (item as SiteToolInput) : {};
+        const imageNodeId = textField(raw.imageNodeId);
+        if (!imageNodeId) continue;
+        const slotNodeId = textField(raw.slotNodeId);
+        const slotName = textField(raw.slotName);
+        const slotType = textField(raw.slotType);
+        const reason = textField(raw.reason);
+        out.push({ imageNodeId, ...(slotNodeId ? { slotNodeId } : {}), ...(slotName ? { slotName } : {}), ...(slotType ? { slotType } : {}), ...(reason ? { reason } : {}) });
+    }
+    return out;
+}
+
 function batchInput(input: SiteToolInput): RunWorkflowBatchInput {
     const materials = Array.isArray(input.materials) ? input.materials.map(materialInput) : [];
     const templateId = textField(input.templateId);
     const title = textField(input.title);
     const concurrency = Number(input.concurrency);
+    const assetBindings = assetBindingsInput(input.assetBindings);
     return {
         // P10：素材缺省（含空数组）= 自动解析画布源视频，交引擎壳按「选中优先 → 画布全部源视频」处理。
         ...(materials.length ? { materials } : {}),
+        // P11：画布替换图的显式指定（缺省 = 选中图优先 → 画布图按槽语义自动匹配）。
+        ...(assetBindings.length ? { assetBindings } : {}),
         ...(templateId ? { templateId } : {}),
         ...(title ? { title } : {}),
         ...(Number.isFinite(concurrency) && concurrency > 0 ? { concurrency } : {}),
@@ -168,7 +191,8 @@ function batchInput(input: SiteToolInput): RunWorkflowBatchInput {
 function instanceInput(input: SiteToolInput): RunWorkflowInstanceInput {
     const templateId = textField(input.templateId);
     const title = textField(input.title);
-    return { material: materialInput(input.material), ...(templateId ? { templateId } : {}), ...(title ? { title } : {}) };
+    const assetBindings = assetBindingsInput(input.assetBindings);
+    return { material: materialInput(input.material), ...(assetBindings.length ? { assetBindings } : {}), ...(templateId ? { templateId } : {}), ...(title ? { title } : {}) };
 }
 
 /**

@@ -1,0 +1,1106 @@
+{
+  "batchId": "batch-cd60326e",
+  "receipt": {
+    "assetBindings": [
+      {
+        "slotNodeId": "twp11a-1-slot-female",
+        "slotTemplateNodeId": "slot-female",
+        "slotKey": "人物|女性A",
+        "slotName": "女性A",
+        "slotType": "人物",
+        "order": 0,
+        "status": "bound",
+        "imageNodeId": "img-person",
+        "imageTitle": "人物-女性.png",
+        "source": "canvas_semantic",
+        "reason": "按槽语义命中「女性/人物」（分 8）→ 选「人物-女性.png」",
+        "matchedTerms": [
+          "女性",
+          "人物"
+        ],
+        "score": 8
+      },
+      {
+        "slotNodeId": "twp11a-1-slot-perfume",
+        "slotTemplateNodeId": "slot-perfume",
+        "slotKey": "主体|香水",
+        "slotName": "香水",
+        "slotType": "主体",
+        "order": 1,
+        "status": "bound",
+        "imageNodeId": "img-product",
+        "imageTitle": "主体-香水.png",
+        "source": "canvas_semantic",
+        "reason": "按槽语义命中「香水/主体」（分 8）→ 选「主体-香水.png」",
+        "matchedTerms": [
+          "香水",
+          "主体"
+        ],
+        "score": 8
+      }
+    ],
+    "assetBindingSummary": "画布替换图绑定 2/2 个槽：女性A ← 「人物-女性.png」（按槽语义自动匹配；按槽语义命中「女性/人物」（分 8）→ 选「人物-女性.png」）；香水 ← 「主体-香水.png」（按槽语义自动匹配；按槽语义命中「香水/主体」（分 8）→ 选「主体-香水.png」）",
+    "instances": [
+      {
+        "instanceId": "wp11a#1",
+        "instanceIndex": 1,
+        "materialTitle": "素材一.mp4",
+        "sourceVideoStorageKey": "video:m1",
+        "nodes": {
+          "sourceVideo": "twp11a-1-video-src",
+          "lapian": "twp11a-1-lap-1",
+          "all": [
+            "twp11a-1-video-src",
+            "twp11a-1-lap-1",
+            "twp11a-1-ins-1",
+            "twp11a-1-it-1",
+            "twp11a-1-cfg-1",
+            "twp11a-1-cfgv-1",
+            "twp11a-1-out-video",
+            "twp11a-1-slot-female",
+            "twp11a-1-slot-perfume",
+            "twp11a-1-ref-img",
+            "twp11a-1-img-person",
+            "twp11a-1-img-product",
+            "twp11a-1-graft@slot-female",
+            "twp11a-1-graft@slot-perfume",
+            "p11-out-1"
+          ],
+          "videoConfig": "twp11a-1-cfgv-1",
+          "videoTarget": "twp11a-1-out-video"
+        },
+        "assetAttaches": [
+          {
+            "slotNodeId": "twp11a-1-slot-female",
+            "slotTemplateNodeId": "slot-female",
+            "imageNodeId": "twp11a-1-img-person",
+            "graftNodeId": "twp11a-1-graft@slot-female",
+            "sourceImageNodeId": "img-person",
+            "sourceImageTitle": "人物-女性.png"
+          },
+          {
+            "slotNodeId": "twp11a-1-slot-perfume",
+            "slotTemplateNodeId": "slot-perfume",
+            "imageNodeId": "twp11a-1-img-product",
+            "graftNodeId": "twp11a-1-graft@slot-perfume",
+            "sourceImageNodeId": "img-product",
+            "sourceImageTitle": "主体-香水.png"
+          }
+        ],
+        "status": "awaiting_approval",
+        "rule": "R4",
+        "reason": "hub 任务在待审批：等人审，不是完成",
+        "materialized": "created",
+        "outcome": "awaiting_approval"
+      }
+    ]
+  },
+  "slotRows": [
+    {
+      "slotKey": "人物|女性A",
+      "currentLibraryImageId": "img-person",
+      "pickedMatchesAttached": true,
+      "note": "按槽语义命中「女性/人物」（分 8）→ 选「人物-女性.png」，另有 2 个候选分数更低"
+    },
+    {
+      "slotKey": "主体|香水",
+      "currentLibraryImageId": "img-product",
+      "pickedMatchesAttached": true,
+      "note": "按槽语义命中「香水/主体」（分 8）→ 选「主体-香水.png」"
+    }
+  ],
+  "project": {
+    "nodes": [
+      {
+        "id": "video-src",
+        "type": "video",
+        "title": "源视频.mp4",
+        "position": {
+          "x": 0,
+          "y": 0
+        },
+        "width": 300,
+        "height": 200,
+        "metadata": {
+          "content": "blob:src",
+          "storageKey": "video:src",
+          "mimeType": "video/mp4"
+        }
+      },
+      {
+        "id": "lap-1",
+        "type": "lapian",
+        "title": "拉片",
+        "position": {
+          "x": 100,
+          "y": 0
+        },
+        "width": 300,
+        "height": 200,
+        "metadata": {
+          "content": "# 拉片正文",
+          "taskId": "lap-task",
+          "jobId": "lap-job",
+          "lapPhase": "done"
+        }
+      },
+      {
+        "id": "ins-1",
+        "type": "text",
+        "title": "转换指令",
+        "position": {
+          "x": 200,
+          "y": 0
+        },
+        "width": 300,
+        "height": 200,
+        "metadata": {
+          "content": "指令正文",
+          "prompt": "指令正文",
+          "promptTemplate": "seedance-flow"
+        }
+      },
+      {
+        "id": "it-1",
+        "type": "text",
+        "title": "改造意图",
+        "position": {
+          "x": 300,
+          "y": 0
+        },
+        "width": 300,
+        "height": 200,
+        "metadata": {
+          "content": "旧意图",
+          "prompt": "旧意图",
+          "lapianIntent": true
+        }
+      },
+      {
+        "id": "cfg-1",
+        "type": "config",
+        "title": "提示词生成配置",
+        "position": {
+          "x": 400,
+          "y": 0
+        },
+        "width": 300,
+        "height": 200,
+        "metadata": {
+          "generationMode": "text",
+          "model": "default::m",
+          "lapianSourceId": "lap-1",
+          "composerContent": "拉片：@[node:lap-1]\n指令：@[node:ins-1]\n意图：@[node:it-1]"
+        }
+      },
+      {
+        "id": "fin-1",
+        "type": "text",
+        "title": "终稿（占位）",
+        "position": {
+          "x": 500,
+          "y": 0
+        },
+        "width": 300,
+        "height": 200,
+        "metadata": {
+          "fontSize": 14,
+          "model": "default::m",
+          "textCount": 1
+        }
+      },
+      {
+        "id": "cfgv-1",
+        "type": "config",
+        "title": "视频生成配置",
+        "position": {
+          "x": 600,
+          "y": 0
+        },
+        "width": 300,
+        "height": 200,
+        "metadata": {
+          "generationMode": "video",
+          "model": "k::sd2.5",
+          "size": "720x1280",
+          "composerContent": "提示词：@[node:fin-1]"
+        }
+      },
+      {
+        "id": "out-video",
+        "type": "video",
+        "title": "生成结果",
+        "position": {
+          "x": 700,
+          "y": 0
+        },
+        "width": 300,
+        "height": 200,
+        "metadata": {
+          "content": "blob:out",
+          "storageKey": "video:out",
+          "status": "idle",
+          "videoTaskId": "task-out",
+          "videoProgress": 100
+        }
+      },
+      {
+        "id": "slot-female",
+        "type": "image",
+        "title": "资产位·人物·女性A",
+        "position": {
+          "x": 800,
+          "y": 0
+        },
+        "width": 300,
+        "height": 200,
+        "metadata": {
+          "content": "blob:sf",
+          "storageKey": "image:sf",
+          "assetSlotSourceId": "lap-1",
+          "assetSlotOrder": 0,
+          "assetSlotName": "女性A",
+          "assetSlotType": "人物",
+          "assetSlot": {
+            "desc": "原片模特，红色风衣",
+            "span": "00:00-02.00"
+          }
+        }
+      },
+      {
+        "id": "slot-perfume",
+        "type": "image",
+        "title": "资产位·主体·香水",
+        "position": {
+          "x": 900,
+          "y": 0
+        },
+        "width": 300,
+        "height": 200,
+        "metadata": {
+          "content": "blob:sp",
+          "storageKey": "image:sp",
+          "assetSlotSourceId": "lap-1",
+          "assetSlotOrder": 1,
+          "assetSlotName": "香水",
+          "assetSlotType": "主体",
+          "assetSlot": {
+            "desc": "细长圆柱体",
+            "span": "02.00-05.00"
+          }
+        }
+      },
+      {
+        "id": "ref-img",
+        "type": "image",
+        "title": "女性-参考图.png",
+        "position": {
+          "x": 1000,
+          "y": 0
+        },
+        "width": 300,
+        "height": 200,
+        "metadata": {
+          "content": "blob:ref",
+          "storageKey": "image:ref",
+          "mimeType": "image/png",
+          "naturalWidth": 1024,
+          "naturalHeight": 1024
+        }
+      },
+      {
+        "id": "m1",
+        "type": "video",
+        "title": "素材一.mp4",
+        "position": {
+          "x": 2100,
+          "y": 0
+        },
+        "width": 300,
+        "height": 200,
+        "metadata": {
+          "content": "blob:video:m1",
+          "storageKey": "video:m1",
+          "mimeType": "video/mp4",
+          "bytes": 4001,
+          "durationMs": 9000
+        }
+      },
+      {
+        "id": "img-person",
+        "type": "image",
+        "title": "人物-女性.png",
+        "position": {
+          "x": 3000,
+          "y": 0
+        },
+        "width": 300,
+        "height": 200,
+        "metadata": {
+          "content": "blob:person",
+          "storageKey": "image:person",
+          "mimeType": "image/png",
+          "naturalWidth": 1024,
+          "naturalHeight": 1024
+        }
+      },
+      {
+        "id": "img-product",
+        "type": "image",
+        "title": "主体-香水.png",
+        "position": {
+          "x": 3100,
+          "y": 0
+        },
+        "width": 300,
+        "height": 200,
+        "metadata": {
+          "content": "blob:product",
+          "storageKey": "image:product",
+          "mimeType": "image/png",
+          "naturalWidth": 1024,
+          "naturalHeight": 1024
+        }
+      },
+      {
+        "id": "twp11a-1-video-src",
+        "type": "video",
+        "title": "素材一.mp4",
+        "position": {
+          "x": 0,
+          "y": 0
+        },
+        "width": 300,
+        "height": 200,
+        "metadata": {
+          "content": "blob:video:m1",
+          "status": "idle",
+          "storageKey": "video:m1",
+          "mimeType": "video/mp4",
+          "bytes": 4001,
+          "durationMs": 9000
+        }
+      },
+      {
+        "id": "twp11a-1-lap-1",
+        "type": "lapian",
+        "title": "拉片",
+        "position": {
+          "x": 100,
+          "y": 0
+        },
+        "width": 300,
+        "height": 200,
+        "metadata": {
+          "content": "# 投影正文 /api/render/task-1/seedance-flow?optional=",
+          "status": "idle",
+          "taskId": "task-1",
+          "jobId": "job-1",
+          "intent": ""
+        }
+      },
+      {
+        "id": "twp11a-1-ins-1",
+        "type": "text",
+        "title": "转换指令",
+        "position": {
+          "x": 200,
+          "y": 0
+        },
+        "width": 300,
+        "height": 200,
+        "metadata": {
+          "content": "指令正文",
+          "status": "idle",
+          "fontSize": 14,
+          "prompt": "指令正文",
+          "promptTemplate": "seedance-flow"
+        }
+      },
+      {
+        "id": "twp11a-1-it-1",
+        "type": "text",
+        "title": "改造意图",
+        "position": {
+          "x": 300,
+          "y": 0
+        },
+        "width": 300,
+        "height": 200,
+        "metadata": {
+          "content": "（可选）写你的改造意图…",
+          "status": "idle",
+          "fontSize": 14,
+          "prompt": "（可选）写你的改造意图…",
+          "lapianIntent": true
+        }
+      },
+      {
+        "id": "twp11a-1-cfg-1",
+        "type": "config",
+        "title": "提示词生成配置",
+        "position": {
+          "x": 400,
+          "y": 0
+        },
+        "width": 300,
+        "height": 200,
+        "metadata": {
+          "content": "",
+          "status": "idle",
+          "generationMode": "text",
+          "model": "default::m",
+          "lapianSourceId": "twp11a-1-lap-1",
+          "composerContent": "拉片：@[node:twp11a-1-lap-1]\n指令：@[node:twp11a-1-ins-1]\n意图：@[node:twp11a-1-it-1]\n\n本次参考图：@[node:twp11a-1-img-person]=人物 女性、@[node:twp11a-1-img-product]=主体 香水"
+        }
+      },
+      {
+        "id": "twp11a-1-cfgv-1",
+        "type": "config",
+        "title": "视频生成配置",
+        "position": {
+          "x": 600,
+          "y": 0
+        },
+        "width": 300,
+        "height": 200,
+        "metadata": {
+          "content": "",
+          "status": "idle",
+          "generationMode": "video",
+          "model": "k::sd2.5",
+          "size": "720x1280",
+          "composerContent": "提示词：@[node:p11-out-1]"
+        }
+      },
+      {
+        "id": "twp11a-1-out-video",
+        "type": "video",
+        "title": "生成结果",
+        "position": {
+          "x": 700,
+          "y": 0
+        },
+        "width": 300,
+        "height": 200,
+        "metadata": {
+          "content": "",
+          "status": "idle"
+        }
+      },
+      {
+        "id": "twp11a-1-slot-female",
+        "type": "image",
+        "title": "资产位·人物·女性A",
+        "position": {
+          "x": 800,
+          "y": 0
+        },
+        "width": 300,
+        "height": 200,
+        "metadata": {
+          "content": "blob:sf",
+          "status": "idle",
+          "storageKey": "image:sf",
+          "assetSlotSourceId": "twp11a-1-lap-1",
+          "assetSlotOrder": 0,
+          "assetSlotName": "女性A",
+          "assetSlotType": "人物",
+          "assetSlot": {
+            "desc": "原片模特，红色风衣",
+            "span": "00:00-02.00",
+            "attachedImageId": "twp11a-1-img-person",
+            "caption": "人物 女性"
+          },
+          "attachedImageId": "twp11a-1-img-person",
+          "attachedImageDesc": "人物 女性"
+        }
+      },
+      {
+        "id": "twp11a-1-slot-perfume",
+        "type": "image",
+        "title": "资产位·主体·香水",
+        "position": {
+          "x": 900,
+          "y": 0
+        },
+        "width": 300,
+        "height": 200,
+        "metadata": {
+          "content": "blob:sp",
+          "status": "idle",
+          "storageKey": "image:sp",
+          "assetSlotSourceId": "twp11a-1-lap-1",
+          "assetSlotOrder": 1,
+          "assetSlotName": "香水",
+          "assetSlotType": "主体",
+          "assetSlot": {
+            "desc": "细长圆柱体",
+            "span": "02.00-05.00",
+            "attachedImageId": "twp11a-1-img-product",
+            "caption": "主体 香水"
+          },
+          "attachedImageId": "twp11a-1-img-product",
+          "attachedImageDesc": "主体 香水"
+        }
+      },
+      {
+        "id": "twp11a-1-ref-img",
+        "type": "image",
+        "title": "女性-参考图.png",
+        "position": {
+          "x": 1000,
+          "y": 0
+        },
+        "width": 300,
+        "height": 200,
+        "metadata": {
+          "content": "blob:ref",
+          "status": "idle",
+          "storageKey": "image:ref",
+          "mimeType": "image/png",
+          "naturalWidth": 1024,
+          "naturalHeight": 1024
+        }
+      },
+      {
+        "id": "twp11a-1-img-person",
+        "type": "image",
+        "title": "人物-女性.png",
+        "position": {
+          "x": 3000,
+          "y": 0
+        },
+        "width": 300,
+        "height": 200,
+        "metadata": {
+          "content": "blob:person",
+          "status": "idle",
+          "storageKey": "image:person",
+          "mimeType": "image/png",
+          "naturalWidth": 1024,
+          "naturalHeight": 1024,
+          "assetLibrarySourceId": "img-person"
+        }
+      },
+      {
+        "id": "twp11a-1-img-product",
+        "type": "image",
+        "title": "主体-香水.png",
+        "position": {
+          "x": 3100,
+          "y": 0
+        },
+        "width": 300,
+        "height": 200,
+        "metadata": {
+          "content": "blob:product",
+          "status": "idle",
+          "storageKey": "image:product",
+          "mimeType": "image/png",
+          "naturalWidth": 1024,
+          "naturalHeight": 1024,
+          "assetLibrarySourceId": "img-product"
+        }
+      },
+      {
+        "id": "twp11a-1-graft@slot-female",
+        "type": "image",
+        "title": "挂图 · 人物 女性",
+        "position": {
+          "x": 1148,
+          "y": 0
+        },
+        "width": 300,
+        "height": 200,
+        "metadata": {
+          "content": "blob:person",
+          "status": "success",
+          "storageKey": "image:person",
+          "naturalWidth": 1024,
+          "naturalHeight": 1024,
+          "mimeType": "image/png",
+          "assetGraftForSlotId": "twp11a-1-slot-female",
+          "assetGraftOfImageId": "twp11a-1-img-person"
+        }
+      },
+      {
+        "id": "twp11a-1-graft@slot-perfume",
+        "type": "image",
+        "title": "挂图 · 主体 香水",
+        "position": {
+          "x": 1248,
+          "y": 0
+        },
+        "width": 300,
+        "height": 200,
+        "metadata": {
+          "content": "blob:product",
+          "status": "success",
+          "storageKey": "image:product",
+          "naturalWidth": 1024,
+          "naturalHeight": 1024,
+          "mimeType": "image/png",
+          "assetGraftForSlotId": "twp11a-1-slot-perfume",
+          "assetGraftOfImageId": "twp11a-1-img-product"
+        }
+      },
+      {
+        "id": "p11-out-1",
+        "type": "text",
+        "title": "终稿（本次）",
+        "position": {
+          "x": 5060,
+          "y": 0
+        },
+        "width": 320,
+        "height": 240,
+        "metadata": {
+          "content": "【本次产物 1】正文",
+          "status": "success",
+          "fontSize": 14,
+          "prompt": "【本次产物 1】正文"
+        }
+      }
+    ],
+    "connections": [
+      {
+        "id": "e1",
+        "fromNodeId": "video-src",
+        "toNodeId": "lap-1"
+      },
+      {
+        "id": "e2",
+        "fromNodeId": "lap-1",
+        "toNodeId": "cfg-1"
+      },
+      {
+        "id": "e3",
+        "fromNodeId": "ins-1",
+        "toNodeId": "cfg-1"
+      },
+      {
+        "id": "e4",
+        "fromNodeId": "it-1",
+        "toNodeId": "cfg-1"
+      },
+      {
+        "id": "e5",
+        "fromNodeId": "cfg-1",
+        "toNodeId": "fin-1"
+      },
+      {
+        "id": "e6",
+        "fromNodeId": "fin-1",
+        "toNodeId": "cfgv-1"
+      },
+      {
+        "id": "e7",
+        "fromNodeId": "cfgv-1",
+        "toNodeId": "out-video"
+      },
+      {
+        "id": "cwp11a-1-e1",
+        "fromNodeId": "twp11a-1-video-src",
+        "toNodeId": "twp11a-1-lap-1"
+      },
+      {
+        "id": "cwp11a-1-e2",
+        "fromNodeId": "twp11a-1-lap-1",
+        "toNodeId": "twp11a-1-cfg-1"
+      },
+      {
+        "id": "cwp11a-1-e3",
+        "fromNodeId": "twp11a-1-ins-1",
+        "toNodeId": "twp11a-1-cfg-1"
+      },
+      {
+        "id": "cwp11a-1-e4",
+        "fromNodeId": "twp11a-1-it-1",
+        "toNodeId": "twp11a-1-cfg-1"
+      },
+      {
+        "id": "cwp11a-1-e7",
+        "fromNodeId": "twp11a-1-cfgv-1",
+        "toNodeId": "twp11a-1-out-video"
+      },
+      {
+        "id": "cwp11a-1-graft@slot-female",
+        "fromNodeId": "twp11a-1-slot-female",
+        "toNodeId": "twp11a-1-graft@slot-female"
+      },
+      {
+        "id": "cwp11a-1-attach:twp11a-1-img-person->cfg-1",
+        "fromNodeId": "twp11a-1-img-person",
+        "toNodeId": "twp11a-1-cfg-1"
+      },
+      {
+        "id": "cwp11a-1-graft@slot-perfume",
+        "fromNodeId": "twp11a-1-slot-perfume",
+        "toNodeId": "twp11a-1-graft@slot-perfume"
+      },
+      {
+        "id": "cwp11a-1-attach:twp11a-1-img-product->cfg-1",
+        "fromNodeId": "twp11a-1-img-product",
+        "toNodeId": "twp11a-1-cfg-1"
+      },
+      {
+        "id": "EI9UgfRNF7m7Kakb3UAN9",
+        "fromNodeId": "twp11a-1-cfg-1",
+        "toNodeId": "p11-out-1"
+      },
+      {
+        "id": "cwp11a-1-product:p11-out-1->twp11a-1-cfgv-1",
+        "fromNodeId": "p11-out-1",
+        "toNodeId": "twp11a-1-cfgv-1"
+      }
+    ],
+    "workflowTemplate": {
+      "schemaVersion": 1,
+      "templateId": "wp11a",
+      "name": "视频拆解",
+      "createdAt": "2026-11-14T03:59:14.100Z",
+      "sourceProjectId": "proj-p11",
+      "sourceProjectTitle": "P11 夹具项目",
+      "sourceNodeIds": [
+        "video-src",
+        "lap-1",
+        "ins-1",
+        "it-1",
+        "cfg-1",
+        "fin-1",
+        "cfgv-1",
+        "out-video",
+        "slot-female",
+        "slot-perfume",
+        "ref-img"
+      ],
+      "slots": [
+        {
+          "kind": "sourceVideo",
+          "label": "①源视频",
+          "required": true,
+          "targets": [
+            {
+              "nodeId": "video-src",
+              "fields": [
+                "content",
+                "storageKey",
+                "mimeType",
+                "bytes",
+                "durationMs",
+                "naturalWidth",
+                "naturalHeight"
+              ]
+            }
+          ],
+          "note": "槽①待注入：模板内源视频节点已剥字节，实例化时写新视频媒体字段并重跑拉片"
+        },
+        {
+          "kind": "intentText",
+          "label": "②意图文本",
+          "required": false,
+          "targets": [
+            {
+              "nodeId": "it-1",
+              "fields": [
+                "content",
+                "prompt"
+              ]
+            }
+          ],
+          "note": "槽②：意图正文（lapianIntent 标记节点的 content/prompt，合同 X1 口径修正）"
+        },
+        {
+          "kind": "assetAttach",
+          "label": "③资产位挂图",
+          "required": false,
+          "targets": [
+            {
+              "nodeId": "slot-female",
+              "fields": [
+                "attachedImageId",
+                "assetSlot.attachedImageId",
+                "attachedImageDesc",
+                "assetSlot.caption"
+              ]
+            },
+            {
+              "nodeId": "slot-perfume",
+              "fields": [
+                "attachedImageId",
+                "assetSlot.attachedImageId",
+                "attachedImageDesc",
+                "assetSlot.caption"
+              ]
+            }
+          ],
+          "derived": false,
+          "note": "槽③：按 assetSlotOrder 写挂图，扁平 attachedImageId 与 assetSlot 镜像须同一次 update 双写"
+        },
+        {
+          "kind": "generationParams",
+          "label": "④生成参数",
+          "required": false,
+          "targets": [
+            {
+              "nodeId": "cfg-1",
+              "fields": [
+                "model",
+                "count",
+                "reasoningEffort"
+              ]
+            },
+            {
+              "nodeId": "cfgv-1",
+              "fields": [
+                "model",
+                "size",
+                "seconds",
+                "vquality"
+              ]
+            }
+          ],
+          "note": "槽④：model/size/seconds/vquality（文本配置另带 count/reasoningEffort）；值来自模板默认值"
+        },
+        {
+          "kind": "optionalSegments",
+          "label": "⑤可选段",
+          "required": false,
+          "targets": [
+            {
+              "nodeId": "lap-1",
+              "fields": [
+                "lapianOptional"
+              ]
+            }
+          ],
+          "note": "槽⑤：lapianOptional 渲染可选段字母（空/缺省 = 全关）；默认值随模板携带"
+        }
+      ],
+      "frozen": {
+        "instructions": [
+          {
+            "nodeId": "ins-1",
+            "promptTemplate": "seedance-flow",
+            "contentDigest": "4f229848",
+            "contentLength": 4
+          }
+        ],
+        "generationModes": [
+          {
+            "nodeId": "cfg-1",
+            "mode": "text"
+          },
+          {
+            "nodeId": "cfgv-1",
+            "mode": "video"
+          }
+        ],
+        "composerSkeletons": [
+          {
+            "nodeId": "cfg-1",
+            "digest": "6d151d5d",
+            "length": 49
+          },
+          {
+            "nodeId": "cfgv-1",
+            "digest": "a0277913",
+            "length": 17
+          }
+        ],
+        "topology": {
+          "edgeCount": 7,
+          "digest": "d23f9e6d",
+          "nodeIds": [
+            "video-src",
+            "lap-1",
+            "ins-1",
+            "it-1",
+            "cfg-1",
+            "fin-1",
+            "cfgv-1",
+            "out-video",
+            "slot-female",
+            "slot-perfume",
+            "ref-img"
+          ]
+        }
+      },
+      "externalReferences": [],
+      "stripped": [
+        {
+          "nodeId": "video-src",
+          "role": "sourceVideo",
+          "fields": [
+            "content",
+            "storageKey",
+            "mimeType"
+          ]
+        },
+        {
+          "nodeId": "lap-1",
+          "role": "lapian",
+          "fields": [
+            "taskId",
+            "jobId",
+            "content",
+            "lapPhase"
+          ]
+        },
+        {
+          "nodeId": "ins-1",
+          "role": "instruction",
+          "fields": []
+        },
+        {
+          "nodeId": "it-1",
+          "role": "intent",
+          "fields": [
+            "content->placeholder",
+            "prompt->placeholder"
+          ]
+        },
+        {
+          "nodeId": "cfg-1",
+          "role": "configText",
+          "fields": []
+        },
+        {
+          "nodeId": "fin-1",
+          "role": "finalText",
+          "fields": []
+        },
+        {
+          "nodeId": "cfgv-1",
+          "role": "configVideo",
+          "fields": []
+        },
+        {
+          "nodeId": "out-video",
+          "role": "generationOutput",
+          "fields": [
+            "content",
+            "storageKey",
+            "videoTaskId",
+            "videoProgress",
+            "status"
+          ]
+        },
+        {
+          "nodeId": "slot-female",
+          "role": "assetSlot",
+          "fields": []
+        },
+        {
+          "nodeId": "slot-perfume",
+          "role": "assetSlot",
+          "fields": []
+        },
+        {
+          "nodeId": "ref-img",
+          "role": "fixedAsset",
+          "fields": []
+        }
+      ]
+    },
+    "workflowBatches": [
+      {
+        "schemaVersion": 1,
+        "batchId": "batch-cd60326e",
+        "templateId": "wp11a",
+        "title": "单实例调试",
+        "signature": "36976ba7",
+        "createdAt": "2026-11-14T03:59:14.102Z",
+        "updatedAt": "2026-11-14T03:59:14.112Z",
+        "members": [
+          {
+            "instanceId": "wp11a#1",
+            "templateId": "wp11a",
+            "instanceIndex": 1,
+            "materials": {
+              "sourceVideoStorageKey": "video:m1",
+              "sourceVideoTitle": "素材一.mp4",
+              "intentChars": 12,
+              "assetCount": 2,
+              "digest": "4e180da0"
+            },
+            "nodes": {
+              "all": [
+                "twp11a-1-video-src",
+                "twp11a-1-lap-1",
+                "twp11a-1-ins-1",
+                "twp11a-1-it-1",
+                "twp11a-1-cfg-1",
+                "twp11a-1-cfgv-1",
+                "twp11a-1-out-video",
+                "twp11a-1-slot-female",
+                "twp11a-1-slot-perfume",
+                "twp11a-1-ref-img",
+                "twp11a-1-img-person",
+                "twp11a-1-img-product",
+                "twp11a-1-graft@slot-female",
+                "twp11a-1-graft@slot-perfume",
+                "p11-out-1"
+              ],
+              "sourceVideo": "twp11a-1-video-src",
+              "lapian": "twp11a-1-lap-1",
+              "assemblyConfig": "twp11a-1-cfg-1",
+              "product": "p11-out-1",
+              "retiredPlaceholders": [
+                "twp11a-1-fin-1"
+              ],
+              "videoConfig": "twp11a-1-cfgv-1",
+              "videoTarget": "twp11a-1-out-video",
+              "downstream": [
+                "twp11a-1-cfgv-1"
+              ]
+            },
+            "hub": {
+              "localId": "p11-local-1",
+              "bridgeId": "b11",
+              "revisionDigest": "5ee613e4",
+              "approvalSnapshot": "snap-p11",
+              "boundAt": "2026-11-14T03:59:14.112Z"
+            },
+            "backend": {
+              "lapianTaskId": "task-1",
+              "lapianJobId": "job-1"
+            },
+            "createdAt": "2026-11-14T03:59:14.112Z"
+          }
+        ],
+        "queue": {
+          "schemaVersion": 1,
+          "concurrency": 1,
+          "phase": "finished",
+          "startedAt": "2026-11-14T03:59:14.102Z",
+          "updatedAt": "2026-11-14T03:59:14.112Z",
+          "entries": [
+            {
+              "instanceId": "wp11a#1",
+              "instanceIndex": 1,
+              "attempts": 1,
+              "congestionRetries": 0,
+              "lastRun": {
+                "at": "2026-11-14T03:59:14.112Z",
+                "outcome": "awaiting_approval"
+              }
+            }
+          ],
+          "summary": {
+            "attempted": 1,
+            "awaitingApproval": 1,
+            "canvasReady": 0,
+            "failed": [],
+            "heldSubmitUnknown": [],
+            "skippedDone": [],
+            "congestionRequeues": 0,
+            "concurrencyPeak": 1
+          }
+        }
+      }
+    ],
+    "workflowAssetVetoes": []
+  }
+}

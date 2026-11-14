@@ -102,6 +102,15 @@ const workflowMaterialSchema = z.object({
     optionalSegments: z.string().optional(),
 });
 
+/** P11：画布替换图指代（用户话语 → 槽 + 图）。slotNodeId 最精确；否则按槽名/槽类型认槽。 */
+const workflowAssetBindingSchema = z.object({
+    slotNodeId: z.string().optional(),
+    slotName: z.string().optional(),
+    slotType: z.string().optional(),
+    imageNodeId: z.string(),
+    reason: z.string().optional(),
+});
+
 export const toolInputSchemas = {
     site_navigate: z.object({ path: z.string() }),
     canvas_list_projects: z.object({ keyword: z.string().optional(), page: z.number().optional(), pageSize: z.number().optional() }),
@@ -132,8 +141,8 @@ export const toolInputSchemas = {
     generation_get_status: z.object({ scope: z.enum(["all", "canvas", "image", "video"]).optional(), taskId: z.string().optional(), nodeIds: z.array(z.string()).optional(), limit: z.number().optional() }),
     read_node_text: z.object({ nodeId: z.string() }),
     extract_workflow_template: z.object({ sourceNodeIds: z.array(z.string()).optional(), name: z.string().optional(), templateId: z.string().optional() }),
-    run_workflow_batch: z.object({ templateId: z.string().optional(), materials: z.array(workflowMaterialSchema).optional(), concurrency: z.number().optional(), title: z.string().optional() }),
-    run_workflow_instance: z.object({ templateId: z.string().optional(), material: workflowMaterialSchema, title: z.string().optional() }),
+    run_workflow_batch: z.object({ templateId: z.string().optional(), materials: z.array(workflowMaterialSchema).optional(), assetBindings: z.array(workflowAssetBindingSchema).optional(), concurrency: z.number().optional(), title: z.string().optional() }),
+    run_workflow_instance: z.object({ templateId: z.string().optional(), material: workflowMaterialSchema, assetBindings: z.array(workflowAssetBindingSchema).optional(), title: z.string().optional() }),
     workbench_image_get_config: z.object({}).passthrough(),
     workbench_image_generate: z.object({ prompt: z.string(), model: z.string().optional(), quality: z.string().optional(), size: z.string().optional(), count: z.number().optional(), run: z.boolean().optional() }),
     workbench_video_get_config: z.object({}).passthrough(),
@@ -173,8 +182,8 @@ export const toolDescriptions: Record<ToolName, string> = {
     generation_get_status: "查询当前活动网页的生成任务状态。默认返回画布、生图工作台和视频工作台最近任务；可用 scope 过滤来源，用 taskId 查询工作台任务，用 nodeIds 查询画布节点。返回的 prompt 只是最多 4000 字的预览，promptTruncated=true 时用 read_node_text 取全文。",
     read_node_text: "读取指定画布节点的完整文本，入参 nodeId，返回 nodeId、projectId、type、title 与 content/prompt/composerContent 全文及各自字数（length 为主文本字数）。正文与提示词逐字返回、不截断不折叠，是批量执行和自修时取完整提示词的唯一通道。图片/视频/音频节点的 content 若是内联 dataURL，只返回 contentLength 与 contentOmitted=media-data-url，不回传原始数据。",
     extract_workflow_template: "从当前画布项目抽取可复用工作流模板（模板声明落在本项目 workflowTemplate 上，随画布保存）。sourceNodeIds 缺省 = 全项目可抽象子图（源视频/拉片/指令/意图/文本/配置等骨架节点）；要连生成产物一起抽就显式列出节点 id。**name 是模板的具名**：抽的时候按用户日后的说法起名（比如用户要「用视频拆解工作流处理这些视频」，就起名「视频拆解」）——这个名字会出现在建批次回执里，也是 Agent 认「用户说的是哪个工作流」的依据；同一个名+同一批节点重抽是原地覆盖，不会多出第二份模板。返回 templateId、模板名、五槽声明（源视频/意图/资产位/生成参数/可选段）、冻结项摘要（拓扑与骨架 digest）、逐节点剥离字段与图外引用报告：图外引用非空时模板不冻结，实例化会被自足性校验拦下，需把这些节点一起选进来重抽。本工具零付费、不生成任何内容，不碰待审批队列。抽完用 run_workflow_batch 建批次（不传 templateId/materials 即自动取用本模板与画布源视频）；实例的终点是「待审批」，付费视频生成不在本工具内发生，审批与提交出片请在画布「待审批」侧栏操作。",
-    run_workflow_batch: "用户说「用视频拆解工作流处理这些视频 / 处理这 N 个视频 / 把这几个视频跑一遍」时：**直接调本工具，templateId 与 materials 都不用传**——templateId 缺省自动取本画布唯一的工作流模板（回执里报模板名，先跟用户对一句用的是哪个模板）；materials 缺省自动把画布上的源视频节点（拖进来的素材，生成产物不算、模板骨架里的示范源视频也不算）解析出来，并在回执的 materials 里逐条列出 id+标题供用户核对；画布上有选中节点时以选中为准（只选中想处理的那几个即可）。用户明确点名节点、或要改意图文案（intentText）/可选段时才显式给 materials（每项 sourceVideoNodeId 或 storageKey，可带 title/intentText/optionalSegments）。画布还没有模板时本工具会人话报错：这时不要自己猜参数，直接告诉用户「先在已跑通的『视频拆解→生成』链上抽一次模板并起名（比如『视频拆解』）」，抽完这句「处理这些视频」就能直达。执行：每素材 materializeWorkflowInstance（幂等落库，同实例不重复拉片）→ 入批次 → runBatchQueue 并发编排（默认并发 3，上限 6）。返回 batchId、模板名、本次素材清单、每实例 instanceId 与节点骨架、派生状态表、队列相位。**终点=待审批，付费视频生成不在本工具内发生**，审批与提交出片请在画布「待审批」侧栏操作。同一批素材重复调用落在同一批次（幂等，不翻倍）。",
-    run_workflow_instance: "单素材单实例（调试用）：只给一个 material，走与 run_workflow_batch 完全相同的落库+编排路径（并发 1），返回该实例的 instanceId、节点骨架与派生状态；终点=待审批，付费视频生成不在本工具内发生，审批与提交出片请在画布「待审批」侧栏操作。同素材重复调用幂等（同实例不重建、不重复拉片）。",
+    run_workflow_batch: "用户说「用视频拆解工作流处理这些视频 / 处理这 N 个视频 / 把这几个视频跑一遍」时：**直接调本工具，templateId 与 materials 都不用传**——templateId 缺省自动取本画布唯一的工作流模板（回执里报模板名，先跟用户对一句用的是哪个模板）；materials 缺省自动把画布上的源视频节点（拖进来的素材，生成产物不算、模板骨架里的示范源视频也不算）解析出来，并在回执的 materials 里逐条列出 id+标题供用户核对；画布上有选中节点时以选中为准（只选中想处理的那几个即可）。**画布上的产品图/人物图会被自动识别为替换素材并绑定到对应槽位（回执逐条给「图→槽」绑定理由；显式指定的优先于自动匹配，判不准的槽留空交人）**：用户说了「人物换成这张/产品用这张」时，把指代翻成 assetBindings（slotNodeId 或 slotName/slotType + imageNodeId，可带 reason 原话）传进来，指定优先；没说时选中替换图也会优先于未选中的图。用户明确点名节点、或要改意图文案（intentText）/可选段时才显式给 materials（每项 sourceVideoNodeId 或 storageKey，可带 title/intentText/optionalSegments）。画布还没有模板时本工具会人话报错：这时不要自己猜参数，直接告诉用户「先在已跑通的『视频拆解→生成』链上抽一次模板并起名（比如『视频拆解』）」，抽完这句「处理这些视频」就能直达。执行：每素材 materializeWorkflowInstance（幂等落库，同实例不重复拉片）→ 入批次 → runBatchQueue 并发编排（默认并发 3，上限 6）。返回 batchId、模板名、本次素材清单、每实例 instanceId 与节点骨架、派生状态表、队列相位。**终点=待审批，付费视频生成不在本工具内发生**，审批与提交出片请在画布「待审批」侧栏操作。同一批素材重复调用落在同一批次（幂等，不翻倍）。",
+    run_workflow_instance: "单素材单实例（调试用）：只给一个 material，走与 run_workflow_batch 完全相同的落库+编排路径（并发 1），返回该实例的 instanceId、节点骨架、槽③挂图与派生状态；画布上的产品图/人物图会被自动识别为替换素材并绑定到对应槽位（回执给绑定理由；显式指定的优先于自动匹配，判不准的槽留空交人；要指定就传 assetBindings）；终点=待审批，付费视频生成不在本工具内发生，审批与提交出片请在画布「待审批」侧栏操作。同素材重复调用幂等（同实例不重建、不重复拉片）。",
     workbench_image_get_config: "读取生图工作台的当前参数和可选项（可用模型、质量、分辨率 1k/2k/4k/auto、宽高比、张数范围），在调用 workbench_image_generate 前先了解可选值。",
     workbench_image_generate: "在生图工作台填入提示词并按需设置 model、quality、size（如 16:9 或 2048x1152）、count，run 默认 true 会自动点击生成按钮。会自动跳转到生图工作台。生成为异步过程，提交后返回 taskId，可用 generation_get_status 查询状态。",
     workbench_video_get_config: "读取视频创作台的当前参数和可选项（可用模型、清晰度 480/720/1080、比例 1:1/3:4/4:3/16:9/9:16/21:9/auto、时长 4–30 秒、首尾帧或全能参考模式、是否生成声音与水印）。",

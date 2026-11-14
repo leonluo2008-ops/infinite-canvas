@@ -95,6 +95,37 @@ test("P10 一句话直达：零参调用原样下发给页面（页面侧自动�
     assert.deepEqual(await pending, { ok: true, materialsFrom: "canvas", materials: [] });
 });
 
+test("P11 画布替换图→槽：描述写明「自动识别替换素材 + 显式优先」且 zod 接受 assetBindings", () => {
+    const batch = toolDescriptions.run_workflow_batch;
+    assert.match(batch, /产品图\/人物图/, "run_workflow_batch 描述缺「画布产品图/人物图」口径");
+    assert.match(batch, /自动识别为替换素材并绑定到对应槽位/, "run_workflow_batch 描述缺「自动识别并绑定到槽位」口径");
+    assert.match(batch, /绑定理由/, "run_workflow_batch 描述缺「回执给绑定理由」口径");
+    assert.match(batch, /显式指定的优先于自动匹配/, "run_workflow_batch 描述缺「显式优先于自动匹配」口径");
+    assert.match(batch, /留空交人/, "run_workflow_batch 描述缺「判不准留空交人」口径");
+    const instance = toolDescriptions.run_workflow_instance;
+    assert.match(instance, /自动识别为替换素材并绑定到对应槽位/, "run_workflow_instance 描述缺绑定口径");
+    assert.match(instance, /显式指定的优先于自动匹配/, "run_workflow_instance 描述缺显式优先口径");
+
+    // zod：一条合法绑定（按槽名指代）与一条最简绑定（只给图）都合法；缺 imageNodeId 不合法
+    assert.equal(toolInputSchemas.run_workflow_batch.safeParse({ assetBindings: [{ slotName: "女性A", imageNodeId: "img-1", reason: "把人物换成这张" }] }).success, true);
+    assert.equal(toolInputSchemas.run_workflow_instance.safeParse({ material: { sourceVideoNodeId: "v1" }, assetBindings: [{ imageNodeId: "img-1" }] }).success, true);
+    assert.equal(toolInputSchemas.run_workflow_batch.safeParse({ assetBindings: [{ slotName: "女性A" }] }).success, false);
+});
+
+test("P11 绑定入参原样下发页面（显式指定不被 Agent 侧改写）", async (t) => {
+    const session = new CanvasSession();
+    const first = connect(session, "first");
+    t.after(() => first.close());
+    session.activateClient("first");
+
+    const input = { materials: [{ sourceVideoNodeId: "v1" }], assetBindings: [{ slotNodeId: "slot-female", imageNodeId: "img-1", reason: "这张人物" }] };
+    const pending = session.callTool("run_workflow_batch", input);
+    const call = first.event("tool_call");
+    assert.deepEqual(field(call, "input"), input);
+    session.resolveResult("first", { requestId: String(field(call, "requestId")), result: { ok: true, assetBindings: [], paidVideoCreations: 0 } });
+    assert.deepEqual(await pending, { ok: true, assetBindings: [], paidVideoCreations: 0 });
+});
+
 test("P9 入参校验拒绝缺 material（不把坏调用下发给页面）", async (t) => {
     const session = new CanvasSession();
     const first = connect(session, "first");
