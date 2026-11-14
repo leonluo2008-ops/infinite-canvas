@@ -1,0 +1,311 @@
+{
+  "at": "2026-11-14T03:15:40.518Z",
+  "pass": 31,
+  "fail": 0,
+  "sections": {
+    "A": {
+      "pass": 14,
+      "fail": 0
+    },
+    "B": {
+      "pass": 3,
+      "fail": 0
+    },
+    "C": {
+      "pass": 3,
+      "fail": 0
+    },
+    "D": {
+      "pass": 4,
+      "fail": 0
+    },
+    "E": {
+      "pass": 3,
+      "fail": 0
+    },
+    "F": {
+      "pass": 4,
+      "fail": 0
+    }
+  },
+  "fails": [],
+  "results": [
+    {
+      "section": "A",
+      "name": "A1 零参直达：不传 templateId / materials 也能建批次（3 个源视频 → 3 实例）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "section": "A",
+      "name": "A2 3 实例全部到待审批（终点=待审批，P4 判据）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "section": "A",
+      "name": "A3 模板自动取用：templateFrom=project、回执报模板名「视频拆解」",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "section": "A",
+      "name": "A4 素材自动解析：materialsFrom=canvas、3 条且逐条有 id+标题+storageKey",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "section": "A",
+      "name": "A5 产物/骨架不算素材：有上游输入的产物、只有生成痕迹没连线的产物、模板骨架里的示范源视频都被排除",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "section": "A",
+      "name": "A6 回执可核对：next 里写明模板名与 3 条素材标题、终点待审批",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "section": "A",
+      "name": "A7 队列收尾：相位 finished、并发 3、3 实例跑到待批",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "section": "A",
+      "name": "A8 付费口径：本工具内视频创建恒 0（paidVideoCreations=0，runGeneration 只 mode:text）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "section": "A",
+      "name": "A9 零生成端点：整段只打桥侧拉片链（upload/run/job/正文/render），无 create 类请求",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "section": "A",
+      "name": "A10 跳过清单如实：只跳过模板骨架里的示范源视频（有理由），无警示",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "section": "A",
+      "name": "A11 侧栏「待审批」立即出 3 行且全部待审批（模板名也进批次头）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "section": "A",
+      "name": "A12 幂等：同一句「处理这些视频」再说一次 → 同批次、3 实例 already_present",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "section": "A",
+      "name": "A13 幂等零副作用：零新增组装调用、零新增节点、实例仍在待审批",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "section": "A",
+      "name": "A14 素材节点删掉后再说一次 → 续跑既有批次（同 batchId、already_present、如实说明）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "section": "B",
+      "name": "B1 选中优先：选中 2 个 → 只处理这 2 个（materialsFrom=selection）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "section": "B",
+      "name": "B2 选中夹带非视频节点 → 只按视频节点处理，并如实警示忽略了哪些",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "section": "B",
+      "name": "B3 选中的全是非视频节点 → 人话报错（不静默改成全画布）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "section": "C",
+      "name": "C1 无模板 → 人话：先在已跑通的拆解→生成链上抽一次模板（extract_workflow_template）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "section": "C",
+      "name": "C2 多模板 → 列名字让人选（不替用户乱选）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "section": "C",
+      "name": "C3 多模板 + 显式 templateId → 按指定模板跑",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "section": "D",
+      "name": "D1 0 源视频 → 人话：请先把视频拖进画布",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "section": "D",
+      "name": "D2 没本地字节的源视频 → 跳过并如实列出原因，剩下的照跑",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "section": "D",
+      "name": "D3 源视频全都没本地字节 → 人话报错（与「没找到源视频」区分）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "section": "D",
+      "name": "D4 源视频判据：产物（有上游输入 / 带生成痕迹）不进素材集合",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "section": "E",
+      "name": "E1 显式 materials 仍照原样生效（materialsFrom=explicit、只这 2 个）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "section": "E",
+      "name": "E2 显式路径终点仍是待审批、付费恒 0",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "section": "E",
+      "name": "E3 没有打开的画布项目 → 人话拒绝（不假跑）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "section": "F",
+      "name": "F1 tsc 仅既有 1 条基线错误（model-script-editor.tsx）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "section": "F",
+      "name": "F2 探针自身没有付费生成调用点（无 run_generation 执行体 / 无视频创建端点）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "section": "F",
+      "name": "F3 真实任务零接触：只操作自建夹具项目（proj-p10）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "section": "F",
+      "name": "F4 引擎五文件零改动：探针只 import 到调用壳与既有模块（entry/runtime/review/batch/ops/builtin）",
+      "ok": true,
+      "detail": ""
+    }
+  ],
+  "evidence": {
+    "generationCalls": [
+      [
+        "twvid-1-cfg-1",
+        "text"
+      ],
+      [
+        "twvid-2-cfg-1",
+        "text"
+      ],
+      [
+        "twvid-3-cfg-1",
+        "text"
+      ],
+      [
+        "twsel-1-cfg-1",
+        "text"
+      ],
+      [
+        "twsel-2-cfg-1",
+        "text"
+      ],
+      [
+        "twsel2-1-cfg-1",
+        "text"
+      ],
+      [
+        "twnobytes-1-cfg-1",
+        "text"
+      ],
+      [
+        "twexplicit-1-cfg-1",
+        "text"
+      ],
+      [
+        "twexplicit-2-cfg-1",
+        "text"
+      ]
+    ],
+    "fetchTargets": [
+      "/api/video/upload",
+      "/api/lapian/run",
+      "/api/job/job-1",
+      "/api/lapian/task-1",
+      "/api/job/job-2",
+      "/api/lapian/task-2",
+      "/api/job/job-3",
+      "/api/lapian/task-3",
+      "/api/render/task-1/seedance-flow?optional=",
+      "/api/render/task-2/seedance-flow?optional=",
+      "/api/render/task-3/seedance-flow?optional=",
+      "/api/job/job-4",
+      "/api/lapian/task-4",
+      "/api/job/job-5",
+      "/api/lapian/task-5",
+      "/api/render/task-4/seedance-flow?optional=",
+      "/api/render/task-5/seedance-flow?optional=",
+      "/api/job/job-6",
+      "/api/lapian/task-6",
+      "/api/render/task-6/seedance-flow?optional=",
+      "/api/job/job-7",
+      "/api/lapian/task-7",
+      "/api/job/job-8",
+      "/api/lapian/task-8",
+      "/api/job/job-9",
+      "/api/lapian/task-9",
+      "/api/job/job-10",
+      "/api/lapian/task-10",
+      "/api/render/task-10/seedance-flow?optional=",
+      "/api/job/job-11",
+      "/api/lapian/task-11",
+      "/api/job/job-12",
+      "/api/lapian/task-12",
+      "/api/render/task-11/seedance-flow?optional=",
+      "/api/render/task-12/seedance-flow?optional=A"
+    ],
+    "hubCalls": {
+      "ingest": 9,
+      "upload": 0,
+      "getTask": 30
+    },
+    "flushes": [
+      "p9-extract-template",
+      "p9-batch-enqueue",
+      "p8-queue",
+      "p8-instance_persisted",
+      "p8-awaiting_approval"
+    ],
+    "identitySaves": 9,
+    "unexpectedFetch": 0
+  }
+}

@@ -59,13 +59,48 @@ test("P9 run_workflow_batch 入参经 zod 校验后原样下发（素材组不�
     assert.deepEqual(await result, pageResult);
 });
 
-test("P9 入参校验拒绝空素材/缺 material（不把坏调用下发给页面）", async (t) => {
+test("P10 具名工作流直达：描述写死「视频拆解」话术 + 零参即可自动解析（不要求 templateId/materials）", () => {
+    const description = toolDescriptions.run_workflow_batch;
+    // 卡面要求 2：用户说「用视频拆解工作流处理这些/这 N 个视频」时直接调本工具
+    assert.match(description, /用视频拆解工作流处理/, "描述缺「视频拆解」话术触发句");
+    assert.match(description, /templateId 与 materials 都不用传/, "描述缺「零参直达」口径");
+    assert.match(description, /源视频节点/, "描述缺「自动解析源视频」口径");
+    assert.match(description, /逐条列出/, "描述缺「回执逐条列素材供核对」口径");
+    assert.match(description, /选中/, "描述缺「选中优先」口径");
+    // 卡面要求 3/4：具名登记 + 首次使用引导抽模板
+    assert.match(description, /模板名/, "描述缺「回执报模板名」口径");
+    assert.match(description, /抽一次模板/, "描述缺「首次使用引导抽模板」口径");
+    assert.match(toolDescriptions.extract_workflow_template, /具名/, "抽模板工具描述缺「name 即具名」引导");
+
+    // zod：templateId / materials / 两者都不传 均合法（materials 空数组也按自动解析处理）
+    assert.equal(toolInputSchemas.run_workflow_batch.safeParse({}).success, true);
+    assert.equal(toolInputSchemas.run_workflow_batch.safeParse({ templateId: "wabc123" }).success, true);
+    assert.equal(toolInputSchemas.run_workflow_batch.safeParse({ materials: [] }).success, true);
+    assert.equal(toolInputSchemas.run_workflow_batch.safeParse({ materials: [{ sourceVideoNodeId: "v1" }] }).success, true);
+    // 素材结构仍然校验（坏素材不下发）
+    assert.equal(toolInputSchemas.run_workflow_batch.safeParse({ materials: [{ sourceVideoNodeId: 1 }] }).success, false);
+});
+
+test("P10 一句话直达：零参调用原样下发给页面（页面侧自动解析模板与素材）", async (t) => {
     const session = new CanvasSession();
     const first = connect(session, "first");
     t.after(() => first.close());
     session.activateClient("first");
 
-    await assert.rejects(() => session.callTool("run_workflow_batch", { materials: [] }));
+    const pending = session.callTool("run_workflow_batch", {});
+    const call = first.event("tool_call");
+    assert.equal(field(call, "name"), "run_workflow_batch");
+    assert.deepEqual(field(call, "input"), {});
+    session.resolveResult("first", { requestId: String(field(call, "requestId")), result: { ok: true, materialsFrom: "canvas", materials: [] } });
+    assert.deepEqual(await pending, { ok: true, materialsFrom: "canvas", materials: [] });
+});
+
+test("P9 入参校验拒绝缺 material（不把坏调用下发给页面）", async (t) => {
+    const session = new CanvasSession();
+    const first = connect(session, "first");
+    t.after(() => first.close());
+    session.activateClient("first");
+
     await assert.rejects(() => session.callTool("run_workflow_instance", {}));
     await assert.rejects(() => session.callTool("run_workflow_instance", { material: "not-an-object" }));
     // 校验失败必须在页面侧零下发（页面没收到任何 tool_call）

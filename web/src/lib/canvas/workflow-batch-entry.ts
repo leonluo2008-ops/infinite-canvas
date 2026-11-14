@@ -35,6 +35,11 @@ export type EntryProject = {
     nodes: CanvasNodeData[];
     connections: CanvasConnection[];
     workflowTemplate?: CanvasWorkflowTemplate;
+    /**
+     * 多模板（前向兼容，当前画布只写单槽 `workflowTemplate`）：存在多个声明时**不替用户乱选**，
+     * 列名字让用户指定。本字段目前无人写入，读取侧留好口子，避免将来加模板库时又改一遍解析层。
+     */
+    workflowTemplates?: CanvasWorkflowTemplate[];
     workflowBatches?: WorkflowBatchRecord[];
     workflowAssetVetoes?: WorkflowAssetVetoRecord[];
 };
@@ -69,6 +74,11 @@ export type WorkflowEntryDeps = {
     runBatch: (batchId: string) => Promise<EntryBatchRunOutcome>;
     /** 任意画布上按节点 id 找节点（素材可来自源画布；缺省只查当前画布）。 */
     findNode?: (nodeId: string) => CanvasNodeData | undefined;
+    /**
+     * 当前画布选中的节点 id（P10：素材缺省时「以选中为准」）。
+     * 页面 = 画布快照的 `selectedNodeIds`；探针 = 夹具自带；缺省 = 没选中。
+     */
+    selectedNodeIds?: () => string[] | undefined;
     now?: () => string;
     log?: (message: string) => void;
 };
@@ -91,7 +101,11 @@ export type WorkflowBatchMaterialInput = {
 
 export type RunWorkflowBatchInput = {
     templateId?: string;
-    materials: WorkflowBatchMaterialInput[];
+    /**
+     * P10：**可省略**。省略（或空数组）时自动解析画布上的源视频节点：
+     * 有选中节点 → 以选中为准；否则取画布全部源视频（`type=video` 且没有任何上游输入 / 不是生成产物）。
+     */
+    materials?: WorkflowBatchMaterialInput[];
     concurrency?: number;
     title?: string;
     /** 批次 id 覆盖（探针用；缺省按模板+素材组确定性派生）。 */
@@ -153,10 +167,33 @@ export type InstanceRow = {
     outcomeReason?: string;
 };
 
+export type MaterialSource = "explicit" | "selection" | "canvas";
+
+/** 本次批次实际用的素材（逐条列出让用户可核对：id + 标题 + 来源）。 */
+export type ResolvedMaterialRow = {
+    /** 画布节点 id（显式只给 storageKey 时为空）。 */
+    nodeId?: string;
+    storageKey: string;
+    title: string;
+    source: MaterialSource;
+};
+
+/** 被跳过的候选源视频（有人话原因，不静默丢）。 */
+export type SkippedSourceVideo = { nodeId: string; title: string; reason: string };
+
 export type RunWorkflowBatchResult = {
     ok: boolean;
     batchId: string;
     templateId: string;
+    /** 模板具名（用户抽模板时起的名字，如「视频拆解」）——回执里报给用户核对。 */
+    templateName: string;
+    /** 模板来源：explicit=用户/Agent 指定；project=画布唯一模板自动取用。 */
+    templateFrom: "explicit" | "project";
+    /** 素材来源：explicit=显式传入；selection=按画布选中解析；canvas=画布全部源视频。 */
+    materialsFrom: MaterialSource;
+    /** 本次素材清单（逐条 id+标题，供用户核对「是不是这 N 个视频」）。 */
+    materials: ResolvedMaterialRow[];
+    skippedSourceVideos: SkippedSourceVideo[];
     title?: string;
     concurrency: number;
     queue?: { phase: string; concurrency: number; attempted: number; awaitingApproval: number; failed: number; skipped: number };
@@ -255,7 +292,7 @@ export function defaultTemplateScope(nodes: CanvasNodeData[]): string[] {
  */
 export async function runWorkflowBatchTool(input: RunWorkflowBatchInput, deps: WorkflowEntryDeps): Promise<RunWorkflowBatchResult> {
     const project = requireProject(deps);
-    const { template } = resolveTemplate(project, input.templateId);
+    const { template, from: templateFrom } = resolveTemplate(project, input.templateId);
     // P2 契约：图外引用非空 = 模板不冻结 → 实例化器必须拒绝（不能带着断链去批量花钱）。
     if ((template.externalReferences || []).length) {
         const targets = [...new Set((template.externalReferences || []).map((reference) => reference.targetId))];
@@ -263,33 +300,60 @@ export async function runWorkflowBatchTool(input: RunWorkflowBatchInput, deps: W
             `模板 ${template.templateId} 不冻结（${template.externalReferences.length} 条图外引用：${targets.slice(0, 5).join("、")}${targets.length > 5 ? " 等" : ""}）：先补全这些节点后用 extract_workflow_template 重抽模板，再建批次`,
         );
     }
-    const rawMaterials = Array.isArray(input.materials) ? input.materials : [];
-    if (!rawMaterials.length) throw new Error("materials 不能为空：至少给一个素材（sourceVideoNodeId 或 storageKey）");
+    // P10：素材缺省时自动解析（选中优先 → 画布全部源视频）；解析不出来给人话，绝不明着空跑。
+    // 排除项：模板骨架节点（示范链）+ 已落在既有批次实例里的节点（同一批视频重复说时不该翻倍）。
+    const resolution = resolveBatchMaterials(project, input, deps, materialExclusions(project, template));
     const concurrency = clampConcurrency(input.concurrency);
     const now = deps.now ? deps.now() : new Date().toISOString();
 
-    const materialList = rawMaterials.map((material) => materialOf(material, project, deps));
-    const batchId = String(input.batchId || "").trim() || deriveEntryBatchId(template.templateId, materialList, input.title);
+    // 画布上没有「新」源视频，但这条模板已有批次 → 视为「同一句再说一次」：直接续跑既有批次（幂等，不翻倍）。
+    const resumeId = resolution.empty ? latestBatchIdForTemplate(project, template.templateId) : undefined;
+    if (resolution.empty && !resumeId) {
+        throw new Error("画布上没有找到源视频（没有可当素材的视频节点）：请先把视频拖进画布，再说「用视频拆解工作流处理这些视频」");
+    }
+
+    const materialList = resolution.inputs.map((material) => materialOf(material, project, deps));
+    const materialRows: ResolvedMaterialRow[] = materialList.map((material, index) => {
+        const nodeId = String(resolution.inputs[index].sourceVideoNodeId || "").trim();
+        return {
+            ...(nodeId ? { nodeId } : {}),
+            storageKey: material.sourceVideo.storageKey,
+            title: String(material.sourceVideo.title || "").trim() || `素材 ${index + 1}`,
+            source: resolution.from,
+        };
+    });
+    const warnings: string[] = [...resolution.warnings];
+    const batchId = String(resumeId || input.batchId || "").trim() || deriveEntryBatchId(template.templateId, materialList, input.title);
 
     const templatePlan = templatePlanInput(project, template);
-    const warnings: string[] = [];
     const materializeFailures: RunWorkflowBatchResult["materializeFailures"] = [];
     const members: WorkflowBatchMember[] = [];
     const created: { member: WorkflowBatchMember; material: WorkflowInstanceMaterials; materialized: "created" | "already_present"; nodes: CanvasNodeData[] }[] = [];
 
-    // 幂等重放：同批次（同模板 + 同素材组 + 同标题 → 同一 batchId）已存在 → **不重建实例**，直接续跑队列。
-    // 已到待批/已批/已完成的实例由队列按派生状态跳过（P6 planBatchResume），因此重复调用零重建、零重复拉片。
+    // 幂等重放：同批次（同模板 + 同素材组 + 同标题 → 同一 batchId / 或「再说一次」命中的既有批次）已存在
+    // → **不重建实例**，直接续跑队列。已到待批/已批/已完成的实例由队列按派生状态跳过（P6 planBatchResume）。
     const replay = findWorkflowBatch(project.workflowBatches, batchId);
     if (replay) {
-        if (replay.members.length !== materialList.length) {
+        if (!resumeId && replay.members.length !== materialList.length) {
             throw new Error(`批次 ${batchId} 已存在但成员数不同（现存 ${replay.members.length} / 本次 ${materialList.length}）：同批次不换成员，换素材请换 title 或用新的模板`);
         }
         const existingNodes = deps.project()?.nodes || project.nodes;
         for (const member of replay.members) created.push({ member, material: materialOf(memberToMaterialInput(member), project, { ...deps, findNode: () => undefined }), materialized: "already_present", nodes: existingNodes });
-        deps.log?.(`p9-batch ${batchId} replay members=${replay.members.length}`);
+        if (resumeId) {
+            warnings.push(`画布上没有新的源视频：这些视频已经在批次 ${batchId} 里（${replay.members.length} 个实例），本次直接续跑该批次，不重复建实例`);
+            for (const member of replay.members) {
+                materialRows.push({
+                    ...(member.nodes?.sourceVideo ? { nodeId: member.nodes.sourceVideo } : {}),
+                    storageKey: String(member.materials?.sourceVideoStorageKey || ""),
+                    title: String(member.materials?.sourceVideoTitle || `素材 ${member.instanceIndex}`),
+                    source: "canvas",
+                });
+            }
+        }
+        deps.log?.(`p9-batch ${batchId} replay members=${replay.members.length} resume=${Boolean(resumeId)}`);
         const replayed = await deps.runBatch(batchId);
         const replayBatch = findWorkflowBatch(deps.project()?.workflowBatches, batchId) || replay;
-        return buildBatchResult({ batchId, template, record: replayBatch, concurrency, run: replayed, instances: await summarizeInstances(replayBatch, created, replayed, deps), materializeFailures, warnings });
+        return buildBatchResult({ batchId, template, templateFrom, materials: materialRows, skipped: resolution.skipped, record: replayBatch, concurrency, run: replayed, instances: await summarizeInstances(replayBatch, created, replayed, deps), materializeFailures, warnings });
     }
 
     // 同号实例已被别的素材占住 → 拒绝（P3 幂等键 = 模板 + 实例序号；already_present 会静默忽略新素材，不能让它发生）
@@ -368,13 +432,16 @@ export async function runWorkflowBatchTool(input: RunWorkflowBatchInput, deps: W
     const liveBatch = findWorkflowBatch(deps.project()?.workflowBatches, batchId) || withQueue;
     const instances = await summarizeInstances(liveBatch, created, run, deps);
 
-    return buildBatchResult({ batchId, template, record: liveBatch, concurrency, run, instances, materializeFailures, warnings });
+    return buildBatchResult({ batchId, template, templateFrom, materials: materialRows, skipped: resolution.skipped, record: liveBatch, concurrency, run, instances, materializeFailures, warnings });
 }
 
 /** 回执组装（首跑与幂等重放共用一份口径）。 */
 function buildBatchResult(input: {
     batchId: string;
     template: CanvasWorkflowTemplate;
+    templateFrom: "explicit" | "project";
+    materials: ResolvedMaterialRow[];
+    skipped: SkippedSourceVideo[];
     record: WorkflowBatchRecord;
     concurrency: number;
     run: EntryBatchRunOutcome;
@@ -383,10 +450,16 @@ function buildBatchResult(input: {
     warnings: string[];
 }): RunWorkflowBatchResult {
     const { batchId, template, record, run, instances } = input;
+    const awaiting = instances.filter((row) => row.status === "awaiting_approval").length;
     return {
         ok: instances.length > 0,
         batchId,
         templateId: template.templateId,
+        templateName: String(template.name || "").trim() || template.templateId,
+        templateFrom: input.templateFrom,
+        materialsFrom: input.materials[0]?.source || "explicit",
+        materials: input.materials,
+        skippedSourceVideos: input.skipped,
         ...(record.title ? { title: record.title } : {}),
         concurrency: run.queue?.concurrency || input.concurrency,
         queue: run.queue
@@ -403,7 +476,7 @@ function buildBatchResult(input: {
         materializeFailures: input.materializeFailures,
         paidVideoCreations: 0,
         next: run.ok
-            ? `批次 ${batchId} 已跑到待审批（${instances.filter((row) => row.status === "awaiting_approval").length}/${instances.length}）：审批与提交出片请到画布左侧「待审批」页签操作，付费视频生成不在本工具内发生`
+            ? `批次 ${batchId} 已用「${String(template.name || "").trim() || template.templateId}」跑到待审批（${awaiting}/${instances.length}；素材 ${input.materials.length} 条：${input.materials.map((row) => row.title).join("、")}）：审批与提交出片请到画布左侧「待审批」页签操作，付费视频生成不在本工具内发生`
             : `批次 ${batchId} 已入册但队列没跑成：${run.reason || "未给出原因"}（实例仍在，可在侧栏「待审批」页签重试）`,
         warnings: input.warnings,
     };
@@ -436,17 +509,146 @@ function requireProject(deps: WorkflowEntryDeps): EntryProject {
     return project;
 }
 
-/** 模板解析：优先显式 templateId，缺省用当前画布的声明；跨画布一律拒绝（不串批次）。 */
-function resolveTemplate(project: EntryProject, templateId?: string): { template: CanvasWorkflowTemplate } {
-    const current = project.workflowTemplate;
+/**
+ * 模板解析（P10 具名工作流直达）：显式 templateId 优先；缺省时**自动取本画布唯一模板**；
+ * 无模板 → 人话引导先抽模板；多模板 → 列名字让用户选，绝不替用户乱选；跨画布一律拒绝（不串批次）。
+ */
+function resolveTemplate(project: EntryProject, templateId?: string): { template: CanvasWorkflowTemplate; from: "explicit" | "project" } {
+    const candidates = projectTemplateCandidates(project);
     const wanted = String(templateId || "").trim();
-    if (!current) {
-        throw new Error("当前画布还没有工作流模板：先调 extract_workflow_template（模板声明随画布项目保存），再建批次");
+    if (!candidates.length) {
+        throw new Error(
+            "画布还没有工作流模板：请先在已跑通的「视频拆解→生成」链上抽一次模板（extract_workflow_template，抽的时候起个名字，比如「视频拆解」），之后说「用视频拆解工作流处理这些视频」就能直达",
+        );
     }
-    if (wanted && wanted !== current.templateId) {
-        throw new Error(`当前画布的模板是 ${current.templateId}，与请求的 ${wanted} 不一致：批次必须在模板所在画布上建（不跨画布串批次）`);
+    const labelOf = (template: CanvasWorkflowTemplate) => `「${String(template.name || "").trim() || template.templateId}」（${template.templateId}）`;
+    if (wanted) {
+        const hit = candidates.find((template) => String(template.templateId) === wanted);
+        if (!hit) {
+            throw new Error(`当前画布的模板是 ${candidates.map(labelOf).join("、")}，与请求的 ${wanted} 不一致：批次必须在模板所在画布上建（不跨画布串批次）`);
+        }
+        return { template: hit, from: "explicit" };
     }
-    return { template: current };
+    if (candidates.length > 1) {
+        throw new Error(`画布上有 ${candidates.length} 个工作流模板（${candidates.map(labelOf).join("、")}）：请指明用哪个（把它的 templateId 传给本工具），不替用户乱选`);
+    }
+    return { template: candidates[0], from: "project" };
+}
+
+/** 画布内模板候选：`workflowTemplates`（前向兼容的多模板槽）优先，否则单槽 `workflowTemplate`。 */
+export function projectTemplateCandidates(project: EntryProject): CanvasWorkflowTemplate[] {
+    const listed = Array.isArray(project.workflowTemplates) ? project.workflowTemplates.filter((item): item is CanvasWorkflowTemplate => Boolean(item && item.templateId)) : [];
+    if (listed.length) return listed;
+    return project.workflowTemplate?.templateId ? [project.workflowTemplate] : [];
+}
+
+/**
+ * 素材解析（P10）：显式 materials 优先；缺省时按「选中优先 → 画布全部源视频」自动解析。
+ *
+ * 「源视频」判据（卡面）：`type=video` 且**没有任何上游输入**——有上游连线的是生成产物（不是素材）；
+ * 另外把带生成痕迹字段（videoTaskId/primaryImageId/images）的视频也排除，防「产物没连线」时混进素材。
+ * 取不到本地字节（storageKey 空，如外部链接/模板节点）的候选如实列入 `skipped`，不静默丢、也不让整批失败。
+ */
+export function resolveBatchMaterials(project: EntryProject, input: RunWorkflowBatchInput, deps: WorkflowEntryDeps, options: { templateNodeIds?: string[]; takenNodeIds?: string[] } = {}): {
+    inputs: WorkflowBatchMaterialInput[];
+    from: MaterialSource;
+    skipped: SkippedSourceVideo[];
+    warnings: string[];
+    /** true = 画布上没有「新」源视频（可能都已属于既有批次）：由调用方决定续跑既有批次还是报错。 */
+    empty?: boolean;
+} {
+    const explicit = (Array.isArray(input.materials) ? input.materials : []).filter(Boolean);
+    if (explicit.length) return { inputs: explicit, from: "explicit", skipped: [], warnings: [] };
+
+    const nodes = project.nodes || [];
+    const byId = new Map(nodes.map((node) => [node.id, node]));
+    const selected = (deps.selectedNodeIds ? deps.selectedNodeIds() : undefined) || [];
+    const selectedNodes = selected.map((id) => byId.get(id)).filter((node): node is CanvasNodeData => Boolean(node));
+    const warnings: string[] = [];
+    const skipped: SkippedSourceVideo[] = [];
+
+    let candidates: CanvasNodeData[];
+    let from: MaterialSource;
+    if (selectedNodes.length) {
+        const nonVideo = selectedNodes.filter((node) => !isVideoNode(node));
+        if (nonVideo.length) {
+            warnings.push(`选中的 ${selectedNodes.length} 个节点里有 ${nonVideo.length} 个不是视频节点（${nonVideo.slice(0, 3).map((node) => String(node.title || node.id)).join("、")}）：已忽略，只按选中的视频节点处理`);
+        }
+        candidates = selectedNodes.filter((node) => isVideoNode(node));
+        from = "selection";
+        if (!candidates.length) {
+            throw new Error("选中的节点里没有视频：请选中要处理的视频节点，或取消选中让我用画布上的全部源视频");
+        }
+    } else {
+        // 模板骨架里的源视频节点是「工作流的一部分」（抽模板用的示范链），不是本次要处理的素材——
+        // 不排除它的话，用户说「处理这 N 个视频」会被多做一条示范片的实例。
+        // 已落在既有批次实例里的节点同理：同一句「处理这些视频」再说一次时不该翻倍。
+        const template = new Set((options.templateNodeIds || []).filter(Boolean));
+        const taken = new Set((options.takenNodeIds || []).filter(Boolean));
+        const all = sourceVideoNodes(project);
+        candidates = [];
+        for (const node of all) {
+            const title = String(node.title || node.id);
+            if (template.has(node.id)) skipped.push({ nodeId: node.id, title, reason: "工作流模板骨架里的源视频节点（示范链的一部分），不当本次素材；要处理它请先选中再让我跑" });
+            else if (taken.has(node.id)) skipped.push({ nodeId: node.id, title, reason: "已经在这个工作流的既有批次实例里（同一句再说一次就是续跑它，不重复建实例）" });
+            else candidates.push(node);
+        }
+        from = "canvas";
+        if (!candidates.length) return { inputs: [], from, skipped, warnings, empty: true };
+    }
+
+    const usable: CanvasNodeData[] = [];
+    const noBytes: SkippedSourceVideo[] = [];
+    for (const node of candidates) {
+        const storageKey = String(node.metadata?.storageKey || "").trim();
+        if (storageKey) usable.push(node);
+        else noBytes.push({ nodeId: node.id, title: String(node.title || node.id), reason: "没有本地视频字节（storageKey 为空）：可能是外部链接或模板节点，取不到字节" });
+    }
+    if (!usable.length) {
+        throw new Error(
+            `画布上找到 ${candidates.length} 个源视频，但都没有本地视频字节（storageKey 为空）：请用拖进画布的视频节点（外部链接/模板节点取不到字节）`,
+        );
+    }
+    if (noBytes.length) {
+        skipped.push(...noBytes);
+        warnings.push(`${noBytes.length} 个视频节点没法当素材（无本地字节），已跳过：${noBytes.map((row) => row.title).join("、")}`);
+    }
+    return { inputs: usable.map((node) => ({ sourceVideoNodeId: node.id })), from, skipped, warnings };
+}
+
+/** 自动解析时要排除的节点：模板骨架（示范链）+ 既有批次实例里的节点（已处理过的同一批视频）。 */
+export function materialExclusions(project: EntryProject, template: CanvasWorkflowTemplate): { templateNodeIds: string[]; takenNodeIds: string[] } {
+    const taken = (project.workflowBatches || []).flatMap((record) => (record.members || []).flatMap((member) => member.nodes?.all || []));
+    return { templateNodeIds: template.frozen?.topology?.nodeIds || [], takenNodeIds: [...new Set(taken)] };
+}
+
+/** 这条模板最近一次批次（「再说一次」的续跑目标；没有则 undefined）。 */
+export function latestBatchIdForTemplate(project: EntryProject, templateId: string): string | undefined {
+    const list = (project.workflowBatches || []).filter((record) => String(record.templateId) === String(templateId) && (record.members || []).length);
+    if (!list.length) return undefined;
+    const latest = [...list].sort((left, right) => String(left.updatedAt || left.createdAt || "").localeCompare(String(right.updatedAt || right.createdAt || ""))).pop();
+    return latest?.batchId;
+}
+
+function isVideoNode(node: CanvasNodeData | undefined): boolean {
+    return String(node?.type || "") === "video";
+}
+
+/** 源视频 = 视频节点里「没有上游输入、也不是生成产物」的那些（产物有上游输入，不算素材）。 */
+export function sourceVideoNodes(project: EntryProject, excludeNodeIds: string[] = []): CanvasNodeData[] {
+    const nodes = project.nodes || [];
+    const connections = project.connections || [];
+    const excluded = new Set(excludeNodeIds.filter(Boolean));
+    const byId = new Map(nodes.map((node) => [node.id, node]));
+    const downstreamOfEdge = new Set(connections.filter((connection) => byId.has(connection.fromNodeId) && byId.has(connection.toNodeId)).map((connection) => connection.toNodeId));
+    return nodes.filter((node) => {
+        if (!isVideoNode(node)) return false;
+        if (excluded.has(node.id)) return false;
+        if (downstreamOfEdge.has(node.id)) return false;
+        const metadata = node.metadata || {};
+        const generated = Boolean(metadata.videoTaskId || metadata.primaryImageId || (metadata.images && metadata.images.length));
+        return !generated;
+    });
 }
 
 /**

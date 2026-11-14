@@ -81,11 +81,11 @@ export async function runSiteTool(name: SiteToolName, input: SiteToolInput, navi
         case "read_node_text":
             return readNodeTextTool(input, context.canvasSnapshot);
         case "extract_workflow_template":
-            return await extractWorkflowTemplateTool(extractTemplateInput(input), workflowEntryDeps());
+            return await extractWorkflowTemplateTool(extractTemplateInput(input), workflowEntryDeps(context));
         case "run_workflow_batch":
-            return await runWorkflowBatchTool(batchInput(input), workflowEntryDeps());
+            return await runWorkflowBatchTool(batchInput(input), workflowEntryDeps(context));
         case "run_workflow_instance":
-            return await runWorkflowInstanceTool(instanceInput(input), workflowEntryDeps());
+            return await runWorkflowInstanceTool(instanceInput(input), workflowEntryDeps(context));
         case "workbench_image_get_config":
             return getImageConfig();
         case "workbench_image_generate":
@@ -157,7 +157,8 @@ function batchInput(input: SiteToolInput): RunWorkflowBatchInput {
     const title = textField(input.title);
     const concurrency = Number(input.concurrency);
     return {
-        materials,
+        // P10：素材缺省（含空数组）= 自动解析画布源视频，交引擎壳按「选中优先 → 画布全部源视频」处理。
+        ...(materials.length ? { materials } : {}),
         ...(templateId ? { templateId } : {}),
         ...(title ? { title } : {}),
         ...(Number.isFinite(concurrency) && concurrency > 0 ? { concurrency } : {}),
@@ -174,7 +175,7 @@ function instanceInput(input: SiteToolInput): RunWorkflowInstanceInput {
  * 三工具的依赖：**全部**来自画布页注册的批次运行时（`registerWorkflowBatchRuntime`）。
  * 未注册（不是画布页 / 页面还没装载）→ 人话报错，绝不假跑。
  */
-function workflowEntryDeps(): WorkflowEntryDeps {
+function workflowEntryDeps(context: SiteToolContext = {}): WorkflowEntryDeps {
     const runtime = getWorkflowBatchRuntime();
     if (!runtime) throw new Error(siteText("workflowRuntimeMissing"));
     return {
@@ -208,6 +209,8 @@ function workflowEntryDeps(): WorkflowEntryDeps {
             }
             return undefined;
         },
+        // P10：素材缺省时「以选中为准」——选中态在画布快照里（useAgentBridge 随状态变化发布）。
+        selectedNodeIds: () => context.canvasSnapshot?.selectedNodeIds || [],
         log: (message) => console.debug(`[canvas-agent] ${message}`),
     };
 }
