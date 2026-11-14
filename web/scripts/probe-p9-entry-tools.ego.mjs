@@ -261,11 +261,14 @@ await page.screenshot({ path: path.join(SHOT_DIR, "P9-侧栏3行待审批.png"),
 const shot2 = await page.evaluate(() => {
     const row = document.querySelector("[data-review-instance]");
     if (!row) return null;
-    row.click();
+    const openBtn = row.querySelector("[data-review-open]") || row;
+    openBtn.click();
     return true;
 });
 await page.waitForTimeout(900);
-if (shot2) await page.screenshot({ path: path.join(SHOT_DIR, "P9-实例抽屉.png"), fullPage: false });
+const drawerOpen = await page.evaluate(() => Boolean(document.querySelector("[data-review-drawer]")));
+check("④-6 点开实例抽屉（抽屉真渲染，截图不是空壳）", shot2 === true && drawerOpen, JSON.stringify({ clicked: shot2, drawer: drawerOpen }));
+if (drawerOpen) await page.screenshot({ path: path.join(SHOT_DIR, "P9-实例抽屉.png"), fullPage: false });
 
 // ---------------------------------------------------------------- ⑤ 零付费 / 零提交
 const net = await page.evaluate(() => ({
