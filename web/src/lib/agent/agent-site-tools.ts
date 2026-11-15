@@ -251,22 +251,19 @@ function variantInput(input: SiteToolInput): DeriveWorkflowVariantToolInput {
     if (!sourceInstanceLapianNodeId) throw new Error(siteText("variantSourceRequired"));
     const assetBindings = assetBindingsInput(input.assetBindings) as VariantAssetBinding[];
     const intentText = textField(input.intentText);
-    const timeoutMs = Number(input.timeoutMs);
     return {
         sourceInstanceLapianNodeId,
         ...(assetBindings.length ? { assetBindings } : {}),
         ...(intentText ? { intentText } : {}),
-        ...(Number.isFinite(timeoutMs) && timeoutMs > 0 ? { timeoutMs } : {}),
     };
 }
 
-/** 变体派生依赖（C3/C4 共用集成函数）：项目现状 + canvas_apply_ops 落库通道 + 取图字节，全来自批次运行时。 */
+/** 变体派生依赖（C3/C4 共用集成函数）：项目现状 + canvas_apply_ops 落库通道，全来自批次运行时。 */
 function variantEntryDeps(context: SiteToolContext = {}) {
     const runtime = workflowEntryDeps(context);
     return {
         project: () => runtime.project() ? { nodes: runtime.project()!.nodes, connections: runtime.project()!.connections } : undefined,
         applyOps: (opList: CanvasAgentOp[]) => runtime.applyOps(opList),
-        getBlob: runtime.getBlob,
         log: (message: string) => console.debug(`[canvas-agent] ${message}`),
     };
 }

@@ -1263,13 +1263,12 @@ function InfiniteCanvasPage() {
                         applyOps: (ops) => {
                             applyAgentOps(ops);
                         },
-                        getBlob: getMediaBlob,
                         log: (line) => console.debug(`[canvas-variant] ${line}`),
                     },
                 );
                 setLapianVariantNodeId(null);
                 if (result.newLapianNodeId) focusNodeRef.current(result.newLapianNodeId);
-                message.success(t("canvas.lapianVariant.success", { task: result.newLocalId }));
+                message.success(t("canvas.lapianVariant.success", { task: result.bridgeId }));
                 if (result.warnings.length) message.warning(result.warnings.slice(0, 3).join("；"));
             } catch (error) {
                 const detail = error instanceof DeriveWorkflowVariantToolError ? error.message : error instanceof Error ? error.message : String(error);

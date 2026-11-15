@@ -452,7 +452,7 @@ export default {
             noSlots: "这个实例没有资产槽",
             stopNote: "派生完成后停在你的人工审批：不自动付费生成。取消不发起任何请求。",
             confirm: "派生",
-            success: "变体已派生并停在待审批（hub 任务 {{task}}）",
+            success: "变体已派生并停在待审批（拆解产物 {{task}} 已复用到新分支）",
             failed: "派生中止：{{reason}}",
         },
         reverseComposer: "参考图片：@[node:{{imageId}}]\n任务说明：@[node:{{textId}}]",

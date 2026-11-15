@@ -2549,15 +2549,6 @@ class Handler(BaseHTTPRequestHandler):
                                                confirm_name=None if confirm_name is None
                                                else str(confirm_name)))
             return
-        if path == "/api/hub/variant/create":
-            # 卡C路A（2026-11-15）：变体任务直建——既有拆解产物（bridge_id）上直接开新任务，
-            # 不经 ingest 的视频 sha 幂等（同源视频 N 个变体各得独立任务号）。
-            # body: {"bridge_id": "...", "intent": "...", "note": "..."} → {local_id, bridge_id, state}
-            payload = self.read_json()
-            self.send_json(hub_api.variant_create(str(payload.get("bridge_id") or ""),
-                                                  str(payload.get("intent") or ""),
-                                                  note=str(payload.get("note") or "")))
-            return
         m = re.fullmatch(r"/api/hub/task/([^/]+)/fork", path)
         if m:
             # AT-21 B0：复用为新版本 → 派生**新任务**（源任务只读，产物按 bridge 共享，清单/资产图各一份）。

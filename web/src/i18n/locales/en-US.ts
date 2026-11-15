@@ -452,7 +452,7 @@ export default {
             noSlots: "This instance has no asset slots",
             stopNote: "The variant stops at your manual approval when done; no paid generation runs automatically. Cancelling sends zero requests.",
             confirm: "Derive",
-            success: "Variant derived and waiting for approval (hub task {{task}})",
+            success: "Variant derived and waiting for approval (breakdown artifacts {{task}} reused into the new branch)",
             failed: "Derivation aborted: {{reason}}",
         },
         reverseComposer: "Reference image: @[node:{{imageId}}]\nTask: @[node:{{textId}}]",

@@ -242,40 +242,6 @@ def init_fork_task(task_dir: Path, task: dict, *, note: str = "") -> dict:
     return payload
 
 
-# ---------------------------------------------------------------- 卡C路A：变体任务受控初始化（2026-11-15）
-# 与 init_fork_task 同模式、**独立函数**：不动 FORKABLE_STATES / init_fork_task（done-fork 零变化）。
-# 变体与 fork 的差别只在「出生证明」：fork 的 derived_from 指向一条 hub 任务；variant 的 variant_of
-# 指向一份既有拆解产物（bridge_id，画布拉片链的产物形态）——出生态同为 awaiting_assets。
-VARIANT_BOOTSTRAP_STATE = FORK_BOOTSTRAP_STATE   # 同一出生态：变体从「补资产/确认置换」起步
-_VARIANT_REQUIRED_KEYS = ("local_id", "bridge_id", "variant_of", "checklist_private")
-
-
-def init_variant_task(task_dir: Path, task: dict, *, note: str = "") -> dict:
-    """变体任务的**受控初始化**（复刻 init_fork_task 的全部守卫，禁端点手写 state）。
-
-    为什么不走 transition()：与 fork 同理——变体没有跑过拆解（复用既有 bridge_id 下的产物），
-    从 transition 走要么伪造「拆解跑过」的历史，要么停在 discussing 被 scan_lost_runs 降级。
-    history 从这一条如实记起（变体起点），禁止覆盖已存在的任务文件。
-    """
-    tdir = Path(task_dir)
-    if task.get("state") != VARIANT_BOOTSTRAP_STATE:
-        raise StateError(f"变体出生态只能是 {VARIANT_BOOTSTRAP_STATE}，收到 {task.get('state')!r}")
-    missing = [k for k in _VARIANT_REQUIRED_KEYS if not task.get(k)]
-    if missing:
-        raise StateError(f"变体任务缺必备字段 {'/'.join(missing)}（拆解产物引用必须可追）")
-    variant_of = task.get("variant_of")
-    if not isinstance(variant_of, dict) or not str(variant_of.get("bridge_id") or "").strip():
-        raise StateError("变体任务的 variant_of 必须是 {bridge_id, at, video}（至少带 bridge_id）")
-    if (tdir / _TASK_FILE).exists():
-        raise StateError(f"任务 {tdir.name} 已存在，变体不得覆盖")
-    payload = dict(task)
-    payload["history"] = [{"at": _now(), "from": None, "to": VARIANT_BOOTSTRAP_STATE,
-                           "note": note or f"变体直建自拆解产物 {variant_of.get('bridge_id')}（未跑拆解）"}]
-    tdir.mkdir(parents=True, exist_ok=True)
-    save(tdir, payload)
-    return payload
-
-
 def rollback_to_assets(task_dir: Path, *, note: str = "退回置换") -> dict:
     """受控回退边（AT-9 数据合同状态机增量 1）：awaiting_approval → awaiting_assets。
 

@@ -57,22 +57,9 @@ export type LocateInstanceSubgraphResult = {
     extraNodeIds: string[];
 };
 
-/**
- * 按实例定位子图（D3）：节点 id 前缀 `t<tid>-<idx>-` 圈定骨架，连线 id 前缀 `c<tid>-<idx>-` 同步收；
- * 执行期新建的产物节点（nanoid，无模板前缀）通过「与子图节点相连线 / 被子图节点 metadata 引用」
- * 闭包并入（不动到不动点），供派生层给它们合成确定性键（`extra-<原id>` 入映射）。
- */
-export function locateInstanceSubgraph(input: { nodes: CanvasNodeData[]; connections: CanvasConnection[]; templateId: string; instanceIndex: number }): LocateInstanceSubgraphResult {
-    const prefix = instanceNodePrefix(input.templateId, input.instanceIndex);
+/** 收敛闭包（两 locate 共用）：连线端点与 metadata 引用把产物节点闭包并入（不动到不动点）。 */
+function closeSubgraphMembers(input: { nodes: CanvasNodeData[]; connections: CanvasConnection[] }, members: Set<string>, extras: Set<string>, reverseRefs = false): void {
     const byId = new Map(input.nodes.map((node) => [node.id, node]));
-    const members = new Set<string>();
-    const extras = new Set<string>();
-
-    for (const node of input.nodes) {
-        if (node.id.startsWith(prefix)) members.add(node.id);
-    }
-    if (!members.size) throw new DeriveVariantError("source_not_ready", `画布上找不到实例 ${input.templateId}#${input.instanceIndex} 的节点（前缀 ${prefix}）`);
-
     // 节点 metadata 里的 id 引用（七类 + composerContent token）
     const metadataRefs = (node: CanvasNodeData): string[] => {
         const metadata = node.metadata || {};
@@ -94,7 +81,6 @@ export function locateInstanceSubgraph(input: { nodes: CanvasNodeData[]; connect
         return out;
     };
 
-    // 收敛：连线端点与 metadata 引用把产物节点闭包并入
     let changed = true;
     while (changed) {
         changed = false;
@@ -112,15 +98,59 @@ export function locateInstanceSubgraph(input: { nodes: CanvasNodeData[]; connect
         }
         for (const id of [...members]) {
             for (const ref of metadataRefs(byId.get(id)!)) {
-                if (byId.has(ref) && !members.has(ref) && !ref.startsWith(prefix)) {
+                if (byId.has(ref) && !members.has(ref)) {
                     members.add(ref);
                     extras.add(ref);
                     changed = true;
                 }
             }
         }
+        // 反向闭包（闭包模式专用）：metadata 指向成员的节点（如资产槽 assetSlotSourceId=拉片节点）一并并入
+        if (reverseRefs) for (const node of input.nodes) {
+            if (members.has(node.id)) continue;
+            if (metadataRefs(node).some((ref) => members.has(ref))) {
+                members.add(node.id);
+                extras.add(node.id);
+                changed = true;
+            }
+        }
     }
+}
 
+/**
+ * 按实例定位子图（D3）：节点 id 前缀 `t<tid>-<idx>-` 圈定骨架，连线 id 前缀 `c<tid>-<idx>-` 同步收；
+ * 执行期新建的产物节点（nanoid，无模板前缀）通过「与子图节点相连线 / 被子图节点 metadata 引用」
+ * 闭包并入（不动到不动点），供派生层给它们合成确定性键（`extra-<原id>` 入映射）。
+ */
+export function locateInstanceSubgraph(input: { nodes: CanvasNodeData[]; connections: CanvasConnection[]; templateId: string; instanceIndex: number }): LocateInstanceSubgraphResult {
+    const prefix = instanceNodePrefix(input.templateId, input.instanceIndex);
+    const members = new Set<string>();
+    const extras = new Set<string>();
+
+    for (const node of input.nodes) {
+        if (node.id.startsWith(prefix)) members.add(node.id);
+    }
+    if (!members.size) throw new DeriveVariantError("source_not_ready", `画布上找不到实例 ${input.templateId}#${input.instanceIndex} 的节点（前缀 ${prefix}）`);
+
+    closeSubgraphMembers(input, members, extras);
+
+    const nodes = input.nodes.filter((node) => members.has(node.id));
+    const connections = input.connections.filter((connection) => members.has(connection.fromNodeId) && members.has(connection.toNodeId));
+    return { nodes, connections, extraNodeIds: [...extras] };
+}
+
+/**
+ * 按源拉片节点定位子图（画布化闭包模式，2026-11-15「全部在画布里面做」拍板）：
+ * 源是画布上任意拉片节点（不要求实例前缀），子图 = 从源节点出发的连线端点 + metadata 引用闭包。
+ * 返回形状与 locateInstanceSubgraph 一致；源节点本身属于骨架，不进 extraNodeIds。
+ */
+export function locateSourceSubgraph(input: { nodes: CanvasNodeData[]; connections: CanvasConnection[]; sourceNodeId: string }): LocateInstanceSubgraphResult {
+    const byId = new Map(input.nodes.map((node) => [node.id, node]));
+    if (!byId.has(input.sourceNodeId)) throw new DeriveVariantError("source_not_ready", `画布上没有找到源拉片节点：${input.sourceNodeId}`);
+    const members = new Set<string>([input.sourceNodeId]);
+    const extras = new Set<string>();
+    closeSubgraphMembers(input, members, extras, true);
+    extras.delete(input.sourceNodeId);
     const nodes = input.nodes.filter((node) => members.has(node.id));
     const connections = input.connections.filter((connection) => members.has(connection.fromNodeId) && members.has(connection.toNodeId));
     return { nodes, connections, extraNodeIds: [...extras] };
@@ -219,7 +249,7 @@ export function deriveStrip(node: CanvasNodeData, role: CanvasTemplateNodeRole):
 
 /** 扫画布上该 templateId 已有最大 instanceIndex，返回 +1（无已有实例 → 1）。 */
 export function assignVariantIndex(nodes: CanvasNodeData[], templateId: string): number {
-    const pattern = new RegExp(`^t${templateId}-(\\d+)-`);
+    const pattern = new RegExp(`^t${templateId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}-(\\d+)-`);
     let max = 0;
     for (const node of nodes) {
         const match = pattern.exec(node.id);
@@ -252,9 +282,13 @@ export type VariantAssetBinding = {
 export type DeriveWorkflowVariantInput = {
     nodes: CanvasNodeData[];
     connections: CanvasConnection[];
-    templateId: string;
-    sourceInstanceIndex: number;
-    /** fork 新任务号（调用方先 fork 成功再调本函数——D7⑤ 顺序由调用方保证）。 */
+    /** 实例模式（源 = `t<tid>-<idx>-` 前缀实例子图）：模板 id。与 sourceLapianNodeId 二选一。 */
+    templateId?: string;
+    /** 实例模式：源实例序号。 */
+    sourceInstanceIndex?: number;
+    /** 闭包模式（源 = 画布上任意拉片节点，无实例前缀）：源拉片节点 id。与 templateId 二选一。 */
+    sourceLapianNodeId?: string;
+    /** 新拉片节点继承的拆解任务号（画布化后 = 源节点 taskId 原样继承，拆解产物引用复用）。 */
     newTaskId: string;
     assetBindings?: VariantAssetBinding[];
     intentText?: string;
@@ -300,31 +334,44 @@ function rewriteTokens(text: string, map: TemplateIdMap): { text: string; unreso
 export function deriveWorkflowVariant(input: DeriveWorkflowVariantInput): DeriveWorkflowVariantResult {
     const warnings: string[] = [];
 
+    // 模式判定：templateId 在 = 实例前缀模式；否则闭包模式（sourceLapianNodeId 必填）
+    const closureMode = !String(input.templateId || "").trim();
+    const sourceLapianNodeId = closureMode ? String(input.sourceLapianNodeId || "").trim() : "";
+    if (closureMode && !sourceLapianNodeId) throw new DeriveVariantError("source_not_ready", "闭包模式缺 sourceLapianNodeId：源拉片节点 id 必填");
+
     // ① 边界校验：源拉片节点须 taskId+content 双全
-    const prefix = instanceNodePrefix(input.templateId, input.sourceInstanceIndex);
+    const templateId = String(input.templateId || "");
+    const sourceIndex = closureMode ? 0 : Number(input.sourceInstanceIndex || 0);
+    const prefix = closureMode ? "" : instanceNodePrefix(templateId, sourceIndex);
     const byId = new Map(input.nodes.map((node) => [node.id, node]));
-    const sourceLapian = input.nodes.find((node) => node.id.startsWith(prefix) && classifyTemplateRole(node) === "lapian");
-    if (!sourceLapian) throw new DeriveVariantError("source_not_ready", `实例 ${input.templateId}#${input.sourceInstanceIndex} 无拉片节点，不可派生`);
+    const sourceLapian = closureMode
+        ? byId.get(sourceLapianNodeId)
+        : input.nodes.find((node) => node.id.startsWith(prefix) && classifyTemplateRole(node) === "lapian");
+    if (!sourceLapian) throw new DeriveVariantError("source_not_ready", closureMode ? `画布上没有找到源拉片节点或它不是拉片节点：${sourceLapianNodeId}` : `实例 ${templateId}#${sourceIndex} 无拉片节点，不可派生`);
+    if (closureMode && classifyTemplateRole(sourceLapian) !== "lapian") throw new DeriveVariantError("source_not_ready", `节点 ${sourceLapianNodeId} 不是拉片节点，不能作为派生源`);
     const sourceLapianMetadata = sourceLapian.metadata || {};
     if (!String(sourceLapianMetadata.taskId || "").trim() || !String(sourceLapianMetadata.content || "").trim()) {
         throw new DeriveVariantError("source_not_ready", `源拉片节点 ${sourceLapian.id} 的 taskId/content 任一为空，拆解未完成不可派生`);
     }
-    if (!String(input.newTaskId || "").trim()) throw new DeriveVariantError("source_not_ready", "newTaskId 为空：须先 fork 成功再派生");
+    if (!String(input.newTaskId || "").trim()) throw new DeriveVariantError("source_not_ready", "newTaskId 为空：派生需继承源拆解任务号（taskId）");
 
-    // ② 新 index
-    const newIndex = assignVariantIndex(input.nodes, input.templateId);
-    if (newIndex === input.sourceInstanceIndex) warnings.push(`新 index ${newIndex} 与源实例相同：源实例不在画布上？`);
+    // ② 新 index（闭包模式：源节点 id 自成模板身份，无已有 → 1）
+    const effectiveTemplateId = closureMode ? sourceLapianNodeId : templateId;
+    const newIndex = assignVariantIndex(input.nodes, effectiveTemplateId);
+    if (!closureMode && newIndex === sourceIndex) warnings.push(`新 index ${newIndex} 与源实例相同：源实例不在画布上？`);
 
     // ③ 子图定位 + id 映射（反解 → 新前缀；产物节点合成键）
-    const subgraph = locateInstanceSubgraph({ nodes: input.nodes, connections: input.connections, templateId: input.templateId, instanceIndex: input.sourceInstanceIndex });
+    const subgraph = closureMode
+        ? locateSourceSubgraph({ nodes: input.nodes, connections: input.connections, sourceNodeId: sourceLapianNodeId })
+        : locateInstanceSubgraph({ nodes: input.nodes, connections: input.connections, templateId, instanceIndex: sourceIndex });
     const nodeMap: TemplateIdMap = new Map();
     for (const node of subgraph.nodes) {
         if (subgraph.extraNodeIds.includes(node.id)) {
-            nodeMap.set(node.id, variantExtraNodeId(input.templateId, newIndex, node.id));
+            nodeMap.set(node.id, variantExtraNodeId(effectiveTemplateId, newIndex, node.id));
             continue;
         }
-        const originalId = stripInstancePrefix(node.id, input.templateId, input.sourceInstanceIndex);
-        nodeMap.set(node.id, templateInstanceNodeId(input.templateId, newIndex, originalId));
+        const originalId = stripInstancePrefix(node.id, effectiveTemplateId, sourceIndex);
+        nodeMap.set(node.id, templateInstanceNodeId(effectiveTemplateId, newIndex, originalId));
     }
     const replaceId = (value?: string): string | undefined => (value ? nodeMap.get(value) || value : value);
 
@@ -415,9 +462,9 @@ export function deriveWorkflowVariant(input: DeriveWorkflowVariantInput): Derive
     }
 
     // 连线：端点 + 连线 id 全部重映射（实例连线反解；产物连线合成键）
-    const connPrefix = instanceConnectionPrefix(input.templateId, input.sourceInstanceIndex);
+    const connPrefix = instanceConnectionPrefix(effectiveTemplateId, sourceIndex);
     const connections: CanvasConnection[] = subgraph.connections.map((connection) => {
-        const nextId = connection.id.startsWith(connPrefix) ? templateInstanceConnectionId(input.templateId, newIndex, connection.id.slice(connPrefix.length)) : variantExtraConnectionId(input.templateId, newIndex, connection.id);
+        const nextId = connection.id.startsWith(connPrefix) ? templateInstanceConnectionId(effectiveTemplateId, newIndex, connection.id.slice(connPrefix.length)) : variantExtraConnectionId(effectiveTemplateId, newIndex, connection.id);
         return { ...connection, id: nextId, fromNodeId: replaceId(connection.fromNodeId) || connection.fromNodeId, toNodeId: replaceId(connection.toNodeId) || connection.toNodeId };
     });
 

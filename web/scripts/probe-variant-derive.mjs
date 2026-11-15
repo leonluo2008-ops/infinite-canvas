@@ -155,6 +155,28 @@ check("产物节点剥生成痕迹但位置保留", Boolean(byId.get(newGenOutId
 // 源实例零改动
 check("源实例零改动（入参节点未被改写）", canvasNodes.find((n) => n.id === slotAId).metadata.attachedImageId === genImageId && canvasNodes.find((n) => n.id === lapianId).metadata.taskId === "task_src");
 
+// ---- 4b. 画布化闭包模式（2026-11-15 拍板：源=画布任意拉片节点，不要求实例形 id）----
+const plainLapianId = "plain-lap-9";
+const plainImageId = "plain-img-1";
+const plainNodes = [
+    { id: plainLapianId, type: "lapian", title: "裸拉片", metadata: { taskId: "task_plain", jobId: "job_plain", content: "裸拉片正文", intent: "裸意图" } },
+    { id: plainImageId, type: "image", title: "图", metadata: { content: "data:image/png;base64,yy" } },
+    { id: "plain-slot-1", type: "image", title: "槽", metadata: { assetSlotSourceId: plainLapianId, assetSlotName: "主角", assetSlotType: "人物", assetSlot: { desc: "主角", span: "" } } },
+];
+const closureResult = variant.deriveWorkflowVariant({
+    nodes: plainNodes,
+    connections: [],
+    sourceLapianNodeId: plainLapianId,
+    newTaskId: "task_plain", // 画布化口径：新拉片继承源 taskId（拆解产物引用复用）
+    assetBindings: [{ imageNodeId: plainImageId, reason: "闭包绑定" }],
+});
+const closureById = new Map(closureResult.nodes.map((n) => [n.id, n]));
+const closureLapian = closureById.get(`t${plainLapianId}-1-${plainLapianId}`);
+check("闭包模式：裸拉片节点 id 可作派生源（不要求实例形 id）", Boolean(closureLapian), closureLapian?.id);
+check("闭包模式：新拉片继承源 taskId/content", closureLapian.metadata.taskId === "task_plain" && closureLapian.metadata.content === "裸拉片正文");
+check("闭包模式：lapianReusedFrom 标记 = 源节点 id", closureLapian.metadata.lapianReusedFrom === plainLapianId);
+check("闭包模式：槽绑定双写仍在（扁平+镜像）", closureResult.bindings.length === 1 && closureById.get(closureResult.bindings[0].slotNodeId).metadata.attachedImageId === plainImageId && closureById.get(closureResult.bindings[0].slotNodeId).metadata.assetSlot?.attachedImageId === plainImageId);
+
 // ---- 5. 边界 ----
 const noTaskNodes = canvasNodes.map((n) => (n.id === lapianId ? { ...n, metadata: { ...n.metadata, taskId: "" } } : n));
 let threw = null;
@@ -171,6 +193,53 @@ threw = null;
 const emptyImage = { id: "img-empty", type: "image", title: "", metadata: {} };
 try { variant.deriveWorkflowVariant({ nodes: [...canvasNodes, emptyImage], connections: fixtureConnections, templateId: TID, sourceInstanceIndex: IDX, newTaskId: "t9", assetBindings: [{ imageNodeId: "img-empty" }] }); } catch (e) { threw = e; }
 check("边界：绑定图节点无内容 → binding_target_missing", threw && threw.code === "binding_target_missing");
+
+// ---- 6. 入口级（workflow-variant-entry）：纯画布派生（无 hub 腿）----
+const entryOutdir = path.join(root, "node_modules", ".probe", "variant-entry");
+await build({
+    entryPoints: [path.join(root, "src/lib/canvas/workflow-variant-entry.ts")],
+    outfile: path.join(entryOutdir, "workflow-variant-entry.mjs"),
+    bundle: true,
+    format: "esm",
+    platform: "node",
+    logLevel: "silent",
+    alias: { "@": path.join(root, "src") },
+    define: { "import.meta.env.DEV": "false", "import.meta.env": "{}" },
+});
+const entry = await import(pathToFileURL(path.join(entryOutdir, "workflow-variant-entry.mjs")).href);
+rmSync(entryOutdir, { recursive: true, force: true });
+
+const entryOps = [];
+const entryImageId = genImageId;
+let entryResult = null;
+try {
+    entryResult = await entry.deriveWorkflowVariantTool(
+        {
+            sourceInstanceLapianNodeId: plainLapianId, // 裸拉片节点 id：源校验放宽的直接证据
+            assetBindings: [{ imageNodeId: entryImageId, reason: "入口绑定" }],
+        },
+        {
+            project: () => ({ nodes: [...plainNodes, ...canvasNodes], connections: fixtureConnections }),
+            applyOps: (ops) => { entryOps.push(...ops); },
+        },
+    );
+} catch (e) {
+    entryResult = { error: e };
+}
+check("入口：裸拉片源派生成功（源校验放宽，不再要求实例形 id）", entryResult && entryResult.ok === true, entryResult && entryResult.error ? String(entryResult.error) : "");
+const hubFieldNames = ["newLocalId", "sourceLocalId", "hubState", "assetsUploaded", "confirmedEmpty", "promptSaved"];
+check("入口：回执无 hub 相关字段", entryResult && entryResult.ok && hubFieldNames.every((k) => !(k in entryResult)), JSON.stringify(entryResult && entryResult.ok ? Object.keys(entryResult) : ""));
+check("入口：bridgeId = 源拆解任务号", entryResult && entryResult.ok && entryResult.bridgeId === "task_plain");
+check("入口：停点=画布侧待批", entryResult && entryResult.ok && entryResult.stopPoint === "awaiting_approval");
+check("入口：落画布 ops=add_node/connect_nodes", entryOps.length > 0 && entryOps.every((op) => op.type === "add_node" || op.type === "connect_nodes"));
+const entryNodeById = new Map(entryOps.filter((op) => op.type === "add_node").map((op) => [op.id, op]));
+const entryLapian = [...entryNodeById.values()].find((op) => op.metadata.taskId === "task_plain" && op.metadata.content === "裸拉片正文");
+check("入口：新拉片节点继承源 taskId/content（拆解产物=画布元数据引用）", Boolean(entryLapian), entryLapian?.id || "");
+check("入口：槽绑定双写落在画布元数据（attachedImageId+assetSlot）", Boolean(entryLapian) && Boolean(entryLapian.metadata.lapianReusedFrom) && [...entryNodeById.values()].some((op) => op.metadata.attachedImageId === entryImageId && op.metadata.assetSlot?.attachedImageId === entryImageId));
+const noContentEntry = plainNodes.map((n) => (n.id === plainLapianId ? { ...n, metadata: { ...n.metadata, content: "" } } : n));
+let entryThrew = null;
+try { await entry.deriveWorkflowVariantTool({ sourceInstanceLapianNodeId: plainLapianId }, { project: () => ({ nodes: noContentEntry, connections: [] }), applyOps: () => {} }); } catch (e) { entryThrew = e; }
+check("入口：拆解产物不在位 → source_not_done", entryThrew && entryThrew.code === "source_not_done", entryThrew && entryThrew.message);
 
 console.log("===SUMMARY=== " + passed + " PASS / " + failures.length + " FAIL" + (failures.length ? " | FAIL: " + failures.join("; ") : ""));
 process.exit(failures.length ? 1 : 0);

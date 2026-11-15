@@ -1587,34 +1587,6 @@ export async function forkHubTask(localId: string): Promise<HubForkResult> {
     });
 }
 
-// ---------------------------------------------------------------- 卡C路A 变体任务直建（2026-11-15）
-
-/** 变体直建回执（POST /api/hub/variant/create）。 */
-export type HubVariantCreateResult = {
-    ok?: boolean;
-    local_id: string;
-    bridge_id: string;
-    state?: string;
-    复制?: { 源视频?: string; 源视频字节?: number; 指纹同抄?: boolean; 私有清单?: string };
-    说明?: string;
-};
-
-/**
- * POST /api/hub/variant/create —— 变体任务直建（既有拆解产物 bridge_id 上直接开新任务）。
- *
- * 为什么不走 forkHubTask：画布拉片节点的 metadata.taskId 是**桥侧拆解任务号（=bridge_id）**，
- * 不是 hub localId——没有「源 hub 任务」可 fork；且直建刻意绕过 ingest 的视频 sha 幂等
- * （ingestion 不写 zip_sha256），同源视频 N 个变体各得独立任务号。
- * 出生态=awaiting_assets；不批准、不提交、不写 gen_*（付费红线不变）。
- */
-export async function createHubVariant(bridgeId: string, intent: string, note = ""): Promise<HubVariantCreateResult> {
-    return request<HubVariantCreateResult>("/api/hub/variant/create", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ bridge_id: bridgeId, intent, note }),
-    });
-}
-
 /** 手改提示词正文的起态门（与后端 hub_api.PROMPT_EDIT_STATES/REFUSALS 同序）。 */
 export function hubPromptEditGate(state: string): { enabled: boolean; reason: string } {
     const s = String(state || "");
