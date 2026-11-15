@@ -753,8 +753,9 @@ def decode_data_url(raw: str, name: str) -> tuple[bytes, str]:
 
 
 # ------------------------------------------- 参考图图床（asset/upload 与 sdgf 共用）
-# 渠道只收公网 HTTPS 直链：本地字节先留一份备份，再转传 uguu（唯一图源；腾讯云
-# videocache 兜底已废弃移除——所有者确认不可用；出站隧道降级同废，AT-16 B12f）。
+# 渠道只收公网 HTTPS 直链：本地字节先留一份备份，再转传 litterbox（主源，72h 时效），
+# uguu（备源，3h）兜底（腾讯云 videocache 兜底已废弃移除——所有者确认不可用；
+# 出站隧道降级同废，AT-16 B12f）。
 # **拿到 URL 必须当场验活**（AT-16 B12）：只查「是不是 https」挡不住死链——格式对但拉不到
 # 的 URL 发给渠道，渠道拉图失败 → 403 拒创建（auto-0043 实测）。
 
@@ -766,9 +767,10 @@ _VERIFY_OPENERS = (urllib.request.build_opener(urllib.request.ProxyHandler({})),
 
 # 上传渠道计数（AT-14 B3 A2，诊断面透出）：local=本地引用（零图床），
 # uguu=转传成功。只增不减，进程内诊断面用。
-ASSET_COUNTERS = {"local": 0, "uguu": 0}
+ASSET_COUNTERS = {"local": 0, "litterbox": 0, "uguu": 0}
 _ASSET_COUNTERS_LOCK = threading.Lock()
 _UGUU_LAST_ERROR = ""       # 最近一次 uguu 上传失败的短原因（人话自述用，进程内诊断面）
+_LITTERBOX_LAST_ERROR = ""  # 同上，litterbox 用
 
 
 def _bump_asset_counter(source: str) -> None:
@@ -776,6 +778,51 @@ def _bump_asset_counter(source: str) -> None:
     if key in ASSET_COUNTERS:
         with _ASSET_COUNTERS_LOCK:
             ASSET_COUNTERS[key] += 1
+
+
+def upload_litterbox_bytes(data: bytes, name: str) -> str:
+    """转传 litterbox（catbox 临时床，72h 时效）返回直链；任何异常返回空串由调用方降级。
+
+    匿名 multipart（reqtype=fileupload/time=72h/fileToUpload），无需任何凭证。
+    直传与系统代理各试一次。失败原因落 _LITTERBOX_LAST_ERROR，供前置拒绝的人话自述用。
+    72h 时效 > uguu 的 3h：站方排队再久也不会拉到过期链（2026-11-15 所有者拍板转正第一图源）。
+    """
+    global _LITTERBOX_LAST_ERROR
+    CRLF = chr(13) + chr(10)
+    boundary = "----wanrepro" + secrets.token_hex(8)
+
+    def part(field: str, value: str) -> bytes:
+        return (f'--{boundary}{CRLF}Content-Disposition: form-data; name="{field}"'
+                f'{CRLF}{CRLF}{value}{CRLF}').encode()
+
+    body = io.BytesIO()
+    body.write(part("reqtype", "fileupload"))
+    body.write(part("time", "72h"))
+    body.write(f'--{boundary}{CRLF}Content-Disposition: form-data; name="fileToUpload"; '
+               f'filename="{name}"{CRLF}Content-Type: application/octet-stream{CRLF}{CRLF}'.encode())
+    body.write(data)
+    body.write(f"{CRLF}--{boundary}--{CRLF}".encode())
+    payload = body.getvalue()
+    headers = {"Content-Type": f"multipart/form-data; boundary={boundary}",
+               "User-Agent": "Mozilla/5.0 (wanrepro-bridge)"}
+    reasons: list[str] = []
+    for handlers in ([urllib.request.ProxyHandler({})], None):  # 先直连，后环境代理
+        try:
+            opener = urllib.request.build_opener(*(handlers or []))
+            req = urllib.request.Request(
+                "https://litterbox.catbox.moe/resources/internals/api.php",
+                data=payload, headers=headers, method="POST")
+            url = opener.open(req, timeout=60).read().decode().strip()
+            if url.startswith("https://"):
+                _LITTERBOX_LAST_ERROR = ""
+                return url
+            reasons.append(f"上传返回不是直链（{url[:60]}）")
+        except urllib.error.HTTPError as err:
+            reasons.append(f"HTTP {err.code}")
+        except (urllib.error.URLError, TimeoutError, OSError) as err:
+            reasons.append(f"连不上（{getattr(err, 'reason', err)}）")
+    _LITTERBOX_LAST_ERROR = " / ".join(dict.fromkeys(reasons)) or "上传失败"
+    return ""
 
 
 def upload_uguu_bytes(data: bytes, name: str) -> str:
@@ -919,13 +966,22 @@ def host_image_detailed(data: bytes, raw_name: str) -> dict:
                       "reason": f"直链验活失败（{why}）"})
         return None
 
-    uguu_url = upload_uguu_bytes(data, ascii_name)          # ① uguu
+    uguu_url = upload_litterbox_bytes(data, ascii_name)     # ① litterbox（主源，72h）
     if uguu_url:
-        got = accept("uguu", "uguu", uguu_url)
+        got = accept("litterbox", "litterbox(72h)", uguu_url)
         if got:
             return got
     else:
-        tried.append({"source": "uguu", "label": "uguu",
+        tried.append({"source": "litterbox", "label": "litterbox(72h)",
+                      "reason": f"上传失败（{_LITTERBOX_LAST_ERROR or '服务不可用'}）"})
+
+    uguu_url = upload_uguu_bytes(data, ascii_name)          # ② uguu（备源，3h）
+    if uguu_url:
+        got = accept("uguu", "uguu(3h)", uguu_url)
+        if got:
+            return got
+    else:
+        tried.append({"source": "uguu", "label": "uguu(3h)",
                       "reason": f"上传失败（{_UGUU_LAST_ERROR or '服务不可用'}）"})
 
     raise ImageHostError(_host_failure_message(tried, skipped), sources=tried, skipped=skipped)

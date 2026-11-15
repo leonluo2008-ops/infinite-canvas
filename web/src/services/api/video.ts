@@ -190,9 +190,17 @@ async function sdgfImageUrls(references: ReferenceImage[], options?: RequestOpti
         if (!blob.size) throw new Error("参考图字节为空：" + (image.name || "未命名"));
         const ext = (blob.type.split("/")[1] || "png").replace("jpeg", "jpg");
         const name = encodeURIComponent(image.name || `ref-${urls.length + 1}.${ext}`);
-        const res = await axios.post<{ url?: string; error?: string }>(SDGF_ASSET_BRIDGE, blob, { headers: { "X-Filename": name, "Content-Type": "application/octet-stream" }, signal: options?.signal });
-        const url = res.data?.url;
-        if (typeof url !== "string" || !/^https:\/\//.test(url)) throw new Error(`参考图上云失败：${res.data?.error || JSON.stringify(res.data).slice(0, 120)}`);
+        let url = "";
+        try {
+            const res = await axios.post<{ url?: string; error?: string }>(SDGF_ASSET_BRIDGE, blob, { headers: { "X-Filename": name, "Content-Type": "application/octet-stream" }, signal: options?.signal });
+            url = res.data?.url || "";
+        } catch (err) {
+            // 图床失败必须当场明文顶到界面（桥在 host 阶段已前置拒绝、零渠道请求零扣费），
+            // 绝不带病放行到视频网关吃模糊 502（2026-11-15 所有者拍板）。
+            const detail = (axios.isAxiosError(err) && (err.response?.data as { error?: string } | undefined)?.error) || (err instanceof Error ? err.message : String(err));
+            throw new Error(`参考图上传失败（未发渠道请求、未扣费）：${detail}`);
+        }
+        if (!/^https:\/\//.test(url)) throw new Error(`参考图上云失败：图床返回里没有 https 直链`);
         urls.push(url);
     }
     return urls;
