@@ -20,7 +20,6 @@ import {
     type WorkflowBatchMaterialInput,
     type WorkflowEntryDeps,
 } from "@/lib/canvas/workflow-batch-entry";
-import { deriveWorkflowVariantTool, type DeriveWorkflowVariantToolInput, type VariantAssetBinding } from "@/lib/canvas/workflow-variant-entry";
 import { clampVideoSeconds } from "@/lib/media-size";
 import { useCanvasStore } from "@/stores/canvas/use-canvas-store";
 import { useAssetStore } from "@/stores/use-asset-store";
@@ -37,7 +36,6 @@ export const SITE_TOOL_NAMES = [
     "extract_workflow_template",
     "run_workflow_batch",
     "run_workflow_instance",
-    "derive_workflow_variant",
     "workbench_image_get_config",
     "workbench_image_generate",
     "workbench_video_get_config",
@@ -64,7 +62,6 @@ export const SITE_TOOL_LABELS: Record<SiteToolName, string> = {
     get extract_workflow_template() { return siteText("workflowTemplate"); },
     get run_workflow_batch() { return siteText("workflowBatch"); },
     get run_workflow_instance() { return siteText("workflowInstance"); },
-    get derive_workflow_variant() { return siteText("workflowVariant"); },
     get workbench_image_get_config() { return siteText("imageConfig"); },
     get workbench_image_generate() { return siteText("imageGenerate"); },
     get workbench_video_get_config() { return siteText("videoConfig"); },
@@ -91,8 +88,6 @@ export async function runSiteTool(name: SiteToolName, input: SiteToolInput, navi
             return await runWorkflowBatchTool(batchInput(input), workflowEntryDeps(context));
         case "run_workflow_instance":
             return await runWorkflowInstanceTool(instanceInput(input), workflowEntryDeps(context));
-        case "derive_workflow_variant":
-            return await deriveWorkflowVariantTool(variantInput(input), variantEntryDeps(context));
         case "workbench_image_get_config":
             return getImageConfig();
         case "workbench_image_generate":
@@ -241,29 +236,6 @@ function workflowEntryDeps(context: SiteToolContext = {}): WorkflowEntryDeps {
         // P10：素材缺省时「以选中为准」——选中态在画布快照里（useAgentBridge 随状态变化发布）。
         selectedNodeIds: () => context.canvasSnapshot?.selectedNodeIds || [],
         log: (message) => console.debug(`[canvas-agent] ${message}`),
-    };
-}
-
-/** 变体派生入参（C3）：源拉片节点 id 必填，槽绑定/意图可选。 */
-function variantInput(input: SiteToolInput): DeriveWorkflowVariantToolInput {
-    const sourceInstanceLapianNodeId = textField(input.sourceInstanceLapianNodeId);
-    if (!sourceInstanceLapianNodeId) throw new Error(siteText("variantSourceRequired"));
-    const assetBindings = assetBindingsInput(input.assetBindings) as VariantAssetBinding[];
-    const intentText = textField(input.intentText);
-    return {
-        sourceInstanceLapianNodeId,
-        ...(assetBindings.length ? { assetBindings } : {}),
-        ...(intentText ? { intentText } : {}),
-    };
-}
-
-/** 变体派生依赖（C3/C4 共用集成函数）：项目现状 + canvas_apply_ops 落库通道，全来自批次运行时。 */
-function variantEntryDeps(context: SiteToolContext = {}) {
-    const runtime = workflowEntryDeps(context);
-    return {
-        project: () => runtime.project() ? { nodes: runtime.project()!.nodes, connections: runtime.project()!.connections } : undefined,
-        applyOps: (opList: CanvasAgentOp[]) => runtime.applyOps(opList),
-        log: (message: string) => console.debug(`[canvas-agent] ${message}`),
     };
 }
 

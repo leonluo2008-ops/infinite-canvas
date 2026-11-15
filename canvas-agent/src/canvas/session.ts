@@ -61,7 +61,6 @@ const SITE_TOOLS = new Set<ToolName>([
     "extract_workflow_template",
     "run_workflow_batch",
     "run_workflow_instance",
-    "derive_workflow_variant",
 ]);
 
 /** 管理网页画布连接、状态、附件和工具请求。 */
