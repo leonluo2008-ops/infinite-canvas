@@ -43,7 +43,7 @@ export const BATCH_SUBMIT_RECONCILE_ROUNDS = 2;
 export const BATCH_SUBMIT_RECONCILE_INTERVAL_MS = 15_000;
 
 /** 派生状态里「已经走到终点，不该再重跑」的那些（P5 派生器给的口径）。 */
-export const BATCH_TERMINAL_STATUSES: InstanceStatus[] = ["awaiting_approval", "approved", "generating", "done"];
+export const BATCH_TERMINAL_STATUSES: InstanceStatus[] = ["awaiting_approval", "assembled", "approved", "generating", "done"];
 
 // ─────────────────────────────────────────────── 提交守卫（未知提交对账的落点）
 

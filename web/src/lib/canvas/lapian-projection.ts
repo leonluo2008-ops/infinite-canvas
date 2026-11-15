@@ -36,7 +36,7 @@ export function lapianOptionalLetters(value?: string): string {
  * 投影 URL（与改造前逐字节一致：`/api/render/<taskId>/<template>?optional=<letters>`）。
  * C2a 核验（2026-11-15 实测 auto-0069）：fork 变体任务不带 `checklist_task` 时桥按共享清单渲染——
  * 变体私有清单（它自己的描述/行决策）不会生效。第四参传 fork 任务号时桥读该任务私有清单副本
- * （server.py render_payload → hub_api.private_list_dir 三重校验）；不传=既有行为逐字节不变。
+ * （server.py render_payload → private_list_dir 三重校验）；不传=既有行为逐字节不变。
  */
 export function lapianProjectionUrl(taskId: string, optional = "", template: string = LAPIAN_PROJECTION_TEMPLATE, checklistTask = ""): string {
     const scope = String(checklistTask || "").trim();

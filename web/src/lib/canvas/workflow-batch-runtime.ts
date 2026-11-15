@@ -4,10 +4,10 @@
  * 依据：
  * - 卡面红线 25：队列一律走 P6 `createBatchQueue/planBatchResume/runBatchQueue`；单实例编排一律走
  *   P4 `runWorkflowInstance`；幂等落库一律走 P3 `materializeWorkflowInstance`。本文件**只有胶水**：
- *   把画布节点/ops 应用/生成链/hub 客户端/落盘 这几样现成能力包成队列要的依赖。
+ *   把画布节点/ops 应用/生成链/落盘 这几样现成能力包成队列要的依赖。
  * - 卡面断言：本文件**不发起任何视频创建**——`runGeneration` 只会被 P4 以 `mode:"text"` 调用一次
  *   （`workflow-instance-run.ts` 的既有约束），本文件不直接调它、也不拼生成请求。
- * - 状态一律现查派生（C5）：续跑计划看 `deriveInstanceStatus` 的当下结论（hub 现查），
+ * - 状态一律现查派生（C5）：续跑计划看 `deriveInstanceStatus` 的当下结论（画布侧派生），
  *   队列条目只当簿记。
  *
  * 为什么是模块级单例：队列运行时依赖画布页的 `applyOps`/`generateNodeRef`/`flushProjects`，
@@ -21,7 +21,7 @@ import type { CanvasAgentOp } from "@/lib/canvas/canvas-agent-ops";
 import { findBatchMember, findWorkflowBatch, type WorkflowBatchMember, type WorkflowBatchRecord } from "@/lib/canvas/workflow-batch";
 import { createBatchQueue, planBatchResume, runBatchQueue, type BatchQueueInstanceOutcome, type BatchQueueJob, type BatchQueueRunResult, type WorkflowBatchQueueRecord } from "@/lib/canvas/workflow-batch-queue";
 import { deriveInstanceStatus, type InstanceStatus } from "@/lib/canvas/workflow-batch-status";
-import type { WorkflowInstanceHubClient, WorkflowInstanceIdentityRecord, InstanceRunDeps } from "@/lib/canvas/workflow-instance-run";
+import type { WorkflowInstanceIdentityRecord, InstanceRunDeps } from "@/lib/canvas/workflow-instance-run";
 import { runWorkflowInstance } from "@/lib/canvas/workflow-instance-run";
 import { materializeWorkflowInstance, planWorkflowInstance, type WorkflowInstanceMaterials, type WorkflowInstancePlan } from "@/lib/canvas/workflow-instance";
 import type { LapianExecuteConfig } from "@/lib/canvas/lapian-execute";
@@ -52,8 +52,6 @@ export type WorkflowBatchRuntimeDeps = {
      * 必须回报本次新建的子节点 id（G18 闭合），拿不到就是失败，绝不按「最新节点」猜。
      */
     runGeneration: (input: { nodeId: string; mode: "text" | "image" | "video" | "audio"; prompt: string }) => Promise<{ childNodeId?: string }>;
-    /** hub 身份客户端（生产 = `createHubIdentityClient()`）。 */
-    hub: WorkflowInstanceHubClient;
     getBlob: (storageKey: string) => Promise<Blob | null>;
     saveIdentity: (record: WorkflowInstanceIdentityRecord) => void | Promise<void>;
     saveBatchMember: (member: WorkflowBatchMember) => void | Promise<void>;
@@ -129,28 +127,8 @@ function isMaterialized(member: WorkflowBatchMember, nodes: CanvasNodeData[]): b
 }
 
 /**
- * 批次成员的 hub 当前 state（现查；单条失败 → null = 查不到，派生未知，**不当成功**）。
  * 分批并发 ≤6（卡面 §3.10）。
  */
-async function loadHubStates(deps: WorkflowBatchRuntimeDeps, batch: WorkflowBatchRecord): Promise<Record<string, string | null>> {
-    const states: Record<string, string | null> = {};
-    const pending = batch.members.filter((member) => String(member.hub?.localId || "").trim());
-    for (let cursor = 0; cursor < pending.length; cursor += 6) {
-        const slice = pending.slice(cursor, cursor + 6);
-        const rows = await Promise.all(
-            slice.map(async (member) => {
-                try {
-                    const task = await deps.hub.getTask(String(member.hub!.localId));
-                    return [member.instanceId, String(task?.state || "")] as const;
-                } catch {
-                    return [member.instanceId, null] as const;
-                }
-            }),
-        );
-        for (const [instanceId, state] of rows) states[instanceId] = state;
-    }
-    return states;
-}
 
 /**
  * 模板重建（P3 计划入参）：只用项目里现存的模板声明 + 模板节点，不新造第二份模板。
@@ -184,7 +162,6 @@ function instanceRunDeps(deps: WorkflowBatchRuntimeDeps): InstanceRunDeps {
         runGeneration: deps.runGeneration,
         // 槽⑤可选段投影刷新：与 P4 生产同一条链（既有 `/api/render/...` 读取），不新写轮询。
         fetchProjection: (url, init) => fetch(url, init),
-        hub: deps.hub,
         getBlob: deps.getBlob,
         saveIdentity: deps.saveIdentity,
         saveBatchMember: deps.saveBatchMember,
@@ -274,9 +251,8 @@ export async function startBatch(batchId: string): Promise<BatchActionResult> {
     const { deps, project, batch } = resolved;
     pausedBatches.delete(batchId);
     const nodes = project.nodes || [];
-    const hubStates = await loadHubStates(deps, batch);
     const statuses: Record<string, InstanceStatus> = {};
-    for (const member of batch.members) statuses[member.instanceId] = deriveInstanceStatus({ member, nodes, hubState: hubStates[member.instanceId] === null ? null : hubStates[member.instanceId] }).status;
+    for (const member of batch.members) statuses[member.instanceId] = deriveInstanceStatus({ member, nodes }).status;
     const queue = batch.queue || createBatchQueue({ members: batch.members, updatedAt: nowIso(deps) });
     const resume = planBatchResume({ batch, queue, statuses, nodes, log: deps.log });
     const jobs = resume.run.map((instanceId) => {
@@ -322,8 +298,7 @@ export async function rerunInstance(batchId: string, instanceId: string): Promis
     const { deps, project, batch, member } = resolved;
     if (!member) return { ok: false, reason: `批次 ${batchId} 里没有实例 ${instanceId}` };
     const nodes = project.nodes || [];
-    const hubStates = await loadHubStates(deps, batch);
-    const status = deriveInstanceStatus({ member, nodes, hubState: hubStates[instanceId] === undefined ? undefined : hubStates[instanceId] }).status;
+    const status = deriveInstanceStatus({ member, nodes }).status;
     if (status === "done") return { ok: false, status, reason: `实例 ${instanceId} 派生状态 done：已完成实例不重跑` };
     const job = buildJob(deps, batch, member);
     const prepared = job.prepare ? await job.prepare() : { ok: true as const };

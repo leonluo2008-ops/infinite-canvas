@@ -7,7 +7,7 @@
     时刻由侧车 `待确认清单.json` 的出现时段给出，与资产名无关。
   · 它不认 看帧/ 的缓存密度（±0.5s 就近取），也没有「时段空 → 整片中段」与「现抽失败 → 原片首帧」
     这两级兜底（数据合同 v3 的兜底链）。
-  · 它在 ui/ 层：server → hub_api → automation 是单向依赖，automation 不能反向 import 它。
+  · 它在 ui/ 层：server → automation 是单向依赖，automation 不能反向 import 它。
   取帧命令（`ffmpeg -ss … -frames:v 1 -vf scale=w=min(960,iw):h=-2`、最大宽 960）与它保持同一口径，
   免得同一任务出现两种尺寸的帧。
 
@@ -280,8 +280,8 @@ def _ensure(video: Path | None, at: float, out: Path) -> tuple[bool, str]:
     return _ffmpeg_frame(video, at, out)
 
 
-def frame_url(local_id: str, filename: str) -> str:
-    return f"/api/hub/frame/{urllib.parse.quote(str(local_id))}/{urllib.parse.quote(filename)}"
+def frame_url(bridge_id: str, filename: str) -> str:
+    return f"/api/frame-file/{urllib.parse.quote(str(bridge_id))}/{urllib.parse.quote(filename)}"
 
 
 def build_frame(bridge_id: str, local_id: str, n: int, span: dict | None,
@@ -306,7 +306,7 @@ def build_frame(bridge_id: str, local_id: str, n: int, span: dict | None,
     if hit is not None:
         sec, path = hit
         if bounds is None or (bounds[0] - 1e-9 <= sec <= bounds[1] + 1e-9):
-            return {"url": frame_url(local_id, path.name), "秒": sec,
+            return {"url": frame_url(bridge_id, path.name), "秒": sec,
                     "来源": "缓存", "定位": "精确"}
     return _derive(bridge_id, local_id, n, video, mid, True,
                    source="现抽", located="精确")
@@ -336,13 +336,13 @@ def build_shot_frame(bridge_id: str, local_id: str, shot_no: int, start: float, 
     hit = nearest(inside, mid)
     if hit is not None:
         sec, path = hit
-        return {"url": frame_url(local_id, path.name), "秒": sec, "镜次": shot_no,
+        return {"url": frame_url(bridge_id, path.name), "秒": sec, "镜次": shot_no,
                 "定位": "精确", "来源": "缓存"}
     out_dir = frames_dir(bridge_id, create=True)
     out = out_dir / f"{SHOT_PREFIX}{shot_no}-{mid:.2f}{FRAME_SUFFIX}"
     ok, err = _ensure(video, mid, out)
     if ok:
-        return {"url": frame_url(local_id, out.name), "秒": mid, "镜次": shot_no,
+        return {"url": frame_url(bridge_id, out.name), "秒": mid, "镜次": shot_no,
                 "定位": "精确", "来源": "现抽"}
     return {"url": "", "秒": mid, "镜次": None, "定位": "未定位", "来源": "现抽",
             "错误": err[:300]}
@@ -362,7 +362,7 @@ def build_fallback_frame(bridge_id: str, local_id: str,
     out = out_dir / f"{FALLBACK_PREFIX}{at:.2f}{FRAME_SUFFIX}"
     ok, err = _ensure(video, at, out)
     if ok:
-        return {"url": frame_url(local_id, out.name), "秒": at, "镜次": None,
+        return {"url": frame_url(bridge_id, out.name), "秒": at, "镜次": None,
                 "定位": "未定位", "来源": "中段兜底"}
     return {"url": "", "秒": at, "镜次": None, "定位": "未定位", "来源": "中段兜底",
             "错误": err[:300]}
@@ -375,13 +375,13 @@ def _derive(bridge_id: str, local_id: str, n: int, video: Path | None,
     out = out_dir / f"{DERIVED_PREFIX}{n}-{at:.2f}{FRAME_SUFFIX}"
     ok, err = _ensure(video, at, out)
     if ok:
-        return {"url": frame_url(local_id, out.name), "秒": at,
+        return {"url": frame_url(bridge_id, out.name), "秒": at,
                 "来源": source, "定位": located}
     if allow_fallback:
         first = out_dir / f"{DERIVED_PREFIX}{n}-0.00{FRAME_SUFFIX}"
         ok2, err2 = _ensure(video, 0.0, first)
         if ok2:
-            return {"url": frame_url(local_id, first.name), "秒": 0.0,
+            return {"url": frame_url(bridge_id, first.name), "秒": 0.0,
                     "来源": "首帧兜底", "定位": "未定位", "错误": err[:200]}
         err = f"{err}；首帧兜底也失败：{err2}"
     # 一张图都拿不到：url 留空，前端 img onerror 出「未定位（点看原片）」

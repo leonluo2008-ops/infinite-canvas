@@ -176,11 +176,11 @@ const resetProject = (nodes, connections, extra = {}) => {
 const logs = [];
 const generationCalls = [];
 const fetchCalls = [];
-const hubCalls = { ingest: 0, upload: 0, getTask: 0 };
+
 const identitiesSaved = [];
 let uploadSeq = 0;
 let generationSeq = 0;
-const HUB_STATE = "awaiting_approval";
+
 
 const applyOpsWithProject = async (batchOps) => {
     const next = ops.applyCanvasAgentOps(
@@ -190,25 +190,6 @@ const applyOpsWithProject = async (batchOps) => {
     project = { ...project, nodes: next.nodes, connections: next.connections };
 };
 
-const hub = {
-    ingest: async () => {
-        hubCalls.ingest += 1;
-        return { localId: `p12-local-${hubCalls.ingest}`, bridgeId: "b12" };
-    },
-    uploadAsset: async () => {
-        hubCalls.upload += 1;
-        return { ref: `ref-${hubCalls.upload}` };
-    },
-    getTask: async () => {
-        hubCalls.getTask += 1;
-        return { state: HUB_STATE, bridgeId: "b12" };
-    },
-    saveRevision: async () => ({ state: HUB_STATE, approvalSnapshot: "snap-p12", promptEditedAt: "2026-11-14T00:00:09.000Z", selfcheck: [] }),
-    approve: async () => ({}),
-    rollback: async () => ({}),
-    revoke: async () => ({}),
-    waitForApproval: async () => HUB_STATE,
-};
 
 const saveMember = (member) => {
     const list = project.workflowBatches || [];
@@ -230,7 +211,6 @@ runtime.registerWorkflowBatchRuntime({
         ]);
         return { childNodeId };
     },
-    hub,
     getBlob: async (storageKey) => new Blob([`bytes-${storageKey}`], { type: "video/mp4" }),
     saveIdentity: (record) => void identitiesSaved.push(record),
     saveBatchMember: saveMember,
@@ -255,7 +235,6 @@ const entryDeps = (overrides = {}) => ({
     project: () => project,
     applyOps: applyOpsWithProject,
     getBlob: async (storageKey) => new Blob([`bytes-${storageKey}`], { type: "video/mp4" }),
-    hub,
     lapianConfig: { lapianDefaultModel: "", channels: [] },
     vetoes: () => project.workflowAssetVetoes || [],
     identities: () => identitiesSaved,
@@ -424,7 +403,7 @@ let coreBatchId;
             product?.status === "bound" && product?.imageNodeId === "img-product" && /你指定/.test(String(product?.reason));
     })(), JSON.stringify(result.assetBindings));
     check("A4 回执摘要写清「图 → 槽」与绑定来源（用户可核对）", /人物/.test(String(result.assetBindingSummary)) && /产品/.test(String(result.assetBindingSummary)) && /人物-女性\.png/.test(String(result.assetBindingSummary)) && /产品-香水\.png/.test(String(result.assetBindingSummary)), String(result.assetBindingSummary));
-    check("A5 实例停待批（终点=待审批）+ 队列 finished", result.instances.length === 1 && result.instances[0].status === "awaiting_approval" && result.instances[0].outcome === "awaiting_approval" && result.queue?.phase === "finished", JSON.stringify({ rows: result.instances.map((row) => [row.instanceId, row.status, row.outcome]), queue: result.queue }));
+    check("A5 实例停待批（终点=已组装）+ 队列 finished", result.instances.length === 1 && result.instances[0].status === "assembled" && result.instances[0].outcome === "canvas_ready" && result.queue?.phase === "finished", JSON.stringify({ rows: result.instances.map((row) => [row.instanceId, row.status, row.outcome]), queue: result.queue }));
 
     // 实例链路真的落到画布上（P3 确定性 id；9 个骨架节点 + 挂图副本 + 挂图对照）
     const idx = 1;
@@ -460,20 +439,17 @@ let coreBatchId;
 
     // 侧栏（P8 派生）同一份数据源
     const batchRecord = batch.findWorkflowBatch(project.workflowBatches, result.batchId);
-    const hubStates = {};
-    for (const member of batchRecord?.members || []) hubStates[member.instanceId] = member.hub?.localId ? HUB_STATE : undefined;
     const rows = review.buildReviewList({
         batches: [batchRecord],
         nodes: project.nodes,
-        hubStates,
         templateNameOf: (templateId) => registry.workflowTemplateDisplayName(project, templateId),
     });
-    check("A12 侧栏可见：「待审批」1 个批次 1 行，状态待审批", rows.length === 1 && rows[0].instances.length === 1 && rows[0].instances[0].status === "awaiting_approval", JSON.stringify(rows.map((row) => [row.templateName, row.instances.map((item) => [item.instanceId, item.statusLabel])])));
+    check("A12 侧栏可见：「已组装」1 个批次 1 行，状态已组装", rows.length === 1 && rows[0].instances.length === 1 && rows[0].instances[0].status === "assembled", JSON.stringify(rows.map((row) => [row.templateName, row.instances.map((item) => [item.instanceId, item.statusLabel])])));
     check("A13 侧栏批次头显示内置模板显示名「视频拆解（内置）」（不露 builtin-video-analysis 内部 id）", rows[0]?.templateName === `${BUILTIN_NAME}（内置）` && !String(rows[0]?.templateName).includes("builtin-"), JSON.stringify(rows[0]?.templateName));
 
     check("A14 付费口径：本工具内视频创建恒 0（paidVideoCreations=0，runGeneration 只 mode:text）", result.paidVideoCreations === 0 && generationCalls.slice(generationBefore).length === 1 && generationCalls.slice(generationBefore).every((call) => call.mode === "text"), JSON.stringify(generationCalls.slice(generationBefore)));
     check("A15 零生成端点：整段只打桥侧拉片链（upload/run/job/正文/render）", fetchCalls.slice(fetchBefore).every((url) => /^\/api\/(video\/upload|lapian\/(run|[^/]+)|job\/[^/]+|render\/)/.test(url)) && unexpectedFetch === 0, JSON.stringify([...new Set(fetchCalls.slice(fetchBefore))]));
-    check("A16 回执人话里写明「系统内置，开箱即用」+ 模板显示名带（内置）+ 终点待审批", /系统内置/.test(result.next) && /开箱即用/.test(result.next) && result.next.includes(`「${BUILTIN_NAME}（内置）」`) && /待审批/.test(result.next), result.next);
+    check("A16 回执人话里写明「系统内置，开箱即用」+ 模板显示名带（内置）+ 终点已组装", /系统内置/.test(result.next) && /开箱即用/.test(result.next) && result.next.includes(`「${BUILTIN_NAME}（内置）」`) && /画布侧收尾/.test(result.next), result.next);
     check("A17 无「先抽模板」类引导（内置模板路径零抽模板提示）", !/抽一次模板|先在已跑通/.test(String(result.next) + JSON.stringify(result.warnings)), JSON.stringify(result.warnings));
 
     // 幂等：同一句话再说一次 → 同批次、already_present、零新增节点
@@ -522,7 +498,7 @@ setSection("B");
     }
     resetProject(nodes, []);
     const result = await entry.runWorkflowBatchTool({}, entryDeps());
-    check("B1 零参（连 assetBindings 都不传）也直达：3 实例全部待审批", result.templateFrom === "builtin" && result.instances.length === 3 && result.instances.every((row) => row.status === "awaiting_approval"), JSON.stringify({ from: result.templateFrom, rows: result.instances.map((row) => [row.instanceId, row.status]) }));
+    check("B1 零参（连 assetBindings 都不传）也直达：3 实例全部已组装", result.templateFrom === "builtin" && result.instances.length === 3 && result.instances.every((row) => row.status === "assembled"), JSON.stringify({ from: result.templateFrom, rows: result.instances.map((row) => [row.instanceId, row.status]) }));
     check("B2 素材自动解析 3 条（画布上的 3 个视频，产物/骨架都不算）", result.materialsFrom === "canvas" && result.materials.length === 3 && ["m1", "m2", "m3"].every((id) => result.materials.some((row) => row.nodeId === id)), JSON.stringify(result.materials.map((row) => row.nodeId)));
     const person = (result.assetBindings || []).find((row) => row.slotName === "人物");
     const product = (result.assetBindings || []).find((row) => row.slotName === "产品");
@@ -581,7 +557,7 @@ setSection("D");
 
     // 缺省解析：同名空壳不采用、用内置，并如实说明
     const result = await entry.runWorkflowBatchTool({}, entryDeps());
-    check("D1 项目内同名「视频拆解」是空壳 → 自动改用内置模板（templateFrom=builtin），照常跑到待审批", result.templateFrom === "builtin" && result.instances.length >= 1 && result.instances.every((row) => row.status === "awaiting_approval"), JSON.stringify({ from: result.templateFrom, rows: result.instances.map((row) => [row.instanceId, row.status]) }));
+    check("D1 项目内同名「视频拆解」是空壳 → 自动改用内置模板（templateFrom=builtin），照常跑到已组装", result.templateFrom === "builtin" && result.instances.length >= 1 && result.instances.every((row) => row.status === "assembled"), JSON.stringify({ from: result.templateFrom, rows: result.instances.map((row) => [row.instanceId, row.status]) }));
     check("D2 回执如实说明「项目内模板不完整（按实际缺项报人话），已使用内置模板」", result.warnings.some((line) => /项目内模板/.test(line) && /不完整/.test(line) && line.includes(`${hollow.nodeCount} 个节点`) && /指令冻结/.test(line) && /本次使用内置模板/.test(line)), JSON.stringify(result.warnings));
     check("D3 空壳模板没有被拿来建批次（没有 2 节点模板的实例）", (project.workflowBatches || []).slice(batchesBefore).every((row) => row.templateId === BUILTIN_ID), JSON.stringify((project.workflowBatches || []).slice(batchesBefore).map((row) => row.templateId)));
 

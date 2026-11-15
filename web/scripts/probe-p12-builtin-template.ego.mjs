@@ -104,16 +104,6 @@ await page.cdp("Page.addScriptToEvaluateOnNewDocument", {
             const url = typeof input === "string" ? input : (input && input.url) || "";
             if (url.includes("/api/")) log.requests.push(url);
             if (/generate|video\\/create|completions/i.test(url)) log.generate += 1;
-            if (url.includes("/api/hub/task/")) {
-                log.hubTask += 1;
-                const id = decodeURIComponent(url.split("/api/hub/task/")[1].split(/[/?#]/)[0]);
-                return json({ task: { local_id: id, state: "awaiting_approval", bridge_id: "p12-bridge", intent: "P12 探针夹具", video_name: "探针素材.mp4", created_at: "2026-11-14T00:00:00.000Z", gen_progress: null, has_output: false, pair_lines: [], asset_cards: [], suggestions: [], summary_md: "", checklist_md: "", prompt_md: "", 自检: [], submit: { form: "none", active_submit: false, can_resume: false }, error: "" } });
-            }
-            if (url.includes("/api/hub/submit/")) {
-                log.submit += 1;
-                return json({ ok: true, job_id: "p12-stub-job" });
-            }
-            if (url.includes("/api/hub/")) return json({ ok: true });
             return orig(input, init);
         };
     })();`,
@@ -276,7 +266,7 @@ await page.screenshot({ path: path.join(SHOT_DIR, "P12-③-待审批侧栏.png")
 
 // ---------------------------------------------------------------- ④ 零提交/零付费/自检
 const net = await page.evaluate(() => ({ requests: window.__p12Net.requests.length, submit: window.__p12Net.submit, generate: window.__p12Net.generate }));
-check("④ 全程零提交出片（/api/hub/submit 从未被调用）", net.submit === 0, JSON.stringify(net));
+check("④ 全程零提交出片（提交通道从未被调用）", net.submit === 0, JSON.stringify(net));
 check("④-2 全程零生成/零付费端点", net.generate === 0, JSON.stringify(net));
 
 // 还原 store（原值原样写回）

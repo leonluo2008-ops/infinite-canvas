@@ -391,7 +391,7 @@ def probe_bridge_products(bridge_id: str) -> dict | None:
 # 与 render.py 提示词链**零交集**：本段不 import render，不读不写任何渲染字段。
 # ============================================================================
 
-# 状态机里的真实运行态（与 ui/hub_api.py 的 RUNNING_STATES 同集合，但只含状态机
+# 状态机里的真实运行态（运行态集合与 server 侧消费口径一致，但只含状态机
 # 有的三个；「ingesting」不是状态机状态，本段不认它）。
 RUNNING_STATES_MACHINE = ("discussing", "rendering", "generating")
 

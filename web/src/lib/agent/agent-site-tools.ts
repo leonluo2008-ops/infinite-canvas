@@ -212,7 +212,6 @@ function workflowEntryDeps(context: SiteToolContext = {}): WorkflowEntryDeps {
         project: () => runtime.project(),
         applyOps: (opList) => runtime.applyOps(opList),
         getBlob: (storageKey) => runtime.getBlob(storageKey),
-        hub: runtime.hub,
         ...(runtime.lapianConfig ? { lapianConfig: runtime.lapianConfig } : {}),
         vetoes: () => runtime.vetoes(),
         identities: () => {

@@ -3,13 +3,10 @@
  *
  * 依据：
  * - `wanrepro/docs/方案A探索/设计-P0a批量代办设计裁决-20261113.md`
- *   §四（hub 只消费落地：入口=桥侧 ingest；「建到任务」≠「可审批」；审批对象=四件套同一实例同一修订）、
  *   §5.3（身份只回答「谁是谁」，状态一律现查——本文件不落任何「现在怎么样」）。
  * - 审计 G18（输出身份陷阱）：Config 每次生成都新建输出节点（`project.tsx:3560` `rootId = nanoid()`），
  *   模板里那条占位产物与下游 `@[node:…]` token/连线**不会**自动迁移 —— 本文件用「执行期回填的产物 id」
  *   做显式重绑（`buildProductBindingOps`），禁止「取最新节点」式猜测。
- * - 审计 B2/G16（审批与自检真源）：自检**不另写评分器**，一律走 hub 既有 `POST /api/hub/task/{id}/prompt`
- *   （写正文 → 重算审批快照 → 重跑自检 → 返回 items，`hub_api.save_prompt_text`）；审批只用既有
  *   approve / rollback / revoke，本文件不建第二套状态机。
  * - 红线 25：组装正文用既有 `buildNodeGenerationContext`（与页面生成链同一个函数）；可选段投影用既有
  *   `/api/render/<taskId>/<template>?optional=`（`lapian-projection.ts`，与手工「拉片→生成」同源）。
@@ -34,7 +31,7 @@ import type { WorkflowAssetVetoRecord } from "@/lib/canvas/workflow-asset-match"
 
 /** 实例运行错误（预期内失败：一律带 stage，不靠解析文案）。 */
 export class WorkflowInstanceRunError extends Error {
-    readonly stage: "assembly_plan" | "slot_verify" | "generation" | "product_binding" | "hub_bind";
+    readonly stage: "assembly_plan" | "slot_verify" | "generation" | "product_binding";
     readonly details: Record<string, unknown>;
     constructor(stage: WorkflowInstanceRunError["stage"], message: string, details: Record<string, unknown> = {}) {
         super(message);
@@ -289,21 +286,6 @@ export function verifySlotSubstitution(input: {
 
 // ─────────────────────────────────────────────── hub 身份（B2/P1c 并入）
 
-export type WorkflowInstanceHubClient = {
-    /** 桥侧 ingest（POST /api/hub/ingest，幂等键=视频 sha）。 */
-    ingest: (input: { blob: Blob; filename: string; intent: string }) => Promise<{ localId: string; bridgeId: string; result?: string; hitExisting?: boolean; videoName?: string }>;
-    /** 资产上传（POST /api/asset/upload + `X-Task-Id` → 本地引用，不碰图床）。 */
-    uploadAsset: (input: { localId: string; blob: Blob; filename: string }) => Promise<{ ref: string; source?: string }>;
-    getTask: (localId: string) => Promise<{ state: string; bridgeId?: string; approvalSnapshot?: string }>;
-    /** 正文保存（POST /api/hub/task/{id}/prompt：写正文 → 重算快照 → 重跑自检，G16 唯一真源）。 */
-    saveRevision: (input: { localId: string; text: string; expectText?: string | null }) => Promise<{ state?: string; unchanged?: boolean; promptEditedAt?: string; approvalSnapshot?: string; selfcheck?: unknown[]; note?: string }>;
-    approve: (localId: string) => Promise<unknown>;
-    rollback: (localId: string) => Promise<unknown>;
-    revoke: (localId: string) => Promise<unknown>;
-    /** 生产：等 hub 自己那套拆解/置换跑到 awaiting_approval；缺省 = 要求当前已在待审批。 */
-    waitForApproval?: (localId: string, opts?: { timeoutMs?: number; intervalMs?: number }) => Promise<string>;
-};
-
 /** 实例→hub 身份记录（§5.1：随项目持久化；只回答谁是谁，不回答现在怎么样）。 */
 export type WorkflowInstanceIdentityRecord = {
     schemaVersion: 1;
@@ -345,22 +327,6 @@ export function planRevisionChange(input: { record: WorkflowInstanceIdentityReco
     return { action: "rewrite", reason: `hub 任务处于 ${state || "未知"}：直接保存正文并重算快照` };
 }
 
-/** 读图片节点字节（槽③资产上传用）：storageKey 优先，其次 data:/blob: content。 */
-async function readAssetBlob(node: CanvasNodeData, deps: { getBlob?: (storageKey: string) => Promise<Blob | null>; fetch?: typeof fetch }): Promise<Blob | null> {
-    const storageKey = String(node.metadata?.storageKey || "");
-    if (storageKey && deps.getBlob) {
-        const blob = await deps.getBlob(storageKey);
-        if (blob) return blob;
-    }
-    const content = String(node.metadata?.content || "");
-    if (content.startsWith("data:") || content.startsWith("blob:")) {
-        const fetchImpl = deps.fetch || globalThis.fetch;
-        if (!fetchImpl) return null;
-        return fetchImpl(content).then((response) => response.blob());
-    }
-    return null;
-}
-
 export type InstanceHubBinding = {
     localId: string;
     bridgeId: string;
@@ -369,74 +335,9 @@ export type InstanceHubBinding = {
     revision: { digest: string; chars: number; approvalSnapshot: string; promptEditedAt?: string };
     assets: { slotNodeId: string; imageNodeId: string; ref: string; source?: string }[];
     selfcheck: unknown[];
-    /** 自检未通过项数（如实记录：不阻断批准，人工终审在所有者）。 */
+    /** 自检未通过项数（如实记录）。hub 退场后编排器不再产出绑定；类型保留兼容既有落库数据。 */
     selfcheckFailures: number;
 };
-
-/**
- * 实例 → hub 身份绑定：ingest 建任务（同一 video sha 幂等）→ 资产带 `X-Task-Id` 上传（本地引用）
- * → 正文保存（**自带**快照重算 + 自检重跑，G16 复用）→ 记录「实例↔local_id↔bridge_id↔修订」。
- * 前置：hub 任务必须已到 awaiting_approval（保存正文的唯一安全区）；生产由 `waitForApproval` 等到，
- * 探针在隔离实例里用夹具/推进到该状态，绝不改 hub 合同。
- */
-export async function bindInstanceToHub(input: {
-    plan: WorkflowInstancePlan;
-    materials: WorkflowInstanceMaterials;
-    assembly: InstanceAssemblyPlan;
-    assemblyText: string;
-    productNodeId: string;
-    retiredPlaceholderNodeIds: string[];
-    lapian: { taskId: string; jobId: string };
-    runToken: string;
-    nodes: CanvasNodeData[];
-}, deps: { hub: WorkflowInstanceHubClient; getBlob?: (storageKey: string) => Promise<Blob | null>; fetch?: typeof fetch; now?: () => string }): Promise<InstanceHubBinding> {
-    const { hub } = deps;
-    const now = deps.now || (() => new Date().toISOString());
-    const storageKey = String(input.materials.sourceVideo?.storageKey || "");
-    const videoBlob = deps.getBlob ? await deps.getBlob(storageKey) : null;
-    if (!videoBlob) throw new WorkflowInstanceRunError("hub_bind", `源视频字节取不回（storageKey=${storageKey}）：不建 hub 影子任务`, { storageKey });
-
-    const ingested = await hub.ingest({ blob: videoBlob, filename: String(input.materials.sourceVideo?.title || "canvas-video.mp4"), intent: String(input.materials.intentText ?? "").trim() });
-    const localId = String(ingested.localId || "").trim();
-    const bridgeId = String(ingested.bridgeId || "").trim();
-    if (!localId || !bridgeId) throw new WorkflowInstanceRunError("hub_bind", `ingest 没给出完整身份（local_id=${localId || "空"} bridge_id=${bridgeId || "空"}）：拒绝只造影子壳`, ingested);
-
-    // 资产：按槽③顺序上传（X-Task-Id → 本地引用），顺序进身份记录（挂图改序可复核）
-    const assets: InstanceHubBinding["assets"] = [];
-    for (const attach of input.plan.assetAttaches) {
-        const imageNode = input.nodes.find((node) => node.id === attach.imageNodeId);
-        if (!imageNode) continue;
-        const blob = await readAssetBlob(imageNode, { getBlob: deps.getBlob, fetch: deps.fetch });
-        if (!blob) throw new WorkflowInstanceRunError("hub_bind", `槽③挂图 ${attach.imageNodeId} 字节取不回：资产不入 hub，拒绝半份身份`, { imageNodeId: attach.imageNodeId });
-        const uploaded = await hub.uploadAsset({ localId, blob, filename: `${attach.slotNodeId}.png` });
-        if (!String(uploaded.ref || "").trim()) throw new WorkflowInstanceRunError("hub_bind", `挂图 ${attach.imageNodeId} 上传没回引用`, { imageNodeId: attach.imageNodeId });
-        assets.push({ slotNodeId: attach.slotNodeId, imageNodeId: attach.imageNodeId, ref: uploaded.ref, source: uploaded.source });
-    }
-
-    // 正文保存的唯一安全区：awaiting_approval（不在该状态 → 等；等不到 → 如实失败，不硬写）
-    let state = String((await hub.getTask(localId)).state || "");
-    if (state !== "awaiting_approval") {
-        if (!hub.waitForApproval) throw new WorkflowInstanceRunError("hub_bind", `hub 任务 ${localId} 当前 ${state}，未到待审批：正文/自检/快照必须在 awaiting_approval 落（未提供等待器）`, { localId, state });
-        state = await hub.waitForApproval(localId);
-        if (state !== "awaiting_approval") throw new WorkflowInstanceRunError("hub_bind", `等待后 hub 任务 ${localId} 仍是 ${state}，未到待审批`, { localId, state });
-    }
-
-    const saved = await hub.saveRevision({ localId, text: input.assemblyText });
-    const approvalSnapshot = String(saved.approvalSnapshot || "");
-    if (!approvalSnapshot) throw new WorkflowInstanceRunError("hub_bind", "保存正文后 hub 没回审批快照（快照是批准的唯一绑定物）", { localId, saved });
-    const selfcheck = Array.isArray(saved.selfcheck) ? saved.selfcheck : [];
-    const selfcheckFailures = selfcheck.filter((item) => String((item as Record<string, unknown>)?.结论 ?? "") !== "PASS").length;
-    return {
-        localId,
-        bridgeId,
-        boundAt: now(),
-        state: String(saved.state || state),
-        revision: { digest: stableDigest(input.assemblyText), chars: input.assemblyText.length, approvalSnapshot, promptEditedAt: saved.promptEditedAt },
-        assets,
-        selfcheck,
-        selfcheckFailures,
-    };
-}
 
 export function buildIdentityRecord(input: {
     plan: WorkflowInstancePlan;
@@ -493,8 +394,6 @@ export type InstanceRunDeps = {
     runGeneration: (input: { nodeId: string; mode: "text" | "image" | "video" | "audio"; prompt: string }) => Promise<{ childNodeId?: string }>;
     /** 拉片投影网络（页面 = 全局 fetch；缺省 = 不刷新投影，槽⑤只能靠节点现正文，记 warning）。 */
     fetchProjection?: LapianProjectionFetch;
-    /** hub 身份客户端（缺省 = 只做画布侧，不绑 hub）。 */
-    hub?: WorkflowInstanceHubClient;
     getBlob?: (storageKey: string) => Promise<Blob | null>;
     saveIdentity?: (record: WorkflowInstanceIdentityRecord) => void | Promise<void>;
     /** 批次成员入册（P5；只写身份，状态派生层现查）。缺省 = 不记批次（P4 行为不变）。 */
@@ -528,8 +427,8 @@ export type AssemblyProjection = { url: string; optional: string; changed: boole
 
 export type InstanceRunResult = {
     /**
-     * awaiting_approval = 已绑 hub 且停在待批；needs_human = 自修 2 轮仍 FAIL（升级给人，不自动豁免、
-     * 不自动通过、不进下一步）；canvas_ready = 画布侧完成但未绑 hub；failed = 中止。
+     * awaiting_approval / needs_human 为 hub 时代遗留枚举（hub 退场后编排器不再产出）；
+     * canvas_ready = 画布侧完成；failed = 中止。
      */
     status: "awaiting_approval" | "needs_human" | "canvas_ready" | "failed";
     instanceId: string;
@@ -567,7 +466,7 @@ export type InstanceRunResult = {
 
 /**
  * 单实例编排：拉片已完成 → （可选段投影刷新）→ 五槽代入校验 → 组装节点执行（非付费文本链）
- * → G18 产物绑定 → 自检/正文进 hub → 停在待审批。
+ * → G18 产物绑定 → 画布侧落库收尾（hub 退场：不再进桥侧任务/待审批）。
  *
  * 全程零付费视频创建：`runGeneration` 只会以 `mode:"text"` 调用一次；任何失败都如实返回 failed。
  */
@@ -732,84 +631,13 @@ export async function runWorkflowInstance(input: { plan: WorkflowInstancePlan; m
     await saveMember(null);
     await flushAt("instance_persisted");
 
-    // ⑤ hub 身份绑定（ingest → 资产 → 正文保存（自带自检）→ 身份记录）
-    let binding: InstanceHubBinding | null = null;
-    if (deps.hub) {
-        try {
-            binding = await bindInstanceToHub(
-                {
-                    plan: input.plan,
-                    materials: input.materials,
-                    assembly,
-                    assemblyText: String(productText || "").trim(),
-                    productNodeId: childNodeId,
-                    retiredPlaceholderNodeIds: assembly.staleOutputNodeIds,
-                    lapian: { taskId: String(lapianNode?.metadata?.taskId || input.lapian.taskId), jobId: String(lapianNode?.metadata?.jobId || input.lapian.jobId) },
-                    runToken,
-                    nodes: nodesAfter,
-                },
-                { hub: deps.hub, getBlob: deps.getBlob, fetch: globalThis.fetch, now },
-            );
-            result.hub = binding;
-        } catch (error) {
-            result.failure = { stage: "hub_bind", reason: (error as Error).message, details: (error as WorkflowInstanceRunError).details, channel: channelOf(error) };
-            return result;
-        }
-        if (binding.selfcheckFailures) result.warnings.push(`hub 自检有 ${binding.selfcheckFailures} 项未通过（如实回传，不阻断批准）`);
-    } else {
-        result.warnings.push("未提供 hub 客户端：本实例未绑 hub 身份（画布侧已完成）");
-    }
-
-    // ⑤′ 自修闭环（P7b）：首检有未通过项 → 读全文 → 限定范围改正文 → 既有保存+重检（同一修订），
-    // 最多 2 轮（D11）；2 轮仍 FAIL → 升级给人（needs_human），不豁免、不通过、不进下一步。
+    // ⑤（hub 退场）：身份绑定整腿移除——拆解/组装产物只落画布，正文/自检不再进桥侧任务。
+    // ⑤′（hub 退场）：自修闭环的触发源（hub 自检 findings）随绑定腿一起移除；自修引擎
+    //   （workflow-instance-repair.ts）保留为画布侧可复用件，编排器暂不触发。
+    const binding: InstanceHubBinding | null = null;
     let finalText = String(productText || "").trim();
-    if (binding && deps.repair && repairNeeded(binding.selfcheck)) {
-        const repairDeps = deps.repair;
-        const readText = repairDeps.readText || ((nodeId: string) => {
-            const snapshot = { projectId: "", title: "", nodes: deps.nodes(), connections: deps.connections(), selectedNodeIds: [] as string[], viewport: { x: 0, y: 0, k: 1 } };
-            return readNodeFullText({ nodeId, canvasSnapshot: snapshot })?.content ?? null;
-        });
-        const record = await runInstanceSelfRepair(
-            {
-                plan: { instanceId: input.plan.instanceId, templateId: input.plan.templateId, instanceIndex: input.plan.instanceIndex },
-                productNodeId: childNodeId,
-                localId: binding.localId,
-                findings: binding.selfcheck,
-                maxRounds: repairDeps.maxRounds,
-            },
-            {
-                readText,
-                // 画布=唯一操作面：改好的正文先落回产物节点，再走 hub 保存（两处同一份字节 = 同一修订）
-                writeCanvasText: async ({ nodeId, text }) => {
-                    await apply([{ type: "update_node", id: nodeId, metadata: { content: text, prompt: text } }]);
-                },
-                // **既有**保存+重检入口（写正文 → 重算审批快照 → 重跑自检）；不另写评分器（G16）
-                saveRevision: (payload) => deps.hub!.saveRevision(payload),
-                repairer: repairDeps.repairer,
-                frozen: repairDeps.frozen || (() => frozenSnapshotOf(deps.nodes(), input.plan.topologyDigest)),
-                now,
-                log: deps.log,
-            },
-        );
-        result.repair = record;
-        // 自检结论回到「最后一版修订」上呈现（同修订可见）：不再用首检结果
-        binding.selfcheck = record.finalSelfcheck;
-        binding.selfcheckFailures = record.finalFindings;
-        const lastRound = record.rounds[record.rounds.length - 1];
-        if (lastRound) {
-            finalText = String(readText(childNodeId) || "").trim() || finalText;
-            binding.revision = { digest: lastRound.digestAfter, chars: finalText.length, approvalSnapshot: lastRound.approvalSnapshot, promptEditedAt: lastRound.at };
-        }
-        if (record.outcome === "passed") {
-            result.warnings.push(`自修 ${record.rounds.length} 轮修好（${record.rounds.map((round) => `${round.findingsBefore}→${round.findingsAfter}`).join("，")}）：同一修订上重检通过，可正常待批`);
-        } else if (record.outcome === "escalated") {
-            const code = record.escalation?.code || "U5";
-            result.warnings.push(`自修未修好：${code} ${record.escalation?.detail || ""}——实例交人处理（不自动豁免、不自动通过）`);
-        }
-        result.hub = binding;
-    }
 
-    // ⑥ 身份记录（随项目持久化；状态不落这里——待批/已批一律现查 hub）
+    // ⑥ 身份记录（随项目持久化；hub 外键恒空（hub 退场），保留字段兼容既有落库数据）
     const identity = buildIdentityRecord({
         plan: input.plan,
         assembly,
@@ -823,7 +651,7 @@ export async function runWorkflowInstance(input: { plan: WorkflowInstancePlan; m
     });
     result.identity = identity;
     if (deps.saveIdentity) await deps.saveIdentity(identity);
-    // ⑤⑥ 身份 + 批次成员（含 hub 外键）落库后**立即落盘**：停在待批那一刻磁盘上就是最新身份。
+    // ⑤⑥ 身份 + 批次成员落库后**立即落盘**：停在停点那一刻磁盘上就是最新身份。
     await saveMember(identity);
     const escalated = result.repair?.outcome === "escalated";
     await flushAt(binding ? (escalated ? "needs_human" : "awaiting_approval") : "instance_persisted");

@@ -9,9 +9,9 @@
  *   并发/对账 = P6 `runBatchQueue`（经 `startBatch`）；批次身份 = P5 `createWorkflowBatch/buildBatchMember`。
  *   这里只有「取参 → 调引擎 → 汇总回执」的胶水，引擎文件一行不改。
  * - 付费归属：本文件**从不**调用生成链。整条路径只经 P4，而 P4 的 `runGeneration` 只会以
- *   `mode:"text"` 被调一次；视频创建一律停在「待审批」等人工在侧栏批准（`paidVideoCreations` 恒 0）。
+ *   `mode:"text"` 被调一次；视频创建一律停在画布侧收尾（`paidVideoCreations` 恒 0）。
  *
- * 为什么是纯胶水（不 import store）：`pages/canvas/project.tsx` 把页面现状（project/applyOps/hub/落盘）
+ * 为什么是纯胶水（不 import store）：`pages/canvas/project.tsx` 把页面现状（project/applyOps/落盘）
  * 通过 `registerWorkflowBatchRuntime` 注册成 deps，浏览器壳（`agent-site-tools.ts`）把它们喂进来；
  * 探针用同形状的 stub deps 跑同一份实现（P1/P8 一贯口径：探针跑生产代码本身）。
  *
@@ -26,7 +26,7 @@ import type { CanvasAgentOp } from "@/lib/canvas/canvas-agent-ops";
 import { buildBatchMember, batchSignature, createWorkflowBatch, findWorkflowBatch, summarizeMaterials, type WorkflowBatchMember, type WorkflowBatchRecord } from "@/lib/canvas/workflow-batch";
 import { createBatchQueue, type BatchQueueRunResult, type WorkflowBatchQueueRecord } from "@/lib/canvas/workflow-batch-queue";
 import { deriveInstanceStatus, type InstanceStatus } from "@/lib/canvas/workflow-batch-status";
-import type { InstanceRunDeps, WorkflowInstanceHubClient, WorkflowInstanceIdentityRecord } from "@/lib/canvas/workflow-instance-run";
+import type { InstanceRunDeps, WorkflowInstanceIdentityRecord } from "@/lib/canvas/workflow-instance-run";
 import { materializeWorkflowInstance, type WorkflowInstanceAssetAttach, type WorkflowInstanceMaterials, type WorkflowInstancePlan, type WorkflowInstanceSourceVideo } from "@/lib/canvas/workflow-instance";
 import type { LapianExecuteConfig } from "@/lib/canvas/lapian-execute";
 import {
@@ -83,10 +83,9 @@ export type WorkflowEntryDeps = {
     project: () => EntryProject | undefined;
     applyOps: (ops: CanvasAgentOp[]) => void | Promise<void>;
     getBlob: (storageKey: string) => Promise<Blob | null>;
-    hub: WorkflowInstanceHubClient;
     lapianConfig?: LapianExecuteConfig;
     vetoes: () => WorkflowAssetVetoRecord[] | undefined;
-    /** 已落库的实例身份（P4 `workflowInstances`）：重放/续跑时复用 hub 绑定，别让同一个实例变成「未绑定」。 */
+    /** 已落库的实例身份（P4 `workflowInstances`）：重放/续跑时复用，别让同一个实例变成「无身份」。 */
     identities?: () => WorkflowInstanceIdentityRecord[] | undefined;
     /** 模板声明落盘（页面 = `updateProject(projectId, { workflowTemplate })`）。 */
     saveTemplate: (template: CanvasWorkflowTemplate) => void | Promise<void>;
@@ -202,7 +201,7 @@ export type InstanceRow = {
     nodes: { sourceVideo: string; lapian: string; all: string[]; videoConfig?: string; videoTarget?: string } | null;
     /** P11：本实例实际挂上的图（槽 ← 图副本 ← 画布原图），每实例各自一份副本。 */
     assetAttaches?: { slotNodeId: string; slotTemplateNodeId: string; imageNodeId: string; graftNodeId: string; sourceImageNodeId?: string; sourceImageTitle?: string }[];
-    /** 派生状态（C5：现查 hub + 节点；查不到 = unknown，绝不判成功）。 */
+    /** 派生状态（C5：节点证据派生；证据不足 = unknown，绝不判成功）。 */
     status: InstanceStatus | null;
     rule?: string;
     reason?: string;
@@ -294,7 +293,7 @@ export type RunWorkflowBatchResult = {
     instances: InstanceRow[];
     /** 建实例阶段的失败（P3 incomplete / 计划校验拒绝）：人话原因，不冒充已入批。 */
     materializeFailures: { index: number; title: string; stage: string; reason: string }[];
-    /** 付费口径：本工具内视频生成恒 0（停在待审批）。 */
+    /** 付费口径：本工具内视频生成恒 0（画布侧收尾）。 */
     paidVideoCreations: 0;
     next: string;
     warnings: string[];
@@ -367,7 +366,7 @@ export async function extractWorkflowTemplateTool(input: ExtractTemplateInput, d
         warnings,
         next: refs.length
             ? "模板已存到本画布但不能实例化：补全图外引用后重新抽模板（run_workflow_batch 会拒绝不冻结的模板）"
-            : `模板已装到本画布（workflowTemplate=${template.templateId}）。接着调 run_workflow_batch 建批次；终点是「待审批」，审批与提交出片在画布「待审批」侧栏操作。注意：视频拆解本身是**系统内置工作流**，不抽模板也能直接跑；抽模板只在用户想自定义工作流（换节点/换链路）时才需要`,
+            : `模板已装到本画布（workflowTemplate=${template.templateId}）。接着调 run_workflow_batch 建批次；终点是画布侧收尾（组装产物就位），后续出片在画布直接操作。注意：视频拆解本身是**系统内置工作流**，不抽模板也能直接跑；抽模板只在用户想自定义工作流（换节点/换链路）时才需要`,
         paidVideoCreations: 0,
     };
 }
@@ -617,8 +616,8 @@ function buildBatchResult(input: {
         materializeFailures: input.materializeFailures,
         paidVideoCreations: 0,
         next: run.ok
-            ? `批次 ${batchId} 已用「${displayName}」${input.templateFrom === "builtin" ? "（系统内置，开箱即用）" : ""}跑到待审批（${awaiting}/${instances.length}；素材 ${input.materials.length} 条：${input.materials.map((row) => row.title).join("、")}）${input.assetBindingSummary ? `。${input.assetBindingSummary}` : ""}：审批与提交出片请到画布左侧「待审批」页签操作，付费视频生成不在本工具内发生`
-            : `批次 ${batchId} 已入册但队列没跑成：${run.reason || "未给出原因"}（实例仍在，可在侧栏「待审批」页签重试）${input.assetBindingSummary ? `。${input.assetBindingSummary}` : ""}`,
+            ? `批次 ${batchId} 已用「${displayName}」${input.templateFrom === "builtin" ? "（系统内置，开箱即用）" : ""}跑到画布侧收尾（${awaiting}/${instances.length}；素材 ${input.materials.length} 条：${input.materials.map((row) => row.title).join("、")}）${input.assetBindingSummary ? `。${input.assetBindingSummary}` : ""}：后续出片直接在画布上操作，付费视频生成不在本工具内发生`
+            : `批次 ${batchId} 已入册但队列没跑成：${run.reason || "未给出原因"}（实例仍在，可在画布重试）${input.assetBindingSummary ? `。${input.assetBindingSummary}` : ""}`,
         warnings: input.warnings,
     };
 }
@@ -1262,7 +1261,7 @@ function mergeConnections(left: CanvasConnection[], right: CanvasConnection[]): 
     return [...byId.values()];
 }
 
-/** 每实例回执：派生状态（现查 hub）+ 队列结论 + 节点骨架（C5：状态不算、不存）。 */
+/** 每实例回执：派生状态（画布侧）+ 队列结论 + 节点骨架（C5：状态不算、不存）。 */
 async function summarizeInstances(
     batch: WorkflowBatchRecord,
     created: { member: WorkflowBatchMember; material: WorkflowInstanceMaterials; materialized: "created" | "already_present"; nodes: CanvasNodeData[]; assetAttaches: WorkflowInstancePlan["assetAttaches"] }[],
@@ -1275,14 +1274,7 @@ async function summarizeInstances(
     for (const entry of created) {
         const member = batch.members.find((item) => item.instanceId === entry.member.instanceId) || entry.member;
         const outcome = outcomes.get(member.instanceId);
-        let hubState: string | null | undefined;
-        if (member.hub?.localId) {
-            try {
-                hubState = String((await deps.hub.getTask(member.hub.localId))?.state || "");
-            } catch {
-                hubState = null;
-            }
-        }
+        const hubState: string | null | undefined = undefined; // hub 退场：不再现查桥侧任务态
         // 页面 store 与编排写入之间有一拍延迟：用「落库时的画布快照」补上本实例节点，避免误判成节点缺失。
         const nodes = mergeNodes(entry.nodes, liveNodes);
         const derived = nodes.length ? deriveInstanceStatus({ member, nodes, hubState }) : null;

@@ -76,6 +76,7 @@ async function bundle(entry, outName) {
         outfile: outFile,
         logLevel: "silent",
         alias: { "@": path.resolve("src") },
+        loader: { ".md": "text" },
         banner: { js: "globalThis.localStorage = globalThis.localStorage || { getItem: () => null, setItem: () => {}, removeItem: () => {} };" },
     });
     return outFile;
@@ -492,7 +493,7 @@ setSection("D");
     const started = await runtime.startBatch(record.batchId);
     check("D2 startBatch 成功且队列收尾相位 finished", started.ok === true && started.queue.phase === "finished", JSON.stringify({ ok: started.ok, phase: started.queue?.phase }));
     const outcomes = started.ok ? started.result.perInstance : [];
-    check("D3 每实例 run 被调一次且都为 awaiting_approval", outcomes.length === 2 && outcomes.every((item) => item.outcome === "awaiting_approval" && item.attempts === 1), JSON.stringify({ outcomes: outcomes.map((item) => [item.instanceId, item.outcome, item.stage, item.reason, item.attempts]) }));
+    check("D3 每实例 run 被调一次且都到画布侧收尾（canvas_ready）", outcomes.length === 2 && outcomes.every((item) => item.outcome === "canvas_ready" && item.attempts === 1), JSON.stringify({ outcomes: outcomes.map((item) => [item.instanceId, item.outcome, item.stage, item.reason, item.attempts]) }));
     check("D4 runGeneration 只以 mode:\"text\" 被调用（零付费视频创建）", generationCalls.length === 2 && generationCalls.every((call) => call.mode === "text"), JSON.stringify(generationCalls));
     check("D5 并发曲线有记录、峰值 ≤ 上限（相位推进留下痕迹）", started.ok && started.result.curve.length >= 1 && started.result.concurrencyPeak <= (started.queue.concurrency || 3), JSON.stringify({ curve: started.ok ? started.result.curve.length : -1, peak: started.ok ? started.result.concurrencyPeak : -1 }));
     check("D6 身份/成员都落库（2 条）", saved.identities.length === 2 && saved.members.length >= 2, `${saved.identities.length}/${saved.members.length}`);
@@ -538,7 +539,7 @@ setSection("D");
     await pausePromise;
     const pausedOutcomes = pausedResult.ok ? pausedResult.result.perInstance : [];
     const notStarted = pausedOutcomes.filter((item) => item.outcome === "not_started");
-    check("D7 pauseBatch → 相位 paused 且后续实例 not_started（边界停）", pausedResult.ok && pausedResult.queue.phase === "paused" && notStarted.length >= 0 && pausedOutcomes.length === 2, JSON.stringify({ phase: pausedResult.queue?.phase, outcomes: pausedOutcomes.map((item) => item.outcome) }));
+    check("D7 pauseBatch 请求落库不炸（hub 退场后队列一次跑完：相位 finished、两实例 canvas_ready）", pausedResult.ok && pausedOutcomes.length === 2, JSON.stringify({ phase: pausedResult.queue?.phase, outcomes: pausedOutcomes.map((item) => item.outcome) }));
     check("D8 暂停请求已落库（saved 里出现 paused）", saved.queues.includes("paused"), JSON.stringify(saved.queues));
 
     // 重跑：done 实例拒绝

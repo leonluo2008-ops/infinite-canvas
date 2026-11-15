@@ -44,12 +44,12 @@ class ReplaceError(RuntimeError):
 
 # ── 清单写锁（AT-22 B0 / 双路审计 M-3）──────────────────────────────────────
 # 同一份 `analysis/reverse/<bridge_id>/待确认清单.md` 有两条写路径：
-#   · hub 链  hub_api.set_asset → replace.set_row / set_group_write（读-改-整文件重写）；
+#   · 画布链  server.set_asset → replace.set_row / set_group_write（读-改-整文件重写）；
 #   · 画布链  server._update_checklist_cell ← set_checklist_image/desc/name
 #     （`name_and_store` 每次上传自动预填描述，是高频写者）。
-# 两条链跑在**同一个 server 进程**里（server.py 开头 import hub_api），从前各持一把互不相识的
+# 两条链跑在**同一个 server 进程**里（server.py 直接 import 本模块），从前各持一把互不相识的
 # 锁（hub 链 task_lock(local_id)、画布链 server.WRITE_LOCK），并发时后写者把先写者的整份重写
-# 覆盖掉 = 丢更新。锁放在本模块：清单的唯一读写原语都在这里，hub_api/server 都已经是它的下游，
+# 覆盖掉 = 丢更新。锁放在本模块：清单的唯一读写原语都在这里，server 等都已经是它的下游，
 # 谁都不用为拿锁多引一个模块。
 # 用 RLock 而不是 Lock：set_group_write 在一把锁内逐行调 set_row（整组=一次原子写），
 # 同一线程必须能重入。锁序只有 task_lock → CHECKLIST_LOCK 一个方向（画布链不反持 task_lock），
@@ -60,8 +60,8 @@ CHECKLIST_LOCK = threading.RLock()
 def analysis_root() -> Path:
     """拆解产物根：`WANREPRO_ANALYSIS_ROOT` 优先，否则 ROOT/analysis/reverse。
 
-    与 `ui/hub_api._analysis_reverse()`、`automation/state._ANALYSIS_REVERSE` **同一真源**：
-    清单是本模块写的、hub_api 读的同一份文件，根不一致就是「读 A 写 B」的伪隔离
+    与 `automation/state._ANALYSIS_REVERSE` **同一真源**：
+    清单是本模块与各调用方共写的同一份文件，根不一致就是「读 A 写 B」的伪隔离
     （probe_guard 记的那类事故），所以这条也认环境变量，探针/自托管才能把父子一起指向临时根。
     """
     env = (os.environ.get("WANREPRO_ANALYSIS_ROOT") or "").strip()
@@ -144,7 +144,7 @@ def parse_rows(md_text: str) -> list[dict]:
     """读层归一：行号/类别/描述/命名/现有资产图列/建议/我的描述。容全角竖线（红线：不假设格式）。
 
     AT-22 E3（§4.1 一处读层）：第 8 列「用我的描述」在这里解一次，`cards`（资产卡预填）与
-    `hub_api.set_asset`（现值/幂等/乐观锁）共用——不另写第二份正则或解码器。解码走
+    `server.set_asset`（现值/幂等/乐观锁）共用——不另写第二份正则或解码器。解码走
     `render.decode_user_desc`（格式所有者一处：写侧 `render.encode_user_desc` 与它成对）。
     """
     rows = []

@@ -4,7 +4,7 @@
  * 输入只有三类**现查证据**，本文件不读也不写任何「状态」字段：
  * ① 画布节点 `metadata.status`（生成态：idle/loading/success/error，见 `types/canvas.ts`）；
  * ② 后端任务状态（拉片 job / 视频任务；经既有 `generation_get_status` 与任务查询取得，红线 25 禁新写轮询器）；
- * ③ hub 任务当前 state（`GET /api/hub/task/{id}`，审批真源，本文件只消费）。
+ * ③ 桥侧任务当前 state（hub 退场后编排器不再传入；参数保留兼容派生口径，缺省=未查）。
  *
  * 派生规则表（顺序即优先级，命中即返回；`rule` 字段把命中行带出去，可复核）：
  *

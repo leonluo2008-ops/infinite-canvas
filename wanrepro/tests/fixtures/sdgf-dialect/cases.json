@@ -398,7 +398,7 @@
   ],
   "sizeCases": {
     "contract": "docs/nodes/AT-14.md v2 §3.1 + §五.1（画幅根治：画布 inferVideoRatio 同口径规约 → 渠道校验两步）",
-    "purpose": "画幅输入的**唯一共享夹具**：PY（wanrepro/automation/probe_sdgf_dialect.py，走 hub_api._ratio_from_size + _normalize_config 真入口）与 TS（web/scripts/probe-at13-b3.mjs，走 gen-settings 前端提交组装真函数）加载同一份期望，单改任一端实现 → 至少一条 case 必红。fixture 是测试合同，不是生产枚举源（生产枚举仍以 media-size.ts / CANVAS_RATIOS 为源）。",
+    "purpose": "画幅输入的**唯一共享夹具**：PY 端与 TS 端各自加载同一份期望（历史：曾由 automation/probe_sdgf_dialect.py 与 web/scripts/probe-at13-b3.mjs 双端对账；两探针已随 hub 退场删除），单改任一端实现 → 至少一条 case 必红。fixture 是测试合同，不是生产枚举源（生产枚举仍以 media-size.ts / CANVAS_RATIOS 为源）。",
     "schema": {
       "input": {
         "size": "用户/前端给 approve config 的 params.size 原值（也可以是 rawSize 原串）",

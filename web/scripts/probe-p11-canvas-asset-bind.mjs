@@ -177,11 +177,11 @@ const flushes = [];
 const logs = [];
 const generationCalls = [];
 const fetchCalls = [];
-const hubCalls = { ingest: 0, upload: 0, getTask: 0 };
+
 const identitiesSaved = [];
 let uploadSeq = 0;
 let generationSeq = 0;
-const hubState = "awaiting_approval";
+
 
 const applyOpsWithProject = async (batchOps) => {
     const next = ops.applyCanvasAgentOps(
@@ -191,25 +191,6 @@ const applyOpsWithProject = async (batchOps) => {
     project = { ...project, nodes: next.nodes, connections: next.connections };
 };
 
-const hub = {
-    ingest: async () => {
-        hubCalls.ingest += 1;
-        return { localId: `p11-local-${hubCalls.ingest}`, bridgeId: "b11" };
-    },
-    uploadAsset: async () => {
-        hubCalls.upload += 1;
-        return { ref: `ref-${hubCalls.upload}` };
-    },
-    getTask: async () => {
-        hubCalls.getTask += 1;
-        return { state: hubState, bridgeId: "b11" };
-    },
-    saveRevision: async () => ({ state: hubState, approvalSnapshot: "snap-p11", promptEditedAt: "2026-11-14T00:00:09.000Z", selfcheck: [] }),
-    approve: async () => ({}),
-    rollback: async () => ({}),
-    revoke: async () => ({}),
-    waitForApproval: async () => "awaiting_approval",
-};
 
 const saveMember = (member) => {
     const list = project.workflowBatches || [];
@@ -231,7 +212,6 @@ runtime.registerWorkflowBatchRuntime({
         ]);
         return { childNodeId };
     },
-    hub,
     getBlob: async (storageKey) => new Blob([`bytes-${storageKey}`], { type: "video/mp4" }),
     saveIdentity: (record) => void identitiesSaved.push(record),
     saveBatchMember: saveMember,
@@ -256,7 +236,6 @@ const entryDeps = (overrides = {}) => ({
     project: () => project,
     applyOps: applyOpsWithProject,
     getBlob: async (storageKey) => new Blob([`bytes-${storageKey}`], { type: "video/mp4" }),
-    hub,
     lapianConfig: { lapianDefaultModel: "", channels: [] },
     vetoes: () => project.workflowAssetVetoes || [],
     identities: () => identitiesSaved,
@@ -364,17 +343,15 @@ setSection("A");
         JSON.stringify(result.instances[0]?.assetAttaches),
     );
     check(
-        "A9 实例链路画布可见 + 停待批（终点=待审批，P4 判据）",
-        project.nodes.length > nodesBefore && result.instances[0].status === "awaiting_approval" && result.instances[0].outcome === "awaiting_approval",
+        "A9 实例链路画布可见 + 停待批（终点=已组装，P4 判据）",
+        project.nodes.length > nodesBefore && result.instances[0].status === "assembled" && result.instances[0].outcome === "canvas_ready",
         JSON.stringify({ nodesBefore, nodesAfter: project.nodes.length, status: result.instances[0].status, outcome: result.instances[0].outcome }),
     );
 
-    // 侧栏（P8 同一份数据源）：真调产出的批次 → 1 行待审批 + 挂图位/理由/缩略
+    // 侧栏（P8 同一份数据源）：真调产出的批次 → 1 行已组装 + 挂图位/理由/缩略
     const batchRecord = batch.findWorkflowBatch(project.workflowBatches, result.batchId);
-    const hubStates = {};
-    for (const member of batchRecord?.members || []) hubStates[member.instanceId] = member.hub?.localId ? hubState : undefined;
-    const rows = review.buildReviewList({ batches: [batchRecord], nodes: project.nodes, hubStates, templateNameOf: () => project.workflowTemplate?.name });
-    check("A10 侧栏「待审批」立即出 1 行且待审批（实例链路可见）", rows.length === 1 && rows[0].instances.length === 1 && rows[0].instances[0].status === "awaiting_approval", JSON.stringify(rows.map((row) => [row.templateName, row.instances.map((item) => item.statusLabel)])));
+    const rows = review.buildReviewList({ batches: [batchRecord], nodes: project.nodes, templateNameOf: () => project.workflowTemplate?.name });
+    check("A10 侧栏「已组装」立即出 1 行且已组装（实例链路可见）", rows.length === 1 && rows[0].instances.length === 1 && rows[0].instances[0].status === "assembled", JSON.stringify(rows.map((row) => [row.templateName, row.instances.map((item) => item.statusLabel)])));
     const slotRows = review.buildSlotRows({ member: batchRecord.members[0], nodes: project.nodes });
     check(
         "A11 侧栏挂图位读到的就是本次绑定（当前挂图=副本、溯源=原图、复算一致）",
@@ -575,7 +552,7 @@ setSection("E");
         JSON.stringify(copies.map((item) => [imageOfCopy(item.person).source, imageOfCopy(item.product).source])),
     );
     check("E4 批次回执给绑定摘要（逐槽写明图与来源，可核对）", /画布替换图绑定 2\/2 个槽/.test(String(result.assetBindingSummary)) && String(result.assetBindingSummary).includes("人物-女性.png") && String(result.assetBindingSummary).includes("主体-香水.png"), String(result.assetBindingSummary));
-    check("E5 3 实例全部到待审批（终点不变）", result.instances.every((row) => row.status === "awaiting_approval"), JSON.stringify(result.instances.map((row) => row.status)));
+    check("E5 3 实例全部到已组装（终点不变）", result.instances.every((row) => row.status === "assembled"), JSON.stringify(result.instances.map((row) => row.status)));
 
     // ---------------------------------------------------------- F. 幂等 / 付费 / 自检
     setSection("F");
@@ -637,7 +614,13 @@ setSection("E");
     // 重试会报「项目没有模板声明」）。允许改动的只有 planInputFor 的模板来源解析；队列相位/审批/付费闸
     // 由下面 F7b 逐行核对 diff 守住，其余引擎/匹配器文件仍零改动。
     const P12_ALLOWED = "web/src/lib/canvas/workflow-batch-runtime.ts";
-    const hardEngine = ENGINE_FILES.filter((file) => file !== P12_ALLOWED);
+    // hub 退场（2026-11-15）合法改动：编排器/状态派生/队列的 hub 绑定腿整批移除（终点=画布侧收尾）。
+    const HUB_EXIT_ALLOWED = new Set([
+        "web/src/lib/canvas/workflow-instance-run.ts",
+        "web/src/lib/canvas/workflow-batch-queue.ts",
+        "web/src/lib/canvas/workflow-batch-status.ts",
+    ]);
+    const hardEngine = ENGINE_FILES.filter((file) => file !== P12_ALLOWED && !HUB_EXIT_ALLOWED.has(file));
     const engineTouched = tree.filter((file) => hardEngine.includes(file));
     check("F7a 引擎/匹配器文件零改动（模板抽取·实例化·匹配·队列状态·资产清单）", engineTouched.length === 0, JSON.stringify({ engineTouched, touched: tree.slice(0, 24) }));
 
@@ -671,7 +654,6 @@ const summary = {
     evidence: {
         generationCalls: generationCalls.map((call) => [call.nodeId, call.mode]),
         fetchTargets: [...new Set(fetchCalls)],
-        hubCalls,
         flushes: [...new Set(flushes)],
         identitySaves: identitiesSaved.length,
         unexpectedFetch,

@@ -96,7 +96,7 @@
       "detail": ""
     },
     {
-      "name": "④ 全程零提交出片（/api/hub/submit 从未被调用）",
+      "name": "④ 全程零提交出片（提交通道从未被调用）",
       "ok": true,
       "detail": ""
     },

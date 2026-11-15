@@ -10,7 +10,7 @@
  * 分段（判据见卡面「探针验收」）：
  *   A 一句话直达（核心）：项目内已有「视频拆解」模板 + 拆解→生成链 + 3 个源视频 + 2 个产物视频
  *            → 调 run_workflow_batch 不传任何参数（Agent 听完「用视频拆解工作流处理这 3 个视频」后就是这个调用）
- *            → 自动取模板 + 自动解析 3 个源视频 → 建批次 → 3 实例全到待审批 → 回执逐条列素材 → 侧栏 3 行
+ *            → 自动取模板 + 自动解析 3 个源视频 → 建批次 → 3 实例全到已组装 → 回执逐条列素材 → 侧栏 3 行
  *   A2 幂等：同素材再调一次零参 → 同批次、实例 already_present、零新增组装、零新增节点
  *   B 选中优先：画布有选中 → 只处理选中的；选中夹带非视频节点 → 忽略并警示；全非视频 → 人话报错
  *   C 缺省 templateId：无模板 → 人话引导抽模板；有唯一模板 → 自动取用；多模板 → 列名字让人选，不乱选
@@ -166,11 +166,11 @@ const flushes = [];
 const logs = [];
 const generationCalls = [];
 const fetchCalls = [];
-const hubCalls = { ingest: 0, upload: 0, getTask: 0 };
+
 const identitiesSaved = [];
 let uploadSeq = 0;
 let generationSeq = 0;
-const hubState = "awaiting_approval";
+
 
 const applyOpsWithProject = async (batchOps) => {
     const next = ops.applyCanvasAgentOps(
@@ -180,25 +180,6 @@ const applyOpsWithProject = async (batchOps) => {
     project = { ...project, nodes: next.nodes, connections: next.connections };
 };
 
-const hub = {
-    ingest: async () => {
-        hubCalls.ingest += 1;
-        return { localId: `p10-local-${hubCalls.ingest}`, bridgeId: "b10" };
-    },
-    uploadAsset: async () => {
-        hubCalls.upload += 1;
-        return { ref: `ref-${hubCalls.upload}` };
-    },
-    getTask: async () => {
-        hubCalls.getTask += 1;
-        return { state: hubState, bridgeId: "b10" };
-    },
-    saveRevision: async () => ({ state: hubState, approvalSnapshot: "snap-p10", promptEditedAt: "2026-11-14T00:00:09.000Z", selfcheck: [] }),
-    approve: async () => ({}),
-    rollback: async () => ({}),
-    revoke: async () => ({}),
-    waitForApproval: async () => "awaiting_approval",
-};
 
 const saveMember = (member) => {
     const list = project.workflowBatches || [];
@@ -220,7 +201,6 @@ runtime.registerWorkflowBatchRuntime({
         ]);
         return { childNodeId };
     },
-    hub,
     getBlob: async (storageKey) => new Blob([`bytes-${storageKey}`], { type: "video/mp4" }),
     saveIdentity: (record) => void identitiesSaved.push(record),
     saveBatchMember: saveMember,
@@ -245,7 +225,6 @@ const entryDeps = (overrides = {}) => ({
     project: () => project,
     applyOps: applyOpsWithProject,
     getBlob: async (storageKey) => new Blob([`bytes-${storageKey}`], { type: "video/mp4" }),
-    hub,
     lapianConfig: { lapianDefaultModel: "", channels: [] },
     vetoes: () => project.workflowAssetVetoes || [],
     identities: () => identitiesSaved,
@@ -314,29 +293,27 @@ setSection("A");
     const result = await entry.runWorkflowBatchTool({}, entryDeps());
 
     check("A1 零参直达：不传 templateId / materials 也能建批次（3 个源视频 → 3 实例）", Boolean(result.batchId) && result.instances.length === 3, JSON.stringify({ batchId: result.batchId, rows: result.instances.length }));
-    check("A2 3 实例全部到待审批（终点=待审批，P4 判据）", result.instances.every((row) => row.status === "awaiting_approval" && row.outcome === "awaiting_approval"), JSON.stringify(result.instances.map((row) => [row.instanceId, row.status, row.outcome])));
+    check("A2 3 实例全部到已组装（终点=已组装，P4 判据）", result.instances.every((row) => row.status === "assembled" && row.outcome === "canvas_ready"), JSON.stringify(result.instances.map((row) => [row.instanceId, row.status, row.outcome])));
     check("A3 模板自动取用：templateFrom=project、回执报模板名「视频拆解」", result.templateFrom === "project" && result.templateId === TEMPLATE_ID && result.templateName === TEMPLATE_NAME, JSON.stringify({ from: result.templateFrom, id: result.templateId, name: result.templateName }));
     check("A4 素材自动解析：materialsFrom=canvas、3 条且逐条有 id+标题+storageKey", result.materialsFrom === "canvas" && result.materials.length === 3 && result.materials.every((row) => ["m1", "m2", "m3"].includes(row.nodeId) && Boolean(row.title) && Boolean(row.storageKey)), JSON.stringify(result.materials));
     check("A5 产物/骨架不算素材：有上游输入的产物、只有生成痕迹没连线的产物、模板骨架里的示范源视频都被排除", !result.materials.some((row) => row.nodeId === OUT_VIDEO || row.nodeId === OUT_LOOSE || row.nodeId === VIDEO), JSON.stringify(result.materials.map((row) => row.nodeId)));
-    check("A6 回执可核对：next 里写明模板名与 3 条素材标题、终点待审批", result.next.includes(TEMPLATE_NAME) && result.next.includes("素材一.mp4") && result.next.includes("待审批"), result.next);
-    check("A7 队列收尾：相位 finished、并发 3、3 实例跑到待批", result.queue?.phase === "finished" && result.queue?.concurrency === 3 && result.queue?.awaitingApproval === 3, JSON.stringify(result.queue));
+    check("A6 回执可核对：next 里写明模板名与 3 条素材标题、终点已组装", result.next.includes(TEMPLATE_NAME) && result.next.includes("素材一.mp4") && result.next.includes("画布侧收尾"), result.next);
+    check("A7 队列收尾：相位 finished、并发 3、3 实例跑到画布侧收尾", result.queue?.phase === "finished" && result.queue?.concurrency === 3 && result.queue?.attempted === 3 && result.queue?.failed === 0 && result.queue?.skipped === 0, JSON.stringify(result.queue));
     check("A8 付费口径：本工具内视频创建恒 0（paidVideoCreations=0，runGeneration 只 mode:text）", result.paidVideoCreations === 0 && generationCalls.slice(generationBefore).length === 3 && generationCalls.slice(generationBefore).every((call) => call.mode === "text"), JSON.stringify(generationCalls.slice(generationBefore)));
     check("A9 零生成端点：整段只打桥侧拉片链（upload/run/job/正文/render），无 create 类请求", fetchCalls.slice(fetchBefore).every((url) => /^\/api\/(video\/upload|lapian\/(run|[^/]+)|job\/[^/]+|render\/)/.test(url)) && unexpectedFetch === 0, JSON.stringify([...new Set(fetchCalls.slice(fetchBefore))]));
     check("A10 跳过清单如实：只跳过模板骨架里的示范源视频（有理由），无警示", result.skippedSourceVideos.length === 1 && result.skippedSourceVideos[0].nodeId === VIDEO && /模板骨架/.test(result.skippedSourceVideos[0].reason) && result.warnings.length === 0, JSON.stringify({ skipped: result.skippedSourceVideos, warnings: result.warnings }));
 
-    // 侧栏（P8）同一份数据源：真调产出的批次 → 3 行待审批
+    // 侧栏（P8）同一份数据源：真调产出的批次 → 3 行已组装
     const batchRecord = batch.findWorkflowBatch(project.workflowBatches, result.batchId);
-    const hubStates = {};
-    for (const member of batchRecord?.members || []) hubStates[member.instanceId] = member.hub?.localId ? hubState : undefined;
-    const rows = review.buildReviewList({ batches: [batchRecord], nodes: project.nodes, hubStates, templateNameOf: () => project.workflowTemplate?.name });
-    check("A11 侧栏「待审批」立即出 3 行且全部待审批（模板名也进批次头）", rows.length === 1 && rows[0].instances.length === 3 && rows[0].instances.every((row) => row.status === "awaiting_approval"), JSON.stringify(rows.map((row) => [row.templateName, row.instances.map((item) => [item.instanceId, item.statusLabel])])));
+    const rows = review.buildReviewList({ batches: [batchRecord], nodes: project.nodes, templateNameOf: () => project.workflowTemplate?.name });
+    check("A11 侧栏「已组装」立即出 3 行且全部已组装（模板名也进批次头）", rows.length === 1 && rows[0].instances.length === 3 && rows[0].instances.every((row) => row.status === "assembled"), JSON.stringify(rows.map((row) => [row.templateName, row.instances.map((item) => [item.instanceId, item.statusLabel])])));
 
     // A2 幂等：同一句话再说一次
     const generationMid = generationCalls.length;
     const nodesMid = project.nodes.length;
     const again = await entry.runWorkflowBatchTool({}, entryDeps());
     check("A12 幂等：同一句「处理这些视频」再说一次 → 同批次、3 实例 already_present", again.batchId === result.batchId && again.instances.length === 3 && again.instances.every((row) => row.materialized === "already_present"), JSON.stringify({ batchId: [result.batchId, again.batchId], rows: again.instances.map((row) => row.materialized) }));
-    check("A13 幂等零副作用：零新增组装调用、零新增节点、实例仍在待审批", generationCalls.length === generationMid && project.nodes.length === nodesMid && again.instances.every((row) => row.status === "awaiting_approval"), JSON.stringify({ generation: generationCalls.length - generationMid, nodes: project.nodes.length - nodesMid }));
+    check("A13 幂等零副作用：零新增组装调用、零新增节点、实例仍在已组装", generationCalls.length === generationMid && project.nodes.length === nodesMid && again.instances.every((row) => row.status === "assembled"), JSON.stringify({ generation: generationCalls.length - generationMid, nodes: project.nodes.length - nodesMid }));
 
     // 交卷证据：把**零参真调**产出的批次落成 JSON，供 ego DOM 探针原样 seed
     writeFileSync(
@@ -456,7 +433,7 @@ setSection("E");
         entryDeps(),
     );
     check("E1 显式 materials 仍照原样生效（materialsFrom=explicit、只这 2 个）", explicit.materialsFrom === "explicit" && explicit.materials.length === 2 && explicit.templateFrom === "explicit" && explicit.instances.length === 2, JSON.stringify({ from: explicit.materialsFrom, templateFrom: explicit.templateFrom, rows: explicit.materials.map((row) => [row.nodeId, row.title]) }));
-    check("E2 显式路径终点仍是待审批、付费恒 0", explicit.instances.every((row) => row.status === "awaiting_approval") && explicit.paidVideoCreations === 0, JSON.stringify(explicit.instances.map((row) => row.status)));
+    check("E2 显式路径终点仍是已组装、付费恒 0", explicit.instances.every((row) => row.status === "assembled") && explicit.paidVideoCreations === 0, JSON.stringify(explicit.instances.map((row) => row.status)));
 
     const noCanvas = await entry
         .runWorkflowBatchTool({}, { ...entryDeps(), project: () => undefined })
@@ -496,7 +473,6 @@ const summary = {
     evidence: {
         generationCalls: generationCalls.map((call) => [call.nodeId, call.mode]),
         fetchTargets: [...new Set(fetchCalls)],
-        hubCalls,
         flushes: [...new Set(flushes)],
         identitySaves: identitiesSaved.length,
         unexpectedFetch,

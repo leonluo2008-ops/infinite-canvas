@@ -6,7 +6,7 @@
  *  B. G18 产物绑定：下游 token 与连线都换成本次产物 / 占位产物删除
  *  C. 五槽代入校验：全过；意图不一致/可选段只改 metadata/挂图序错 → 逐槽 FAIL（不静默）
  *  D. 编排器：文本链只调一次（零付费视频）/ 产物绑定后半成品不能冒充 / 生成链不回报子节点 → 失败
- *  E. hub 身份：ingest→资产→正文保存（自检原样回传）→身份记录；修订变更 → revoke_required
+ *  E. 修订变更挂钩：同修订 → none；改文 → rewrite / revoke_required
  */
 
 import assert from "node:assert/strict";
@@ -23,7 +23,6 @@ import {
     planRevisionChange,
     runWorkflowInstance,
     verifySlotSubstitution,
-    type WorkflowInstanceHubClient,
     type WorkflowInstanceIdentityRecord,
 } from "@/lib/canvas/workflow-instance-run";
 import { instanceIdentityGaps, upsertInstanceIdentity } from "@/lib/canvas/workflow-instance-identity";
@@ -172,31 +171,6 @@ function makeGeneration(store: ReturnType<typeof makeStore>, opts: { token: stri
     };
 }
 
-function hubStub(options: { state?: string; selfcheck?: unknown[] } = {}) {
-    const calls: string[] = [];
-    const client: WorkflowInstanceHubClient = {
-        async ingest() {
-            calls.push("ingest");
-            return { localId: "auto-9001", bridgeId: "bridge-42", result: "OK" };
-        },
-        async uploadAsset(input) {
-            calls.push(`asset:${input.filename}`);
-            return { ref: `local:${input.filename}`, source: "local" };
-        },
-        async getTask() {
-            return { state: options.state || "awaiting_approval" };
-        },
-        async saveRevision(input) {
-            calls.push(`prompt:${input.text.length}`);
-            return { state: "awaiting_approval", approvalSnapshot: "sha-p4", selfcheck: options.selfcheck ?? [{ 序号: 1, 结论: "PASS" }, { 序号: 2, 结论: "FAIL" }] };
-        },
-        approve: async () => ({ state: "approved" }),
-        rollback: async () => ({ state: "awaiting_assets" }),
-        revoke: async () => ({ state: "awaiting_approval" }),
-    };
-    return { client, calls };
-}
-
 describe("A 组装计划（纯函数）", () => {
     it("定位组装 Config、算本次正文、认出模板占位产物与下游", () => {
         const store = makeStore();
@@ -279,7 +253,6 @@ describe("D 编排器", () => {
         const plan = planWorkflowInstance(planInput(1, mats));
         materializeTo(store, plan);
         const generation = makeGeneration(store, { token: "tokA" });
-        const hub = hubStub();
         const saved: WorkflowInstanceIdentityRecord[] = [];
         const result = await runWorkflowInstance(
             { plan, materials: mats, lapian: { taskId: "task-p4", jobId: "job-p4" } },
@@ -288,30 +261,22 @@ describe("D 编排器", () => {
                 connections: store.connections,
                 applyOps: store.apply,
                 runGeneration: generation.run,
-                hub: hub.client,
-                getBlob: async () => new Blob(["bytes"], { type: "video/mp4" }),
                 saveIdentity: (record) => void saved.push(record),
                 newRunToken: () => "tokA",
                 now: () => "2026-11-13T00:00:00.000Z",
             },
         );
         assert.equal(result.failure, undefined, JSON.stringify(result.failure));
-        assert.equal(result.status, "awaiting_approval");
+        assert.equal(result.status, "canvas_ready");
         assert.deepEqual(generation.calls.map((call) => call.mode), ["text"]);
         assert.equal(result.paidVideoCreations, 0);
         assert.equal(result.assembly?.productNodeId, "product-tokA");
         assert.equal(result.assembly?.downstreamNodeIds.length, 1);
         assert.ok(String(result.assembly?.downstreamPrompt).includes("本次产物 tokA"), "下游必须消费本次产物");
-        assert.equal(hub.calls[0], "ingest");
-        assert.ok(hub.calls[1].startsWith("asset:"), `资产应按槽序上传，实际 ${hub.calls.join(",")}`);
-        assert.ok(hub.calls[2].startsWith("prompt:"), `正文保存必须走 hub 保存语义，实际 ${hub.calls.join(",")}`);
-        assert.equal(result.identity?.hub?.localId, "auto-9001");
-        assert.equal(result.identity?.hub?.revision.digest.length, 8);
+        assert.equal(result.identity?.hub, null, "hub 退场：不再产出桥侧绑定");
         assert.equal(result.identity?.canvas.outputNodeId, "product-tokA");
-        assert.deepEqual(instanceIdentityGaps(result.identity), []);
         assert.equal(saved.length, 1);
         assert.deepEqual(upsertInstanceIdentity(saved, saved[0]), saved);
-        assert.equal(result.hub?.selfcheckFailures, 1);
     });
 
     it("生成链不回报子节点 id → failed(product_binding)，绝不按最新节点猜", async () => {
@@ -344,23 +309,6 @@ describe("D 编排器", () => {
         assert.equal(result.status, "failed");
         assert.equal(result.failure?.stage, "slot_verify");
         assert.equal(generation.calls.length, 0);
-    });
-
-    it("hub 未到待审批且没有等待器 → failed(hub_bind)，不硬写正文", async () => {
-        const store = makeStore();
-        const mats = materials("A");
-        const plan = planWorkflowInstance(planInput(1, mats));
-        materializeTo(store, plan);
-        const generation = makeGeneration(store, { token: "tokD" });
-        const hub = hubStub({ state: "ingested" });
-        const result = await runWorkflowInstance(
-            { plan, materials: mats, lapian: { taskId: "task-p4", jobId: "job-p4" } },
-            { nodes: store.nodes, connections: store.connections, applyOps: store.apply, runGeneration: generation.run, hub: hub.client, getBlob: async () => new Blob(["x"], { type: "video/mp4" }), newRunToken: () => "tokD" },
-        );
-        assert.equal(result.status, "failed");
-        assert.equal(result.failure?.stage, "hub_bind");
-        assert.match(String(result.failure?.reason), /未到待审批/);
-        assert.equal(hub.calls.includes("prompt:0"), false);
     });
 });
 

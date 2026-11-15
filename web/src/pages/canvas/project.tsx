@@ -24,7 +24,6 @@ import { registerWorkflowBatchRuntime } from "@/lib/canvas/workflow-batch-runtim
 import { setBatchQueue } from "@/lib/canvas/workflow-batch-queue";
 import { upsertBatchMember } from "@/lib/canvas/workflow-batch";
 import { upsertInstanceIdentity } from "@/lib/canvas/workflow-instance-identity";
-import { createHubIdentityClient } from "@/lib/canvas/workflow-instance-hub";
 import { toLegacyPayload } from "@/lib/canvas/wan-file-task-map";
 import { cameraCoverage } from "@/lib/canvas/camera-coverage";
 import { App, Button, Modal } from "antd";
@@ -153,7 +152,7 @@ type LapianAssetFrame = { url: string; t: number; width: number; height: number;
 const VIDEO_NODE_MAX_WIDTH = 420;
 const VIDEO_NODE_MAX_HEIGHT = 420;
 
-// AT-17 B3：画布链音频三态——读回 / 落盘（hub 链走 /api/hub/task/<id>/audio-mode，各链各的端点）。
+// AT-17 B3：画布链音频三态——读回 / 落盘（各链各的端点，画布链=/api/audio-mode/<id>）。
 // 画布链没有 approve：落 audio_mode.json 即生效，渲染时 render.py 自己读这份（B2a 的 resolve_audio_mode）。
 type CanvasAudioMode = { audio_mode: string; 依据: string; 待核对: boolean };
 
@@ -1007,7 +1006,7 @@ function InfiniteCanvasPage() {
      *
      * 只把页面**已有**能力接给 `workflow-batch-runtime`：ops 应用走 `applyAgentOps`（`useAgentBridge`
      * 导出的那一个）、生成链走 `generateNodeRef`、落盘走 `updateProject`/`flushProjects`、
-     * hub 读走 `createHubIdentityClient`。**不改任何既有行为**：没有批次时这些回调永不触发。
+     * **不改任何既有行为**：没有批次时这些回调永不触发。
      */
     const flushProjects = useCanvasStore((state) => state.flushProjects);
     const batchRuntimeProject = useRef(currentProject);
@@ -1027,7 +1026,6 @@ function InfiniteCanvasPage() {
                 });
                 return { childNodeId };
             },
-            hub: createHubIdentityClient(),
             getBlob: getMediaBlob,
             saveIdentity: (record) => {
                 const project = batchRuntimeProject.current;

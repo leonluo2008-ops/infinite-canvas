@@ -110,20 +110,9 @@ await page.cdp("Page.addScriptToEvaluateOnNewDocument", {
         const log = { requests: [], hubTask: 0, submit: 0 };
         window.__p10Net = log;
         const orig = window.fetch.bind(window);
-        const json = (payload, status = 200) => new Response(JSON.stringify(payload), { status, headers: { "Content-Type": "application/json" } });
         window.fetch = async function (input, init) {
             const url = typeof input === "string" ? input : (input && input.url) || "";
             if (url.includes("/api/")) log.requests.push(url);
-            if (url.includes("/api/hub/task/")) {
-                log.hubTask += 1;
-                const id = decodeURIComponent(url.split("/api/hub/task/")[1].split(/[/?#]/)[0]);
-                return json({ task: { local_id: id, state: "awaiting_approval", bridge_id: "p10-bridge", intent: "P10 探针夹具", video_name: "探针素材.mp4", created_at: "2026-11-14T00:00:00.000Z", gen_progress: null, has_output: false, pair_lines: [], asset_cards: [], suggestions: [], summary_md: "", checklist_md: "", prompt_md: "", 自检: [], submit: { form: "none", active_submit: false, can_resume: false }, error: "" } });
-            }
-            if (url.includes("/api/hub/submit/")) {
-                log.submit += 1;
-                return json({ ok: true, job_id: "p10-stub-job" });
-            }
-            if (url.includes("/api/hub/")) return json({ ok: true });
             return orig(input, init);
         };
     })();`,

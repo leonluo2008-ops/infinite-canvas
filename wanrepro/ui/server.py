@@ -52,14 +52,15 @@ _NOWINDOW_DIR = str(ROOT / "pipeline" / "_nowindow")
 if _NOWINDOW_DIR not in sys.path:
     sys.path.insert(0, _NOWINDOW_DIR)
 
-import hub_api  # noqa: E402 —— 自动化工作台业务层（内部自行把 wanrepro/ 加进 sys.path）
 os.environ["PYTHONPATH"] = _NOWINDOW_DIR + (os.pathsep + os.environ["PYTHONPATH"] if os.environ.get("PYTHONPATH") else "")
 import sitecustomize  # noqa: E402  （_nowindow 目录；import 即安装 subprocess 无窗口补丁）
-from automation import config as auto_config, local_assets  # noqa: E402  AT-14 B3 本地资产（config.PROJECTS_DIR 与 hub TASKS_DIR 同源）
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))   # automation/ 包在仓库根（sys.path 装配收编到这）
+from automation import config as auto_config, frames as auto_frames, local_assets, state as auto_state  # noqa: E402  AT-14 B3 本地资产（config.PROJECTS_DIR）
 from automation import replace as auto_replace          # noqa: E402  AT-22 B0 清单写锁（两链同一把）
 
-# 拆解产物根：与 hub_api._analysis_reverse / replace.analysis_root / state 同一真源
-# （`WANREPRO_ANALYSIS_ROOT` 优先）。为什么画布链也要认它：清单是本模块与 hub 链共写的
+# 拆解产物根：与 replace.analysis_root / state 同一真源
+# （`WANREPRO_ANALYSIS_ROOT` 优先）。为什么画布链也要认它：清单是各链共写的
 # 同一份文件，根不一致 = 读 A 写 B 的伪隔离（隔离探针会打到真实 analysis/reverse）。
 _ANALYSIS_ENV = (os.environ.get("WANREPRO_ANALYSIS_ROOT") or "").strip()
 ANALYSIS = Path(_ANALYSIS_ENV).expanduser() if _ANALYSIS_ENV else ROOT / "analysis" / "reverse"
@@ -595,7 +596,7 @@ _INTENT_MODULE_CACHE: list = []
 
 
 def _intent_module():
-    """按路径加载 pipeline/reverse/intent.py（与 hub_api._intent_mod 同一做法，进程内缓存一次）。"""
+    """按路径加载 pipeline/reverse/intent.py（进程内缓存一次）。"""
     if _INTENT_MODULE_CACHE:
         return _INTENT_MODULE_CACHE[0]
     import importlib.util
@@ -769,7 +770,7 @@ VC_UPLOAD_BASE = os.environ.get("WANREPRO_VC_UPLOAD_BASE", "http://1.14.74.186/u
 VC_UPLOAD_TIMEOUT = 60
 VC_PUBLIC_BASE = os.environ.get("WANREPRO_VC_PUBLIC_BASE", "https://vc.aistar.work/vc/")   # 渠道只收 https
 
-# 上传渠道计数（AT-14 B3 A2，/api/hub/where 透出）：local=本地引用（零图床），
+# 上传渠道计数（AT-14 B3 A2，诊断面透出）：local=本地引用（零图床），
 # uguu=转传成功，tencent=腾讯云图床。只增不减，进程内诊断面用。
 ASSET_COUNTERS = {"local": 0, "uguu": 0, "tencent": 0}
 _ASSET_COUNTERS_LOCK = threading.Lock()
@@ -2078,15 +2079,6 @@ class Handler(BaseHTTPRequestHandler):
             raise ApiError(400, "请求体必须是 JSON 对象")
         return payload
 
-    def _rows_param(self, payload: dict) -> list[int]:
-        """确认组端点的 rows 参数：非空整数数组（清单行号）。"""
-        raw = (payload or {}).get("rows")
-        if not isinstance(raw, list) or not raw:
-            raise ApiError(400, "rows 必须是非空数组（待确认清单的行号）")
-        try:
-            return sorted({int(x) for x in raw})
-        except (TypeError, ValueError):
-            raise ApiError(400, "rows 必须是整数数组") from None
 
     # -- 路由 ------------------------------------------------------
     def do_GET(self) -> None:
@@ -2178,9 +2170,6 @@ class Handler(BaseHTTPRequestHandler):
         except ApiError as err:
             self.send_json({"error": err.msg, **({"stage": err.stage} if err.stage else {}), **err.extra},
                            err.status)
-        except hub_api.HubError as e:      # 工作台业务错（状态不对/文件缺失）→ 4xx，原文给员工看
-            # AT-13 §2.2：配置不合法（HubInputError）→ 400，不是状态冲突 409
-            extra = getattr(e, "extra", None)
             self.send_json({"error": str(e), **(extra if isinstance(extra, dict) else {})},
                            getattr(e, "status", 409))
         except subprocess.TimeoutExpired:
@@ -2197,23 +2186,25 @@ class Handler(BaseHTTPRequestHandler):
                 self.close_connection = True
 
     def route_get(self, path: str) -> None:
-        # ---- 自动化工作台（hub）：任务列表/详情/成片/job 轮询 ----
-        if path == "/api/hub/tasks":
-            self.send_json({"tasks": hub_api.list_tasks()})
+        if path == "/api/lapian/slot":
+            # 拆解槽真相（只读）：hub 侧用它把「槽忙」翻成人话（在等谁的远程返回、预计还需多久）
+            self.send_json(lapian_slot_view())
             return
-        if path == "/api/hub/where":
-            # 数据根自述（诊断面）：探针跑前据此断言「服务端写入目录 == 探针读取目录」，
-            # 读/写分家的伪隔离直接拒跑（AT-14 B2 P0：真实任务 auto-0001 被误删）。
-            # AT-14 B3 A2：附上传渠道计数（local/uguu/tencent），装配链自述可对账。
-            self.send_json({**hub_api.where(), "asset_counters": dict(ASSET_COUNTERS)})
-            return
-        m = re.fullmatch(r"/api/hub/asset-file/([^/]+)/([^/]+)", path)
+        m = re.fullmatch(r"/api/frame-file/([^/]+)/([^/]+)", path)
         if m:
-            # AT-14 B3 A：本地引用取图（local:任务号/asset-uploads/文件名 的读面）。
-            # 为什么不能复用现有 /assets/ 路由：那条按 bridge_id 取 bridge 资产目录
-            # （analysis/reverse/<bridge_id>/assets）、且只认 图片N 扩展名；本地引用按
-            # automation local_id 分任务目录、内容寻址命名（16位hex），且在上传时就
-            # 要能取（拆解/桥任务存在之前）——两套命名两套根，塞不进同一个 handler。
+            # 帧缓存取图（只认 frames 缓存目录里的 png/jpg，不认目录穿越）。
+            bridge_id = urllib.parse.unquote(m.group(1))
+            name = urllib.parse.unquote(m.group(2))
+            if "/" in name or "\\" in name or not name.lower().endswith((".png", ".jpg", ".jpeg")):
+                raise ApiError(404, "没有这个帧文件")
+            f = auto_frames.frames_dir(bridge_id) / name
+            if not f.is_file():
+                raise ApiError(404, f"帧缓存里没有 {name}")
+            self.send_body(f.read_bytes(), 200, MIME.get(f.suffix.lower().lstrip("."), "image/png"))
+            return
+        m = re.fullmatch(r"/api/local-asset/([^/]+)/([^/]+)", path)
+        if m:
+            # 本地引用取图：local:任务号/asset-uploads/文件名 的读面（上传时要能取，拆解之前也在）。
             local_id = urllib.parse.unquote(m.group(1))
             name = urllib.parse.unquote(m.group(2))
             try:
@@ -2224,35 +2215,6 @@ class Handler(BaseHTTPRequestHandler):
                     ".jpeg": "image/jpeg", ".webp": "image/webp"}.get(
                         Path(name).suffix.lower(), "application/octet-stream")
             self.send_body(blob, 200, mime)
-            return
-        m = re.fullmatch(r"/api/hub/task/([^/]+)", path)
-        if m:
-            self.send_json({"task": hub_api.get_task(urllib.parse.unquote(m.group(1)))})
-            return
-        if path == "/api/lapian/slot":
-            # 拆解槽真相（只读）：hub 侧用它把「槽忙」翻成人话（在等谁的远程返回、预计还需多久）
-            self.send_json(lapian_slot_view())
-            return
-        m = re.fullmatch(r"/api/hub/file/([^/]+)", path)
-        if m:
-            f = hub_api.output_file(urllib.parse.unquote(m.group(1)))
-            self.send_body_bytes_or_file(f)
-            return
-        m = re.fullmatch(r"/api/hub/job/([^/]+)", path)
-        if m:
-            self.send_json(hub_api.job_status(urllib.parse.unquote(m.group(1))))
-            return
-        m = re.fullmatch(r"/api/hub/frame/([^/]+)/([^/]+)", path)
-        if m:
-            # AT-8 B2：置换台帧图（看帧缓存 / at8 派生帧同目录；只认 png/jpg，不认目录穿越）
-            f = hub_api.frame_file(urllib.parse.unquote(m.group(1)),
-                                   urllib.parse.unquote(m.group(2)))
-            self.send_body(f.read_bytes(), 200,
-                           MIME.get(f.suffix.lower().lstrip("."), "image/png"))
-            return
-        m = re.fullmatch(r"/api/hub/render/([^/]+)", path)
-        if m:
-            self.send_json(hub_api.do_render(urllib.parse.unquote(m.group(1))))
             return
         # ---- 图床直链（M4）：https://vc-t.aistar.work/vc/<key> → uploads/vc/<key> ----
         if path.startswith("/vc/"):
@@ -2411,212 +2373,6 @@ class Handler(BaseHTTPRequestHandler):
         raise ApiError(404, f"没有这个地址：{path}")
 
     def route_post(self, path: str) -> None:
-        # ---- 自动化工作台（hub）：建任务/拆解/置换/确认/渲染/批准/提交 ----
-        if path == "/api/hub/maintenance/scan-lost-runs":
-            # AT-18 §4.1：假运行态对账扫描（手动/定时同一入口）。默认 dry-run 只返回清单；
-            # apply=true 才真的降级（幂等：已 failed 的下一轮进 skipped{not_running}）。
-            payload = self.read_json()
-            self.send_json(hub_api.scan_lost_runs(apply=payload.get("apply") is True))
-            return
-        if path == "/api/hub/maintenance/sweep-residue":
-            # t_4f779245：删除通道残留清扫（隔离箱 `.trash/` + 无 任务.json 的孤儿目录）。
-            # 同样默认 dry-run 只报清单；apply=true 才真删（启动对账/watchdog 走 apply=True）。
-            payload = self.read_json()
-            self.send_json(hub_api.sweep_residue(apply=payload.get("apply") is True))
-            return
-        if path == "/api/hub/ingest":
-            self.do_hub_ingest()
-            return
-        m = re.fullmatch(r"/api/hub/asset-probe/([^/]+)", path)
-        if m:
-            # AT-14 B3 A3：该任务全部资产引用健康态（local/ok/expired/unknown + 显示URL）
-            self.read_json()                    # 无字段，读掉请求体保持 keep-alive 干净
-            self.send_json(hub_api.probe_assets(urllib.parse.unquote(m.group(1))))
-            return
-        m = re.fullmatch(r"/api/hub/discuss/([^/]+)", path)
-        if m:
-            self.send_json(hub_api.start_discuss(urllib.parse.unquote(m.group(1))))
-            return
-        m = re.fullmatch(r"/api/hub/assets/([^/]+)", path)
-        if m:
-            self.do_hub_assets(urllib.parse.unquote(m.group(1)))
-            return
-        m = re.fullmatch(r"/api/hub/confirm/([^/]+)", path)
-        if m:
-            # AT-9 B2：body 可带 empty_confirm:true = 全沿用（空置换显式确认 → rendering）
-            # AT-9 B5：body 可带 按原样:[行号] = 确认时点「知道，按原样」勾选（自检③锁点对账数据源）
-            payload = self.read_json()
-            raw_acks = payload.get("按原样")
-            try:
-                ack_rows = sorted({int(x) for x in raw_acks}) if raw_acks else []
-            except (TypeError, ValueError):
-                raise ApiError(400, "按原样 必须是行号数组") from None
-            self.send_json(hub_api.do_confirm(urllib.parse.unquote(m.group(1)),
-                                              empty_confirm=bool(payload.get("empty_confirm")),
-                                              ack_rows=ack_rows))
-            return
-        m = re.fullmatch(r"/api/hub/render/([^/]+)", path)
-        if m:
-            self.send_json(hub_api.do_render(urllib.parse.unquote(m.group(1))))
-            return
-        m = re.fullmatch(r"/api/hub/approve/([^/]+)", path)
-        if m:
-            # AT-13 §2.2/§三：body 可带 config（画布生成配置：渠道身份/model/mode/params，**无 key**）
-            # → 服务端白名单取键（hub_api._normalize_config 校验+构造）→ 固化+算 v2 快照 → approved。
-            # 不带 config = 旧语义（v1 快照，老任务/CLI），行为零变化。
-            payload = self.read_json()
-            config = payload.get("config")
-            if config is not None and not isinstance(config, dict):
-                raise ApiError(400, "config 必须是 JSON 对象（{渠道身份,model,mode,params}）")
-            self.send_json(hub_api.do_approve(urllib.parse.unquote(m.group(1)), config=config))
-            return
-        m = re.fullmatch(r"/api/hub/submit/([^/]+)", path)
-        if m:
-            # AT-13 §三：body 可带 key（一次性，不落盘、不进 argv/URL/日志）→ start_submit 透传
-            payload = self.read_json()
-            key = payload.get("key")
-            if key is not None and not isinstance(key, str):
-                raise ApiError(400, "key 必须是字符串（渠道密钥，提交时一次性透传）")
-            self.send_json(hub_api.start_submit(urllib.parse.unquote(m.group(1)),
-                                                key=(key or "").strip() or None))
-            return
-        m = re.fullmatch(r"/api/hub/task/([^/]+)/release", path)
-        if m:
-            # AT-13 §2.3：人工解除「未知收单」阻断（核对渠道无单之后，身体带 confirm:true）
-            payload = self.read_json()
-            self.send_json(hub_api.release_submit_unknown(
-                urllib.parse.unquote(m.group(1)),
-                confirm=payload.get("confirm") is True,
-                note=str(payload.get("note") or "")))
-            return
-        m = re.fullmatch(r"/api/hub/task/([^/]+)/recover", path)
-        if m:
-            # AT-13 §2.4：generating 孤儿受控恢复（四守卫，confirm:true 才动）
-            payload = self.read_json()
-            self.send_json(hub_api.recover_orphan(urllib.parse.unquote(m.group(1)),
-                                                  confirm=payload.get("confirm") is True))
-            return
-        m = re.fullmatch(r"/api/hub/task/([^/]+)/audio-mode", path)
-        if m:
-            # AT-17 B3：确认流改选音频三态 → 落盘 + 按新三态重渲染 + 门禁重判（hub_api 一处收口）。
-            # body: {"audio_mode": "沿用原片|按新主体调整|不要"}；枚举外 → 400，状态不对 → 409。
-            payload = self.read_json()
-            self.send_json(hub_api.set_audio_mode(urllib.parse.unquote(m.group(1)),
-                                                  str(payload.get("audio_mode") or "")))
-            return
-        m = re.fullmatch(r"/api/hub/task/([^/]+)/selfcheck-whitelist", path)
-        if m:
-            # AT-22 E4：误报豁免白名单（行×词键）。
-            #   POST   {"行": 6|[5,6], "词": "右下角"} → 加白 + 自检重跑回显
-            #   DELETE 同上（撤销这几行的这个词）或 {"全部": true}（全撤）
-            payload = self.read_json()
-            local_id = urllib.parse.unquote(m.group(1))
-            if str(getattr(self, "command", "POST") or "POST").upper() == "DELETE":
-                self.send_json(hub_api.set_selfcheck_whitelist(
-                    local_id, hub_api.whitelist_rows(payload),
-                    word=str(payload.get("词") or ""), remove=True,
-                    remove_all=payload.get("全部") is True))
-                return
-            self.send_json(hub_api.set_selfcheck_whitelist(
-                local_id, hub_api.whitelist_rows(payload),
-                word=str(payload.get("词") or "")))
-            return
-        m = re.fullmatch(r"/api/hub/task/([^/]+)/revoke", path)
-        if m:
-            # AT-13 §2.2/§2.4：撤销批准（受控回退 approved→awaiting_approval，不自动重批）
-            payload = self.read_json()
-            self.send_json(hub_api.revoke_approval(
-                urllib.parse.unquote(m.group(1)),
-                note=str(payload.get("note") or "撤销批准（改配置后重批）")))
-            return
-        # ---- AT-9 B2：任务级 REST（确认组 / 回退 / 删除，路径参数非模板变量） ----
-        m = re.fullmatch(r"/api/hub/task/([^/]+)/force-finish", path)
-        if m:
-            # AT-18 §4.2：所有者人工兜底口（覆盖阈值误判）。二次确认参数缺/类型不对 → 400；
-            # 状态不是运行态 → 409；已 failed → 200 幂等（不二次写 history）。
-            payload = self.read_json()
-            self.send_json(hub_api.force_finish(
-                urllib.parse.unquote(m.group(1)),
-                confirm=payload.get("confirm"),
-                confirm_name=payload.get("confirm_name"),
-                reason=str(payload.get("reason") or "")))
-            return
-        m = re.fullmatch(r"/api/hub/task/([^/]+)/delete", path)
-        if m:
-            payload = self.read_json()
-            confirm_name = payload.get("confirm_name")
-            self.send_json(hub_api.delete_task(urllib.parse.unquote(m.group(1)),
-                                               confirm_name=None if confirm_name is None
-                                               else str(confirm_name)))
-            return
-        m = re.fullmatch(r"/api/hub/task/([^/]+)/fork", path)
-        if m:
-            # AT-21 B0：复用为新版本 → 派生**新任务**（源任务只读，产物按 bridge 共享，清单/资产图各一份）。
-            # 只接受无体（或空体）请求：派生不携带任何「沿用上次配置」参数——新版本必须重新批准。
-            self.send_json(hub_api.fork_task(urllib.parse.unquote(m.group(1))))
-            return
-        m = re.fullmatch(r"/api/hub/task/([^/]+)/prompt", path)
-        if m:
-            # AT-21 B0 D3-②：手改正文 → 直写 提示词.md + 重算审批快照 + 自检/音频门禁重跑。
-            # body: {"text": "<全文>", "expect_text": "<打开编辑器时的正文，可选乐观锁>"}
-            payload = self.read_json()
-            self.send_json(hub_api.save_prompt_text(
-                urllib.parse.unquote(m.group(1)),
-                str(payload.get("text") if payload.get("text") is not None else ""),
-                expect_text=None if payload.get("expect_text") is None
-                else str(payload.get("expect_text"))))
-            return
-        m = re.fullmatch(r"/api/hub/task/([^/]+)/group", path)
-        if m:
-            # AT-11 M2 确认小窗：可选 主行/组名 → 『组元数据』落盘（缺省仍=最小行）。
-            payload = self.read_json()
-            primary = payload.get("主行")
-            self.send_json(hub_api.group_rows(urllib.parse.unquote(m.group(1)),
-                                              self._rows_param(payload),
-                                              primary=payload.get("主行"),
-                                              name=payload.get("组名")))
-            return
-        m = re.fullmatch(r"/api/hub/task/([^/]+)/ungroup", path)
-        if m:
-            self.send_json(hub_api.ungroup_rows(urllib.parse.unquote(m.group(1)),
-                                                self._rows_param(self.read_json())))
-            return
-        m = re.fullmatch(r"/api/hub/task/([^/]+)/rollback", path)
-        if m:
-            self.read_json()                    # 无字段，读掉请求体保持 keep-alive 干净
-            self.send_json(hub_api.do_rollback(urllib.parse.unquote(m.group(1))))
-            return
-        m = re.fullmatch(r"/api/hub/task/([^/]+)/retry", path)
-        if m:
-            # AT-9 B5：failed 态续跑入口（重跑即续，产物优先）；非 failed → 409
-            self.read_json()                    # 无字段，读掉请求体保持 keep-alive 干净
-            self.send_json(hub_api.start_retry(urllib.parse.unquote(m.group(1))))
-            return
-        if path == "/api/hub/asset":
-            # AT-8 B2 写路径（数据合同 v3）：{task_id,n,image_url} 覆盖 / {…,clear:true} 清空 /
-            # {…,text} 写命名；AT-11/AT-12 扩展：{…,decision} 行决策（keep_origin/dismissed/restore，与上互斥）；
-            # AT-22 E3 扩展：{…,desc,expect_desc?,rerender?} 写「用我的描述」列（awaiting_approval 时
-            # 同一请求内重渲染 + 自检/门禁重跑），与上面各支互斥。
-            payload = self.read_json()
-            try:
-                n = int(payload.get("n"))
-            except (TypeError, ValueError):
-                raise ApiError(400, "n 必须是整数（待确认清单的行号）") from None
-            text = payload.get("text")
-            decision = payload.get("decision")
-            desc = payload.get("desc")
-            expect_desc = payload.get("expect_desc")
-            self.send_json(hub_api.set_asset(
-                str(payload.get("task_id") or ""), n,
-                image_url=(str(payload.get("image_url") or "").strip() or None),
-                clear=bool(payload.get("clear")),
-                text=None if text is None else str(text),
-                decision=str(decision) if decision else None,
-                desc=None if desc is None else str(desc),
-                expect_desc=None if expect_desc is None else str(expect_desc),
-                rerender=bool(payload.get("rerender")),
-            ))
-            return
         if path == "/api/asset/upload":
             self.do_asset_upload()
             return
@@ -2736,81 +2492,7 @@ class Handler(BaseHTTPRequestHandler):
                 left -= len(chunk)
         return written
 
-    def do_hub_ingest(self) -> None:
-        """POST /api/hub/ingest —— multipart(video=<文件>, intent=<文本>) → 建任务。
 
-        收完落临时文件转 automation.ingest（幂等键=视频 sha，同片重传命中同任务）。
-        """
-        length = int(self.headers.get("Content-Length") or 0)
-        ctype = (self.headers.get("Content-Type") or "").lower()
-        if not ctype.startswith("multipart/") or length <= 0:
-            raise ApiError(400, "hub/ingest 要 multipart：video=<文件> intent=<文本>")
-        if length > 64 * 1024 * 1024:
-            raise ApiError(413, f"浏览器直传上限 64 MB（收到 {length / 1048576:.1f} MB）")
-        bm = re.search(r"boundary=([^;]+)", self.headers.get("Content-Type") or "", re.IGNORECASE)
-        if not bm:
-            raise ApiError(400, "multipart 缺 boundary")
-        fields, files = parse_multipart(self.read_body(), bm.group(1).strip().strip('"'))
-        if "video" not in files:
-            raise ApiError(400, "multipart 里没有 video 字段（文件放 video 字段）")
-        name, blob = files["video"]
-        UPLOADS.mkdir(parents=True, exist_ok=True)
-        stem, ext = clean_video_name(name)
-        suffix = f".{ext}".lower() if ext else Path(name).suffix.lower()
-        if suffix not in {".mp4", ".mov", ".webm"}:
-            raise ApiError(400, f"参考视频只收 mp4/mov/webm（收到 {suffix or '无扩展名'}）")
-        # 两段式：临时目录+原始名——video_name/桥任务 id 都来自文件名，不能让 .hub-incoming 泄进去
-        tdir = UPLOADS / f".hub-incoming-{os.getpid()}-{int(time.time() * 1000)}"
-        tdir.mkdir(parents=True, exist_ok=True)
-        temp = tdir / f"{stem}{suffix}"
-        try:
-            temp.write_bytes(blob)
-            if temp.stat().st_size <= 0:
-                raise ApiError(400, "视频是空的（0 字节）")
-            res = hub_api.do_ingest(temp, fields.get("intent", ""))
-        finally:
-            for p in tdir.iterdir():
-                p.unlink(missing_ok=True)
-            if tdir.is_dir():
-                tdir.rmdir()
-        self.send_json(res)
-
-    def do_hub_assets(self, local_id: str) -> None:
-        """POST /api/hub/assets/<local_id> —— multipart 多图（file / file0 / file1 …）。
-
-        parse_multipart 同名字段会覆盖，所以多图用 file、file0、file1… 任意组合。
-        """
-        length = int(self.headers.get("Content-Length") or 0)
-        ctype = (self.headers.get("Content-Type") or "").lower()
-        if not ctype.startswith("multipart/") or length <= 0:
-            raise ApiError(400, "hub/assets 要 multipart：file=<图片>（多图用 file0/file1…）")
-        if length > 20 * 1024 * 1024:
-            raise ApiError(413, f"图太大（{length / 1048576:.1f} MB），单次上限 20 MB")
-        bm = re.search(r"boundary=([^;]+)", self.headers.get("Content-Type") or "", re.IGNORECASE)
-        if not bm:
-            raise ApiError(400, "multipart 缺 boundary")
-        _fields, files = parse_multipart(self.read_body(), bm.group(1).strip().strip('"'))
-        items = sorted((k, v) for k, v in files.items() if k == "file" or k.startswith("file"))
-        if not items:
-            raise ApiError(400, "multipart 里没有图（文件放 file 字段，多图 file0/file1…）")
-        paths: list[Path] = []
-        try:
-            for i, (_k, (name, blob)) in enumerate(items):
-                suffix = Path(name).suffix.lower()
-                if suffix not in {".png", ".jpg", ".jpeg", ".webp"}:
-                    raise ApiError(400, f"替换图只收 png/jpg/webp（{name} 是 {suffix or '无扩展名'}）")
-                p = UPLOADS / f".hub-asset-{local_id}-{int(time.time() * 1000)}-{i}{suffix}"
-                p.write_bytes(blob)
-                paths.append(p)
-            res = hub_api.do_assets(local_id, paths)
-        finally:
-            for p in paths:
-                p.unlink(missing_ok=True)
-        self.send_json(res)
-
-    def send_body_bytes_or_file(self, f: Path) -> None:
-        """成片发送：小文件整读；带 Range 支持的流式留给后续（当前成片 ≤ 数 MB）。"""
-        self.send_body(f.read_bytes(), 200, "video/mp4")
 
     def do_asset_upload(self) -> None:
         """POST /api/asset/upload —— 参考图上传。
@@ -3482,6 +3164,36 @@ def lapian_payload(tid: str, spec: str) -> dict:
             "markdown": render_lapian.render_markdown(tid, spec, blocks)}
 
 
+def private_list_dir(bridge_id: str, list_task: str | None) -> Path | None:
+    """`checklist_task` 查询参数 → 私有清单所在目录（桥侧渲染用）；空 → None（走共享清单）。
+
+    三重校验，缺一不可：
+      ① 形状：只认 `auto-<数字>`，绝不把调用方字符串直接拼进路径（`../`、绝对路径、UNC 全挡）；
+      ② 归属：该任务的 bridge_id 必须等于请求里的桥 id（否则 A 桥的渲染能读任意任务清单）；
+      ③ 真源：这个任务确实是 fork（清单在它自己目录里），且那份副本真实存在。
+    任一项不过就 4xx 原文回给调用方——静默退回共享清单会让 fork 改了描述却渲染出旧正文。
+    """
+    tid = str(list_task or "").strip()
+    if not tid:
+        return None
+    if not re.fullmatch(r"auto-\d+", tid):
+        raise ApiError(400, f"清单作用域只认任务号（形如 auto-0066），收到 {tid!r}")
+    tdir = auto_config.PROJECTS_DIR / tid
+    if not (tdir / "任务.json").is_file():
+        raise ApiError(404, f"任务不存在: {tid}")
+    task = auto_state.load(tdir)
+    if str(task.get("bridge_id") or "") != str(bridge_id or ""):
+        raise ApiError(403, f"任务 {tid} 的拆解产物不在 {bridge_id or '（空）'} 下"
+                       f"（它的 bridge_id={task.get('bridge_id') or '空'}）——拒绝跨桥引用清单")
+    scope = auto_replace.private_scope(tid, task)
+    if not scope:
+        raise ApiError(400, f"任务 {tid} 用的是共享清单（不是派生任务），不该带 checklist_task")
+    path = auto_replace.checklist_path(bridge_id, scope)
+    if not path.is_file():
+        raise ApiError(409, f"任务 {tid} 的私有清单副本不在：{path.name}（派生任务必须自带清单）")
+    return path.parent
+
+
 def render_payload(tid: str, spec_name: str, optional: str = "", audio_mode: str = "",
                    checklist_task: str = "") -> dict:
     """M3 bridge：生成规范 → 提示词正文（走 render.py，产物照常落盘可回看）。
@@ -3493,7 +3205,7 @@ def render_payload(tid: str, spec_name: str, optional: str = "", audio_mode: str
     AT-21 B0：`checklist_task` 是**清单作用域**（派生任务号）。非空 = 这次渲染读那个任务自己的
     私有清单副本（`任务目录/待确认清单.md/.json`），产物也落它自己的任务目录——共享 `analysis/reverse/<id>`
     里的清单/提示词一概不碰（否则 fork 一渲染就把源任务侧的共享提示词覆盖了）。
-    形状/归属/存在三重校验在 `hub_api.private_list_dir`，这里只转发。
+    形状/归属/存在三重校验在本模块 `private_list_dir`（原桥侧清单作用域逻辑收编至此），这里直调。
     """
     sys.path.insert(0, str(ROOT / "pipeline" / "reverse"))
     from spec_registry import load_registry
@@ -3505,7 +3217,7 @@ def render_payload(tid: str, spec_name: str, optional: str = "", audio_mode: str
     if meta["类型"] != "生成":
         raise ApiError(400, f"{spec_name} 是{meta['类型']}规范，不是生成规范")
     task_dir(tid)                                    # 校验任务存在（404 语义一致）
-    scoped = hub_api.private_list_dir(tid, checklist_task)   # None = 共享清单（既有行为）
+    scoped = private_list_dir(tid, checklist_task)           # None = 共享清单（既有行为）
     tpl_stem = Path(meta["正文模板"]).stem
     argv = ["--id", tid, "--template", tpl_stem]
     if scoped is not None:
@@ -3819,21 +3531,6 @@ def main(argv: list[str] | None = None) -> int:
     print(f"[OK] {url}  （Ctrl+C 停）", flush=True)
     print(f"     仓库：{ROOT}", flush=True)
     print(f"     ffmpeg: {ffmpeg_src}", flush=True)
-    # AT-18 §5.2：后台对账看门狗（首个 30s 后首跑，之后每 300s）。可关：--no-watchdog 或
-    # WANREPRO_WATCHDOG=0（隔离探针必须带上，免自动降级干扰夹具）。
-    watchdog_on = (not args.no_watchdog
-                   and (os.environ.get("WANREPRO_WATCHDOG", "1") or "").strip() != "0")
-    watchdog_started = hub_api.start_lost_run_watchdog() if watchdog_on else False
-    print(f"     假运行态对账：{'每 300s 自动扫描' if watchdog_started else '已关闭（手动 scan 入口仍可用）'}",
-          flush=True)
-    # AT-19 §3：启动即对账——bind + [OK] 之后立刻后台跑**一次** apply 扫描（不等 watchdog 首跑
-    # 的 30s）。可关：WANREPRO_BOOT_RECONCILE=0（只影响这一条，watchdog 另有开关）。
-    boot_on = (os.environ.get("WANREPRO_BOOT_RECONCILE", "1") or "").strip() != "0"
-    if boot_on:
-        hub_api.startup_reconcile_async()
-        print("     启动即对账：已触发（结果行随扫描完成打印）", flush=True)
-    else:
-        print("     启动即对账：已关闭（WANREPRO_BOOT_RECONCILE=0）", flush=True)
     if not args.no_browser and WEB_DIST_ROOT is not None:
         threading.Timer(0.8, lambda: webbrowser.open(url)).start()  # 整合包才开页；开发机画布在 vite :3000
     try:
@@ -3841,15 +3538,6 @@ def main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         print("\n[ui] 已停", flush=True)
     finally:
-        hub_api.stop_lost_run_watchdog()
-        # AT-19 §1.5 停服语义：Ctrl+C **不杀执行体**（执行体与 server 解耦正是目标本身），
-        # 但必须可见——重启后启动对账会按磁盘证据接管其状态。
-        alive = [rec for rec in hub_api.HUB_JOBS.values()
-                 if rec.get("mode") == "process" and rec.get("status") == "running"
-                 and rec.get("pid")]
-        for rec in alive[:5]:
-            print(f"[ui] 拆解执行体仍在后台运行（pid={rec.get('pid')} kind={rec.get('kind')} "
-                  f"job={rec.get('local_id')}），重启后启动对账会接管其状态", flush=True)
         httpd.server_close()
     return 0
 

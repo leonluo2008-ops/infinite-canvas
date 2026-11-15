@@ -9,9 +9,9 @@
  * 分段（判据见卡面「探针验收」）：
  *   A 抽模板：显式节点边界 → 五槽声明/冻结项/零图外引用；缺省边界 → 图外引用如实报告且标记「不冻结」；
  *             模板落盘到项目 workflowTemplate；空画布 → 人话拒绝
- *   B 批次：3 素材 → 建批次 → 3 实例全部到待审批；队列并发 3；侧栏 buildReviewList 出 3 行；
+ *   B 批次：3 素材 → 建批次 → 3 实例全部到已组装；队列并发 3；侧栏 buildReviewList 出 3 行；
  *           付费动作提取 = 0（runGeneration 只 mode:"text"，零视频创建端点）
- *   C 单实例：单素材跑到待审批；同素材重复调用幂等（同实例 already_present、零新增生成、零冲突）；
+ *   C 单实例：单素材跑到已组装；同素材重复调用幂等（同实例 already_present、零新增生成、零冲突）；
  *           换素材撞同号实例 → 如实拒绝、绝不覆盖
  *   D 不冻结模板：建批次被拒绝（P2 契约「图外引用 → 实例化器须拒绝或补槽」）
  *   E 零回归：tsc 基线仍只有 1 条既有错误；探针自身无付费生成调用点；跨画布模板 id 被拒绝
@@ -160,12 +160,10 @@ const flushes = [];
 const logs = [];
 const generationCalls = [];
 const fetchCalls = [];
-const hubCalls = { ingest: 0, upload: 0, getTask: 0 };
 const identitySaves = [];
 const identitiesSaved = [];
 let uploadSeq = 0;
 let generationSeq = 0;
-let hubState = "awaiting_approval";
 
 const applyOpsWithProject = async (batchOps) => {
     const next = ops.applyCanvasAgentOps(
@@ -175,26 +173,6 @@ const applyOpsWithProject = async (batchOps) => {
     project = { ...project, nodes: next.nodes, connections: next.connections };
 };
 
-const hub = {
-    ingest: async () => {
-        hubCalls.ingest += 1;
-        const localId = `p9-local-${hubCalls.ingest}`;
-        return { localId, bridgeId: "b1" };
-    },
-    uploadAsset: async () => {
-        hubCalls.upload += 1;
-        return { ref: `ref-${hubCalls.upload}` };
-    },
-    getTask: async () => {
-        hubCalls.getTask += 1;
-        return { state: hubState, bridgeId: "b1" };
-    },
-    saveRevision: async () => ({ state: hubState, approvalSnapshot: "snap-p9", promptEditedAt: "2026-11-14T00:00:09.000Z", selfcheck: [] }),
-    approve: async () => ({}),
-    rollback: async () => ({}),
-    revoke: async () => ({}),
-    waitForApproval: async () => "awaiting_approval",
-};
 
 const saveMember = (member) => {
     const list = project.workflowBatches || [];
@@ -216,7 +194,6 @@ const runtimeDeps = () => ({
         ]);
         return { childNodeId };
     },
-    hub,
     getBlob: async (storageKey) => new Blob([`bytes-${storageKey}`], { type: "video/mp4" }),
     saveIdentity: (record) => {
         identitySaves.push(record);
@@ -246,7 +223,6 @@ const entryDeps = () => ({
     project: () => project,
     applyOps: applyOpsWithProject,
     getBlob: async (storageKey) => new Blob([`bytes-${storageKey}`], { type: "video/mp4" }),
-    hub,
     lapianConfig: { lapianDefaultModel: "", channels: [] },
     vetoes: () => project.workflowAssetVetoes || [],
     identities: () => identitiesSaved,
@@ -340,7 +316,7 @@ setSection("D");
     check("D3 没有项目模板时直接用系统内置「视频拆解」（templateFrom=builtin，不再引导先抽模板）", noTemplate.templateFrom === "builtin" && noTemplate.templateId === "builtin-video-analysis" && !/extract_workflow_template|先抽模板|抽一次模板/.test(String(noTemplate.next) + JSON.stringify(noTemplate.warnings)), JSON.stringify({ from: noTemplate.templateFrom, id: noTemplate.templateId }));
 }
 
-// ================================================================ B. 3 素材建批次跑到待审批
+// ================================================================ B. 3 素材建批次跑到已组装
 setSection("B");
 {
     resetProject();
@@ -366,24 +342,22 @@ setSection("B");
     );
 
     check("B2 返回 batchId + 3 个实例（每实例 materialize 成功）", Boolean(result.batchId) && result.instances.length === 3 && result.instances.every((row) => row.materialized === "created"), JSON.stringify({ batchId: result.batchId, rows: result.instances.map((row) => [row.instanceId, row.materialized]) }));
-    check("B3 3 个实例全部到待审批（P4 判据：终点=待审批）", result.instances.every((row) => row.status === "awaiting_approval" && row.outcome === "awaiting_approval"), JSON.stringify(result.instances.map((row) => [row.instanceId, row.status, row.outcome])));
-    check("B4 队列收尾：相位 finished、并发=3（缺省）、3 个实例都跑到待批", result.queue?.phase === "finished" && result.queue?.concurrency === 3 && result.queue?.awaitingApproval === 3 && result.queue?.attempted === 3, JSON.stringify(result.queue));
+    check("B3 3 个实例全部到已组装（P4 判据：终点=已组装）", result.instances.every((row) => row.status === "assembled" && row.outcome === "canvas_ready"), JSON.stringify(result.instances.map((row) => [row.instanceId, row.status, row.outcome])));
+    check("B4 队列收尾：相位 finished、并发=3（缺省）、3 个实例都跑到待批", result.queue?.phase === "finished" && result.queue?.concurrency === 3 && result.queue?.attempted === 3 && result.queue?.failed === 0 && result.queue?.skipped === 0, JSON.stringify(result.queue));
     check("B5 每实例节点骨架可读（源视频/拉片/全量 id）", result.instances.every((row) => row.nodes && row.nodes.lapian && row.nodes.sourceVideo && row.nodes.all.length >= 8), JSON.stringify(result.instances.map((row) => row.nodes && row.nodes.all.length)));
     check("B6 付费动作提取 = 0：runGeneration 只以 mode:\"text\" 被调用（3 次=3 实例各一次组装）", generationCalls.length - generationBefore === 3 && generationCalls.slice(generationBefore).every((call) => call.mode === "text"), JSON.stringify(generationCalls.slice(generationBefore)));
     check("B7 零视频创建端点：整段只打了桥侧拉片链（upload/run/job/正文），没有生成/创建类请求", fetchCalls.every((url) => /^\/api\/(video\/upload|lapian\/(run|[^/]+)|job\/[^/]+|render\/)/.test(url)) && unexpectedFetch === 0, JSON.stringify([...new Set(fetchCalls)]));
-    check("B8 回执 paidVideoCreations 恒 0（结构性：本工具不碰生成链）", result.paidVideoCreations === 0 && /待审批/.test(result.next), result.next);
+    check("B8 回执 paidVideoCreations 恒 0（结构性：本工具不碰生成链）", result.paidVideoCreations === 0 && /画布侧收尾/.test(result.next), result.next);
 
     // 侧栏页签（P8）同一份数据源：buildReviewList 行数 = 实例数
     const batchRecord = batch.findWorkflowBatch(project.workflowBatches, result.batchId);
-    const hubStates = {};
-    for (const member of batchRecord?.members || []) hubStates[member.instanceId] = member.hub?.localId ? "awaiting_approval" : undefined;
-    const rows = review.buildReviewList({ batches: [batchRecord], nodes: project.nodes, hubStates, templateNameOf: () => project.workflowTemplate?.name });
-    check("B9 侧栏「待审批」页签立即可见：buildReviewList 出 3 行且全部待批", rows.length === 1 && rows[0].instances.length === 3 && rows[0].instances.every((row) => row.status === "awaiting_approval"), JSON.stringify(rows.map((row) => row.instances.map((item) => [item.instanceId, item.statusLabel]))));
-    check("B10 批次成员都绑了 hub 身份（P4 真的走到绑定，不是画布自嗨）", (batchRecord?.members || []).length === 3 && (batchRecord?.members || []).every((member) => Boolean(member.hub?.localId)), JSON.stringify((batchRecord?.members || []).map((member) => member.hub?.localId || null)));
+    const rows = review.buildReviewList({ batches: [batchRecord], nodes: project.nodes, templateNameOf: () => project.workflowTemplate?.name });
+    check("B9 侧栏「已组装」页签立即可见：buildReviewList 出 3 行且全部待批", rows.length === 1 && rows[0].instances.length === 3 && rows[0].instances.every((row) => row.status === "assembled"), JSON.stringify(rows.map((row) => row.instances.map((item) => [item.instanceId, item.statusLabel]))));
+    check("B10 批次成员落库（3 实例身份齐）", (batchRecord?.members || []).length === 3, JSON.stringify((batchRecord?.members || []).map((member) => member.instanceId)));
     check("B11 落盘链路走过（批次记录 + 队列都 flush 过）", flushes.includes("p9-batch-enqueue") && flushes.includes("p8-queue"), JSON.stringify([...new Set(flushes)]));
 
     // 派生状态表与队列结论一致（状态来自 C5 派生，不是回执自填）
-    const derived = (batchRecord?.members || []).map((member) => batchStatus.deriveInstanceStatus({ member, nodes: project.nodes, hubState: "awaiting_approval" }));
+    const derived = (batchRecord?.members || []).map((member) => batchStatus.deriveInstanceStatus({ member, nodes: project.nodes }));
     check("B12 派生状态与回执一致（C5：状态现查派生，不落库）", derived.every((view, index) => view.status === result.instances[index].status), JSON.stringify(derived.map((view) => [view.instanceId, view.status, view.rule])));
 
     // 交卷证据：把**真调产出的**批次落成 JSON，供 ego DOM 探针原样 seed（DOM 看到的数据不是手写夹具）
@@ -403,7 +377,7 @@ setSection("C");
     // 同素材（= B 段实例 #1 的素材）重复调用：同实例、already_present、零新增生成
     const again = await entry.runWorkflowInstanceTool({ material: { sourceVideoNodeId: "m1" } }, entryDeps());
     check("C1 单实例同素材：落到同一实例（already_present，不重建不复拉片）", again.instances.length === 1 && again.instances[0].materialized === "already_present", JSON.stringify(again.instances.map((row) => [row.instanceId, row.materialized])));
-    check("C2 单实例同素材：实例仍在待审批、零新增组装调用、节点数不变（幂等零冲突）", again.instances[0].status === "awaiting_approval" && generationCalls.length === generationBefore && project.nodes.length === nodeCountBefore, JSON.stringify({ status: again.instances[0].status, generation: generationCalls.length - generationBefore, nodes: project.nodes.length - nodeCountBefore }));
+    check("C2 单实例同素材：实例仍在已组装、零新增组装调用、节点数不变（幂等零冲突）", again.instances[0].status === "assembled" && generationCalls.length === generationBefore && project.nodes.length === nodeCountBefore, JSON.stringify({ status: again.instances[0].status, generation: generationCalls.length - generationBefore, nodes: project.nodes.length - nodeCountBefore }));
 
     // 换素材撞同号实例：如实拒绝，绝不覆盖
     project = { ...project, nodes: [...project.nodes, materialNode("m4", "video:solo", 4)] };
@@ -448,7 +422,6 @@ const summary = {
         batchId: results.find((item) => item.name.startsWith("B2"))?.detail || "",
         generationCalls: generationCalls.map((call) => [call.nodeId, call.mode]),
         fetchTargets: [...new Set(fetchCalls)],
-        hubCalls,
         flushes: [...new Set(flushes)],
         identitySaves: identitySaves.length,
     },

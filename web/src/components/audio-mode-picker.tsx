@@ -2,13 +2,13 @@
  * 音频三态选择器（AT-17 B3，方案 `docs/nodes/AT-17.md` §4 B3 + §7 附注 14）。
  *
  * **两处界面增量共用这一个控件**：画布拉片弹层（`pages/canvas/project.tsx`）与 hub 确认流按钮区
- * （`pages/hub/task-detail-drawer.tsx`）。不新开面板、不造第二套样式（红线 25）：hub 侧沿用抽屉里
+ * （hub 侧抽屉已随 hub 退场删除，本控件保留画布拉片弹层这一处使用）。不新开面板、不造第二套样式（红线 25）：
  * 现有的 stone/amber 配色与字号，画布侧沿用拉片弹层的深色面板。
  *
  * 合同：
  *  · 值恒为后端枚举的三个中文词（`pipeline/reverse/intent.py:AUDIO_MODE_VALUES`）——全链一套命名，
  *    禁止 `audio_mode` / `音频三态` / `沿用·调整·不要` 三套混用（B0 附注 4）；
- *  · 本组件**只展示 + 回调**，不发请求：写盘与重渲染归调用方（hub=POST /api/hub/task/<id>/audio-mode，
+ *  · 本组件**只展示 + 回调**，不发请求：写盘与重渲染归调用方（画布链=/api/audio-mode/<id>，
  *    画布=POST /api/audio-mode/<id>），两条链各自一处收口；
  *  · `待核对` 是 B2c 的「不猜无 BGM」透传：拆解读不到 BGM 判定时挂 WARN，让人先核对再信这个值。
  */

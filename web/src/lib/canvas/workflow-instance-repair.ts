@@ -6,7 +6,7 @@
  *   超限升级给人」；C8：全文读取通道（`read_node_text`）已就位，自修必须读到**全文**才动手。
  * - 审计 G16：自检修后**必须走 hub 既有保存/重检入口并绑定同一修订**，禁另写正则评分器 —— 所以本文件
  *   **不产出任何 PASS/FAIL 判定**：finding 一律来自 hub 自检生产者（`selfcheck.run_selfcheck`，
- *   `hub_api.save_prompt_text` 透出），重检也只调既有保存端点（写正文 → 重算快照 → 重跑自检）。
+ *   保存端点透出），重检也只调既有保存端点（写正文 → 重算快照 → 重跑自检）。
  * - 审计红线表「自检/正文修改」行：消费生产者 finding，调用既有保存与重检入口；**不把「自动修好」与
  *   「自动豁免失败」混为一谈** —— 本文件既不豁免 finding、也不改判定口径，修不好就升级给人。
  * - P0a §六（自修边界细化）：§6.1 计数口径=**每实例「修改→重检」完整闭环轮次**（与 finding 数量无关，
@@ -297,7 +297,7 @@ export type InstanceRepairDeps = {
     readText: (nodeId: string) => string | null;
     /** 把改好的正文写回画布产物节点（画布是唯一操作面：画布与 hub 必须同一份字节）。 */
     writeCanvasText: (input: { nodeId: string; text: string }) => void | Promise<void>;
-    /** **既有**保存+重检入口（`hub_api.save_prompt_text` 语义：写正文 → 重算快照 → 重跑自检）。 */
+    /** **既有**保存+重检入口（写正文 → 重算快照 → 重跑自检）。 */
     saveRevision: (input: { localId: string; text: string; expectText?: string | null }) => Promise<{ selfcheck?: unknown[]; approvalSnapshot?: string; state?: string; unchanged?: boolean }>;
     repairer: InstanceRepairer;
     /** 冻结项快照（每轮前后各取一次）；缺省 = 不校验（探针里会显式传）。 */

@@ -3,7 +3,7 @@
 
 定位（冻结设计 A1）：
   · 上传只落本地引用（local:任务号/asset-uploads/文件名），不再强行转公网图床；
-  · 提交时才由 automation.generate._assemble_images 经 read() 取字节装配；
+  · 提交/装配侧经 read() 取字节装配；
   · 路径/引用串的唯一出点在本模块——别处禁止手拼 local: 串或 asset-uploads 路径。
 
 根目录 = automation.config.PROJECTS_DIR / <local_id> / "asset-uploads"
@@ -94,9 +94,9 @@ def parse_ref(ref: str) -> tuple[str, str]:
 
 
 def display_url(ref: str) -> str:
-    """引用串 → 服务端取图 URL（GET /api/hub/asset-file/<local_id>/<文件名>）。"""
+    """引用串 → 服务端取图 URL（GET /api/local-asset/<local_id>/<文件名>）。"""
     local_id, name = parse_ref(ref)
-    return f"/api/hub/asset-file/{local_id}/{name}"
+    return f"/api/local-asset/{local_id}/{name}"
 
 
 def store(local_id: str, data: bytes, raw_name: str) -> str:
