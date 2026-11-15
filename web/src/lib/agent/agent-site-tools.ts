@@ -307,7 +307,6 @@ function getVideoConfig() {
             size: config.size || "1280x720",
             seconds: config.videoSeconds || "6",
             resolution: config.vquality || "720",
-            generateAudio: config.videoGenerateAudio !== "false",
             watermark: config.videoWatermark === "true",
             mode: config.videoMode === "reference" ? "reference" : "frames",
         },
@@ -343,10 +342,6 @@ function runVideoWorkbench(input: SiteToolInput, navigate: NavigateFunction) {
         configStore.updateConfig("vquality", input.resolution);
         applied.resolution = input.resolution;
     }
-    if (typeof input.generateAudio === "boolean") {
-        configStore.updateConfig("videoGenerateAudio", String(input.generateAudio));
-        applied.generateAudio = input.generateAudio;
-    }
     if (typeof input.watermark === "boolean") {
         configStore.updateConfig("videoWatermark", String(input.watermark));
         applied.watermark = input.watermark;
@@ -359,9 +354,7 @@ function runVideoWorkbench(input: SiteToolInput, navigate: NavigateFunction) {
     const run = input.run !== false;
     navigate("/video");
     const taskId = useWorkbenchAgentStore.getState().dispatchVideo({ prompt, run });
-    // 卡E4：显式改了全局默认音频时必须在回执里明示（写全局本身是设计内行为）。
-    let note = siteText(run ? "videoGenerationStarted" : "videoConfigApplied");
-    if ("generateAudio" in applied) note += ` ${siteText("videoAudioGlobalApplied", { value: String(applied.generateAudio) })}`;
+    const note = siteText(run ? "videoGenerationStarted" : "videoConfigApplied");
     return { ok: true, navigated: "/video", prompt, run, taskId, applied, note };
 }
 

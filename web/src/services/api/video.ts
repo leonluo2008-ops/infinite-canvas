@@ -133,7 +133,8 @@ async function createPluginVideoTask(config: AiConfig, model: string, script: st
                 size: normalizeVideoSize(config.size, config.vquality),
                 resolution: normalizeVideoResolution(config.vquality),
                 ratio: videoAspectRatio(config.size),
-                generateAudio: boolConfig(config.videoGenerateAudio, true),
+                // 音频恒开：产品口径 2026-11-15 所有者拍板，视频默认必须有声，不提供无声选项
+                generateAudio: true,
                 watermark: boolConfig(config.videoWatermark, false),
                 mode: resolveVideoMode(config.videoMode, refs.length),
             },
@@ -234,7 +235,7 @@ async function createSdgfVideoTask(config: AiConfig, model: string, prompt: stri
     // 时长按代际：SD2.0 系旧合同上限 15 秒，超出截断并提示；SD2.5 全系 4–30 原样（services 层不引 UI，用 console.warn + 任务字段）。
     // 实测依据见 docs/需求-SDGF新模型比例与无声问题-20261105.md §四/§五。
     const ratioFields = sdgfRatioFields(modelName, sdgfAspectRatio(config.size || "16:9"));
-    const soundFields = sdgfSoundFields(modelName, boolConfig(config.videoGenerateAudio, true));
+    const soundFields = sdgfSoundFields(modelName, true); // 音频恒开：产品口径 2026-11-15 所有者拍板，视频默认必须有声，不提供无声选项
     const requestedDuration = sdgfDuration(config.videoSeconds);
     const duration = sdgfClampDuration(modelName, requestedDuration);
     const durationClamped = duration !== requestedDuration;
@@ -391,7 +392,8 @@ async function createWanVideoTask(config: AiConfig, model: string, prompt: strin
         duration: wanDuration(config.videoSeconds),
         ratio: videoAspectRatio(config.size || "16:9"),
         resolution: normalizeVideoResolution(config.vquality).replace(/p$/i, ""), // wan 契约：数字（"720"），不带 p 后缀（bridge WAN_RESOLUTIONS 键）
-        audio: boolConfig(config.videoGenerateAudio, true),
+        // 音频恒开：产品口径 2026-11-15 所有者拍板，视频默认必须有声，不提供无声选项
+        audio: true,
         confirm: true,
     };
     let created: unknown;
@@ -459,7 +461,7 @@ async function createOpenAIVideoTask(config: AiConfig, model: string, prompt: st
         body.append("ratio", ratio);
     }
     body.append("resolution_name", normalizeVideoResolution(config.vquality));
-    body.append("generate_audio", String(boolConfig(config.videoGenerateAudio, true)));
+    body.append("generate_audio", "true"); // 音频恒开：产品口径 2026-11-15 所有者拍板，视频默认必须有声，不提供无声选项
     body.append("watermark", String(boolConfig(config.videoWatermark, false)));
     body.append("mode", mode);
     if (mode === "frames") {
@@ -537,7 +539,8 @@ async function createGeminiVideoTask(config: AiConfig, model: string, prompt: st
                 aspectRatio: videoAspectRatio(config.size),
                 durationSeconds: Number(normalizeVideoSeconds(config.videoSeconds)) || 8,
                 resolution: normalizeVideoResolution(config.vquality),
-                generateAudio: boolConfig(config.videoGenerateAudio, true),
+                // 音频恒开：产品口径 2026-11-15 所有者拍板，视频默认必须有声，不提供无声选项
+                generateAudio: true,
                 addWatermark: boolConfig(config.videoWatermark, false),
             },
         }, { headers: geminiVideoHeaders(config), signal: options?.signal })).data, apiText("noVideoTask"));

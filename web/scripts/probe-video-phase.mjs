@@ -21,6 +21,7 @@ if (typeof globalThis.window === "undefined") globalThis.window = globalThis;
 
 // axios stub：按模式回放任务查询/成片下载
 const calls = [];
+const postCalls = [];
 let mode = "f2";
 let f3Queries = 0;
 const mp4Blob = () => new Blob([new Uint8Array([0x66, 0x74, 0x79, 0x70, 1, 2, 3, 4])], { type: "video/mp4" });
@@ -38,7 +39,13 @@ const axiosStub = {
             if (url.includes("/videos/task_f3")) { f3Queries += 1; return { data: { id: "task_f3", status: "in_progress", progress: 90, metadata: {} } }; }
             return { data: {} };
         },
-        post: async () => ({ data: {} }),
+        post: async (url, body) => {
+            calls.push("POST " + url);
+            postCalls.push({ url, body });
+            // 创建回执带固定任务 ID，后续查询复用 f2 的 completed+content 回放
+            if (url.includes("/videos")) return { data: { id: "task_f2" } };
+            return { data: {} };
+        },
         isAxiosError: (e) => Boolean(e && e.isAxiosError),
         isCancel: () => false,
     },
@@ -107,6 +114,31 @@ try {
     check("F3 行为探针跑通", false, String(e && e.stack ? e.stack.split("\n").slice(0, 6).join(" ⏎ ") : e).slice(0, 400));
 }
 
+// ---- 音频恒开·按模型族分档行为断言（sdgfSoundFields V3/V6/V7 合同：满血 GF 顶层 enableSound；ap 系 metadata.enableSound）----
+mode = "f2";
+calls.length = 0;
+postCalls.length = 0;
+try {
+    const gfModel = "SD2.5-满血-GF-720P";
+    const apModel = "sd2.5-720p-ap";
+    const mkConfig = (model) => ({ ...config, model: "ch1::" + model, channels: [{ ...config.channels[0], apiFormat: "sdgf", models: [model] }] });
+    // ① 满血 GF：顶层 enableSound="on"，metadata 无 enableSound
+    const gfTask = await video.createVideoGenerationTask(mkConfig(gfModel), "音频恒开探针（满血GF）", []);
+    const gfBody = postCalls.find((c) => c.url.includes("/videos"))?.body;
+    check("音频恒开·满血GF：顶层 enableSound === 'on'", gfBody?.enableSound === "on", "body=" + JSON.stringify(gfBody || null));
+    check("音频恒开·满血GF：metadata 无 enableSound", !(gfBody?.metadata && "enableSound" in gfBody.metadata));
+    await video.waitForVideoGenerationTask(mkConfig(gfModel), gfTask, { onProgress: () => {} });
+    // ② ap 系：生效位在 metadata.enableSound，顶层不发（发了也会被站方静默忽略）
+    postCalls.length = 0;
+    const apTask = await video.createVideoGenerationTask(mkConfig(apModel), "音频恒开探针（ap系）", []);
+    const apBody = postCalls.find((c) => c.url.includes("/videos"))?.body;
+    check("音频恒开·ap系：metadata.enableSound === 'on'", apBody?.metadata?.enableSound === "on", "body=" + JSON.stringify(apBody || null));
+    check("音频恒开·ap系：顶层不发 enableSound", !("enableSound" in (apBody || {})));
+    await video.waitForVideoGenerationTask(mkConfig(apModel), apTask, { onProgress: () => {} });
+} catch (e) {
+    check("音频恒开·按模型族行为探针跑通", false, String(e && e.stack ? e.stack.split("\n").slice(0, 6).join(" ⏎ ") : e).slice(0, 400));
+}
+
 // ---- 接线层源码断言 ----
 const read = (p) => readFileSync(path.join(root, p), "utf8");
 const projectSrc = read("src/pages/canvas/project.tsx");
@@ -121,8 +153,8 @@ check("接线：canvas-node 渲染 downloading 分支", nodeSrc.includes("videoP
 check("接线：types 补 videoPhase 可选字段", typesSrc.includes("videoPhase"));
 check("接线：wait 层 onPhase 透传", waitSrc.includes("onPhase"));
 check("F3 计数器：completed/failed 删除计数", videoSrc.includes("sdgfEarlyProbeStreaks.delete"));
-check("E4：workbench 回执含全局变更明示", toolsSrc.includes("videoAudioGlobalApplied") || toolsSrc.includes("已修改全局默认"));
-for (const [name, file, key] of [["i18n zh 徽标 key", "src/i18n/locales/zh-CN.ts", "audioBadgeOn"], ["i18n en 徽标 key", "src/i18n/locales/en-US.ts", "audioBadgeOn"], ["i18n zh 下载中 key", "src/i18n/locales/zh-CN.ts", "videoPhaseDownloading"], ["i18n en 下载中 key", "src/i18n/locales/en-US.ts", "videoPhaseDownloading"]]) {
+check("音频恒开源码：video.ts 无 boolConfig(config.videoGenerateAudio（无声通路已拆除）", !videoSrc.includes("boolConfig(config.videoGenerateAudio"));
+for (const [name, file, key] of [["i18n zh 下载中 key", "src/i18n/locales/zh-CN.ts", "videoPhaseDownloading"], ["i18n en 下载中 key", "src/i18n/locales/en-US.ts", "videoPhaseDownloading"]]) {
     check(name, read(file).includes(key));
 }
 const instructions = read("../canvas-agent/agent-instructions.md");

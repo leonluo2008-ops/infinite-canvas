@@ -18,5 +18,4 @@
 - 仅当内置模板实例化失败或用户明确拒绝时才声明降级，且必须说明站方不支持音频/视频参考（视频参考会被忽略），文本拆解需用户确认。
 - 禁止用 `canvas_generate_video` 冒充拆解工作流。
 - instance/batch 停在待审批时必须明报「拉片+组装+自检已完成，等你审批后批量生成」，不自动续跑付费生成。
-- `canvas_generate_video` 默认显式传 `generateAudio: true`（用户明确要求无声除外）。
-- 工作台工具（`workbench_video_generate`）显式传 `generateAudio` 后，必须在回复中告知用户全局默认已被改变。
+- 视频生成恒有声（无无声选项），无需也不得传 generateAudio 参数（画布与工作台工具均无此参数）。
