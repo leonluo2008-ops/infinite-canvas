@@ -1,0 +1,147 @@
+{
+  "at": "2026-11-14T08:31:15.404Z",
+  "space": 25,
+  "pass": 18,
+  "fail": 0,
+  "fails": [],
+  "results": [
+    {
+      "name": "① 真 router 顶层布局路由挂 errorElement（生产组件 RouteErrorPage）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "①-2 通配路由（* = 404 兜底）也挂 errorElement",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "①-3 路由结构零改动：9 条既有路径原样在位（/ /image /video /hub /assets /prompts /canvas /canvas/:id /config）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "①-4 chunk 失效归因 = stale（含被 cause 包一层的情况），404/403/其它各归各位",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "② 首页正常渲染，无兜底页",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "②-1 画布项目夹具已写入真 store（原值已备份，跑完写回）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "②-2 画布页正常渲染（节点在位、无兜底页）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "②-3 零回归：/canvas /assets /prompts /hub /config /image /video 七个路由照常渲染，无一落兜底页",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "③-0 控制组（未封 chunk）：同一条带代码块的 Agent 回复真渲染，且语法高亮懒加载块真跑过（pre + 着色 span 在位、零异常）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "③-0b 控制组未封 chunk 时页面照常（无兜底页）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "③-1 封锁生效前页面仍正常（异常由懒加载触发，不是加载页面就炸）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "③-2 懒加载 chunk 失败真实发生（页面捕获到 Failed to fetch dynamically imported module: …highlighted-body-*.js，与所有者撞到的是同一句）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "③-3 该异常走全局 errorElement → 出人话页，裸错误页不再出现",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "③-4 人话页说的是「版本过期/加载失败 + 刷新」，不是英文报错",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "③-5 一键刷新按钮在位（文案含「刷新」）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "③-6 主按钮可读（文字色 ≠ 底色、底不为透明；白底白字这类主题事故的回归守卫）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "④ 按兜底页引导刷新后恢复（同一地址重新正常渲染）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "⑤ 探针自建夹具已清（store 原值原样写回）",
+      "ok": true,
+      "detail": ""
+    }
+  ],
+  "routerFacts": {
+    "topLevel": 2,
+    "rootHasErrorElement": true,
+    "wildcardHasErrorElement": true,
+    "rootErrorElementType": "RouteErrorPage",
+    "childPaths": [
+      "/",
+      "/image",
+      "/video",
+      "/hub",
+      "/assets",
+      "/prompts",
+      "/canvas",
+      "/canvas/:id",
+      "/config"
+    ],
+    "childErrorElements": [],
+    "wildcardChild": "NotFound"
+  },
+  "kindFacts": {
+    "chunk": "stale",
+    "wrappedCause": "stale",
+    "generic": "unknown",
+    "notFound": "notFound",
+    "forbidden": "forbidden"
+  },
+  "controlCode": {
+    "pre": 1,
+    "hasAnswer": true,
+    "highlightedSpans": 4
+  },
+  "failChunkErrors": [
+    "%o\n\n%s\n\n%s\n | Failed to fetch dynamically imported module: http://127.0.0.1:3000/node_modules/.vite/deps/highlighted-body-OFNGDK62-HR3YGE2B.js?v=7fc1650b | The above error occurred in one of your React components. | React will try to recreate this component tree from scratch using the error boundary you provided, RenderErrorBoundary.",
+    "React Router caught the following error during render | Failed to fetch dynamically imported module: http://127.0.0.1:3000/node_modules/.vite/deps/highlighted-body-OFNGDK62-HR3YGE2B.js?v=7fc1650b"
+  ],
+  "failDom": {
+    "present": true,
+    "kind": "stale",
+    "title": "页面版本已过期，刷新一下就好",
+    "reloadText": "刷新页面",
+    "reloadStyle": {
+      "color": "oklch(0.145 0 0)",
+      "background": "oklch(0.985 0 0)"
+    },
+    "reloadReadable": true,
+    "bodyExcerpt": "页面版本已过期，刷新一下就好 你打开的页面还是旧版本，本地文件已经被更新替换，所以内容加载失败了。刷新一次就能继续，画布里的内容不会丢。 刷新后还是这样，关掉这个标签页重新打开即可。 刷新页面 返回首页",
+    "leaksEnglishError": false
+  }
+}

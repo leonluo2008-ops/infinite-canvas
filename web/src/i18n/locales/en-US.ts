@@ -136,6 +136,30 @@ export default {
         description: "There is no page at this address. It may have moved or been merged into another section.",
         home: "Back to home",
     },
+    routeError: {
+        refresh: "Refresh page",
+        home: "Back to home",
+        stale: {
+            title: "Page version is stale — a refresh will fix it",
+            description: "You opened an older version of the page and its local files were replaced, so loading failed. A refresh brings you back, and nothing on the canvas is lost.",
+            hint: "If refreshing doesn't help, send this message to the person maintaining the app.",
+        },
+        notFound: {
+            title: "Page not found",
+            description: "This address doesn't match any page. It may have been moved or merged into another entry.",
+            hint: "",
+        },
+        forbidden: {
+            title: "No access",
+            description: "Your account can't open this page. Switch to an account with access, or contact the administrator.",
+            hint: "",
+        },
+        unknown: {
+            title: "This page failed to open",
+            description: "Something went wrong while loading. A refresh usually fixes it.",
+            hint: "If it keeps happening, send the current address to the person maintaining the app.",
+        },
+    },
     workbench: {
         logs: "Generation history",
         settings: "Settings",

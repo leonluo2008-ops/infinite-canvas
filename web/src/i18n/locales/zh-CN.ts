@@ -136,6 +136,30 @@ export default {
         description: "这个地址没有对应的页面，可能已经移动或被合并到其他入口。",
         home: "返回首页",
     },
+    routeError: {
+        refresh: "刷新页面",
+        home: "返回首页",
+        stale: {
+            title: "页面版本已过期，刷新一下就好",
+            description: "你打开的页面还是旧版本，本地文件已经被更新替换，所以内容加载失败了。刷新一次就能继续，画布里的内容不会丢。",
+            hint: "刷新后还是这样，就把这条提示截图发给维护的人。",
+        },
+        notFound: {
+            title: "页面不存在",
+            description: "这个地址没有对应的页面，可能已经移动或被合并到其他入口。",
+            hint: "",
+        },
+        forbidden: {
+            title: "没有访问权限",
+            description: "当前账号不能打开这个页面，请换一个有权限的账号，或联系管理员。",
+            hint: "",
+        },
+        unknown: {
+            title: "页面没能打开",
+            description: "页面加载时出了点问题，刷新一次通常就能恢复正常。",
+            hint: "如果反复出现，请把当前地址发给维护的人。",
+        },
+    },
     workbench: {
         logs: "生成记录",
         settings: "参数",

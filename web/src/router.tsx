@@ -1,6 +1,7 @@
 import { createBrowserRouter, Outlet } from "react-router-dom";
 
 import { AnalyticsTracker } from "@/components/layout/analytics-tracker";
+import RouteErrorPage from "@/components/layout/route-error-page";
 import UserLayout from "@/layouts/user-layout";
 import AssetsPage from "@/pages/assets";
 import CanvasPage from "@/pages/canvas";
@@ -15,6 +16,8 @@ import VideoPage from "@/pages/video";
 
 export const router = createBrowserRouter([
     {
+        // 全局兜底：任何路由级异常（含懒加载 chunk 失效 = 页面版本过期）都出人话刷新页，不露英文堆栈。
+        errorElement: <RouteErrorPage />,
         element: (
             <UserLayout>
                 <AnalyticsTracker />
@@ -33,5 +36,5 @@ export const router = createBrowserRouter([
             { path: "/config", element: <ConfigPage /> },
         ],
     },
-    { path: "*", element: <NotFound /> },
+    { path: "*", errorElement: <RouteErrorPage />, element: <NotFound /> },
 ]);
