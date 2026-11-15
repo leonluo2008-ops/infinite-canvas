@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { ChangeEvent as ReactChangeEvent, DragEvent as ReactDragEvent, MouseEvent as ReactMouseEvent, PointerEvent as ReactPointerEvent } from "react";
 import { useNavigate, useParams, useSearchParams } from "react-router-dom";
-import { Group, Video, Clapperboard, FileText, FolderPlus, LayoutTemplate, ListChecks, Boxes, ImagePlus, Pencil, Cpu } from "lucide-react";
+import { Group, Video, Clapperboard, FileText, FolderPlus, LayoutTemplate, ListChecks, Boxes, ImagePlus, Pencil, Cpu, GitFork } from "lucide-react";
 import { saveAs } from "file-saver";
 import { useTranslation } from "react-i18next";
 
@@ -47,6 +47,8 @@ import { LapianPromptTemplateModal } from "@/components/canvas/lapian-prompt-tem
 import { LapianOptionalModal, parseLapianOptional } from "@/components/canvas/lapian-optional-modal";
 import { LAPIAN_PROJECTION_TEMPLATE, LapianProjectionError, lapianOptionalLetters, renderLapianProjection } from "@/lib/canvas/lapian-projection";
 import { LapianModelModal } from "@/components/canvas/lapian-model-modal";
+import { LapianVariantModal, type LapianVariantImage } from "@/components/canvas/lapian-variant-modal";
+import { DeriveWorkflowVariantToolError, deriveWorkflowVariantTool, parseInstanceNodeId } from "@/lib/canvas/workflow-variant-entry";
 import { AudioModePicker } from "@/components/audio-mode-picker";
 import { InfiniteCanvas } from "@/components/canvas/infinite-canvas";
 import { Minimap } from "@/components/canvas/canvas-mini-map";
@@ -319,6 +321,8 @@ function InfiniteCanvasPage() {
     const [lapianNodeId, setLapianNodeId] = useState<string | null>(null);
     const [lapianIntent, setLapianIntent] = useState("");
     const [lapianModelNodeId, setLapianModelNodeId] = useState<string | null>(null);  // M6-T7-R：拉片节点「模型」弹窗的目标节点
+    const [lapianVariantNodeId, setLapianVariantNodeId] = useState<string | null>(null);  // 卡C4：源实例拉片节点「派生变体」弹窗的目标节点
+    const [variantDeriving, setVariantDeriving] = useState(false);  // 卡C4：派生进行中（重复点击/重复派生给 warning 中止）
     const [lapianBusy, setLapianBusy] = useState(false);
     // AT-17 B3：拉片弹层的音频三态（回显 + 改选落盘；画布链没有 approve，落盘即生效）
     const [lapianAudioMode, setLapianAudioMode] = useState<CanvasAudioMode | null>(null);
@@ -1211,6 +1215,71 @@ function InfiniteCanvasPage() {
             .filter((node) => node.type === CanvasNodeType.Image && Boolean(node.metadata?.content) && !node.metadata?.assetGraftForSlotId)
             .map((node) => ({ id: node.id, title: node.title || t("canvas.nodeTypes.image"), previewUrl: node.metadata?.content }));
     }, [lapianAttachSlot, nodes, t]);
+    // 卡C4 弹窗数据：源实例槽清单（源实例子图内 assetSlotName 节点）+ 画布可选替换图 + 源意图文本。
+    const lapianVariantNode = lapianVariantNodeId ? nodes.find((node) => node.id === lapianVariantNodeId) ?? null : null;
+    const lapianVariantParsed = lapianVariantNode ? parseInstanceNodeId(lapianVariantNode.id) : null;
+    const lapianVariantSlots = useMemo(() => {
+        if (!lapianVariantNode || !lapianVariantParsed) return [];
+        const prefix = `t${lapianVariantParsed.templateId}-${lapianVariantParsed.instanceIndex}-`;
+        const seen = new Set<string>();
+        const slots: { slotNodeId: string; slotName: string }[] = [];
+        for (const node of nodes) {
+            if (!node.id.startsWith(prefix)) continue;
+            const slotName = String(node.metadata?.assetSlotName || "").trim();
+            if (!slotName || seen.has(slotName)) continue;
+            seen.add(slotName);
+            slots.push({ slotNodeId: node.id, slotName });
+        }
+        return slots;
+    }, [lapianVariantNode, lapianVariantParsed, nodes]);
+    const lapianVariantImages = useMemo<LapianVariantImage[]>(
+        () =>
+            nodes
+                .filter((node) => node.type === CanvasNodeType.Image && Boolean(node.metadata?.content) && !node.metadata?.assetGraftForSlotId)
+                .map((node) => ({ id: node.id, title: node.title || t("canvas.nodeTypes.image"), previewUrl: node.metadata?.content })),
+        [nodes, t],
+    );
+    const lapianVariantSourceIntent = useMemo(() => {
+        if (!lapianVariantNode || !lapianVariantParsed) return "";
+        const prefix = `t${lapianVariantParsed.templateId}-${lapianVariantParsed.instanceIndex}-`;
+        const intentNode = nodes.find((node) => node.id.startsWith(prefix) && node.metadata?.lapianIntent);
+        return String(intentNode?.metadata?.content || "");
+    }, [lapianVariantNode, lapianVariantParsed, nodes]);
+    // 卡C4 确认：与 agent 工具 derive_workflow_variant 调同一个页面侧集成函数；成功后新分支已落库，focus 到新拉片节点。
+    const deriveVariantFromModal = useCallback(
+        async (intentText: string, picks: { slotName: string; imageNodeId: string }[]) => {
+            const sourceNode = lapianVariantNode;
+            if (!sourceNode) return;
+            setVariantDeriving(true);
+            try {
+                const result = await deriveWorkflowVariantTool(
+                    {
+                        sourceInstanceLapianNodeId: sourceNode.id,
+                        ...(picks.length ? { assetBindings: picks.map((pick) => ({ slotName: pick.slotName, imageNodeId: pick.imageNodeId, reason: "人工弹窗指定" })) } : {}),
+                        ...(intentText ? { intentText } : {}),
+                    },
+                    {
+                        project: () => (batchRuntimeProject.current ? { nodes: batchRuntimeProject.current.nodes, connections: batchRuntimeProject.current.connections } : undefined),
+                        applyOps: (ops) => {
+                            applyAgentOps(ops);
+                        },
+                        getBlob: getMediaBlob,
+                        log: (line) => console.debug(`[canvas-variant] ${line}`),
+                    },
+                );
+                setLapianVariantNodeId(null);
+                if (result.newLapianNodeId) focusNodeRef.current(result.newLapianNodeId);
+                message.success(t("canvas.lapianVariant.success", { task: result.newLocalId }));
+                if (result.warnings.length) message.warning(result.warnings.slice(0, 3).join("；"));
+            } catch (error) {
+                const detail = error instanceof DeriveWorkflowVariantToolError ? error.message : error instanceof Error ? error.message : String(error);
+                message.warning(t("canvas.lapianVariant.failed", { reason: detail }));
+            } finally {
+                setVariantDeriving(false);
+            }
+        },
+        [lapianVariantNode, message, t],
+    );
     // T3-J2：资产位截帧。bridge 侧查任务源视频、按 IR「出现于」区间中点 ffmpeg 抽一帧；
     // 前端只拿 URL（不传视频、不碰 ffmpeg）。失败返回 null → 调用方降级成纯文字卡。
     const fetchLapianAssetFrame = useCallback(async (taskId: string, name: string): Promise<LapianAssetFrame | null> => {
@@ -1723,7 +1792,27 @@ function InfiniteCanvasPage() {
                     label: t("canvas.lapianAsset.derive"),
                     icon: <Boxes className="size-4" />,
                     onClick: () => void createLapianAssetSlots(node),
-                }];
+                },
+                // 卡C4：「派生变体」人工入口——仅源实例拉片节点（metadata.taskId 在位）出现；点击弹层，确认才发起（取消零请求）。
+                ...(String(node.metadata?.taskId || "").trim() ? [{
+                    id: "wan-lapian-derive-variant",
+                    title: t("canvas.lapianVariant.buttonTitle"),
+                    label: t("canvas.lapianVariant.button"),
+                    icon: <GitFork className="size-4" />,
+                    active: lapianVariantNodeId === node.id,
+                    onClick: () => {
+                        if (variantDeriving) {
+                            message.warning(t("canvas.lapianVariant.deriving"));
+                            return;
+                        }
+                        // 源未完成（拆解产物 taskId/content 任一为空）→ warning 中止，不弹层。
+                        if (!String(node.metadata?.taskId || "").trim() || !String(node.metadata?.content || "").trim()) {
+                            message.warning(t("canvas.lapianVariant.sourceIncomplete"));
+                            return;
+                        }
+                        setLapianVariantNodeId(node.id);
+                    },
+                }] : [])];
             }
             // T3-H2/J2：资产位自带的【挂图】按钮（决策 4：不依赖连线，写 metadata）。
             // 资产位节点型是官方 Image（J2），截帧失败降级时才是 Text——两种都要能挂图。
@@ -1794,7 +1883,7 @@ function InfiniteCanvasPage() {
                 },
             }];
         },
-        [createLapianAssetSlots, createLapianPromptNodes, generateVideoFromLapianNode, effectiveConfig.lapianModels, message, t],
+        [createLapianAssetSlots, createLapianPromptNodes, generateVideoFromLapianNode, effectiveConfig.lapianModels, lapianVariantNodeId, variantDeriving, message, t],
     );
 
     // T3-E 入口：终稿（普通文本节点）才有【生成视频】；带 promptTemplate 的是转换指令节点，
@@ -4505,6 +4594,19 @@ function InfiniteCanvasPage() {
                     onConfirm={(ref) => {
                         if (lapianModelNode) applyLapianModel(lapianModelNode.id, ref);
                     }}
+                />
+
+                <LapianVariantModal
+                    open={Boolean(lapianVariantNode)}
+                    sourceTitle={lapianVariantNode?.title || lapianVariantNodeId || ""}
+                    slots={lapianVariantSlots}
+                    images={lapianVariantImages}
+                    sourceIntentText={lapianVariantSourceIntent}
+                    deriving={variantDeriving}
+                    onCancel={() => {
+                        if (!variantDeriving) setLapianVariantNodeId(null);
+                    }}
+                    onConfirm={(intentText, picks) => void deriveVariantFromModal(intentText, picks)}
                 />
 
                 <LapianAssetGroupModal

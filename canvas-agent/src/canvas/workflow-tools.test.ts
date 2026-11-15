@@ -21,6 +21,38 @@ test("P9 三工具已注册：名称/入参 schema/中文描述齐全（注册�
     }
 });
 
+test("卡C3 derive_workflow_variant 已注册：名称/schema/描述齐全 + 触发话术与停待批口径（三层之一：schemas）", () => {
+    const name = "derive_workflow_variant";
+    assert.ok((toolNames as readonly string[]).includes(name), `${name} 不在 toolNames`);
+    assert.ok(toolInputSchemas[name], `${name} 没有入参 schema`);
+    // 入参：sourceInstanceLapianNodeId 必填；assetBindings/intentText 可选；assetBindings 缺 imageNodeId 拒绝
+    assert.equal(toolInputSchemas[name].safeParse({ sourceInstanceLapianNodeId: "twabc123-1-lap1" }).success, true);
+    assert.equal(toolInputSchemas[name].safeParse({ sourceInstanceLapianNodeId: "twabc123-1-lap1", assetBindings: [{ slotName: "人物", imageNodeId: "img-1", reason: "换个模特" }], intentText: "换元宝" }).success, true);
+    assert.equal(toolInputSchemas[name].safeParse({}).success, false);
+    assert.equal(toolInputSchemas[name].safeParse({ assetBindings: [{ slotName: "人物" }] }).success, false);
+    const description = toolDescriptions[name];
+    assert.ok(description && description.length > 40, `${name} 描述过短`);
+    assert.match(description, /再出一个/, `${name} 描述缺触发话术`);
+    assert.match(description, /仅显式指令|只认显式指令/, `${name} 描述缺「仅显式指令触发」口径`);
+    assert.match(description, /待审批/, `${name} 描述缺停待批口径`);
+    assert.match(description, /付费视频生成不在本工具内发生/, `${name} 描述缺付费口径`);
+});
+
+test("卡C3 derive_workflow_variant 走 SITE_TOOLS 页面通道（三层之二：session 路由）", async (t) => {
+    const session = new CanvasSession();
+    const first = connect(session, "first");
+    t.after(() => first.close());
+    session.activateClient("first");
+    const input = { sourceInstanceLapianNodeId: "twabc123-1-lap1", assetBindings: [{ slotName: "产品", imageNodeId: "img-2" }] };
+    const result = session.callTool("derive_workflow_variant", input);
+    const call = first.event("tool_call");
+    assert.equal(field(call, "name"), "derive_workflow_variant");
+    assert.deepEqual(field(call, "input"), input);
+    const pageResult = { ok: true, templateId: "wabc123", instanceIndex: 2, nodeIds: ["n1"], newLocalId: "task-2", stopPoint: "awaiting_approval" };
+    session.resolveResult("first", { requestId: String(field(call, "requestId")), result: pageResult });
+    assert.deepEqual(await result, pageResult);
+});
+
 test("P9 extract_workflow_template 走页面通道（当前激活网页执行并回执）", async (t) => {
     const session = new CanvasSession();
     const first = connect(session, "first");
