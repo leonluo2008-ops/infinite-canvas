@@ -1,15 +1,17 @@
 /**
- * 卡C3/C4 · 变体派生页面侧集成函数（方案 docs/方案-卡C一拆多用变体派生-20261115.md §三 D1/D2b/D7/D8）。
+ * 卡C3/C4 · 变体派生页面侧集成函数（方案 docs/方案-卡C一拆多用变体派生-20261115.md §三 D1/D2b/D7/D8
+ * + 路线 A 修正 2026-11-15：拆解完成即可派生，不要求源先出片）。
  *
  * 两个入口共用同一执行体（拍板 1：双入口同函数）：
  * - C3 agent 工具 `derive_workflow_variant`（web/src/lib/agent/agent-site-tools.ts 分发到本文件）；
  * - C4 源实例拉片节点悬浮栏「派生变体」（web/src/components/canvas/lapian-variant-modal.tsx）。
  *
- * 顺序（D7⑤：fork 失败不落半套节点——先 fork 成功、再绑、最后落画布）：
- * ① 校验源（拉片节点 taskId/content 双全 = 拉片产物在位；源 hub 任务 done 方可派生，D7①）；
- * ② fork（POST /api/hub/task/<源localId>/fork，源 localId = 拉片节点 metadata.taskId——
- *    勘察确认：workflow-instance-run.ts 落库时 lapian 节点 metadata.taskId 即 hub 任务号）；
- * ③ deriveWorkflowVariant（C1 纯逻辑：子图副本/id 重写/槽起手空/意图继承）；
+ * 顺序（路线 A：直建变体任务，不走 fork）：
+ * ① 校验源（拉片节点 taskId/content 双全 = 拆解产物在位；metadata.taskId 是**桥侧拆解任务号
+ *    =bridge_id**，正确用途是拆解产物引用——不是 hub localId，禁拿去 fork）；
+ * ② 变体直建（POST /api/hub/variant/create，bridge_id + intent → 新 localId；不经 ingest 的
+ *    视频 sha 幂等，同源视频 N 个变体各得独立任务号）；
+ * ③ deriveWorkflowVariant（C1 纯逻辑：子图副本/id 重写/槽起手空/意图继承，newTaskId=新 localId）；
  * ④ bindVariantToHub（C2b 直绑通道：零 ingest，awaiting_assets→awaiting_approval，停待批）；
  * ⑤ canvas_apply_ops 落新分支节点+连线；
  * ⑥ 回执（节点 id 清单/新 localId/槽绑定结果/停点状态，D8）。
@@ -17,7 +19,7 @@
  * 付费红线：本文件从不调用 approve/submit/generate；终点=awaiting_approval 等人。
  */
 
-import { forkHubTask, confirmHubReplace, getHubTask, saveHubPrompt, uploadHubImage } from "@/pages/hub/hub-api";
+import { createHubVariant, confirmHubReplace, getHubTask, saveHubPrompt, uploadHubImage } from "@/pages/hub/hub-api";
 import { classifyTemplateRole } from "@/lib/canvas/workflow-template";
 import { deriveWorkflowVariant, type VariantAssetBinding } from "@/lib/canvas/workflow-variant";
 export type { VariantAssetBinding };
@@ -36,15 +38,15 @@ export type DeriveWorkflowVariantToolInput = {
     timeoutMs?: number;
 };
 
-/** fork 回执最小形状（forkHubTask 的 local_id/bridge_id；探针可注入 stub）。 */
-export type VariantForkResponse = { local_id?: string; bridge_id?: string };
+/** 变体直建回执最小形状（createHubVariant 的 local_id/bridge_id；探针可注入 stub）。 */
+export type VariantCreateResponse = { local_id?: string; bridge_id?: string };
 
 export type DeriveWorkflowVariantToolDeps = {
     project: () => { nodes: CanvasNodeData[]; connections: CanvasConnection[] } | undefined;
     /** 落库通道（页面=canvas_apply_ops 通道；探针=收集器）。 */
     applyOps: (ops: CanvasAgentOp[]) => void | Promise<void>;
-    /** 缺省 = forkHubTask（hub 既有合同，红线 25 不复制第二份）；探针注入 stub。 */
-    fork?: (sourceLocalId: string) => Promise<VariantForkResponse>;
+    /** 缺省 = createHubVariant（卡C路A 直建端点，红线 25 不复制第二份）；探针注入 stub。 */
+    create?: (bridgeId: string, intent?: string) => Promise<VariantCreateResponse>;
     /** C2b 直绑客户端；缺省 = hub-api 既有函数包成窄接口；探针注入 stub。 */
     hub?: VariantHubDirectClient;
     /** 画布图节点字节（替换图上传 hub 用）；缺省不可得时如实降级为「全沿用」空确认。 */
@@ -121,8 +123,8 @@ export function defaultVariantHubClient(): VariantHubDirectClient {
 
 /**
  * 变体派生集成主入口（C3/C4 共用）：
- * ① 源校验（拉片产物在位 + 源任务 done）→ ② fork → ③ derive 纯逻辑 → ④ 直绑推进到待批 → ⑤ 落画布 → ⑥ 回执。
- * 任一步失败即中止：fork 前失败画布零改动；落库失败时 hub 任务已存在，如实报错带 localId（不假装成功）。
+ * ① 源校验（拉片产物在位：taskId=bridge_id + content）→ ② 变体直建 → ③ derive 纯逻辑 → ④ 直绑推进到待批 → ⑤ 落画布 → ⑥ 回执。
+ * 任一步失败即中止：直建前失败画布零改动；落库失败时变体任务已存在，如实报错带 localId（不假装成功）。
  */
 export async function deriveWorkflowVariantTool(input: DeriveWorkflowVariantToolInput, deps: DeriveWorkflowVariantToolDeps): Promise<DeriveWorkflowVariantToolResult> {
     const warnings: string[] = [];
@@ -136,31 +138,28 @@ export async function deriveWorkflowVariantTool(input: DeriveWorkflowVariantTool
     const sourceLapian = project.nodes.find((node) => node.id === sourceLapianNodeId);
     if (!sourceLapian) throw new DeriveWorkflowVariantToolError("source_not_ready", `画布上没有找到源拉片节点：${sourceLapianNodeId}`);
     if (classifyTemplateRole(sourceLapian) !== "lapian") throw new DeriveWorkflowVariantToolError("source_not_ready", `节点 ${sourceLapianNodeId} 不是拉片节点，不能作为派生源`);
-    const sourceLocalId = String(sourceLapian.metadata?.taskId || "").trim();
-    if (!sourceLocalId || !String(sourceLapian.metadata?.content || "").trim()) {
-        throw new DeriveWorkflowVariantToolError("source_not_ready", `源拉片节点 ${sourceLapianNodeId} 的拆解产物不在位（taskId/content 任一为空）：先等拆解完成再派生`, { sourceLapianNodeId, taskId: sourceLocalId || null });
+    // 路线 A 字段口径（2026-11-15 修正）：拉片节点 metadata.taskId 是**桥侧拆解任务号（=bridge_id）**，
+    // 正确用途=拆解产物引用；变体直建拿它当 bridge_id，绝不把它错当 hub localId 去 fork。
+    const bridgeId = String(sourceLapian.metadata?.taskId || "").trim();
+    if (!bridgeId || !String(sourceLapian.metadata?.content || "").trim()) {
+        throw new DeriveWorkflowVariantToolError("source_not_ready", `源拉片节点 ${sourceLapianNodeId} 的拆解产物不在位（taskId/content 任一为空）：先等拆解完成再派生`, { sourceLapianNodeId, bridgeId: bridgeId || null });
     }
+    const sourceLocalId = bridgeId;   // 拆解产物引用（本入口没有「源 hub 任务」，出处记 bridge_id）
 
-    // D7①：源任务须已出片（done）方可派生——fork 前现查，未完成拒绝并明报
-    const client = deps.hub || defaultVariantHubClient();
-    const sourceTask = await client.getTask(sourceLocalId);
-    if (String(sourceTask.state || "") !== "done") {
-        throw new DeriveWorkflowVariantToolError("source_not_done", `源 hub 任务 ${sourceLocalId} 当前状态 ${sourceTask.state || "未知"}：须已出片（done）方可派生（先在画布把源实例审批出片）`, { sourceLocalId, state: sourceTask.state });
-    }
-
-    // ② fork（D7⑤：fork 失败如实报错，画布零改动）
-    let forkResponse: VariantForkResponse;
+    // ② 变体直建（路线 A：拆解完成即可派生；不经 ingest 幂等 → 双变体顺序调用各自建号。
+    //    直建失败如实报错，画布零改动——先建号成功、再落画布，顺序保证 D7⑤）
+    let createResponse: VariantCreateResponse;
     try {
-        forkResponse = await (deps.fork || forkHubTask)(sourceLocalId);
+        createResponse = await (deps.create || createHubVariant)(bridgeId, input.intentText || String(sourceLapian.metadata?.lapianIntent || "").trim() || String(sourceLapian.metadata?.content || "").trim());
     } catch (error) {
-        throw new DeriveWorkflowVariantToolError("fork", `fork 源任务 ${sourceLocalId} 失败：${error instanceof Error ? error.message : String(error)}`, { sourceLocalId });
+        throw new DeriveWorkflowVariantToolError("fork", `变体直建失败（bridge ${bridgeId}）：${error instanceof Error ? error.message : String(error)}`, { bridgeId });
     }
-    const newLocalId = String(forkResponse?.local_id || "").trim();
-    const bridgeId = String(forkResponse?.bridge_id || "").trim();
-    if (!newLocalId || !bridgeId) throw new DeriveWorkflowVariantToolError("fork", `fork 回执身份不完整（local_id/bridge_id 任一为空）：${sourceLocalId} → ${newLocalId || "(空)"}`, { sourceLocalId, forkResponse });
-    deps.log?.(`变体 fork：${sourceLocalId} → ${newLocalId}（bridge ${bridgeId}）`);
+    const newLocalId = String(createResponse?.local_id || "").trim();
+    const createdBridgeId = String(createResponse?.bridge_id || "").trim() || bridgeId;
+    if (!newLocalId || !createdBridgeId) throw new DeriveWorkflowVariantToolError("fork", `变体直建回执身份不完整（local_id/bridge_id 任一为空）：bridge ${bridgeId} → ${newLocalId || "(空)"}`, { bridgeId, createResponse });
+    deps.log?.(`变体直建：bridge ${bridgeId} → ${newLocalId}（出生态 awaiting_assets）`);
 
-    // ③ 纯逻辑派生（校验/重写/绑定/意图都在 C1 模块内；失败则 fork 任务作废留档，画布仍零改动）
+    // ③ 纯逻辑派生（校验/重写/绑定/意图都在 C1 模块内；失败则变体任务作废留档，画布仍零改动）
     const derived = deriveWorkflowVariant({
         nodes: project.nodes,
         connections: project.connections,
@@ -172,7 +171,8 @@ export async function deriveWorkflowVariantTool(input: DeriveWorkflowVariantTool
     });
     warnings.push(...derived.warnings);
 
-    // ④ 直绑推进（C2b：零 ingest，awaiting_assets→awaiting_approval；替换图字节随传）
+    // ④ 直绑推进（C2b：零 ingest、零 fork_task，awaiting_assets→awaiting_approval；替换图字节随传）
+    const client = deps.hub || defaultVariantHubClient();
     const assets: { blob: Blob; filename: string }[] = [];
     if (deps.getBlob) {
         const nodeById = new Map(project.nodes.map((node) => [node.id, node]));

@@ -33,7 +33,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from automation import bridge, cards, config as auto_config, discuss, fork, frames, generate  # noqa: E402
-from automation import ingest, local_assets, remote_wait, replace, selfcheck, state, submit_view  # noqa: E402
+from automation import ingest, local_assets, remote_wait, replace, selfcheck, state, submit_view, variant  # noqa: E402
 
 # 任务目录根的**唯一来源** = automation.config.PROJECTS_DIR（认 WANREPRO_AUTO_DIR）。
 # 禁止在这里另写一个 ROOT/"automation"/"projects"：硬编码会让「设 env 起隔离实例」变成
@@ -3467,6 +3467,35 @@ def fork_task(local_id: str) -> dict:
                      "清单引用重写": out["清单引用重写"]},
             "说明": (f"已派生 {out['local_id']}（复用自 {local_id}）："
                      "拆解产物按同一 bridge 共享只读，清单/资产图是它自己的副本；"
+                     "出片仍需你亲自确认置换与批准（一次批准 = 一次扣费）")}
+
+
+# ---------------------------------------------------------------- 卡C路A：变体任务直建（2026-11-15）
+# 变体挂的是**既有拆解产物 bridge_id**（画布拉片链产物，可能没有对应 hub 任务），不经 ingest 的
+# 视频 sha 幂等——同源视频 N 个变体各得独立任务号。机制在 automation/variant.py；本函数只做
+# 校验、锁与 HTTP 回执（fork_task 同款分层）。编号分配 + 建目录必须串行 → 同 fork 用一把全局锁。
+_VARIANT_LOCK = threading.Lock()
+
+
+def variant_create(bridge_id: str, intent: str, *, note: str = "") -> dict:
+    """POST /api/hub/variant/create —— 变体任务直建（路线 A：拆解完成即可派生，不要求源先出片）。
+
+    派生端点同样**不**批准、**不**提交、**不**写任何 `gen_*`（付费停点铁律）；
+    出生态=awaiting_assets，后续确认置换→渲染→待批走既有 hub 链。
+    """
+    with _VARIANT_LOCK:
+        try:
+            out = variant.create_variant_task(bridge_id, intent, note=note)
+        except variant.VariantError as exc:
+            raise HubError(str(exc)) from None
+        except state.StateError as exc:            # 受控初始化的守卫（出生态/必备字段/不覆盖）
+            raise HubError(f"变体初始化被状态机拒绝：{exc}", status=500) from None
+    return {"ok": True, "local_id": out["local_id"], "bridge_id": out["bridge_id"],
+            "state": out["state"],
+            "复制": {"源视频": out["video"], "源视频字节": out["video_bytes"],
+                     "指纹同抄": out["指纹同抄"], "私有清单": out["私有清单"]},
+            "说明": (f"已直建变体 {out['local_id']}（复用拆解产物 {out['bridge_id']}，未经 ingest 幂等）："
+                     "拆解产物按同一 bridge 共享只读，清单是它自己的私有副本；"
                      "出片仍需你亲自确认置换与批准（一次批准 = 一次扣费）")}
 
 
