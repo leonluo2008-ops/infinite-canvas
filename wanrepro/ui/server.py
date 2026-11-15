@@ -753,8 +753,8 @@ def decode_data_url(raw: str, name: str) -> tuple[bytes, str]:
 
 
 # ------------------------------------------- 参考图图床（asset/upload 与 sdgf 共用）
-# 渠道只收公网 HTTPS 直链：本地字节先留一份备份，再转传 uguu；uguu 不可用而本机又配了
-# 腾讯云 videocache 凭证时走第二顺位（出站隧道降级已废弃移除，AT-16 B12f）。
+# 渠道只收公网 HTTPS 直链：本地字节先留一份备份，再转传 uguu（唯一图源；腾讯云
+# videocache 兜底已废弃移除——所有者确认不可用；出站隧道降级同废，AT-16 B12f）。
 # **拿到 URL 必须当场验活**（AT-16 B12）：只查「是不是 https」挡不住死链——格式对但拉不到
 # 的 URL 发给渠道，渠道拉图失败 → 403 拒创建（auto-0043 实测）。
 
@@ -764,21 +764,15 @@ IMAGE_VERIFY_UA = "Mozilla/5.0 (wanrepro-bridge)"
 # 直连优先、再环境代理（与 upload_uguu_bytes 的双路径同法）：本机出站与渠道拉图不是同一条链路
 _VERIFY_OPENERS = (urllib.request.build_opener(urllib.request.ProxyHandler({})), None)
 
-# 第三图源：腾讯云 videocache（nginx + WebDAV PUT）。凭证是机器级 env，没配就**如实跳过**（不静默）。
-VC_TOKEN_ENV = "TENCENT_VC_TOKEN"
-VC_UPLOAD_BASE = os.environ.get("WANREPRO_VC_UPLOAD_BASE", "http://1.14.74.186/upload/")
-VC_UPLOAD_TIMEOUT = 60
-VC_PUBLIC_BASE = os.environ.get("WANREPRO_VC_PUBLIC_BASE", "https://vc.aistar.work/vc/")   # 渠道只收 https
-
 # 上传渠道计数（AT-14 B3 A2，诊断面透出）：local=本地引用（零图床），
-# uguu=转传成功，tencent=腾讯云图床。只增不减，进程内诊断面用。
-ASSET_COUNTERS = {"local": 0, "uguu": 0, "tencent": 0}
+# uguu=转传成功。只增不减，进程内诊断面用。
+ASSET_COUNTERS = {"local": 0, "uguu": 0}
 _ASSET_COUNTERS_LOCK = threading.Lock()
 _UGUU_LAST_ERROR = ""       # 最近一次 uguu 上传失败的短原因（人话自述用，进程内诊断面）
 
 
 def _bump_asset_counter(source: str) -> None:
-    key = {"tencent-videocache": "tencent"}.get(source, source)
+    key = source
     if key in ASSET_COUNTERS:
         with _ASSET_COUNTERS_LOCK:
             ASSET_COUNTERS[key] += 1
@@ -883,30 +877,6 @@ def image_url_alive(url: str, timeout: float = IMAGE_VERIFY_TIMEOUT) -> tuple[bo
     return False, " / ".join(dict.fromkeys(reasons)) or "不可达"
 
 
-def upload_tencent_vc(data: bytes, name: str, key: str, token: str) -> tuple[str, str]:
-    """第三图源：腾讯云 videocache（WebDAV PUT）→ (公网 https 直链, 失败原因)。
-
-    上传走明文直连（快）；对外直链必须是 https（渠道只收 https），前缀可用
-    WANREPRO_VC_PUBLIC_BASE 换。云服 6 小时定时清空 + 5GB 配额：只当提交瞬间的中转。
-    """
-    path = urllib.parse.quote(key, safe="/")
-    try:
-        req = urllib.request.Request(
-            f"{VC_UPLOAD_BASE.rstrip('/')}/{path}", data=data, method="PUT",
-            headers={"X-Token": token, "Content-Type": "application/octet-stream",
-                     "User-Agent": IMAGE_VERIFY_UA})
-        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-        with opener.open(req, timeout=VC_UPLOAD_TIMEOUT) as resp:
-            code = int(getattr(resp, "status", 0) or 0)
-            if code not in (200, 201, 204):
-                return "", f"上传 HTTP {code}"
-    except urllib.error.HTTPError as err:
-        return "", f"上传 HTTP {err.code}"
-    except (urllib.error.URLError, TimeoutError, OSError) as err:
-        return "", f"上传连不上（{getattr(err, 'reason', err)}）"
-    return f"{VC_PUBLIC_BASE.rstrip('/')}/{path}", ""
-
-
 def _host_failure_message(tried: list[dict], skipped: list[dict]) -> str:
     """图床全不可用的人话指引：逐图源自述 + 明说「没发渠道请求、不扣费」。"""
     parts = [f"{row.get('label') or row.get('source')} {row.get('reason') or '不可用'}"
@@ -920,7 +890,7 @@ def _host_failure_message(tried: list[dict], skipped: list[dict]) -> str:
 def host_image_detailed(data: bytes, raw_name: str) -> dict:
     """参考图字节 → 公网 https 直链，**每个候选直链逐一验活** → {url, source, tried, skipped}。
 
-    图源顺序 uguu → 腾讯云 videocache（没配 TENCENT_VC_TOKEN 就如实跳过）；
+    图源仅 uguu（腾讯云 videocache 兜底已废弃移除——所有者确认不可用）；
     出站隧道降级已废弃移除（AT-16 B12f）。
     本地一律留一份备份（uploads/vc/）——M4 直链路由靠它出图。
     全部不可用抛 ImageHostError：本地前置拒绝，参考图没有公网地址就不发任何渠道请求。
@@ -957,19 +927,6 @@ def host_image_detailed(data: bytes, raw_name: str) -> dict:
     else:
         tried.append({"source": "uguu", "label": "uguu",
                       "reason": f"上传失败（{_UGUU_LAST_ERROR or '服务不可用'}）"})
-
-    token = os.environ.get(VC_TOKEN_ENV, "").strip()        # ② 腾讯云 videocache
-    if not token:
-        skipped.append({"source": "tencent-videocache", "label": "腾讯云图床",
-                        "reason": f"未配置 {VC_TOKEN_ENV}，已跳过"})
-    else:
-        vc_url, vc_why = upload_tencent_vc(data, ascii_name, key, token)
-        if vc_url:
-            got = accept("tencent-videocache", "腾讯云图床", vc_url)
-            if got:
-                return got
-        else:
-            tried.append({"source": "tencent-videocache", "label": "腾讯云图床", "reason": vc_why})
 
     raise ImageHostError(_host_failure_message(tried, skipped), sources=tried, skipped=skipped)
 
@@ -1493,7 +1450,7 @@ def sdgf_host_images(plan: dict) -> tuple[dict, list[str]]:
     换不到就报错——宁可失败也不发一条没有参考图（或图拉不到）的请求
     （那会出一版跟提示词无关的片子，渠道还会拒创建并可能扣费）。
     AT-14 B3 A5：同时返回每张图的**实际来源**（(body, sources)，序=images 序）——
-    来源 ∈ uguu / tencent-videocache / url，调用点把它当 imageSources 落账。
+    来源 ∈ uguu / url，调用点把它当 imageSources 落账。
     AT-16 B12：图源全不可用时这里抛 ImageHostError（502 + stage=host_images），
     automation 认它做**前置拒绝**（零渠道请求、回 awaiting_approval），不记成「结果未知」。
     """
