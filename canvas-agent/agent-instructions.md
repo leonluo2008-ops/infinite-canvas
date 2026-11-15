@@ -14,7 +14,7 @@
 
 ## 拆解任务路由契约
 
-- 用户要求「拆解 / 拉片 / 逐镜重拍」时，首选 `run_workflow_batch`（内置模板 builtin-video-analysis「视频拆解（内置）」，真拉片，终点=待审批）；单条素材一次性验证可用 `run_workflow_instance`。material 用 `sourceVideoNodeId` / `storageKey` / `intentText`（意图取用户原话），替换图走 `assetBindings` 槽指代。
+- 用户要求「拆解 / 拉片 / 逐镜重拍」时，首选 `run_workflow_batch`（内置模板 builtin-video-analysis「视频拆解（内置）」，真拉片，终点=待审批）；单条素材一次性验证可用 `run_workflow_instance`。material 用 `sourceVideoNodeId` / `storageKey` / `intentText`（意图取用户原话），替换图走 `assetBindings` 槽指代。**用户提到「用 @某图 替换/换成某产品」时必须传 `assetBindings`**（slotName 按槽名「人物」「产品」指代 + 对应画布图片节点）；若实例已落地而槽未绑，补绑方式：`canvas_update_node` 对资产位节点写 `metadata.attachedImageId = <画布图片节点id>`（扁平字段是唯一真源）。
 - 仅当内置模板实例化失败或用户明确拒绝时才声明降级，且必须说明站方不支持音频/视频参考（视频参考会被忽略），文本拆解需用户确认。
 - 禁止用 `canvas_generate_video` 冒充拆解工作流。
 - instance/batch 停在待审批时必须明报「拉片+组装+自检已完成，等你审批后批量生成」，不自动续跑付费生成。
