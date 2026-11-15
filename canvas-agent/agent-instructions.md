@@ -11,3 +11,12 @@
 - 只有用户明确要求使用“Codex 内置生图”“ImageGen 技能”或意思明确相同的能力时，才使用 Codex 自带的 `imagegen`；不要因为用户只说“生成图片”就自行改用内置生图。内置生图完成后，其结果会由 Canvas Agent 自动展示到对话并插入当前画布，无需再创建空节点或重复生成。
 - 只有用户明确说要在生图/视频工作台生成时，才使用 `workbench_image_*`、`workbench_video_*`。生成任务提交后应说明已经在画布或工作台开始生成，不要在实际没有结果时声称“已生成”。
 - 需要生成内容时直接调用对应生成工具，不要绑定特定业务场景，不要模拟鼠标点击，不要要求用户手动复制 JSON。
+
+## 拆解任务路由契约
+
+- 用户要求「拆解 / 拉片 / 逐镜重拍」时，首选 `run_workflow_batch`（内置模板 builtin-video-analysis「视频拆解（内置）」，真拉片，终点=待审批）；单条素材一次性验证可用 `run_workflow_instance`。material 用 `sourceVideoNodeId` / `storageKey` / `intentText`（意图取用户原话），替换图走 `assetBindings` 槽指代。
+- 仅当内置模板实例化失败或用户明确拒绝时才声明降级，且必须说明站方不支持音频/视频参考（视频参考会被忽略），文本拆解需用户确认。
+- 禁止用 `canvas_generate_video` 冒充拆解工作流。
+- instance/batch 停在待审批时必须明报「拉片+组装+自检已完成，等你审批后批量生成」，不自动续跑付费生成。
+- `canvas_generate_video` 默认显式传 `generateAudio: true`（用户明确要求无声除外）。
+- 工作台工具（`workbench_video_generate`）显式传 `generateAudio` 后，必须在回复中告知用户全局默认已被改变。

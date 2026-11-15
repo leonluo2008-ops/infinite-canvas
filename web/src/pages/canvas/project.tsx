@@ -408,9 +408,17 @@ function InfiniteCanvasPage() {
                 await waitForVideoGenerationTask(config, task, {
                     signal,
                     onProgress: (pct) => setNodes((prev) => prev.map((item) => (item.id === nodeId ? { ...item, metadata: { ...item.metadata, videoProgress: pct } } : item))),
+                    onPhase: (phase) => setNodes((prev) => prev.map((item) => (item.id === nodeId ? { ...item, metadata: { ...item.metadata, videoPhase: phase } } : item))),
                 }),
             );
-            setNodes((prev) => prev.map((item) => (item.id === nodeId ? applyGeneratedVideo(item, video, { prompt, model: config.model, ...extra }) : item)));
+            setNodes((prev) =>
+                prev.map((item) => {
+                    if (item.id !== nodeId) return item;
+                    const next = applyGeneratedVideo(item, video, { prompt, model: config.model, ...extra });
+                    // 完成/失败即清阶段标记，videoPhase 只在生成中有效。
+                    return { ...next, metadata: { ...next.metadata, videoPhase: undefined } };
+                }),
+            );
         },
         [],
     );
@@ -441,24 +449,26 @@ function InfiniteCanvasPage() {
                         {
                             signal: controller.signal,
                             onProgress: (pct) => setNodes((prev) => prev.map((item) => (item.id === node.id ? { ...item, metadata: { ...item.metadata, videoProgress: pct } } : item))),
+                            onPhase: (phase) => setNodes((prev) => prev.map((item) => (item.id === node.id ? { ...item, metadata: { ...item.metadata, videoPhase: phase } } : item))),
                         },
                     ),
                 );
                 setNodes((prev) =>
-                    prev.map((item) =>
-                        item.id === node.id
-                            ? applyGeneratedVideo(item, video, {
-                                  prompt: item.metadata?.prompt,
-                                  model: generationConfig.model,
-                                  size: generationConfig.size,
-                                  seconds: generationConfig.videoSeconds,
-                                  vquality: generationConfig.vquality,
-                                  generateAudio: generationConfig.videoGenerateAudio,
-                                  watermark: generationConfig.videoWatermark,
-                                  videoMode: generationConfig.videoMode,
-                              })
-                            : item,
-                    ),
+                    prev.map((item) => {
+                        if (item.id !== node.id) return item;
+                        const next = applyGeneratedVideo(item, video, {
+                            prompt: item.metadata?.prompt,
+                            model: generationConfig.model,
+                            size: generationConfig.size,
+                            seconds: generationConfig.videoSeconds,
+                            vquality: generationConfig.vquality,
+                            generateAudio: generationConfig.videoGenerateAudio,
+                            watermark: generationConfig.videoWatermark,
+                            videoMode: generationConfig.videoMode,
+                        });
+                        // 完成/失败即清阶段标记，videoPhase 只在生成中有效。
+                        return { ...next, metadata: { ...next.metadata, videoPhase: undefined } };
+                    }),
                 );
             } catch (error) {
                 if (isGenerationCanceled(error)) return;
@@ -474,6 +484,7 @@ function InfiniteCanvasPage() {
                                       status: item.metadata?.content ? NODE_STATUS_SUCCESS : NODE_STATUS_ERROR,
                                       errorDetails: item.metadata?.content ? undefined : errorDetails,
                                       videoProgress: undefined,
+                                      videoPhase: undefined,
                                       ...(isVideoTaskFailed(error) ? { videoTaskId: undefined } : {}),
                                   },
                               }

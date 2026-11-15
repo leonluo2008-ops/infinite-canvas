@@ -20,8 +20,8 @@ type VideoResponse = { id: string; status?: string; error?: { message?: string }
 type ApiVideoResponse = VideoResponse | { code?: number | string; data?: VideoResponse | null; msg?: string; message?: string; error?: { message?: string } };
 type ApiEnvelope<T> = T | { code?: number | string; data?: T | null; msg?: string; message?: string; error?: { message?: string } };
 type RequestOptions = { signal?: AbortSignal };
-/** 等待期选项：onProgress 只在等待循环里用（SDGF 渠道有进度，其余渠道不回调）。 */
-type VideoWaitOptions = RequestOptions & { onProgress?: (pct: number) => void };
+/** 等待期选项：onProgress 只在等待循环里用（SDGF 渠道有进度，其余渠道不回调）；onPhase 透传给 poll 驱动（如成片下载前发 "downloading"）。 */
+type VideoWaitOptions = RequestOptions & { onProgress?: (pct: number) => void; onPhase?: (phase: string) => void };
 type VideoMediaOptions = RequestOptions & { videos?: ReferenceVideo[]; audios?: ReferenceAudio[] };
 const apiText = (key: string, options?: Record<string, unknown>) => i18n.t(`apiErrors.${key}`, options);
 
@@ -64,6 +64,7 @@ export async function waitForVideoGenerationTask(config: AiConfig, task: VideoGe
         delay: (ms) => delay(ms, options?.signal),
         isAborted: () => Boolean(options?.signal?.aborted),
         onProgress: (pct) => options?.onProgress?.(pct),
+        onPhase: (phase) => options?.onPhase?.(phase),
         onTaskFailed: (error) => {
             throw videoTaskFailed(error);
         },
@@ -95,7 +96,7 @@ export async function createVideoGenerationTask(config: AiConfig, prompt: string
     return createOpenAIVideoTask(requestConfig, selectedModel, prompt, references, options);
 }
 
-export async function pollVideoGenerationTask(config: AiConfig, task: VideoGenerationTask, options?: RequestOptions): Promise<VideoGenerationTaskState> {
+export async function pollVideoGenerationTask(config: AiConfig, task: VideoGenerationTask, options?: VideoWaitOptions): Promise<VideoGenerationTaskState> {
     if (task.provider === "plugin") {
         const result = pluginVideoResults.get(task.id);
         return result ? { status: "completed", result } : { status: "failed", error: apiText("pluginVideoExpired") };
@@ -164,6 +165,10 @@ function videoPluginResult(result: unknown): VideoGenerationResult {
 // 分辨率由精确模型名定档——本分支不发送 size/resolution。
 
 const SDGF_ASSET_BRIDGE = "/api/asset/upload";
+
+// 卡F3 提前探测：taskId → 连续 pending 次数（≥90 进度）。completed/failed 即删，不随任务完成永久膨胀。
+const SDGF_EARLY_PROBE_STREAK_LIMIT = 5;
+const sdgfEarlyProbeStreaks = new Map<string, number>();
 
 // 聚鑫只收裸 HTTPS URL；重试链会从 metadata 恢复出 `@url:`...`` token 格式的引用——剥出内层 URL。
 function stripReferenceToken(value: string): string {
@@ -264,7 +269,7 @@ async function createSdgfVideoTask(config: AiConfig, model: string, prompt: stri
     return { id, provider: "sdgf", model, ...(durationClamped ? { durationClamped: true } : {}) };
 }
 
-async function pollSdgfVideoTask(config: AiConfig, task: VideoGenerationTask, options?: RequestOptions): Promise<VideoGenerationTaskState> {
+async function pollSdgfVideoTask(config: AiConfig, task: VideoGenerationTask, options?: VideoWaitOptions): Promise<VideoGenerationTaskState> {
     try {
         const raw = (await axios.get<Record<string, unknown>>(aiApiUrl(config, `/videos/${task.id}`), { headers: aiHeaders(config), signal: options?.signal })).data;
         const status = String(raw?.status || "");
@@ -275,14 +280,34 @@ async function pollSdgfVideoTask(config: AiConfig, task: VideoGenerationTask, op
         const rawUrl = typeof metadata.url === "string" ? metadata.url : "";
         const url = /^https?:\/\//.test(rawUrl) ? rawUrl : "";
         if (status === "completed") {
+            sdgfEarlyProbeStreaks.delete(task.id);
+            options?.onPhase?.("downloading");
             if (url) return { status: "completed", result: await videoResultFromUrl(url, options) };
             const content = await axios.get<Blob>(aiApiUrl(config, `/videos/${task.id}/content`), { headers: aiHeaders(config), responseType: "blob", signal: options?.signal });
             await assertVideoBlob(content.data);
             return { status: "completed", result: { blob: content.data } };
         }
         if (status === "failed" || status === "cancelled") {
+            sdgfEarlyProbeStreaks.delete(task.id);
             const err = (raw?.error || {}) as { message?: string };
             return { status: "failed", error: readApiErrorMessage(err.message) || "SD GF 生成失败" };
+        }
+        // 卡F3 提前探测：站方 progress 停在 >=90 的 pending 常是「站方忘了置 completed」。连续 5 次起每次轮询
+        // 先按 completed 同款逻辑试着拉成片：拉到就当 completed 返回；失败/未完成保持 pending，不清零计数继续累加。
+        // 探测异常一律吞掉——绝不改变节点失败态，绝不 throw 打断正常轮询。
+        const streak = (sdgfEarlyProbeStreaks.get(task.id) || 0) + 1;
+        sdgfEarlyProbeStreaks.set(task.id, streak);
+        if (streak >= SDGF_EARLY_PROBE_STREAK_LIMIT && progress !== undefined && progress >= 90) {
+            try {
+                options?.onPhase?.("downloading");
+                if (url) return { status: "completed", result: await videoResultFromUrl(url, options) };
+                const content = await axios.get<Blob>(aiApiUrl(config, `/videos/${task.id}/content`), { headers: aiHeaders(config), responseType: "blob", signal: options?.signal });
+                await assertVideoBlob(content.data);
+                sdgfEarlyProbeStreaks.delete(task.id);
+                return { status: "completed", result: { blob: content.data } };
+            } catch {
+                // 探测失败不判死：站方可能马上自愈，继续按 pending 轮询（计数保留）。
+            }
         }
         return progress === undefined ? { status: "pending" } : { status: "pending", progress };
     } catch (error) {

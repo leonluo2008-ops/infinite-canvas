@@ -168,7 +168,7 @@ export const toolDescriptions: Record<ToolName, string> = {
     canvas_create_generation_flow: "创建通用生成流程：提示词文本节点、生成配置节点、参考节点连线，可用于文案、生图、视频或音频。",
     canvas_generate_text: "创建通用文本生成流程并立即触发生成。",
     canvas_generate_image: "创建通用图片生成流程并立即触发生成。",
-    canvas_generate_video: "创建通用视频生成流程并立即触发生成。",
+    canvas_generate_video: "创建通用视频生成流程并立即触发生成。注意：referenceNodeIds 只接受图片节点；视频节点参考不被站方支持（会被忽略），不要传视频节点。",
     canvas_generate_audio: "创建通用音频生成流程并立即触发生成。",
     canvas_update_node: "更新节点基础字段或 metadata。",
     canvas_update_node_text: "更新文本节点内容和标题。",

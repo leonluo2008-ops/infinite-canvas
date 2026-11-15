@@ -516,12 +516,13 @@ function GroupNodeContent({ node, theme, groupChildCount }: NodeContentRendererP
 
 function LoadingContent({ node, theme }: Pick<NodeContentRendererProps, "node" | "theme">) {
     const { t } = useTranslation();
-    // 视频节点有站方进度（SDGF progress 0-100）就显示百分比；其余节点/无进度仍旧「生成中」——不显示假数字。
-    const progress = node.type === CanvasNodeType.Video && typeof node.metadata?.videoProgress === "number" && Number.isFinite(node.metadata.videoProgress) ? Math.round(node.metadata.videoProgress) : null;
+    // 视频节点有站方进度（SDGF progress 0-100）就显示百分比；成片下载阶段显示「生成完成，下载中…」；其余仍旧「生成中」——不显示假数字。
+    const phase = node.type === CanvasNodeType.Video ? node.metadata?.videoPhase : undefined;
+    const progress = phase === "downloading" ? null : node.type === CanvasNodeType.Video && typeof node.metadata?.videoProgress === "number" && Number.isFinite(node.metadata.videoProgress) ? Math.round(node.metadata.videoProgress) : null;
     return (
         <div className="flex h-full w-full flex-col items-center justify-center gap-3" style={{ color: theme.node.activeStroke }}>
             <div className="size-10 animate-spin rounded-full border-2" style={{ borderColor: theme.node.stroke, borderTopColor: theme.node.activeStroke }} />
-            <span className="text-[10px] tracking-[0.2em]">{progress === null ? t("canvas.node.generating") : t("videoProgressLabel", { progress })}</span>
+            <span className="text-[10px] tracking-[0.2em]">{phase === "downloading" ? t("videoPhaseDownloading") : progress === null ? t("canvas.node.generating") : t("videoProgressLabel", { progress })}</span>
         </div>
     );
 }

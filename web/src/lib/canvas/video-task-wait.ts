@@ -27,6 +27,8 @@ export type VideoWaitDriverOptions<T> = {
     isAborted?: () => boolean;
     /** 进度回调（0-100）。仅当本次 poll 为 pending 且带 progress 时调用；缺进度不回调——不显示假数字。 */
     onProgress?: (pct: number) => void;
+    /** 阶段回调（如 "downloading"）：poll 驱动在站方 completed 后发起成片下载前透传，供 UI 区分「生成中/下载中」。 */
+    onPhase?: (phase: string) => void;
     onTaskFailed: (error: string) => never;
     onTimeout: () => never;
 };

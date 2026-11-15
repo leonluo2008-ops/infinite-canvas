@@ -359,7 +359,10 @@ function runVideoWorkbench(input: SiteToolInput, navigate: NavigateFunction) {
     const run = input.run !== false;
     navigate("/video");
     const taskId = useWorkbenchAgentStore.getState().dispatchVideo({ prompt, run });
-    return { ok: true, navigated: "/video", prompt, run, taskId, applied, note: siteText(run ? "videoGenerationStarted" : "videoConfigApplied") };
+    // 卡E4：显式改了全局默认音频时必须在回执里明示（写全局本身是设计内行为）。
+    let note = siteText(run ? "videoGenerationStarted" : "videoConfigApplied");
+    if ("generateAudio" in applied) note += ` ${siteText("videoAudioGlobalApplied", { value: String(applied.generateAudio) })}`;
+    return { ok: true, navigated: "/video", prompt, run, taskId, applied, note };
 }
 
 async function searchPrompts(input: SiteToolInput) {

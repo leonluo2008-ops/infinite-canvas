@@ -34,6 +34,9 @@ export function CanvasConfigNodePanel({ node, isRunning, inputSummary, onConfigC
     const hasAnyInput = Boolean(inputSummary.textCount || inputSummary.imageCount || inputSummary.videoCount || inputSummary.audioCount);
     const hasComposerContent = Boolean((node.metadata?.composerContent ?? node.metadata?.prompt ?? "").trim());
     const canGenerate = hasComposerContent || (mode === "audio" ? inputSummary.textCount > 0 : hasAnyInput);
+    // 卡E2：有效音频值（节点指定 > 全局 > 默认）与来源标注，仅视频模式展示。
+    const nodeAudioOverride = typeof node.metadata?.generateAudio === "string" && node.metadata.generateAudio.trim() !== "";
+    const audioOn = config.videoGenerateAudio !== "false";
 
     return (
         <div className="flex h-full w-full cursor-move flex-col px-3 pb-3 pt-7 text-sm" style={{ color: theme.node.text }} onWheel={(event) => event.stopPropagation()}>
@@ -92,6 +95,9 @@ export function CanvasConfigNodePanel({ node, isRunning, inputSummary, onConfigC
                 <InputChip label={t("canvas.configNode.references")} value={t("canvas.configNode.images", { count: inputSummary.imageCount })} style={chipStyle} />
                 <InputChip label={t("canvas.configNode.videoReferences")} value={t("canvas.configNode.items", { count: inputSummary.videoCount })} style={chipStyle} />
                 <InputChip label={t("canvas.configNode.audioReferences")} value={t("canvas.configNode.items", { count: inputSummary.audioCount })} style={chipStyle} />
+                {mode === "video" ? (
+                    <InputChip label={t(audioOn ? "canvas.configNode.audioBadgeOn" : "canvas.configNode.audioBadgeOff")} value={t(nodeAudioOverride ? "canvas.configNode.audioBadgeSourceNode" : "canvas.configNode.audioBadgeSourceGlobal")} style={chipStyle} />
+                ) : null}
                 <button type="button" className="inline-flex h-7 cursor-pointer items-center gap-1 rounded-md border px-2 text-[11px]" style={chipStyle} onMouseDown={(event) => event.stopPropagation()} onClick={onComposerToggle}>
                     <Settings2 className="size-3.5" />
                     {t("canvas.configNode.compose")}

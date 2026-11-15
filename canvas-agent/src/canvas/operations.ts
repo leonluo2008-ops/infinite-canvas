@@ -4,7 +4,7 @@ import type { ToolName } from "./schemas.js";
 import { nextCanvasX } from "./tools.js";
 import type { CanvasNode, CanvasNodeType, CanvasSnapshot } from "./types.js";
 
-export type CanvasToolRequest = { name: "canvas_apply_ops"; input: Record<string, unknown> };
+export type CanvasToolRequest = { name: "canvas_apply_ops"; input: Record<string, unknown>; warning?: string };
 
 /** 将上层画布工具调用转换为前端可执行的批量操作。 */
 export function buildCanvasToolRequest(name: ToolName, input: Record<string, unknown>, state: CanvasSnapshot | null): CanvasToolRequest {
@@ -24,7 +24,10 @@ export function buildCanvasToolRequest(name: ToolName, input: Record<string, unk
         const gap = Number(data.gap ?? 40);
         return applyOps(data.items.map((item, index) => textNodeOp(item, item.x ?? (data.direction === "row" ? x + index * (340 + gap) : x), item.y ?? (data.direction === "row" ? y : y + index * (240 + gap)))));
     }
-    if (name === "canvas_create_image_prompt_flow") return applyOps(generationFlowOps({ ...input, mode: "image" }, state));
+    if (name === "canvas_create_image_prompt_flow") {
+        const flow = generationFlowOps({ ...input, mode: "image" }, state);
+        return applyOps(flow.ops, flow.warning);
+    }
     if (name === "canvas_create_config_node") {
         const x = Number(input.x ?? nextCanvasX(state));
         const y = Number(input.y ?? 0);
@@ -33,9 +36,13 @@ export function buildCanvasToolRequest(name: ToolName, input: Record<string, unk
         const prompt = String(input.prompt || "");
         return applyOps([configNodeOp(configId, input, x, y), ...(input.autoRun ? [runGenerationOp(configId, mode, prompt)] : [])]);
     }
-    if (name === "canvas_create_generation_flow") return applyOps(generationFlowOps(input, state));
+    if (name === "canvas_create_generation_flow") {
+        const flow = generationFlowOps(input, state);
+        return applyOps(flow.ops, flow.warning);
+    }
     if (name === "canvas_generate_text" || name === "canvas_generate_image" || name === "canvas_generate_video" || name === "canvas_generate_audio") {
-        return applyOps(generationFlowOps({ ...input, mode: name.replace("canvas_generate_", ""), autoRun: true }, state));
+        const flow = generationFlowOps({ ...input, mode: name.replace("canvas_generate_", ""), autoRun: true }, state);
+        return applyOps(flow.ops, flow.warning);
     }
     if (name === "canvas_update_node") {
         const data = input as { id: string; patch?: Record<string, unknown>; metadata?: Record<string, unknown> };
@@ -76,9 +83,9 @@ export function fitAttachmentNodeSize(width: number, height: number) {
     return { width: width * scale, height: height * scale };
 }
 
-/** 创建统一的批量画布操作请求。 */
-function applyOps(ops: unknown[]): CanvasToolRequest {
-    return { name: "canvas_apply_ops", input: { ops } };
+/** 创建统一的批量画布操作请求。warning 为非致命提示（如视频参考被降级），随请求透出给调用方。 */
+function applyOps(ops: unknown[], warning?: string): CanvasToolRequest {
+    return warning ? { name: "canvas_apply_ops", input: { ops }, warning } : { name: "canvas_apply_ops", input: { ops } };
 }
 
 /** 创建文本节点操作。 */
@@ -120,22 +127,26 @@ function configNodeOp(id: string, input: Record<string, unknown>, x: number, y: 
     };
 }
 
-/** 创建包含提示词、配置节点和引用连线的生成流程。 */
-function generationFlowOps(input: Record<string, unknown>, state: CanvasSnapshot | null) {
+/** 创建包含提示词、配置节点和引用连线的生成流程。视频类型参考节点不被站方支持：剔除不发送并在 warning 里说明。 */
+function generationFlowOps(input: Record<string, unknown>, state: CanvasSnapshot | null): { ops: unknown[]; warning?: string } {
     const mode = generationMode(input.mode);
     const prompt = String(input.prompt || "");
     const x = Number(input.x ?? nextCanvasX(state));
     const y = Number(input.y ?? 0);
     const textId = `text-${crypto.randomUUID()}`;
     const configId = `config-${crypto.randomUUID()}`;
-    const referenceNodeIds = Array.isArray(input.referenceNodeIds) ? input.referenceNodeIds.filter((id): id is string => typeof id === "string") : [];
+    const allReferenceNodeIds = Array.isArray(input.referenceNodeIds) ? input.referenceNodeIds.filter((id): id is string => typeof id === "string") : [];
+    // 卡D：referenceNodeIds 只收图片节点；视频节点参考会被站方忽略——直接剔除不发送，并在返回值里带 warning。
+    const referenceNodeIds = allReferenceNodeIds.filter((id) => findNode(state, id)?.type !== "video");
+    const hasVideoReference = referenceNodeIds.length !== allReferenceNodeIds.length;
+    const warning = hasVideoReference ? "视频参考不被站方支持，未发送，已降级" : undefined;
     // When the prompt only @-mentions nodes already passed as references, reuse them instead of minting a duplicate text node.
     const mentionedIds = [...prompt.matchAll(/@\[node:([\w-]+)\]/g)].map((match) => match[1]);
     const reuseReferences = referenceNodeIds.length > 0 && mentionedIds.length > 0
         && mentionedIds.every((id) => referenceNodeIds.includes(id))
         && prompt.replace(/@\[node:[\w-]+\]/g, "").trim() === "";
     const tokens = reuseReferences ? referenceNodeIds.map((id) => `@[node:${id}]`) : [`@[node:${textId}]`, ...referenceNodeIds.map((id) => `@[node:${id}]`)];
-    return [
+    const ops = [
         ...(reuseReferences ? [] : [textNodeOp({ id: textId, text: prompt, title: String(input.title || "提示词") }, x, y)]),
         configNodeOp(configId, { ...input, prompt: tokens.join("\n") }, x + 420, y),
         ...(reuseReferences ? [] : [{ type: "connect_nodes", fromNodeId: textId, toNodeId: configId }]),
@@ -143,6 +154,7 @@ function generationFlowOps(input: Record<string, unknown>, state: CanvasSnapshot
         { type: "select_nodes", ids: [configId] },
         ...(input.autoRun ? [runGenerationOp(configId, mode, tokens.join("\n"))] : []),
     ];
+    return warning ? { ops, warning } : { ops };
 }
 
 /** 创建触发节点生成的画布操作。 */

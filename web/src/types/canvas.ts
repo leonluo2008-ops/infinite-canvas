@@ -153,6 +153,8 @@ export type CanvasNodeMetadata = {
     videoTaskProvider?: VideoTaskProvider;
     // SDGF 站方进度 0-100（轮询回报，仅生成中有值）；缺失时 UI 退回「生成中」，不显示假数字。
     videoProgress?: number;
+    // 卡F：生成阶段标记（目前仅 "downloading"=生成完成正在下载成片）；完成/失败时清除。
+    videoPhase?: string;
     groupId?: string;
     interactive?: boolean; // Plugin node interaction/move state; see CanvasNodeDefinition.interactionToggle.
 };
