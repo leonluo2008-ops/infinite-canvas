@@ -58,7 +58,10 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))   # automation/ 包在仓库根（sys.path 装配收编到这）
 from automation import config as auto_config, frames as auto_frames, local_assets, state as auto_state  # noqa: E402  AT-14 B3 本地资产（config.PROJECTS_DIR）
 from automation import replace as auto_replace          # noqa: E402  AT-22 B0 清单写锁（两链同一把）
-from wanrepro.ui import multiuser  # noqa: E402
+try:
+    from wanrepro.ui import multiuser  # noqa: E402  仓根包形态（探针/测试导入）
+except ImportError:  # 脚本直跑形态：ui/ 在 sys.path[0]，直接平级导入（ROOT 下的嵌套 wanrepro/ 目录会遮蔽包名）
+    import multiuser  # noqa: E402
 
 # 拆解产物根：与 replace.analysis_root / state 同一真源
 # （`WANREPRO_ANALYSIS_ROOT` 优先）。为什么画布链也要认它：清单是各链共写的
