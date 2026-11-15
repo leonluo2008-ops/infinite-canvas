@@ -15,7 +15,23 @@ from pathlib import Path
 DB_PATH_ENV = "WANREPRO_MULTIUSER_DB"
 LOCK = threading.Lock()
 FAILURES: dict[str, list[float]] = {}
+REG_ATTEMPTS: dict[str, list[float]] = {}  # 注册限速（按来源 IP，3600s 窗口内 10 次）
 COOKIE = "wan_session"
+DUMMY_SALT = secrets.token_bytes(16)  # 未知用户也走一次等价 scrypt，抹平时序侧信道
+
+
+def _cap(d: dict, limit: int = 4096) -> None:
+    """限速字典封顶，防内存无界增长。"""
+    if len(d) > limit:
+        for k in list(d)[: len(d) - limit]:
+            d.pop(k, None)
+
+
+def _cookie(value: str, max_age: int) -> str:
+    parts = f"{COOKIE}={value}; Path=/; HttpOnly; SameSite=Lax; Max-Age={max_age}"
+    if os.environ.get("MULTI_USER_COOKIE_SECURE", "").strip() == "1":
+        parts += "; Secure"  # HTTPS 部署时经环境变量打开
+    return parts
 
 
 def enabled() -> bool:
@@ -33,6 +49,7 @@ def connect() -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=5000")
+    conn.execute("PRAGMA foreign_keys=ON")
     conn.executescript("""
       CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, username TEXT NOT NULL UNIQUE,
         pwd_hash BLOB NOT NULL, salt BLOB NOT NULL, created_at INTEGER NOT NULL);
@@ -98,25 +115,42 @@ def handle(h: BaseHTTPRequestHandler, method: str, path: str) -> bool:
     body = _body(h)
     if path == "/api/auth/logout":
         with connect() as db: db.execute("UPDATE sessions SET revoked=1 WHERE token=?", (_token(h),))
-        _send(h, {"ok":True}, headers={"Set-Cookie": f"{COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0"})
+        _send(h, {"ok":True}, headers={"Set-Cookie": _cookie("", 0)})
         return True
     username, password = str(body.get("username") or "").strip(), str(body.get("password") or "")
     if not username or len(username) > 128 or len(password) < 8:
         _send(h, {"error":"用户名必填，密码至少 8 位"}, 400); return True
     if path.endswith("register"):
+        # 注册限速（按来源 IP）：未认证端点不该被无限刷（含 scrypt 成本）
+        ip = h.client_address[0] if h.client_address else "?"
+        now_f = time.time()
+        with LOCK:
+            att = [t for t in REG_ATTEMPTS.get(ip, []) if now_f - t < 3600]
+            REG_ATTEMPTS[ip] = att + [now_f]
+            _cap(REG_ATTEMPTS)
+            if len(att) >= 10:
+                _send(h, {"error": "注册尝试过于频繁，请稍后再试"}, 429); return True
         code = str(body.get("inviteCode") or "")
+        now = int(time.time())
+        # 邀请码先行只读校验：无效码不做 scrypt（省 CPU，时序差异不泄露码内容）
+        with connect() as db:
+            inv = db.execute("SELECT * FROM invites WHERE code=?", (code,)).fetchone()
+        if not inv or inv["revoked"] or inv["used_count"] >= inv["max_uses"] or (inv["expires_at"] is not None and inv["expires_at"] <= now):
+            _send(h, {"error": "邀请码无效、过期、已撤销或已用尽"}, 403); return True
         salt = secrets.token_bytes(16)
         pwd = hashlib.scrypt(password.encode(), salt=salt, n=2**15, r=8, p=1, dklen=32, maxmem=64*1024*1024)
         try:
             with connect() as db:
                 db.execute("BEGIN IMMEDIATE")
-                inv = db.execute("SELECT * FROM invites WHERE code=?", (code,)).fetchone()
-                now = int(time.time())
-                if not inv or inv["revoked"] or inv["used_count"] >= inv["max_uses"] or (inv["expires_at"] is not None and inv["expires_at"] <= now):
-                    db.rollback(); _send(h, {"error":"邀请码无效、过期、已撤销或已用尽"}, 403); return True
+                # 条件更新 + rowcount 复核：限额不依赖先读后写
+                cur = db.execute(
+                    "UPDATE invites SET used_count=used_count+1 WHERE code=? AND revoked=0"
+                    " AND used_count<max_uses AND (expires_at IS NULL OR expires_at>?)",
+                    (code, now))
+                if cur.rowcount != 1:
+                    db.rollback(); _send(h, {"error": "邀请码无效、过期、已撤销或已用尽"}, 403); return True
                 db.execute("INSERT INTO users(username,pwd_hash,salt,created_at) VALUES(?,?,?,?)", (username,pwd,salt,now))
                 uid = db.execute("SELECT id FROM users WHERE username=?", (username,)).fetchone()[0]
-                db.execute("UPDATE invites SET used_count=used_count+1 WHERE code=?", (code,))
                 token = secrets.token_urlsafe(32); expiry = now + 30*24*3600
                 db.execute("INSERT INTO sessions(token,user_id,expires_at) VALUES(?,?,?)", (token,uid,expiry))
                 db.commit()
@@ -129,17 +163,17 @@ def handle(h: BaseHTTPRequestHandler, method: str, path: str) -> bool:
             if len(times) >= 5:
                 FAILURES[username] = times; _send(h,{"error":"登录失败次数过多，请 10 分钟后重试"},429); return True
         with connect() as db: user = db.execute("SELECT * FROM users WHERE username=?",(username,)).fetchone()
-        valid = False
-        if user:
-            candidate = hashlib.scrypt(password.encode(), salt=user["salt"], n=2**15,r=8,p=1,dklen=32,maxmem=64*1024*1024)
-            valid = hmac.compare_digest(candidate, user["pwd_hash"])
+        # 未知用户也走一次等价 scrypt：抹平「已知用户 vs 未知用户」的耗时侧信道
+        candidate = hashlib.scrypt(password.encode(), salt=(user["salt"] if user else DUMMY_SALT), n=2**15,r=8,p=1,dklen=32,maxmem=64*1024*1024)
+        valid = bool(user) and hmac.compare_digest(candidate, user["pwd_hash"])
         if not valid:
-            with LOCK: FAILURES[username] = times + [now]
+            with LOCK:
+                FAILURES[username] = times + [now]; _cap(FAILURES)
             _send(h,{"error":"用户名或密码错误"},401); return True
         with LOCK: FAILURES.pop(username, None)
         token = secrets.token_urlsafe(32); expiry = int(now)+30*24*3600
         with connect() as db: db.execute("INSERT INTO sessions(token,user_id,expires_at) VALUES(?,?,?)",(token,user["id"],expiry))
-    _send(h,{"username":username,"expiresAt":expiry},headers={"Set-Cookie":f"{COOKIE}={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000"})
+    _send(h,{"username":username,"expiresAt":expiry},headers={"Set-Cookie":_cookie(token, 2592000)})
     return True
 
 
