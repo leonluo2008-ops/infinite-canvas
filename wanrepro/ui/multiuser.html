@@ -1,0 +1,7 @@
+<!doctype html><meta charset="utf-8"><title>Multi-user auth probe</title>
+<h1>账号骨架验收</h1>
+<label>用户名 <input id="u"></label><label>密码 <input id="p" type="password"></label><label>邀请码 <input id="i"></label>
+<button onclick="act('/api/auth/register',{username:u.value,password:p.value,inviteCode:i.value})">注册</button>
+<button onclick="act('/api/auth/login',{username:u.value,password:p.value})">登录</button>
+<button onclick="fetch('/api/auth/me').then(show)">查看会话</button><pre id="out"></pre>
+<script>async function act(path,body){show(await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}))}async function show(r){out.textContent=JSON.stringify(await r.json(),null,2)}</script>

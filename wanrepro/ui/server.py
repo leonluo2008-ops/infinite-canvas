@@ -58,6 +58,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))   # automation/ 包在仓库根（sys.path 装配收编到这）
 from automation import config as auto_config, frames as auto_frames, local_assets, state as auto_state  # noqa: E402  AT-14 B3 本地资产（config.PROJECTS_DIR）
 from automation import replace as auto_replace          # noqa: E402  AT-22 B0 清单写锁（两链同一把）
+from wanrepro.ui import multiuser  # noqa: E402
 
 # 拆解产物根：与 replace.analysis_root / state 同一真源
 # （`WANREPRO_ANALYSIS_ROOT` 优先）。为什么画布链也要认它：清单是各链共写的
@@ -2106,11 +2107,9 @@ class Handler(BaseHTTPRequestHandler):
         self.dispatch("GET")
 
     def gate(self) -> bool:
-        """公网口径：设了 WAN_TOKEN 就要求口令，没设就直通（本机开发行为不变）。
-
-        `?token=…` 校验通过后种 HttpOnly Cookie 并 302 到不带 token 的地址，
-        这样刷新、点链接、下载图片都不会再把口令写进历史记录。
-        """
+        """公网访问口令 gate；MULTI_USER 启用时整体旁路。"""
+        if multiuser.enabled():
+            return True
         if not TOKEN:
             return True
         # 本机直连（Host 是 127.0.0.1/localhost）不用口令；隧道过来的请求 Host 是公网域名，
@@ -2197,6 +2196,10 @@ class Handler(BaseHTTPRequestHandler):
                 self.close_connection = True
 
     def route_get(self, path: str) -> None:
+        if multiuser.handle(self, "GET", path):
+            return
+        if multiuser.route_missing(path):
+            raise ApiError(404, f"没有这个地址：{path}")
         if path == "/api/lapian/slot":
             # 拆解槽真相（只读）：hub 侧用它把「槽忙」翻成人话（在等谁的远程返回、预计还需多久）
             self.send_json(lapian_slot_view())
@@ -2384,6 +2387,10 @@ class Handler(BaseHTTPRequestHandler):
         raise ApiError(404, f"没有这个地址：{path}")
 
     def route_post(self, path: str) -> None:
+        if multiuser.handle(self, self.command, path):
+            return
+        if multiuser.route_missing(path):
+            raise ApiError(404, f"没有这个地址：{path}")
         if path == "/api/asset/upload":
             self.do_asset_upload()
             return
@@ -3533,6 +3540,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     try:
+        ThreadingHTTPServer.daemon_threads = True
         httpd = ThreadingHTTPServer((args.host, args.port), Handler)
     except OSError as err:
         print(f"[FAIL exit=2] 端口 {args.port} 起不来：{err}", file=sys.stderr)
