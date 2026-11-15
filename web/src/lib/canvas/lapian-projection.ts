@@ -32,9 +32,16 @@ export function lapianOptionalLetters(value?: string): string {
     return parseLapianOptional(value).join(",");
 }
 
-/** 投影 URL（与改造前逐字节一致：`/api/render/<taskId>/<template>?optional=<letters>`）。 */
-export function lapianProjectionUrl(taskId: string, optional = "", template: string = LAPIAN_PROJECTION_TEMPLATE): string {
-    return `/api/render/${encodeURIComponent(taskId)}/${template}?optional=${encodeURIComponent(optional)}`;
+/**
+ * 投影 URL（与改造前逐字节一致：`/api/render/<taskId>/<template>?optional=<letters>`）。
+ * C2a 核验（2026-11-15 实测 auto-0069）：fork 变体任务不带 `checklist_task` 时桥按共享清单渲染——
+ * 变体私有清单（它自己的描述/行决策）不会生效。第四参传 fork 任务号时桥读该任务私有清单副本
+ * （server.py render_payload → hub_api.private_list_dir 三重校验）；不传=既有行为逐字节不变。
+ */
+export function lapianProjectionUrl(taskId: string, optional = "", template: string = LAPIAN_PROJECTION_TEMPLATE, checklistTask = ""): string {
+    const scope = String(checklistTask || "").trim();
+    const suffix = scope ? `&checklist_task=${encodeURIComponent(scope)}` : "";
+    return `/api/render/${encodeURIComponent(taskId)}/${template}?optional=${encodeURIComponent(optional)}${suffix}`;
 }
 
 /** 投影正文截断口径：去掉「# 附注」节及其后内容（v4 审计 B-03：附注随提示词提交会在聚鑫链复发）。 */
@@ -51,6 +58,8 @@ export type LapianProjectionInput = {
     /** 本次可选段字母（逗号分隔；空 = 全关，与手工路径同义）。 */
     optionalSegments?: string;
     template?: string;
+    /** 清单作用域（C2a）：fork 变体任务传它自己的任务号 → 桥读私有清单副本；缺省=共享清单（既有行为）。 */
+    checklistTask?: string;
 };
 
 export type LapianProjectionResult = {
@@ -79,7 +88,7 @@ export class LapianProjectionError extends Error {
 export async function renderLapianProjection(input: LapianProjectionInput, deps: { fetch: LapianProjectionFetch }): Promise<LapianProjectionResult> {
     const taskId = String(input.taskId || "").trim();
     const optional = lapianOptionalLetters(input.optionalSegments);
-    const url = lapianProjectionUrl(taskId, optional, input.template || LAPIAN_PROJECTION_TEMPLATE);
+    const url = lapianProjectionUrl(taskId, optional, input.template || LAPIAN_PROJECTION_TEMPLATE, input.checklistTask);
     if (!taskId) throw new LapianProjectionError("拉片节点没有任务号，拉不了投影", url);
     const payload = (await deps.fetch(url).then((response) => response.json())) as { text?: string; error?: string };
     if (!payload || payload.error) throw new LapianProjectionError(String(payload?.error || "拉片投影渲染失败"), url);
