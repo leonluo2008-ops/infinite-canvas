@@ -2127,8 +2127,6 @@ class Handler(BaseHTTPRequestHandler):
         except ApiError as err:
             self.send_json({"error": err.msg, **({"stage": err.stage} if err.stage else {}), **err.extra},
                            err.status)
-            self.send_json({"error": str(e), **(extra if isinstance(extra, dict) else {})},
-                           getattr(e, "status", 409))
         except subprocess.TimeoutExpired:
             self.send_json({"error": "子进程超时"}, 500)
         except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
