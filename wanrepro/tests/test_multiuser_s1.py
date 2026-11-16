@@ -10,6 +10,8 @@ import sys; sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 os.environ['WAN_TOKEN']='regression-token'
 # S2-B1：先立「没有主密钥 env」的基线——无 key 时 MULTI_USER=0 必须照常启动（B-03 回归）
 os.environ.pop('WANREPRO_CHANNEL_KEY', None)
+# S2.6：拆解链探针要自己建任务目录（.源视频指纹.json），绝不碰真实 analysis/reverse
+os.environ['WANREPRO_ANALYSIS_ROOT'] = tempfile.mkdtemp(prefix='s2-6-analysis-')
 from wanrepro.ui import multiuser, server, channel_store
 CHANNELS='/api/user/channels'
 def enc_of(db, cid):
@@ -378,6 +380,197 @@ def phase_admin():
     return checks
 
 
+def phase_s2_6():
+    """S2.6：拆解（/api/lapian/run）与 SDGF（/api/sdgf/video/run）接入服务端渠道。
+
+    判据对应任务书 §三：
+      * W1 登录用户带 channelId 拆解 → 子进程收到的 JXIN_API_KEY == 该用户渠道解密 key，
+        baseUrl/model 透传（argv），前端一个 key 字节都没传；
+      * W2 他人 channelId → 404（与不存在同形）、未登录带 channelId → 401；
+      * W3 无 channelId → 现行为逐字节一致（前端带 key 用带 key 的、否则不注入环境）；
+      * W4 SDGF channelId 提交走用户 key（sdgf_create 收到的是解密后的 key）；
+      * W5 响应/任务记录零 key 明文；
+      * 零兜底：渠道没有密文 → 拆解 409、SDGF preflight 拒绝，绝不回落服务器 env 密钥。
+
+    拆解子进程用 `server.run_py` 捕获点（argv/附加环境就是 run_py 交给子进程的那一份，
+    与真实 spawn 同源；不真跑 analyze.py＝不花钱、不碰网络）。
+    """
+    checks = []
+    multiuser.FAILURES.clear(); multiuser.REG_ATTEMPTS.clear()
+    os.environ['WANREPRO_CHANNEL_KEY'] = base64.b64encode(bytes(range(32))).decode()
+    srv, base = serve('1')
+    db = Path(os.environ[multiuser.DB_PATH_ENV])
+    opA = build_opener(HTTPCookieProcessor(http.cookiejar.CookieJar()))
+    opB = build_opener(HTTPCookieProcessor(http.cookiejar.CookieJar()))
+    PUB = 'https://93.184.216.34'
+    KEY_A, KEY_B, KEY_LEGACY = 'sk-user-a-0001', 'sk-user-b-0002', 'sk-legacy-0003'
+    real_run_py, real_create, real_query = server.run_py, server.sdgf_create, server.sdgf_query
+    real_delay, real_uploads = server.SDGF_FAILED_RECHECK_DELAY, server.UPLOADS
+    seen: list[dict] = []
+    made: list[dict] = []
+    tmp_uploads = Path(tempfile.mkdtemp(prefix='s2-6-uploads-'))
+    try:
+        assert req(base, '/api/auth/register', 'POST',
+                   {'username': 'ua', 'password': 'password1'}, opA)[0] == 200
+        assert req(base, '/api/auth/register', 'POST',
+                   {'username': 'ub', 'password': 'password1'}, opB)[0] == 200
+        conn = sqlite3.connect(str(db))
+        uid_a = conn.execute("SELECT id FROM users WHERE username='ua'").fetchone()[0]
+        conn.close()
+        st, _ = req(base, CHANNELS, 'PUT', {'channels': [
+            {'id': 'ch_a', 'name': 'A渠道', 'baseUrl': PUB, 'apiFormat': 'gemini',
+             'models': ['vision-1', 'text-1'], 'apiKey': KEY_A}]}, opA)
+        assert st == 200, st
+        st, _ = req(base, CHANNELS, 'PUT', {'channels': [
+            {'id': 'ch_b', 'name': 'B渠道', 'baseUrl': PUB, 'apiFormat': 'gemini',
+             'models': ['vision-1'], 'apiKey': KEY_B}]}, opB)
+        assert st == 200, st
+        # 零兜底负向夹具：渠道行在、密文为空（api_key_enc 可空）——「渠道存在且有密文」必须被单独判死
+        conn = sqlite3.connect(str(db))
+        conn.execute("INSERT INTO user_channels(id,user_id,name,base_url,api_key_enc,api_format,models_json,updated_at)"
+                     " VALUES(?,?,?,?,NULL,?,?,?)",
+                     ('ch_nokey', uid_a, '空密文渠道', PUB, 'gemini', '["vision-1"]', int(time.time())))
+        conn.commit(); conn.close()
+
+        # ---- 拆解任务夹具（临时 ANALYSIS 根 + 仓库内可解析的 mp4 路径）----
+        vid_dir = server.ROOT / 'uploads' / 'probe-s2-6'
+        vid_dir.mkdir(parents=True, exist_ok=True)
+        video = vid_dir / 'clip.mp4'
+        video.write_bytes(b'\x00\x00\x00\x18ftypmp42' + b'\x00' * 64)
+        task_id = 's26task'
+        tdir = server.ANALYSIS / task_id
+        tdir.mkdir(parents=True, exist_ok=True)
+        (tdir / '.源视频指纹.json').write_text(
+            json.dumps({'路径': video.relative_to(server.ROOT).as_posix()}, ensure_ascii=False),
+            encoding='utf-8')
+
+        def fake_run_py(args, timeout, extra_env=None):
+            seen.append({'args': list(args), 'env': dict(extra_env or {})})
+            return 0, '', ''
+        server.run_py = fake_run_py
+
+        def wait_job(job_id, timeout=10.0):
+            end = time.time() + timeout
+            while time.time() < end:
+                with server.JOBS_LOCK:
+                    rec = dict(server.JOBS.get(job_id) or {})
+                if rec.get('status') in ('done', 'error', 'failed'):
+                    return rec
+                time.sleep(0.05)
+            raise AssertionError(f'job {job_id} 10s 内没结束')
+
+        # ---- W1：登录用户带 channelId 拆解 → 解密 key 注入子进程 ----
+        st, body = req(base, '/api/lapian/run', 'POST',
+                       {'id': task_id, 'intent': '重点看产品镜头', 'channelId': 'ch_a',
+                        'model': 'vision-1'}, opA)
+        blob = body.decode('utf-8')
+        assert st == 200 and json.loads(blob).get('job'), f'lapian run with channelId: {st} {blob[:200]}'
+        assert KEY_A not in blob and '***' not in blob, 'response must not echo any key material'
+        rec = wait_job(json.loads(blob)['job'])
+        assert rec.get('status') == 'done', f'analyze job should finish: {rec}'
+        assert seen, 'run_py must have been called'
+        got = seen[-1]
+        assert got['env'].get('JXIN_API_KEY') == KEY_A, f"child env key must be A's decrypted key, got {got['env'].get('JXIN_API_KEY')!r}"
+        assert '--model' in got['args'] and got['args'][got['args'].index('--model') + 1] == 'vision-1', got['args']
+        assert '--base-url' in got['args'] and got['args'][got['args'].index('--base-url') + 1] == PUB + '/v1beta', got['args']
+        assert KEY_A not in ' '.join(got['args']), 'key must never ride the command line (child logs it)'
+        checks.append('W1 lapian channelId: child env JXIN_API_KEY == user channel decrypted key; baseUrl/model via argv; '
+                      'zero key in response or argv')
+
+        # ---- W2：他人 channelId 404（与不存在同形）、未登录 401 ----
+        st_other, b_other = req(base, '/api/lapian/run', 'POST',
+                               {'id': task_id, 'intent': 'x', 'channelId': 'ch_a', 'model': 'vision-1'}, opB)
+        st_ghost, b_ghost = req(base, '/api/lapian/run', 'POST',
+                                {'id': task_id, 'intent': 'x', 'channelId': 'ch_ghost', 'model': 'vision-1'}, opB)
+        assert st_other == 404 and st_ghost == 404, f'other/ghost channelId must both 404, got {st_other}/{st_ghost}'
+        assert json.loads(b_other) == json.loads(b_ghost), f'他人 id 与不存在必须同形：{b_other!r} vs {b_ghost!r}'
+        st_anon, b_anon = req(base, '/api/lapian/run', 'POST',
+                              {'id': task_id, 'intent': 'x', 'channelId': 'ch_a', 'model': 'vision-1'})
+        assert st_anon == 401, f'anon + channelId must 401, got {st_anon}'
+        assert KEY_A not in b_other.decode() + b_ghost.decode() + b_anon.decode(), 'error bodies must not leak keys'
+        checks.append('W2 lapian: other user channelId 404 with identical body as unknown id; anon + channelId 401')
+
+        # ---- W3：无 channelId 旧路径逐字节一致（登录态无关）----
+        seen.clear()
+        st, body = req(base, '/api/lapian/run', 'POST',
+                       {'id': task_id, 'intent': 'x', 'channel': {'baseUrl': PUB, 'key': KEY_LEGACY,
+                                                                  'model': 'legacy-model'}})
+        assert st == 200, f'legacy lapian body must keep working anon, got {st} {body[:120]}'
+        wait_job(json.loads(body)['job'])
+        got = seen[-1]
+        assert got['env'].get('JXIN_API_KEY') == KEY_LEGACY, got['env']
+        assert got['args'][got['args'].index('--model') + 1] == 'legacy-model', got['args']
+        assert got['args'][got['args'].index('--base-url') + 1] == PUB + '/v1beta', got['args']
+        seen.clear()
+        st, body = req(base, '/api/lapian/run', 'POST', {'id': task_id, 'intent': 'x'})
+        assert st == 200, f'plain lapian body must keep working, got {st}'
+        wait_job(json.loads(body)['job'])
+        got = seen[-1]
+        assert got['env'] == {}, f'no channel → zero extra env (server env fallback untouched), got {got["env"]}'
+        assert got['args'] == ['analyze.py', video.relative_to(server.ROOT).as_posix(), '--id', task_id,
+                               '--yes', '--intent', 'x'], f'argv must be byte-identical to baseline, got {got["args"]}'
+        checks.append('W3 no channelId: legacy channel{baseUrl,key,model} body → same env/argv as baseline; '
+                      'bare {id,intent} → zero extra env + byte-identical argv')
+
+        # ---- 零兜底：渠道存在但没有密文 → 409（不回落 env）----
+        st, body = req(base, '/api/lapian/run', 'POST',
+                       {'id': task_id, 'intent': 'x', 'channelId': 'ch_nokey', 'model': 'vision-1'}, opA)
+        assert st == 409 and 'API Key' in body.decode(), f'channel without ciphertext must 409 with hint, got {st} {body[:200]}'
+        checks.append('zero-fallback: channelId whose channel has no ciphertext -> 409 (never falls back to server env key)')
+
+        # ---- W4：SDGF channelId 提交走用户 key ----
+        server.UPLOADS = tmp_uploads
+        server.SDGF_FAILED_RECHECK_DELAY = 0.05
+        server.sdgf_create = lambda api_base, key, body: (made.append(
+            {'api_base': api_base, 'key': key, 'body': body}) or 'tsk-s26')
+        server.sdgf_query = lambda api_base, key, task_id_: {'status': 'failed', 'progress': None,
+                                                             'url': '', 'error': 'probe-forced'}
+        sdgf_body = {'prompt': 'ok', 'images': ['https://cdn.example.com/ref-1.png'],
+                     'duration': 8, 'ratio': '9:16', 'resolution': '720', 'audio': True,
+                     'channelId': 'ch_a', 'model': 'sd2.5-720p-ap'}
+        st, body = req(base, '/api/sdgf/video/run', 'POST', sdgf_body, opA)
+        dry = json.loads(body)
+        assert st == 200 and dry.get('dry') is True and dry['preflight']['ok'] is True, f'dry with channelId: {st} {body[:300]}'
+        assert dry['preview']['url'] == PUB + '/v1/videos', dry['preview']['url']
+        assert dry['preview']['headers']['Authorization'] == 'Bearer ***', dry['preview']['headers']
+        assert KEY_A not in body.decode() and '***' not in body.decode().replace('Bearer ***', ''), 'dry must not echo keys'
+        assert not made, 'dry must not submit'
+        st, body = req(base, '/api/sdgf/video/run', 'POST', {**sdgf_body, 'confirm': True}, opA)
+        assert st == 200 and json.loads(body).get('dry') is False, f'confirm with channelId: {st} {body[:200]}'
+        assert made and made[0]['key'] == KEY_A, f"sdgf_create must receive A's decrypted key, got {made[:1]}"
+        assert made[0]['api_base'] == PUB + '/v1', made[0]['api_base']
+        assert made[0]['body'].get('model') == 'sd2.5-720p-ap' and 'apiKey' not in made[0]['body'], made[0]['body']
+        rec = wait_job(json.loads(body)['job'])
+        assert rec.get('status') == 'failed' and KEY_A not in str(rec.get('error') or ''), \
+            f'job state must never carry the key: {rec}'
+        record = server.sdgf_task_dir('tsk-s26') / server.SDGF_RECORD
+        assert record.is_file(), 'task record should be written'
+        assert KEY_A not in record.read_text(encoding='utf-8'), 'on-disk task record must not hold the key'
+        checks.append("W4/W5 sdgf channelId: create receives the user's decrypted key + channel baseUrl; "
+                      'dry preview/response/job state/on-disk record all key-free')
+
+        # ---- SDGF：他人 404 / 未登录 401 / 空密文 preflight 拒绝 ----
+        st_other, b1 = req(base, '/api/sdgf/video/run', 'POST', sdgf_body, opB)
+        st_ghost, b2 = req(base, '/api/sdgf/video/run', 'POST', {**sdgf_body, 'channelId': 'ch_ghost'}, opB)
+        assert st_other == 404 and st_ghost == 404 and b1 == b2, f'sdgf other/ghost must 404 identically: {st_other}/{st_ghost}'
+        assert req(base, '/api/sdgf/video/run', 'POST', sdgf_body)[0] == 401, 'sdgf anon + channelId must 401'
+        st, body = req(base, '/api/sdgf/video/run', 'POST', {**sdgf_body, 'channelId': 'ch_nokey'}, opA)
+        no_key = json.loads(body)
+        assert st == 200 and no_key['preflight']['ok'] is False, f'nokey dry must fail preflight: {st} {body[:200]}'
+        assert any('密文缺失' in r for r in no_key['preflight']['reasons']), no_key['preflight']['reasons']
+        made.clear()
+        st, body = req(base, '/api/sdgf/video/run', 'POST',
+                       {**sdgf_body, 'channelId': 'ch_nokey', 'confirm': True}, opA)
+        assert st == 400 and not made, f'confirm with key-less server channel must 400 and send nothing: {st} {made}'
+        checks.append('sdgf: other/unknown channelId 404 same shape, anon 401, key-less server channel preflight-refused '
+                      '(zero request sent)')
+    finally:
+        server.run_py, server.sdgf_create, server.sdgf_query = real_run_py, real_create, real_query
+        server.SDGF_FAILED_RECHECK_DELAY, server.UPLOADS = real_delay, real_uploads
+        srv.shutdown(); srv.server_close()
+    return checks
+
+
 def main():
  checks=[]; srv,base=serve('0')
  try:
@@ -515,6 +708,7 @@ def main():
  finally: srv.shutdown(); srv.server_close()
  checks += phase_b2()
  checks += phase_admin()
+ checks += phase_s2_6()
  print('SUMMARY: PASS %d/%d'%(len(checks),len(checks)))
  for c in checks: print('PASS: '+c)
  return 0

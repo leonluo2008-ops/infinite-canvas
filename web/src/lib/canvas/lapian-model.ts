@@ -83,15 +83,31 @@ export function lapianModelGroups(channels: ModelChannel[] | undefined, refs: st
 }
 
 export type LapianChannelRef = { baseUrl: string; key: string; model: string };
-export type LapianRunBody = { id: string; intent: string; model?: string; channel?: LapianChannelRef };
+export type LapianRunBody = { id: string; intent: string; model?: string; channel?: LapianChannelRef; channelId?: string };
+
+/** 掩码 key（服务端只回显 `***last4` / `***?`）：**绝不能**发给上游——上游收到的就是字面量 `***`，必 401。
+ *  与 `services/api/channel-proxy.isMaskedKeyValue` 同一口径（此处内联一份：本模块要能被 node 直接
+ *  import，不引入 store/i18n 依赖链）。 */
+function isMaskedKeyValue(value: string | null | undefined) {
+    return /^\*{2,}/.test((value || "").trim());
+}
 
 /**
  * 装配 /api/lapian/run 请求体（与 c4d9b8a 同契约，bridge 不动）。
- * 未配置/未选模型时与现状逐字节一致（只 {id,intent}——旧链路零回归）；
- * 选了则补 `{model, channel:{baseUrl,key,model}}`（参照 services/api/video.ts 生成节点的渠道透传）。
- * 防御：选中值缺分隔符当裸模型名；渠道已删/配置不全时绝不发半截请求（不带 model/channel）。
+ * 未配置/未选模型时与现状逐字节一致（只 {id,intent}——旧链路零回归）；选了则分两态（S2.6）：
+ *  * **local**（单人模式，默认）：补 `{model, channel:{baseUrl,key,model}}`——带明文 key，逐字节不变；
+ *  * **remote**（服务端渠道模式）：只补 `{channelId, model}`——**前端零 key**，服务端按登录用户的
+ *    渠道解密后注入子进程环境；masked key（服务端视图回显）也只可能出现在这一态，因此不再因
+ *    「key 不是明文」把渠道丢掉（旧防御分支把 remote 用户整条渠道丢了 → 回落服务器单租户密钥）。
+ * 防御：选中值缺分隔符当裸模型名；渠道已删/配置不全/模型已改名时绝不发半截请求（不带 model/channel）。
  */
-export function buildLapianRunBody(id: string, intent: string, selection: string | undefined, channels: ModelChannel[] | undefined): LapianRunBody {
+export function buildLapianRunBody(
+    id: string,
+    intent: string,
+    selection: string | undefined,
+    channels: ModelChannel[] | undefined,
+    channelMode: "local" | "remote" = "local",
+): LapianRunBody {
     const body: LapianRunBody = { id, intent };
     const trimmed = (selection || "").trim();
     if (!trimmed) return body;
@@ -99,9 +115,15 @@ export function buildLapianRunBody(id: string, intent: string, selection: string
     const model = ref?.model || trimmed;
     const channel = (channels || []).find((item) => item.id === ref?.channelId);
     const baseUrl = channel?.baseUrl.trim();
-    const apiKey = channel?.apiKey.trim();
-    if (!channel || !baseUrl || !apiKey) return body;
+    if (!channel || !baseUrl) return body;
     // T7-R 防御：引用指向的模型已被改名/删除 → 绝不发半截请求（零字段，走 bridge 默认）。
     if (!channel.models.some((item) => item.name === model)) return body;
+    if (channelMode === "remote" || isMaskedKeyValue(channel.apiKey)) {
+        // 服务端渠道模式：渠道 id 就是全部凭据；masked key 说明这是服务端视图，同样走 id
+        if (!channel.id) return body;
+        return { ...body, model, channelId: channel.id };
+    }
+    const apiKey = channel.apiKey.trim();
+    if (!apiKey) return body;
     return { ...body, model, channel: { baseUrl, key: apiKey, model } };
 }

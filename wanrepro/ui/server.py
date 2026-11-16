@@ -1131,6 +1131,9 @@ def wan_video_job_state(job_id: str) -> dict:
 # 不用开浏览器：
 #   POST /api/sdgf/video/run   body {prompt, images?, duration, ratio, resolution, audio,
 #                                    mode?, confirm, channel{baseUrl,apiKey,model}}
+#                              S2.6：登录用户可改传 {channelId, model?}——服务端按该用户渠道解密
+#                              注入 baseUrl/key（前端零 key）；他人/不存在的 channelId 404 同形、
+#                              未登录 401，绝不回落服务器 env 密钥。无 channelId 的旧请求逐字节不变。
 #        dry（confirm 不是布尔 true）→ {dry:true, preview, preflight}
 #        confirm=true              → {job, taskId, dry:false}，后台轮询并代下成片
 #   GET  /api/sdgf/video/job/<job>     → {status: running|done|failed, stage, elapsed, progress?, taskId, error?}
@@ -1218,6 +1221,73 @@ def sdgf_mode_name(mode: str, image_count: int) -> str:
     if image_count == 2:
         return "首尾帧"
     return "参考生视频"
+
+
+def user_channel_for_request(h: BaseHTTPRequestHandler, payload: dict) -> dict | None:
+    """S2.6：`payload.channelId` → **该登录用户**的渠道（已解密）。无 channelId → None。
+
+    「登录用户的一切 AI 调用都用自己渠道的 key」的服务端唯一解析点：拆解（/api/lapian/run）
+    与 SDGF 视频提交（/api/sdgf/video/run）共用，前端零 key（连 masked 都不带），密钥只在
+    服务端内存里出现。
+
+    零兜底（**绝不**静默回落服务器 env 密钥）：
+      * 无 channelId → None：单人模式/旧客户端走原路径（逐字节不变）；
+      * MULTI_USER=0 → 404「没有这个渠道」（单人模式根本不存在服务端渠道表）；
+      * 未登录/会话失效 → 401；
+      * 他人 channelId 与不存在**同形** 404（不泄露存在性，与 B2 `_find_channel` 同语义）；
+      * 密文损坏/主密钥轮换 → 该渠道自己的 4xx/5xx 文案（V10：不含密文或明文片段）；
+      * 渠道没有密文 → `apiKey` 回空串，由调用方显式报错（SDGF 走 preflight / 拆解直接 409）。
+    """
+    cid = str(payload.get("channelId") or "").strip()
+    if not cid:
+        return None
+    if not multiuser.enabled():
+        raise ApiError(404, "没有这个渠道（服务端未启用多账户渠道表）")
+    username = multiuser._session_user(h)
+    uid = multiuser.user_id_for_username(username) if username else None
+    if uid is None:
+        raise ApiError(401, "未登录：带 channelId 的请求必须登录后使用自己的渠道")
+    try:
+        row = channel_store._find_channel(uid, cid)      # 只查本用户：他人 id 与不存在同形
+        if row is None:
+            raise ApiError(404, "没有这个渠道")
+        try:
+            plaintext = channel_store.decrypt(channel_store.master_key(), row["api_key_enc"])
+        except channel_store.Reject:
+            # 单渠道密文坏了只坏这一条，文案不带密文/明文片段（与 _forward 同口径）
+            raise ApiError(409, "该渠道的 API Key 无法解密（密文损坏或主密钥已轮换），"
+                                "请重新录入完整 API Key。") from None
+    except channel_store.Reject as err:                 # 主密钥缺失/非法（503）
+        raise ApiError(int(err.status), err.msg) from None
+    except channel_store.sqlite3.Error:                 # 存储层故障：不回显任何渠道内容
+        raise ApiError(500, "渠道存储读取失败") from None
+    try:
+        models = json.loads(row["models_json"]) if row["models_json"] else []
+    except (ValueError, TypeError):
+        models = []
+    return {
+        "id": row["id"],
+        "baseUrl": str(row["base_url"] or ""),
+        "apiFormat": str(row["api_format"] or ""),
+        "apiKey": plaintext,                            # 可能为空串（渠道无密文）：由调用方判
+        "models": models if isinstance(models, list) else [],
+    }
+
+
+def sdgf_apply_user_channel(payload: dict, user_channel: dict | None) -> dict:
+    """SDGF：channelId 解析结果 → 覆盖 `payload.channel`（baseUrl/key 以服务端渠道为准）。
+
+    model 仍由调用方选（渠道里有多模型，服务端不替用户挑）；无 channelId 时**原样返回同一个
+    对象**——旧客户端（带 channel{baseUrl,apiKey,model}）路径逐字节不变。
+    """
+    if user_channel is None:
+        return payload
+    given = payload.get("channel") if isinstance(payload.get("channel"), dict) else {}
+    model = str(given.get("model") or payload.get("model") or "").strip()
+    channel: dict = {"baseUrl": user_channel["baseUrl"], "apiKey": user_channel["apiKey"]}
+    if model:
+        channel["model"] = model
+    return {**payload, "channel": channel}
 
 
 def sdgf_plan(payload: dict) -> dict:
@@ -2417,12 +2487,15 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/lapian/run":
             payload = self.read_json()
+            # S2.6：带 channelId 时先解析该用户渠道（未登录 401 / 他人或不存在的 id 404 同形，
+            # 早失败，不先建任务）；无 channelId → None，旧链路逐字节不变
+            user_channel = user_channel_for_request(self, payload)
             tid = str(payload.get("id") or "")
             task_dir(tid)                     # 校验任务存在（404 语义一致）
             vf = video_file(tid)              # 指纹解析源视频路径（404/500 语义沿用）
             rel = vf.resolve().relative_to(ROOT) if str(vf.resolve()).startswith(str(ROOT)) else vf
             # M6-T7-C：可选 分析模型/渠道 透传（不传 → 与旧版完全一致）
-            extra_args, extra_env = lapian_channel_passthrough(payload)
+            extra_args, extra_env = lapian_channel_passthrough(payload, user_channel)
             self.send_json(start_analyze_job(str(rel), str(payload.get("intent") or ""), tid,
                                              extra_args=extra_args, extra_env=extra_env))
             return
@@ -2918,7 +2991,18 @@ class Handler(BaseHTTPRequestHandler):
             raise ApiError(400, "prompt 不能为空")
         if payload.get("images") is not None and not isinstance(payload.get("images"), list):
             raise ApiError(400, "images 必须是列表（公网 https URL 字符串或 {name, dataUrl}）")
-        plan = sdgf_plan(payload)
+        # S2.6：带 channelId → 服务端按**该用户**渠道解密注入 baseUrl/key（前端零 key）。
+        # 无 channelId → 原样（旧客户端带 channel{baseUrl,apiKey,model} 路径逐字节不变）。
+        user_channel = user_channel_for_request(self, payload)
+        plan = sdgf_plan(sdgf_apply_user_channel(payload, user_channel))
+        if user_channel is not None and not user_channel["apiKey"]:
+            # 服务端渠道分支的 key 真相是「渠道有密文」：文案别让用户去找前端根本不该传的字段
+            plan["preflight"] = {
+                "ok": False,
+                "reasons": ["该渠道没有可用的 API Key（服务端渠道密文缺失）：请到渠道设置重新录入完整 API Key"
+                            if r == "channel.apiKey 不能为空" else r
+                            for r in plan["preflight"]["reasons"]],
+            }
         if payload.get("confirm") is not True:
             self.send_json({"dry": True, "preview": plan["preview"], "preflight": plan["preflight"]})
             return
@@ -3341,19 +3425,41 @@ def normalize_gemini_base(url: str) -> str:
     return f"{base}/v1beta"
 
 
-def lapian_channel_passthrough(payload: dict) -> tuple[list[str], dict]:
+def lapian_channel_passthrough(payload: dict, user_channel: dict | None = None) -> tuple[list[str], dict]:
     """从 /api/lapian/run 请求体提取可选「分析模型 / 渠道」→（analyze.py 附加参数, 子进程附加环境）。
 
-    channel 形如 {baseUrl, key, model}（与生成节点随请求带渠道的做法同款）；顶层 model 是
-    只选模型名的简写，channel.model 优先。什么都不传 → ([], {})：命令行与环境与旧版完全
-    一致（旧任务零回归）。key 不上命令行——子进程会把命令行原样打进日志，密钥走环境变量
-    JXIN_API_KEY 传（extract.load_api_key 本就环境变量优先，读法不变）。
+    两条来源（S2.6）：
+      * `user_channel` 非空（payload 带 channelId、登录用户）→ **服务端渠道模式**：baseUrl/key
+        只认该用户渠道的解密结果，前端传什么都不采信（连 masked 都不该带）；模型由请求体选
+        （channel.model 优先，其次顶层 model），渠道里有多模型时服务端不替用户挑。
+      * `user_channel` 为 None（单人模式 / 旧客户端）→ 原行为逐字节不变：channel 形如
+        {baseUrl, key, model}（与生成节点随请求带渠道的做法同款）；顶层 model 是只选模型名
+        的简写，channel.model 优先。什么都不传 → ([], {})：命令行与环境与旧版完全一致
+        （旧任务零回归）。
+
+    key 不上命令行——子进程会把命令行原样打进日志，密钥走环境变量 JXIN_API_KEY 传
+    （extract.load_api_key 本就环境变量优先，读法不变）。
     """
     channel = payload.get("channel")
     channel = channel if isinstance(channel, dict) else {}
 
     def clean(value) -> str:
         return str(value or "").strip()
+
+    if user_channel is not None:
+        model = clean(channel.get("model")) or clean(payload.get("model"))
+        base = normalize_gemini_base(clean(user_channel.get("baseUrl")))
+        key = clean(user_channel.get("apiKey"))
+        if not key:
+            # 零兜底：渠道没有密文就明确报错，绝不回落服务器 env 的单租户密钥
+            raise ApiError(409, "该渠道没有可用的 API Key（服务端渠道密文缺失），"
+                                "请到渠道设置重新录入完整 API Key。")
+        argv: list[str] = []
+        if model:
+            argv += ["--model", model]
+        if base:
+            argv += ["--base-url", base]
+        return argv, {"JXIN_API_KEY": key}
 
     model = clean(channel.get("model")) or clean(payload.get("model"))
     base = normalize_gemini_base(clean(channel.get("baseUrl")))

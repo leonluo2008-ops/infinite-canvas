@@ -1054,10 +1054,10 @@ function InfiniteCanvasPage() {
             vetoes: () => batchRuntimeProject.current?.workflowAssetVetoes,
             wanFileTasks: () => toLegacyPayload(batchRuntimeProject.current?.workflowWanFileTasks || []),
             project: () => batchRuntimeProject.current,
-            lapianConfig: { lapianDefaultModel: effectiveConfig.lapianDefaultModel, channels: effectiveConfig.channels },
+            lapianConfig: { lapianDefaultModel: effectiveConfig.lapianDefaultModel, channels: effectiveConfig.channels, channelMode: effectiveConfig.channelMode },
         });
         return unregister;
-    }, [applyAgentOps, effectiveConfig.channels, effectiveConfig.lapianDefaultModel, flushProjects, projectId, updateProject]);
+    }, [applyAgentOps, effectiveConfig.channels, effectiveConfig.channelMode, effectiveConfig.lapianDefaultModel, flushProjects, projectId, updateProject]);
 
     const { pluginHost, renderPluginPanel, buildNodeToolbarItems } = usePluginHost({
         effectiveConfig,
@@ -1086,7 +1086,7 @@ function InfiniteCanvasPage() {
                         storageKey: key,
                         title: videoNode.title,
                         intent,
-                        config: { lapianDefaultModel: effectiveConfig.lapianDefaultModel, channels: effectiveConfig.channels },
+                        config: { lapianDefaultModel: effectiveConfig.lapianDefaultModel, channels: effectiveConfig.channels, channelMode: effectiveConfig.channelMode },
                     },
                     { getBlob: getMediaBlob, fetch: (url, init) => fetch(url, init), log: LOG },
                 );
@@ -1102,7 +1102,7 @@ function InfiniteCanvasPage() {
                         width: size.width,
                         height: size.height,
                         // 不用 status（二开仓通用 loading/error 分支会拦截内容渲染）；lapianModel 只在实际随请求发出时落盘（节点上可见，透明）
-                        metadata: { taskId: chain.taskId, jobId: chain.jobId, intent, lapPhase: "loading", ...(chain.runBody.channel ? { lapianModel: chain.lapianModel } : {}) },
+                        metadata: { taskId: chain.taskId, jobId: chain.jobId, intent, lapPhase: "loading", ...(chain.runBody.channel || chain.runBody.channelId ? { lapianModel: chain.lapianModel } : {}) },
                     },
                 ]);
                 setConnections((prev) => [...prev, { id: nanoid(), fromNodeId: videoNode.id, toNodeId: lapId }]);

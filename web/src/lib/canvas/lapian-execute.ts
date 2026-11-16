@@ -34,6 +34,9 @@ export type LapianExecuteConfig = {
     /** 全局默认拉片模型（设置 → 拉片模型；空串 = 走 bridge 默认）。 */
     lapianDefaultModel?: string;
     channels?: ModelChannel[];
+    /** 渠道模式（S2.6）：remote = 服务端渠道模式（请求体只带 channelId，前端零 key）；
+     *  缺省 local = 单人模式，请求体带明文渠道，逐字节不变。 */
+    channelMode?: "local" | "remote";
 };
 
 export type LapianExecuteInput = {
@@ -85,7 +88,7 @@ export async function runLapianTask(
     deps: Pick<LapianExecuteDeps, "fetch" | "log">,
 ): Promise<{ jobId: string; runBody: LapianRunBody; lapianModel: string; run: Record<string, unknown> }> {
     const effectiveModel = resolveEffectiveLapianModel(input.nodeModel, input.config.lapianDefaultModel);
-    const runBody = buildLapianRunBody(input.taskId, input.intent, effectiveModel, input.config.channels);
+    const runBody = buildLapianRunBody(input.taskId, input.intent, effectiveModel, input.config.channels, input.config.channelMode || "local");
     const run = (await deps.fetch(`${BRIDGE}/api/lapian/run`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -93,7 +96,9 @@ export async function runLapianTask(
     }).then((response) => response.json())) as Record<string, unknown>;
     deps.log?.(`run=${JSON.stringify(run).slice(0, 120)}`);
     if (run?.error) throw new Error(String(run.error));
-    return { jobId: String(run.job || ""), runBody, lapianModel: runBody.channel ? effectiveModel : "", run };
+    // 渠道是否真的透传了：local 带 channel、remote 带 channelId（S2.6），两种都算选中了模型
+    const channelSent = Boolean(runBody.channel || runBody.channelId);
+    return { jobId: String(run.job || ""), runBody, lapianModel: channelSent ? effectiveModel : "", run };
 }
 
 /**
