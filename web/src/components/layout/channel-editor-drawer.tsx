@@ -9,16 +9,17 @@ import { ModelSelectModal } from "./model-select-modal";
 
 type ScriptTarget = { name: string; capability: ModelCapability; value: string };
 
-export function ChannelEditorDrawer({ open, channel, onSave, onClose }: { open: boolean; channel: ModelChannel | null; onSave: (channel: ModelChannel) => void; onClose: () => void }) {
+export function ChannelEditorDrawer({ open, channel, onSave, onClose, serverMode = false }: { open: boolean; channel: ModelChannel | null; onSave: (channel: ModelChannel) => void; onClose: () => void; serverMode?: boolean }) {
     const { t } = useTranslation();
     const [draft, setDraft] = useState<ModelChannel | null>(channel);
     const [selectOpen, setSelectOpen] = useState(false);
     const [scriptTarget, setScriptTarget] = useState<ScriptTarget | null>(null);
-    const apiFormatOptions: Array<{ label: string; value: ApiCallFormat }> = [
+    const apiFormatOptions: Array<{ label: string; value: ApiCallFormat; disabled?: boolean }> = [
         { label: "OpenAI", value: "openai" },
         { label: "Gemini", value: "gemini" },
         { label: "SD GF（聚鑫统一视频）", value: "sdgf" },
-        { label: t("config.channelEditor.formats.wan"), value: "wan" },
+        // S2-B3：wan（万相 CLI bridge）同源零 key，服务端渠道表明确拒收 → 服务端模式下不给选
+        { label: t("config.channelEditor.formats.wan"), value: "wan", disabled: serverMode },
     ];
     const capabilityOptions: Array<{ label: string; value: ModelCapability }> = ["image", "video", "text", "audio"].map((value) => ({ label: t(`config.channelEditor.capabilities.${value}`), value: value as ModelCapability }));
 
@@ -68,6 +69,7 @@ export function ChannelEditorDrawer({ open, channel, onSave, onClose }: { open: 
                 </Space>
             }
         >
+            {serverMode ? <div className="mb-3 rounded-lg bg-stone-100 px-3 py-2 text-xs text-stone-600 dark:bg-stone-900 dark:text-stone-300">{t("config.channels.serverModeHint")}</div> : null}
             <div className="grid gap-4 md:grid-cols-2">
                 <label className="block">
                     <span className="mb-1 block text-sm font-medium">{t("config.channelEditor.name")}</span>

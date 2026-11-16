@@ -2,6 +2,7 @@ import axios, { type AxiosRequestConfig } from "axios";
 
 import i18n from "@/i18n";
 import { buildApiUrl, withLocalProxy, type AiConfig, type ModelCapability } from "@/stores/use-config-store";
+import { isServerChannelMode, type ChannelTarget } from "./channel-proxy";
 
 type RequestOptions = { signal?: AbortSignal };
 
@@ -52,7 +53,8 @@ function createPluginHttp(config: AiConfig, options?: RequestOptions): PluginHtt
             url: pluginUrl(config, path),
             data: method === "post" ? body : undefined,
             params: opts?.params,
-            headers: pluginHeaders({ Authorization: `Bearer ${config.apiKey}`, ...opts?.headers }, method === "post" && !isForm && body !== undefined),
+            // 服务端模式下脚本渠道已被 runModelPlugin 前置拒绝；这里再兜一层：不带鉴权头（key 只在服务端密文里）
+            headers: pluginHeaders({ ...(isServerChannelMode(config as AiConfig & ChannelTarget) ? {} : { Authorization: `Bearer ${config.apiKey}` }), ...opts?.headers }, method === "post" && !isForm && body !== undefined),
             responseType: opts?.responseType || "json",
             signal: options?.signal,
         });
@@ -112,6 +114,9 @@ function createPoll(signal?: AbortSignal) {
  */
 export async function runModelPlugin<T = unknown>(args: RunPluginArgs): Promise<T> {
     const { config } = args;
+    // S2-B3：自定义脚本渠道在服务端模式下不支持——脚本自己拿 key 发任意请求，
+    // 服务端代转发管不了它的目标地址，key 也不该下发到脚本里。UI 侧同时置灰（配置页提示）。
+    if (isServerChannelMode(config as AiConfig & ChannelTarget)) throw new Error(i18n.t("modelPlugin.remoteUnsupported"));
     const http = createPluginHttp(config, { signal: args.signal });
     const request = createPluginRequest(config, { signal: args.signal });
     const poll = createPoll(args.signal);

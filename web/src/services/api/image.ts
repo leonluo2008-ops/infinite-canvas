@@ -1,7 +1,8 @@
 import axios from "axios";
 
 import i18n from "@/i18n";
-import { buildApiUrl, resolveModelRequestConfig, resolveModelScript, withLocalProxy, type AiConfig, type ModelChannel } from "@/stores/use-config-store";
+import { resolveModelRequestConfig, resolveModelScript, type AiConfig, type ModelChannel } from "@/stores/use-config-store";
+import { channelAbsoluteUrl, channelApiUrl, channelAuthHeaders, geminiChannelHeaders, type ChannelTarget } from "./channel-proxy";
 import { normalizePluginImages, runModelPlugin } from "./model-plugin";
 import { nanoid } from "nanoid";
 import { dataUrlToFile } from "@/lib/image-utils";
@@ -310,15 +311,14 @@ function withSystemPrompt(config: AiConfig, prompt: string) {
     return systemPrompt ? `${systemPrompt}\n\n${prompt}` : prompt;
 }
 
-function aiApiUrl(config: AiConfig, path: string) {
-    return buildApiUrl(config.baseUrl, path);
+function aiApiUrl(config: AiConfig & ChannelTarget, path: string) {
+    // S2-B3：服务端渠道模式改道 /api/proxy/<channelId>/…，本地模式保持原直连（含本地转发前缀）
+    return channelApiUrl(config, path);
 }
 
-function aiHeaders(config: AiConfig, contentType?: string) {
-    return {
-        Authorization: `Bearer ${config.apiKey}`,
-        ...(contentType ? { "Content-Type": contentType } : {}),
-    };
+function aiHeaders(config: AiConfig & ChannelTarget, contentType?: string) {
+    // 服务端模式不带鉴权头（key 由服务端按渠道密文注入）；本地模式与基线一致
+    return channelAuthHeaders(config, contentType);
 }
 
 function geminiBaseUrl(config: Pick<AiConfig, "baseUrl">) {
@@ -331,17 +331,15 @@ function geminiModelName(model: string) {
     return model.trim().replace(/^models\//, "");
 }
 
-function geminiApiUrl(config: Pick<AiConfig, "baseUrl" | "model">, action?: "generateContent" | "streamGenerateContent") {
+function geminiApiUrl(config: Pick<AiConfig, "baseUrl" | "model"> & ChannelTarget, action?: "generateContent" | "streamGenerateContent") {
     const baseUrl = geminiBaseUrl(config);
-    if (!action) return withLocalProxy(`${baseUrl}/models`);
-    return withLocalProxy(`${baseUrl}/models/${encodeURIComponent(geminiModelName(config.model))}:${action}`);
+    if (!action) return channelAbsoluteUrl(config as AiConfig & ChannelTarget, `${baseUrl}/models`);
+    return channelAbsoluteUrl(config as AiConfig & ChannelTarget, `${baseUrl}/models/${encodeURIComponent(geminiModelName(config.model))}:${action}`);
 }
 
-function geminiHeaders(config: Pick<AiConfig, "apiKey">) {
-    return {
-        "x-goog-api-key": config.apiKey,
-        "Content-Type": "application/json",
-    };
+function geminiHeaders(config: Pick<AiConfig, "apiKey"> & ChannelTarget) {
+    // 服务端模式下 key 由代转发层以 ?key= 注入（任务书 B3.5），前端不带
+    return geminiChannelHeaders(config as AiConfig & ChannelTarget);
 }
 
 function withSystemMessage<T extends ResponseInputMessage>(config: AiConfig, messages: T[]): ResponseInputMessage[] {
@@ -856,20 +854,23 @@ export async function requestImageQuestion(config: AiConfig, messages: AiTextMes
     }
 }
 
-export async function fetchImageModels(config: Pick<AiConfig, "baseUrl" | "apiKey" | "apiFormat">) {
+/** 模型列表拉取的入参：老调用点只给 baseUrl/key/format；渠道 id 与模式可选（缺省回落 store 当前模式）。 */
+export type ModelFetchConfig = Pick<AiConfig, "baseUrl" | "apiKey" | "apiFormat"> & Partial<Pick<AiConfig, "model" | "channelMode">> & { channelId?: string };
+
+export async function fetchImageModels(config: ModelFetchConfig) {
+    // S2-B3：服务端模式走 GET /api/proxy/<channelId>/<baseUrl.path>/v1/models（key 由服务端注入）
+    const target = { ...defaultGeminiConfig, ...config } as AiConfig & ChannelTarget;
     try {
         if (config.apiFormat === "gemini") {
-            const response = await axios.get<GeminiPayload>(geminiApiUrl({ ...defaultGeminiConfig, ...config }), { headers: geminiHeaders({ ...defaultGeminiConfig, ...config }) });
+            const response = await axios.get<GeminiPayload>(geminiApiUrl(target), { headers: geminiHeaders(target) });
             validateGeminiPayload(response.data);
             return (response.data.models || [])
                 .map((model) => model.name?.replace(/^models\//, ""))
                 .filter((id): id is string => Boolean(id))
                 .sort((a, b) => a.localeCompare(b));
         }
-        const response = await axios.get<{ data?: Array<{ id?: string }>; error?: { message?: string } }>(buildApiUrl(config.baseUrl, "/models"), {
-            headers: {
-                Authorization: `Bearer ${config.apiKey}`,
-            },
+        const response = await axios.get<{ data?: Array<{ id?: string }>; error?: { message?: string } }>(channelApiUrl(target, "/models"), {
+            headers: channelAuthHeaders(target),
         });
         return (response.data.data || [])
             .map((model) => model.id)
@@ -880,8 +881,9 @@ export async function fetchImageModels(config: Pick<AiConfig, "baseUrl" | "apiKe
     }
 }
 
-export async function fetchChannelModels(channel: ModelChannel) {
-    return fetchImageModels({ baseUrl: channel.baseUrl, apiKey: channel.apiKey, apiFormat: channel.apiFormat });
+export async function fetchChannelModels(channel: ModelChannel, channelMode?: AiConfig["channelMode"]) {
+    // 渠道对象自带 id：服务端模式下模型列表直接按该渠道代转发，无需模型引用串
+    return fetchImageModels({ baseUrl: channel.baseUrl, apiKey: channel.apiKey, apiFormat: channel.apiFormat, channelId: channel.id, ...(channelMode ? { channelMode } : {}) });
 }
 
 const defaultGeminiConfig: Pick<AiConfig, "baseUrl" | "apiKey" | "apiFormat" | "model" | "systemPrompt"> = {

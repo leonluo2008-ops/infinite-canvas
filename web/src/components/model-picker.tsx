@@ -5,6 +5,7 @@ import { useTranslation } from "react-i18next";
 import i18n from "@/i18n";
 import { Select, SelectContent, SelectItem, SelectTrigger } from "@/components/ui/select";
 import { cn } from "@/lib/utils";
+import { isServerChannelMode } from "@/services/api/channel-proxy";
 import { modelOptionLabel, modelOptionName, selectableModelsByCapability, type AiConfig, type ModelCapability } from "@/stores/use-config-store";
 
 type ModelPickerProps = {
@@ -33,7 +34,10 @@ export function ModelPicker({ config, value, onChange, capability, className, fu
             Array.from(
                 new Set(
                     [
-                        ...(config.channelMode === "local" && !capability ? [value] : []),
+                        // 本地模式：把当前值也列进去（允许手填/历史值不被清空）。
+                        // 服务端模式：模型清单只认服务端渠道（B3.1「remote 下模型选择走服务端渠道」），
+                        // 不在渠道里的陈旧值不再注入，就绪检查会把它挡在请求之外。
+                        ...(!isServerChannelMode(config) && !capability ? [value] : []),
                         ...(optionsOverride ?? selectableModelsByCapability(config, capability)),
                     ].filter((model): model is string => Boolean(model)),
                 ),
@@ -56,7 +60,9 @@ export function ModelPicker({ config, value, onChange, capability, className, fu
             open={open}
             value={current}
             onOpenChange={(nextOpen) => {
-                if (nextOpen && !options.length && config.channelMode === "local") onMissingConfig?.();
+                // 选项为空 → 引导去配渠道。单人模式（恒为 local）与基线的判定完全等价；
+                // 服务端模式同样引导（去配置页录自己的渠道 / 重新登录刷新）。
+                if (nextOpen && !options.length) onMissingConfig?.();
                 if (nextOpen) window.dispatchEvent(new CustomEvent("model-picker-open", { detail: pickerId }));
                 setOpen(nextOpen);
             }}

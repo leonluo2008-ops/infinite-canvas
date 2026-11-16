@@ -7,7 +7,8 @@ import { clampVideoSeconds, computeVideoSize, inferVideoRatio } from "@/lib/medi
 import { readVideoTaskProgress, waitForVideoTaskOutput } from "@/lib/canvas/video-task-wait";
 import { getMediaBlob, resolveMediaUrl, uploadMediaFile, type UploadedFile } from "@/services/file-storage";
 import { imageToDataUrl } from "@/services/image-storage";
-import { boolConfig, buildApiUrl, modelOptionName, resolveModelRequestConfig, resolveModelScript, withLocalProxy, type AiConfig } from "@/stores/use-config-store";
+import { boolConfig, modelOptionName, resolveModelRequestConfig, resolveModelScript, withLocalProxy, type AiConfig } from "@/stores/use-config-store";
+import { channelAbsoluteUrl, channelApiUrl, channelAuthHeaders, geminiChannelHeaders, type ChannelTarget } from "./channel-proxy";
 import { lookupProjectWanFileTask, rememberProjectWanFileTask } from "@/lib/canvas/wan-file-task-project";
 import { toLegacyPayload } from "@/lib/canvas/wan-file-task-map";
 import { runModelPlugin } from "./model-plugin";
@@ -39,15 +40,14 @@ export type VideoGenerationTaskState = { status: "pending"; progress?: number } 
 /** Results for scripted (plugin) video models, which run their own create+poll in one shot at task creation. */
 const pluginVideoResults = new Map<string, VideoGenerationResult>();
 
-function aiApiUrl(config: AiConfig, path: string) {
-    return buildApiUrl(config.baseUrl, path);
+function aiApiUrl(config: AiConfig & ChannelTarget, path: string) {
+    // S2-B3：服务端渠道模式改道 /api/proxy/<channelId>/…；wan（同源 bridge）走 wanVideoUrl，不经此处
+    return channelApiUrl(config, path);
 }
 
-function aiHeaders(config: AiConfig, contentType?: string) {
-    return {
-        Authorization: `Bearer ${config.apiKey}`,
-        ...(contentType ? { "Content-Type": contentType } : {}),
-    };
+function aiHeaders(config: AiConfig & ChannelTarget, contentType?: string) {
+    // 服务端模式不带鉴权头（key 由服务端注入）
+    return channelAuthHeaders(config, contentType);
 }
 
 export async function requestVideoGeneration(config: AiConfig, prompt: string, references: ReferenceImage[] = [], options?: VideoMediaOptions): Promise<VideoGenerationResult> {
@@ -585,16 +585,17 @@ function geminiVideoBaseUrl(config: Pick<AiConfig, "baseUrl">) {
     return lowerBaseUrl.endsWith("/v1") || lowerBaseUrl.endsWith("/v1beta") ? normalizedBaseUrl : `${normalizedBaseUrl}/v1beta`;
 }
 
-function geminiVideoUrl(config: Pick<AiConfig, "baseUrl">, model: string, action: string) {
-    return withLocalProxy(`${geminiVideoBaseUrl(config)}/models/${encodeURIComponent(modelOptionName(model).replace(/^models\//, ""))}:${action}`);
+function geminiVideoUrl(config: Pick<AiConfig, "baseUrl"> & ChannelTarget, model: string, action: string) {
+    return channelAbsoluteUrl(config as AiConfig & ChannelTarget, `${geminiVideoBaseUrl(config)}/models/${encodeURIComponent(modelOptionName(model).replace(/^models\//, ""))}:${action}`);
 }
 
-function geminiOperationUrl(config: Pick<AiConfig, "baseUrl">, name: string) {
-    return withLocalProxy(`${geminiVideoBaseUrl(config)}/${name.replace(/^\//, "")}`);
+function geminiOperationUrl(config: Pick<AiConfig, "baseUrl"> & ChannelTarget, name: string) {
+    return channelAbsoluteUrl(config as AiConfig & ChannelTarget, `${geminiVideoBaseUrl(config)}/${name.replace(/^\//, "")}`);
 }
 
-function geminiVideoHeaders(config: Pick<AiConfig, "apiKey">) {
-    return { "x-goog-api-key": config.apiKey, "Content-Type": "application/json" };
+function geminiVideoHeaders(config: Pick<AiConfig, "apiKey"> & ChannelTarget) {
+    // 服务端模式 key 由代转发层注入（?key=），前端不带
+    return geminiChannelHeaders(config as AiConfig & ChannelTarget);
 }
 
 function videoAspectRatio(size: string) {

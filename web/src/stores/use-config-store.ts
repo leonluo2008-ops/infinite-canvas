@@ -216,8 +216,13 @@ export function resolveModelScript(config: AiConfig, value: string) {
 
 function isAiConfigReady(config: AiConfig, model: string) {
     const match = findChannelModel(config, model);
+    if (!match || !match.channel.baseUrl.trim()) return false;
+    // 服务端渠道模式（S2-B3）：Key 只存在服务端密文里，前端拿到的永远是 masked 值，不能再按「非空」判就绪；
+    // wan（万相 CLI bridge，同源零 key）服务端明确不收，服务端模式下不可能就绪。
+    // 密文损坏时服务端下发 `***?`（IF-A 降级标记），提前判死比让请求撞 409 更好。
+    if (config.channelMode === "remote") return match.channel.apiFormat !== "wan" && match.channel.apiKey.trim() !== "***?";
     // wan（万相 CLI bridge）不需要 API Key——key 可任意留空，只认 bridge 地址；其余格式维持 key 必填
-    return Boolean(match && match.channel.baseUrl.trim() && (match.channel.apiFormat === "wan" || match.channel.apiKey.trim()));
+    return match.channel.apiFormat === "wan" || Boolean(match.channel.apiKey.trim());
 }
 
 export const useConfigStore = create<ConfigStore>()(
@@ -272,6 +277,7 @@ export const useConfigStore = create<ConfigStore>()(
                     webdav: { ...defaultWebdavSyncConfig, ...persistedWebdav },
                     config: {
                         ...config,
+                        // 水合默认 local（单人零改动）；服务端模式由启动门 bootstrapChannelSync 在渲染前改回 "remote"
                         channelMode: "local",
                         apiFormat: normalizeApiFormat(config.apiFormat),
                         channels,
@@ -306,7 +312,9 @@ export const useConfigStore = create<ConfigStore>()(
 
 export function useEffectiveConfig() {
     const config = useConfigStore((state) => state.config);
-    return useMemo(() => ({ ...config, channelMode: "local" as const }), [config]);
+    // S2-B3：不再把 channelMode 钉成 "local"——服务端模式要靠它把请求改道 /api/proxy。
+    // 单人模式（未登录）由启动门保证 channelMode 恒为 "local"，行为与基线一致。
+    return useMemo(() => ({ ...config }), [config]);
 }
 
 /** Normalize a mixed list of raw model names or model objects into deduped ChannelModel entries. */
@@ -452,6 +460,8 @@ export function resolveModelRequestConfig(config: AiConfig, value: string) {
     const channel = resolveModelChannel(config, value);
     return {
         ...config,
+        // S2-B3：带上渠道 id（不是 store 结构字段，只是派生请求上下文），服务端代转发按它路由
+        channelId: channel.id,
         model: modelOptionName(value || config.model),
         baseUrl: channel.baseUrl,
         apiKey: channel.apiKey,
@@ -505,10 +515,19 @@ function uniqueModelOptions(models: string[]) {
 }
 
 export function buildApiUrl(baseUrl: string, path: string) {
+    return withLocalProxy(buildApiAbsoluteUrl(baseUrl, path));
+}
+
+/**
+ * 与 buildApiUrl 同一套 `/v1` 归一，但**不套本地转发代理**：
+ * 服务端代转发（S2-B3）要拼出上游绝对路径再由 `/api/proxy/<channelId>/<path>` 送给服务端，
+ * 本地转发前缀（proxyUrl）在服务端模式下没有意义。
+ */
+export function buildApiAbsoluteUrl(baseUrl: string, path: string) {
     const normalizedBaseUrl = baseUrl.trim().replace(/\/+$/, "");
     const lowerBaseUrl = normalizedBaseUrl.toLowerCase();
     const apiBaseUrl = lowerBaseUrl.endsWith("/v1") ? normalizedBaseUrl : `${normalizedBaseUrl}/v1`;
-    return withLocalProxy(`${apiBaseUrl}${path}`);
+    return `${apiBaseUrl}${path}`;
 }
 
 export function normalizeLocalProxyUrl(value: string) {

@@ -1,4 +1,4 @@
-import { App, Button, Form, Input, Modal, Progress, Radio, Select, Switch, Tabs } from "antd";
+import { App, Button, Form, Input, Modal, Progress, Radio, Select, Spin, Switch, Tabs, Tag } from "antd";
 import type { TFunction } from "i18next";
 import { Cloud, Download, Pencil, Plus, RefreshCw, Trash2, Upload, Wifi } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
@@ -19,6 +19,7 @@ import { audioFormatOptions, audioVoiceOptions, normalizeAudioSpeedValue } from 
 import { computeMediaSize, inferMediaRatio, inferMediaScale, mediaScaleOptions, parseVideoResolution } from "@/lib/media-size";
 import { createModelChannel, modelOptionsFromChannels, normalizeModelOptionValue, selectableModelsByCapability, useConfigStore, type AiConfig, type ApiCallFormat, type ConfigTabKey, type ModelCapability, type ModelChannel } from "@/stores/use-config-store";
 import { normalizeLapianDefaultModel, normalizeLapianModelList } from "@/lib/canvas/lapian-model";
+import { useChannelSyncStore } from "@/services/channel-sync";
 
 type ModelGroup = {
     capability: ModelCapability;
@@ -62,6 +63,10 @@ export function AppConfigPanel({ showDoneButton = false, initialTab = "channels"
     const [webdavSyncStatus, setWebdavSyncStatus] = useState("");
     const [webdavDomainProgress, setWebdavDomainProgress] = useState(createWebdavDomainProgress);
     const config = useConfigStore((state) => state.config);
+    // S2-B3.4 渲染门控：启动门（登录态 + 服务端渠道）完成前，配置页不得用本地陈旧数据完成首次渲染
+    const syncPhase = useChannelSyncStore((state) => state.phase);
+    const syncError = useChannelSyncStore((state) => state.error);
+    const serverMode = config.channelMode === "remote";
     const webdav = useConfigStore((state) => state.webdav);
     const updateConfig = useConfigStore((state) => state.updateConfig);
     const updateWebdavConfig = useConfigStore((state) => state.updateWebdavConfig);
@@ -79,7 +84,8 @@ export function AppConfigPanel({ showDoneButton = false, initialTab = "channels"
     };
 
     const finishConfig = () => {
-        const ready = config.channels.some((channel) => channel.baseUrl.trim() && channel.apiKey.trim() && channel.models.length);
+        // 服务端模式下 key 只在服务端密文里（前端仅有掩码），就绪判断不再看 key 非空
+        const ready = config.channels.some((channel) => channel.baseUrl.trim() && channel.models.length && (serverMode || channel.apiKey.trim()));
         setConfigDialogOpen(false);
         if (!ready) return;
         message.success(t(shouldPromptContinue ? "config.savedContinue" : "config.saved"));
@@ -188,34 +194,53 @@ export function AppConfigPanel({ showDoneButton = false, initialTab = "channels"
                     {
                         key: "channels",
                         label: t("config.tabs.channels"),
-                        children: (
-                            <div>
-                                <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
-                                    <div className="text-xs text-stone-500">{t("config.channels.description")}</div>
-                                    <Button type="primary" icon={<Plus className="size-4" />} onClick={addChannel}>
-                                        {t("config.channels.add")}
-                                    </Button>
+                        children:
+                            syncPhase !== "ready" ? (
+                                // 渲染门控：迁移/首次 GET 未完成 → 挂 loading，绝不拿本地陈旧渠道先渲染
+                                <div className="flex flex-col items-center gap-3 py-16 text-sm text-stone-500">
+                                    <Spin />
+                                    <div>{t("config.channels.loading")}</div>
                                 </div>
-                                <div className="space-y-2">
-                                    {config.channels.map((channel) => (
-                                        <div key={channel.id} className="flex items-center justify-between gap-3 rounded-lg border border-stone-200 px-4 py-3 dark:border-stone-800">
-                                            <div className="min-w-0">
-                                                <div className="truncate text-sm font-semibold">{channel.name || t("config.channels.unnamed")}</div>
-                                                <div className="mt-1 truncate text-xs text-stone-500">
-                                                    {apiFormatLabel(channel.apiFormat)} · {t("config.channels.modelCount", { count: channel.models.length })} · {channel.baseUrl || t("config.channels.missingUrl")}
+                            ) : (
+                                <div>
+                                    <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
+                                        <div className="text-xs text-stone-500">{t("config.channels.description")}</div>
+                                        <Button type="primary" icon={<Plus className="size-4" />} onClick={addChannel}>
+                                            {t("config.channels.add")}
+                                        </Button>
+                                    </div>
+                                    {serverMode ? <div className="mb-3 rounded-lg bg-stone-100 px-3 py-2 text-xs text-stone-600 dark:bg-stone-900 dark:text-stone-300">{t("config.channels.serverModeHint")}</div> : null}
+                                    {syncError ? <div className="mb-3 rounded-lg bg-red-50 px-3 py-2 text-xs text-red-600 dark:bg-red-950/40 dark:text-red-300">{t("config.channels.saveError", { message: syncError })}</div> : null}
+                                    <div className="space-y-2">
+                                        {config.channels.map((channel) => {
+                                            // 自定义脚本渠道：脚本自己拿 key 发任意请求，服务端模式下无法代转发 → 置灰（B3.5③）
+                                            const scriptLocalOnly = serverMode && channel.models.some((model) => Boolean(model.script?.trim()));
+                                            return (
+                                                <div
+                                                    key={channel.id}
+                                                    className={`flex items-center justify-between gap-3 rounded-lg border border-stone-200 px-4 py-3 dark:border-stone-800 ${scriptLocalOnly ? "opacity-60" : ""}`}
+                                                >
+                                                    <div className="min-w-0">
+                                                        <div className="flex min-w-0 items-center gap-2">
+                                                            <span className="truncate text-sm font-semibold">{channel.name || t("config.channels.unnamed")}</span>
+                                                            {scriptLocalOnly ? <Tag className="shrink-0">{t("config.channels.scriptLocalOnly")}</Tag> : null}
+                                                        </div>
+                                                        <div className="mt-1 truncate text-xs text-stone-500">
+                                                            {apiFormatLabel(channel.apiFormat)} · {t("config.channels.modelCount", { count: channel.models.length })} · {channel.baseUrl || t("config.channels.missingUrl")}
+                                                        </div>
+                                                    </div>
+                                                    <div className="flex shrink-0 gap-2">
+                                                        <Button size="small" disabled={scriptLocalOnly} icon={<Pencil className="size-3.5" />} onClick={() => setEditingChannelId(channel.id)}>
+                                                            {t("common.edit")}
+                                                        </Button>
+                                                        <Button size="small" danger icon={<Trash2 className="size-3.5" />} onClick={() => deleteChannel(channel.id)} />
+                                                    </div>
                                                 </div>
-                                            </div>
-                                            <div className="flex shrink-0 gap-2">
-                                                <Button size="small" icon={<Pencil className="size-3.5" />} onClick={() => setEditingChannelId(channel.id)}>
-                                                    {t("common.edit")}
-                                                </Button>
-                                                <Button size="small" danger icon={<Trash2 className="size-3.5" />} onClick={() => deleteChannel(channel.id)} />
-                                            </div>
-                                        </div>
-                                    ))}
+                                            );
+                                        })}
+                                    </div>
                                 </div>
-                            </div>
-                        ),
+                            ),
                     },
                     {
                         key: "lapian-models",
@@ -366,7 +391,7 @@ export function AppConfigPanel({ showDoneButton = false, initialTab = "channels"
                     </Button>
                 </div>
             ) : null}
-            <ChannelEditorDrawer open={Boolean(editingChannel)} channel={editingChannel} onSave={saveChannel} onClose={() => setEditingChannelId("")} />
+            <ChannelEditorDrawer open={Boolean(editingChannel)} channel={editingChannel} serverMode={serverMode} onSave={saveChannel} onClose={() => setEditingChannelId("")} />
         </>
     );
 }

@@ -3,21 +3,21 @@ import axios from "axios";
 import i18n from "@/i18n";
 import { audioMimeType, normalizeAudioFormatValue, normalizeAudioSpeedValue, normalizeAudioVoiceValue } from "@/lib/audio-generation";
 import { uploadMediaFile, type UploadedFile } from "@/services/file-storage";
-import { buildApiUrl, resolveModelRequestConfig, resolveModelScript, withLocalProxy, type AiConfig } from "@/stores/use-config-store";
+import { resolveModelRequestConfig, resolveModelScript, withLocalProxy, type AiConfig } from "@/stores/use-config-store";
+import { channelApiUrl, channelAuthHeaders, type ChannelTarget } from "./channel-proxy";
 import { runModelPlugin } from "./model-plugin";
 
 type RequestOptions = { signal?: AbortSignal };
 const apiText = (key: string, options?: Record<string, unknown>) => i18n.t(`apiErrors.${key}`, options);
 
-function aiApiUrl(config: AiConfig, path: string) {
-    return buildApiUrl(config.baseUrl, path);
+function aiApiUrl(config: AiConfig & ChannelTarget, path: string) {
+    // S2-B3：服务端渠道模式改道 /api/proxy/<channelId>/…
+    return channelApiUrl(config, path);
 }
 
-function aiHeaders(config: AiConfig) {
-    return {
-        Authorization: `Bearer ${config.apiKey}`,
-        "Content-Type": "application/json",
-    };
+function aiHeaders(config: AiConfig & ChannelTarget) {
+    // 服务端模式不带鉴权头（key 由服务端注入）
+    return channelAuthHeaders(config, "application/json");
 }
 
 export async function requestAudioGeneration(config: AiConfig, prompt: string, options?: RequestOptions): Promise<Blob> {

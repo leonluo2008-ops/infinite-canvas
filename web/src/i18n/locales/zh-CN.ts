@@ -44,6 +44,7 @@ export default {
     videoPhaseDownloading: "生成完成，下载中…",
     imageReferences: { label: "图片{{index}}", separator: "、", promptPrefix: "参考图片编号：{{labels}}。请按这些编号理解提示词中的图片引用。\n\n{{prompt}}" },
     modelPlugin: {
+        remoteUnsupported: "自定义脚本渠道仅本地模式可用：服务端模式不会把 API Key 下发到脚本里，请在本地模式使用该渠道，或改用内置协议渠道",
         pollTimeout: "插件轮询超时，请检查调用脚本或稍后重试", executionFailed: "模型调用脚本执行失败：{{message}}", noImages: "模型调用脚本没有返回图片",
         variables: { prompt: "用户输入的提示词（已拼接系统提示词）", images: "参考图，dataURL 数组（改图 / 图生视频时有值）", videos: "参考视频 File 数组，可直接 form.append；画布或工作台接入的参考视频，无则为空数组", audios: "参考音频 File 数组，可直接 form.append；画布或工作台接入的参考音频，无则为空数组", messages: "对话消息数组，含系统消息", params: "生成参数：生图 {size,resolution,quality,count,background}、视频 {mode,seconds,size,resolution,ratio,generateAudio,watermark}（mode 为 frames 首尾帧或 reference 全能参考；超过 2 张图时为 reference）、音频 {voice,format,speed,instructions}", model: "模型名称（不含渠道前缀）", baseUrl: "渠道接口地址（原样，未拼 /v1）", apiKey: "渠道 API Key，请求头里自己带上", systemPrompt: "系统提示词原文", reasoningEffort: "文本推理强度；auto 表示由脚本决定是否传递", http: "便捷请求：http.post(path, body, {headers,params,responseType})、http.get(path, opts)、http.url(path)；默认带 Authorization: Bearer apiKey，可用 headers 覆盖；path 相对时按 baseUrl 拼 /v1", request: "原始请求 request({ method, url, headers, params, data, responseType })，不加任何默认头，鉴权头自己写；url 相对时按 baseUrl 拼接（不加 /v1）", poll: "轮询 poll(request, extract, {intervalMs,timeoutMs})，extract 返回真值即结束", sleep: "sleep(ms) 延时", signal: "取消信号，可透传给 http/request", onDelta: "onDelta(text) 推送流式文本（文本模型）" },
         returns: { image: "文生图（images 为空）和图生图（images 有参考图）接口不同，脚本需自行区分；返回图片 URL 或 dataURL 字符串，也可返回它们的数组，或 [{ dataUrl }] / [{ url }] / [{ b64_json }]", video: "脚本内部完成轮询，返回 { url } 或 { blob } 或视频 URL 字符串", audio: "返回 Blob，或 base64 / dataURL 字符串，或 { b64_json } / { data } / { url }", text: "用 onDelta(text) 推送流式，最终 return 完整文本字符串" },
@@ -60,7 +61,7 @@ export default {
             anyModel: "（当前选中的模型）",
         },
     },
-    apiErrors: { requestFailed: "请求失败", requestCanceled: "请求已取消", baseUrlRequired: "请先配置 Base URL", apiKeyRequired: "请先配置 API Key", authenticationFailed: "鉴权失败，请检查 API Key、套餐权限或模型权限", rateLimited: "请求被限流或额度不足，请稍后重试", notFound: "接口地址不存在（404），请检查 Base URL 和模型选择", badGateway: "网关错误（502），接口服务暂时不可用，请稍后重试", serviceBusy: "服务繁忙（503），请稍后重试", httpFailed: "请求失败（HTTP {{status}}），请检查 Base URL 和 API Key 是否正确", htmlError: "服务返回了 HTML 错误页面（{{preview}}）", imageTimeout: "生图请求超时，接口长时间没有返回，请稍后重试或更换渠道", audioModelRequired: "请先配置音频模型", audioGenerationFailed: "音频生成失败", scriptNoAudio: "模型调用脚本没有返回音频", geminiAudioUnsupported: "Gemini 调用格式暂不支持音频生成，请使用 OpenAI 格式渠道", invalidImageSizeFormat: "图像尺寸格式不支持，请使用 auto、9:16 或 1024x1024", positiveImageRatio: "图像比例必须是正数，例如 9:16", imageRatioLimit: "图像宽高比不能超过 3:1，请调整尺寸", positiveImageDimensions: "图像尺寸必须是正整数，例如 1024x1024", imageDimensionStep: "图像尺寸的宽高必须是 16 的倍数，请调整尺寸", imageEdgeLimit: "图像尺寸最长边不能超过 3840px，请调整尺寸", imagePixelLimit: "图像总像素需在 655360 到 8294400 之间，请调整尺寸", unknownImageResponse: "接口返回了未知格式的数据（字段：{{fields}}），请检查模型或接口兼容性", noImageReturned: "接口没有返回图片，请检查提示词是否触发安全审核或模型是否支持该操作", geminiRejected: "Gemini 拒绝了本次请求：{{reason}}", geminiNoImage: "Gemini 接口没有返回图片", maskModelUnsupported: "蒙版编辑暂不支持该模型，请使用其他渠道", noContent: "没有返回内容", modelReadFailed: "读取模型失败", videoTimeout: "{{provider}}视频生成超时，请稍后重试", pluginVideoExpired: "插件视频任务已失效，请重新生成", scriptNoVideo: "模型调用脚本没有返回视频", noPlayableVideo: "视频接口没有返回可播放的视频", noVideoTaskId: "视频接口没有返回任务 ID", videoTaskCreateFailed: "视频任务创建失败", videoGenerationFailed: "视频生成失败", videoTaskQueryFailed: "视频任务查询失败", videoPromptRequired: "请输入视频提示词，或连接参考图片/视频/音频", referenceImageReadFailed: "参考图读取失败，请换一张图片或重新上传", invalidReferenceVideo: "参考视频必须是公网 URL、资产 ID，或本地已保存的视频", invalidReferenceAudio: "参考音频必须是公网 URL、资产 ID，或本地已保存的音频", videoModelRequired: "请先配置视频模型", geminiVideoUnsupported: "Gemini 调用格式暂不支持视频生成，请使用 OpenAI 格式渠道", noVideoTask: "接口没有返回视频任务", videoDownloadFailed: "视频下载失败", localAssetReadFailed: "读取本地资产失败", wanBridgeRequired: "请先填写万相 bridge 地址（渠道的接口地址）", wanVideoCreateFailed: "万相任务创建失败", wanVideoQueryFailed: "万相任务查询失败（沿用同一任务 ID 重查，勿重新创建）", wanVideoFailed: "万相视频生成失败", wanVideoNoJob: "万相 bridge 没有返回任务 ID（提交状态不明，勿重复提交）", wanVideoFileMissing: "万相任务已完成，但成片文件 ID 丢失（未在本页面创建或缓存已清），请重新生成" },
+    apiErrors: { requestFailed: "请求失败", requestCanceled: "请求已取消", baseUrlRequired: "请先配置 Base URL", apiKeyRequired: "请先配置 API Key", authenticationFailed: "鉴权失败，请检查 API Key、套餐权限或模型权限", rateLimited: "请求被限流或额度不足，请稍后重试", notFound: "接口地址不存在（404），请检查 Base URL 和模型选择", badGateway: "网关错误（502），接口服务暂时不可用，请稍后重试", serviceBusy: "服务繁忙（503），请稍后重试", httpFailed: "请求失败（HTTP {{status}}），请检查 Base URL 和 API Key 是否正确", htmlError: "服务返回了 HTML 错误页面（{{preview}}）", imageTimeout: "生图请求超时，接口长时间没有返回，请稍后重试或更换渠道", audioModelRequired: "请先配置音频模型", audioGenerationFailed: "音频生成失败", scriptNoAudio: "模型调用脚本没有返回音频", geminiAudioUnsupported: "Gemini 调用格式暂不支持音频生成，请使用 OpenAI 格式渠道", invalidImageSizeFormat: "图像尺寸格式不支持，请使用 auto、9:16 或 1024x1024", positiveImageRatio: "图像比例必须是正数，例如 9:16", imageRatioLimit: "图像宽高比不能超过 3:1，请调整尺寸", positiveImageDimensions: "图像尺寸必须是正整数，例如 1024x1024", imageDimensionStep: "图像尺寸的宽高必须是 16 的倍数，请调整尺寸", imageEdgeLimit: "图像尺寸最长边不能超过 3840px，请调整尺寸", imagePixelLimit: "图像总像素需在 655360 到 8294400 之间，请调整尺寸", unknownImageResponse: "接口返回了未知格式的数据（字段：{{fields}}），请检查模型或接口兼容性", noImageReturned: "接口没有返回图片，请检查提示词是否触发安全审核或模型是否支持该操作", geminiRejected: "Gemini 拒绝了本次请求：{{reason}}", geminiNoImage: "Gemini 接口没有返回图片", maskModelUnsupported: "蒙版编辑暂不支持该模型，请使用其他渠道", noContent: "没有返回内容", modelReadFailed: "读取模型失败", videoTimeout: "{{provider}}视频生成超时，请稍后重试", pluginVideoExpired: "插件视频任务已失效，请重新生成", scriptNoVideo: "模型调用脚本没有返回视频", noPlayableVideo: "视频接口没有返回可播放的视频", noVideoTaskId: "视频接口没有返回任务 ID", videoTaskCreateFailed: "视频任务创建失败", videoGenerationFailed: "视频生成失败", videoTaskQueryFailed: "视频任务查询失败", videoPromptRequired: "请输入视频提示词，或连接参考图片/视频/音频", referenceImageReadFailed: "参考图读取失败，请换一张图片或重新上传", invalidReferenceVideo: "参考视频必须是公网 URL、资产 ID，或本地已保存的视频", invalidReferenceAudio: "参考音频必须是公网 URL、资产 ID，或本地已保存的音频", videoModelRequired: "请先配置视频模型", geminiVideoUnsupported: "Gemini 调用格式暂不支持视频生成，请使用 OpenAI 格式渠道", noVideoTask: "接口没有返回视频任务", videoDownloadFailed: "视频下载失败", localAssetReadFailed: "读取本地资产失败", wanBridgeRequired: "请先填写万相 bridge 地址（渠道的接口地址）", wanVideoCreateFailed: "万相任务创建失败", wanVideoQueryFailed: "万相任务查询失败（沿用同一任务 ID 重查，勿重新创建）", wanVideoFailed: "万相视频生成失败", wanVideoNoJob: "万相 bridge 没有返回任务 ID（提交状态不明，勿重复提交）", wanVideoFileMissing: "万相任务已完成，但成片文件 ID 丢失（未在本页面创建或缓存已清），请重新生成", channelMissing: "服务端渠道模式下无法定位渠道（缺少 channelId），请刷新页面重试" },
     prompts: {
         title: "提示词中心",
         library: "提示词库",
@@ -497,6 +498,11 @@ export default {
         lightTheme: "切换到浅色主题",
         darkTheme: "切换到深色主题",
     },
+    channelSync: {
+        missingKey: "渠道「{{names}}」还没填写 API Key，暂未保存到服务端",
+        loadFailed: "读取服务端渠道失败（HTTP {{status}}）：请刷新重试或检查登录状态",
+        saveFailed: "保存渠道到服务端失败（HTTP {{status}}）：改动已留在本地，稍后会自动重试",
+    },
     account: {
         login: "登录",
         logout: "退出登录",
@@ -659,6 +665,10 @@ export default {
             defaultName: "默认渠道",
             newName: "新渠道",
             indexedName: "渠道 {{index}}",
+            serverModeHint: "渠道配置保存在你的账号下（服务端模式）：换设备登录即可看到；API Key 只在服务端加密保存、前端只显示掩码，生成请求由服务端代转发。",
+            scriptLocalOnly: "自定义脚本渠道仅本地模式可用",
+            loading: "正在读取账号下的渠道配置…",
+            saveError: "渠道保存到服务端失败：{{message}}",
         },
         preferences: {
             interface: "界面偏好",
@@ -710,6 +720,7 @@ export default {
             },
         },
         modelSelect: {
+            remoteSaveFirst: "服务端模式下需先把渠道保存到账号，再拉取模型列表",
             missingConfig: "请先填写接口地址和 API Key",
             fetched: "已拉取 {{count}} 个模型",
             fetchFailed: "拉取模型失败",

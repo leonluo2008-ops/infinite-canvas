@@ -4,6 +4,7 @@ import { useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 
 import { fetchChannelModels } from "@/services/api/image";
+import { isServerChannelMode } from "@/services/api/channel-proxy";
 import type { ModelChannel } from "@/stores/use-config-store";
 
 // Channel model selector: fetch upstream models or add them manually, then include checked models in the channel list.
@@ -72,7 +73,9 @@ export function ModelSelectModal({ open, channel, selectedNames, onConfirm, onCl
             setActiveTab("new");
             message.success(t("config.modelSelect.fetched", { count: models.length }));
         } catch (error) {
-            message.error(error instanceof Error ? error.message : t("config.modelSelect.fetchFailed"));
+            // 服务端模式：模型列表只能由服务端代转发拉（前端没有 key），渠道还没落到服务端时会 404
+            const detail = error instanceof Error ? error.message : t("config.modelSelect.fetchFailed");
+            message.error(isServerChannelMode() ? `${t("config.modelSelect.remoteSaveFirst")}（${detail}）` : detail);
         } finally {
             setLoading(false);
         }
