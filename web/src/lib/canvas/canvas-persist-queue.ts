@@ -54,6 +54,23 @@ export type PersistQueue<T> = {
     lastError: () => string | null;
     /** flush 调用次数（探针据此断言编排关键节点真的调了）。 */
     flushCount: () => number;
+    /**
+     * S3-B2：换落盘目标（transport indirection）。
+     *
+     * 只换「写到哪」，不换队列语义：待写值、去重基线、计时器、flush 串行链一律不动。
+     * 启动门拿到服务端结果后调用 `setTransport(remoteStorage)`，此后 store 的 set 才走「本地立写 + 远端推送」；
+     * 启动门返回前不切，就能保证「首帧前零远端 PUT」（V5）。
+     */
+    setTransport: (storage: PersistQueueStorage) => void;
+    /**
+     * S3-B2：换基线（启动门用合并结果 prime）。
+     *
+     * 语义与 `prime` 相同（视为已在新目标上落盘，清空待写），单独成名的理由只有一条：
+     * 启动门里这是「切换 transport 之后才允许调用」的动作，读代码时不该被误当成普通恢复。
+     */
+    rehydrate: (value: T) => void;
+    /** 当前落盘目标（探针断言 transport 真的切过）。 */
+    currentTransport: () => PersistQueueStorage;
 };
 
 const defaultSetTimer = (callback: () => void, ms: number) => setTimeout(callback, ms);
@@ -63,6 +80,8 @@ export function createPersistQueue<T>(options: PersistQueueOptions<T>): PersistQ
     const delayMs = Math.max(0, Number(options.delayMs ?? 400));
     const setTimer = options.setTimer ?? defaultSetTimer;
     const clearTimer = options.clearTimer ?? defaultClearTimer;
+    /** 落盘目标：可变（S3-B2 transport indirection）。默认就是 options.storage —— 单人模式零改动。 */
+    let transport: PersistQueueStorage = options.storage;
 
     let queued: { value: T; json: string } | null = null;
     let timer: unknown = null;
@@ -84,7 +103,7 @@ export function createPersistQueue<T>(options: PersistQueueOptions<T>): PersistQ
         if (!queued) return { ok: true, written: false, bytes: lastBytes };
         const target = queued;
         try {
-            await options.storage.setItem(options.name, target.json);
+            await transport.setItem(options.name, target.json);
             if (queued === target) queued = null;
             persisted = target.value;
             lastBytes = target.json.length;
@@ -125,5 +144,16 @@ export function createPersistQueue<T>(options: PersistQueueOptions<T>): PersistQ
         lastWrittenBytes: () => lastBytes,
         lastError: () => lastErrorText,
         flushCount: () => flushCalls,
+        setTransport(storage) {
+            // 只换目标：待写值/去重基线/计时器/flush 链一律不动（换目标后下一次写就走新目标）
+            transport = storage;
+        },
+        rehydrate(value) {
+            // 与 prime 同一语义（新目标上的基线），但只在启动门「切完 transport 之后」调用
+            cancelTimer();
+            queued = null;
+            persisted = value;
+        },
+        currentTransport: () => transport,
     };
 }

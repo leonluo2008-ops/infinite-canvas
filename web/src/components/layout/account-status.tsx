@@ -53,9 +53,23 @@ export function AccountStatus({ iconStyle, className }: { iconStyle?: React.CSSP
         );
     }
     const logout = () => {
-        void fetch("/api/auth/logout", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" }).then(() => {
+        // S3-B2 §2.4：登出前先把本站账号的画布缓存「留档到隔离键 + 清空共享主键」，
+        // 否则下一个人（B 账号）在同一浏览器登录会读到 A 的项目（V9）。
+        // 顺序：留档/清空完成 → 才踢会话 → 才跳转（跳转前必须落完，页面一走就写不了了）。
+        void (async () => {
+            try {
+                const { prepareCanvasLogout } = await import("@/services/canvas-project-sync");
+                await prepareCanvasLogout();
+            } catch (error) {
+                console.warn("[account] 登出前清空画布缓存失败（数据仍在盘上，下次登录会按 owner 重新判定）", error);
+            }
+            try {
+                await fetch("/api/auth/logout", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+            } catch {
+                // 会话没踢掉也只能继续跳转：本地已清空，服务端会话过期由后端判定
+            }
             location.href = "/multiuser/";
-        });
+        })();
     };
     return (
         <>

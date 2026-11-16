@@ -5,7 +5,8 @@ import { nanoid } from "nanoid";
 import i18n from "@/i18n";
 import { localForageStorage } from "@/lib/localforage-storage";
 import type { CanvasBackgroundMode } from "@/lib/canvas-theme";
-import { createPersistQueue, type FlushResult } from "@/lib/canvas/canvas-persist-queue";
+import { createPersistQueue, type FlushResult, type PersistQueueStorage } from "@/lib/canvas/canvas-persist-queue";
+import { clampDeletedAtIso } from "@/lib/canvas/canvas-timestamp";
 import { acceptWorkflowBatches, type WorkflowBatchRecord } from "@/lib/canvas/workflow-batch";
 import { acceptWorkflowAssetVetoes, type WorkflowAssetVetoRecord } from "@/lib/canvas/workflow-asset-match";
 import { acceptWorkflowInstances } from "@/lib/canvas/workflow-instance-identity";
@@ -100,10 +101,26 @@ type CanvasStore = {
 };
 
 const initialViewport: ViewportTransform = { x: 0, y: 0, k: 1 };
-const CANVAS_STORE_KEY = "infinite-canvas:canvas_store";
-type PersistedCanvasState = Pick<CanvasStore, "projects" | "deletedProjects">;
+/** localForage 键：**不可改**（任务书 §2.5；6 个既有 ego 探针直接读写该键）。 */
+export const CANVAS_STORE_KEY = "infinite-canvas:canvas_store";
+/**
+ * 落盘的 state 载荷。
+ *
+ * S3-B2 在 `state` 内**追加**三个可选字段（`dirtyIds` / `owner` / `migratedAt`），外层 `{state,version}`
+ * 信封不变：
+ *  - 单人/本地模式这三个字段恒不存在 → 序列化字节与基线逐字节一致（V4 指纹口径）；
+ *  - 账号服务端模式由 `services/canvas-project-sync.ts` 的 transport 在落盘时补进去（store 本身不感知远端）。
+ */
+export type PersistedCanvasState = Pick<CanvasStore, "projects" | "deletedProjects"> & {
+    /** 待推服务端：项目 id → 本地 revision（ms）。单人模式不出现。 */
+    dirtyIds?: Record<string, number>;
+    /** 该缓存载荷归属的账号（服务端下发 username）。单人模式不出现。 */
+    owner?: string;
+    /** 一次性迁移完成时刻（ISO）。单人模式不出现。 */
+    migratedAt?: string;
+};
 /** 落盘载荷就是 zustand persist 的 StorageValue（`{state, version}`）——不能只存 state，否则恢复时无处可取。 */
-type PersistedCanvasValue = { state: PersistedCanvasState; version?: number };
+export type PersistedCanvasValue = { state: PersistedCanvasState; version?: number };
 
 /**
  * 持久化队列（P5 / 收敛裁决 A8-G14）：set 后 400ms 防抖合并写，`flushProjects` 可立即落盘。
@@ -119,6 +136,21 @@ const persistQueue = createPersistQueue<PersistedCanvasValue>({
         useCanvasStore.setState({ lastFlush: { at: new Date().toISOString(), ok: false, bytes: 0, error: error.message } });
     },
 });
+
+/**
+ * S3-B2 的 transport indirection 入口（只给 `services/canvas-project-sync.ts` 用）。
+ *
+ * 为什么不让 store 直接认识远端：单人模式零改动（§2.5）——store 只提供「换目标 / 换基线 / 立即落盘」
+ * 三个原子的队列操作，远端语义（清单/合并/dirty/推送）全部留在服务层，local 分支逐字节不变。
+ */
+export const canvasPersistQueue = {
+    setTransport: (storage: PersistQueueStorage) => persistQueue.setTransport(storage),
+    /** 启动门：切完 transport 之后用合并结果 prime 基线（此后 store 的 set 才走远端写穿）。 */
+    rehydrate: (value: PersistedCanvasValue) => persistQueue.rehydrate(value),
+    flush: (reason?: string) => persistQueue.flush(reason),
+    pending: () => persistQueue.pending(),
+    lastError: () => persistQueue.lastError(),
+};
 
 const canvasStorage: PersistStorage<CanvasStore> = {
     getItem: async (name) => {
@@ -199,10 +231,17 @@ export const useCanvasStore = create<CanvasStore>()(
                 })),
             deleteProjects: (ids) =>
                 set((state) => {
-                    const now = new Date().toISOString();
+                    const now = Date.now();
                     const removing = new Set(ids);
+                    const byId = new Map(state.projects.map((project) => [project.id, project]));
                     const projects = state.projects.filter((project) => !removing.has(project.id));
-                    const deletedProjects = [...state.deletedProjects.filter((item) => !removing.has(item.id)), ...ids.map((id) => ({ id, deletedAt: now }))];
+                    // 任务书 §2.1「删除时序 clamp」（v1.2）：墓碑时间必须 ≥ 该项目最后一次改写，
+                    // 否则另一台设备在「删除」与「最后一次 PUT」之间的窗口里会把项目复活（V3 的反向漏口）。
+                    // 正常时钟下 max(now, updatedAt) == now —— 单人模式取值逐字节不变。
+                    const deletedProjects = [
+                        ...state.deletedProjects.filter((item) => !removing.has(item.id)),
+                        ...ids.map((id) => ({ id, deletedAt: clampDeletedAtIso(byId.get(id)?.updatedAt, now) })),
+                    ];
                     return { projects, deletedProjects };
                 }),
             replaceProjects: (projects, deletedProjects = []) => set({ projects, deletedProjects }),
@@ -226,6 +265,23 @@ export const useCanvasStore = create<CanvasStore>()(
                     projects: state.projects,
                     deletedProjects: state.deletedProjects,
                 }) as StorageValue<CanvasStore>["state"],
+            /**
+             * S3-B2.5（polish③）：恢复时**只认 store 认识的键**。
+             *
+             * 账号模式的落盘载荷在 `state` 里追加了 `owner` / `dirtyIds` / `migratedAt` 三个同步元数据。
+             * zustand 默认 merge 是 `{...current, ...persisted}` —— 会把这三个键原样灌进 store 状态，
+             * 于是 `useCanvasStore.getState().owner` 之类的幽灵字段出现，和 `canvas-project-sync` 的
+             * `runtime.owner` 形成两个真源（读的人会误以为 store 知道账号）。
+             * 单人模式载荷本来就只有这两个键 → 逐字节/逐键不变（§2.5 零改动）。
+             */
+            merge: (persisted, current) => {
+                const stored = (persisted ?? null) as Partial<PersistedCanvasState> | null;
+                return {
+                    ...current,
+                    projects: Array.isArray(stored?.projects) ? (stored!.projects as CanvasProject[]) : current.projects,
+                    deletedProjects: Array.isArray(stored?.deletedProjects) ? (stored!.deletedProjects as CanvasDeletedProject[]) : current.deletedProjects,
+                } as CanvasStore;
+            },
             onRehydrateStorage: () => () => {
                 useCanvasStore.setState({ hydrated: true });
             },

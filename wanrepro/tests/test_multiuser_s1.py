@@ -990,6 +990,50 @@ def phase_s3_b1():
         checks.append('S3-T7 V3 墓碑优先（ms 级造数）：updatedAt=deletedAt-1000 的旧设备 PUT → 409 且墓碑原样'
                       '（不复活、deleted_at 不动）；updatedAt=deletedAt+1000 + base=墓碑版本 → 复活（deleted=0/deletedAt=0）')
 
+        # ---- S3-T7b 墓碑时序边界 ts == deletedAt（B2 复审顺手②：S3-T7 只测了 ±1000，等号边界半恒真）----
+        # 判据：project_store._put_project 的墓碑分支必须用 `ts <= deleted_at` 判 409（墓碑优先），
+        # 因此 **ts == deleted_at 不得复活**；而 CAS 已通过（base==version）时这一条是**唯一**拦截者，
+        # 若有人把它写成 `<` 或先判 CAS 通过就放行，等号用例才会红 —— 这就是本条要锁死的东西。
+        st, body, _ = put('p_t7b', {'content': {'id': 'p_t7b', 'name': '边界项目', 'nodes': []},
+                                    'updatedAt': T0 + 30000}, opA)
+        assert st == 200 and body['project']['version'] == T0 + 30000, f'边界项目建行: {st} {body}'
+        edge_del = T0 + 31000
+        st, body, _ = jreq(PROJ + '/p_t7b', 'DELETE', {'deletedAt': edge_del}, opA)
+        assert st == 200 and body['project']['deleted'] is True and body['project']['deletedAt'] == edge_del, \
+            f'边界墓碑落盘: {st} {body}'
+        assert body['project']['version'] == edge_del, f'墓碑版本 = max(updated_at, deleted_at): {body["project"]}'
+
+        # (1) ts == deleted_at，且**不带** base → 409
+        st, nb, _ = put('p_t7b', {'content': {'id': 'p_t7b', 'name': '等号复活', 'nodes': []},
+                                  'updatedAt': edge_del}, opA)
+        assert st == 409, f'updatedAt == deleted_at 不得复活（墓碑优先是 <=）, got {st} {nb}'
+        assert nb['server']['deleted'] is True and nb['server']['deletedAt'] == edge_del, nb
+
+        # (2) ts == deleted_at 且 base 正好等于墓碑版本（CAS 通过）→ 仍然 409（这条才是半恒真锁）
+        st, nb, _ = put('p_t7b', {'content': {'id': 'p_t7b', 'name': '等号复活', 'nodes': []},
+                                  'updatedAt': edge_del, 'baseUpdatedAt': edge_del}, opA)
+        assert st == 409, f'base 命中也必须被墓碑规则拦下, got {st} {nb}'
+        allr, cols = rows('p_t7b')
+        a_row = [r for r in allr if r[cols.index('user_id')] == uid_a][0]
+        assert a_row[cols.index('deleted')] == 1 and a_row[cols.index('deleted_at')] == edge_del, \
+            '等号边界被拒后墓碑必须原样（不被改写、不被复活）'
+
+        # (3) ts == deleted_at + 1 → 复活（边界的另一侧必须真的能过）
+        st, body, _ = put('p_t7b', {'content': {'id': 'p_t7b', 'name': '越界一毫秒复活', 'nodes': []},
+                                    'updatedAt': edge_del + 1, 'baseUpdatedAt': edge_del}, opA)
+        assert st == 200 and body['project']['deleted'] is False and body['project']['version'] == edge_del + 1, \
+            f'deleted_at+1 应复活: {st} {body}'
+        assert body['project']['deletedAt'] == 0, body['project']
+
+        # (4) 同 deletedAt 重复 DELETE（幂等）：版本不倒退、行仍为墓碑
+        st, body, _ = jreq(PROJ + '/p_t7b', 'DELETE', {'deletedAt': edge_del + 1}, opA)
+        assert st == 200 and body['project']['deleted'] is True, f'再次删除: {st} {body}'
+        st, body, _ = jreq(PROJ + '/p_t7b', 'DELETE', {'deletedAt': edge_del + 1}, opA)
+        assert st == 200 and body['project']['deletedAt'] == edge_del + 1 and body['project']['version'] == edge_del + 1, \
+            f'重复 DELETE 幂等（deleted_at 不被更小的值改小）: {body["project"]}'
+        checks.append('S3-T7b 墓碑等号边界：updatedAt == deletedAt（带/不带 baseUpdatedAt）一律 409 且墓碑原样；'
+                      'deletedAt+1 复活；重复 DELETE 幂等（版本不倒退）')
+
         # ---- S3-T8 体积：content 超 8MB → 413 且不落行 ----
         big = {'id': 'pbig', 'name': '巨大', 'blob': 'x' * (8 * 1024 * 1024)}
         st, body, _ = put('pbig', {'content': big, 'updatedAt': T0 + 9000}, opA)

@@ -1,6 +1,8 @@
 import localforage from "localforage";
 
 import i18n from "@/i18n";
+import { mergeCanvasData, mergeCanvasById } from "@/lib/canvas/canvas-merge";
+import { isRemoteCanvasMode } from "@/lib/canvas/canvas-sync-mode";
 import { getMediaBlob, resolveMediaUrl, setMediaBlob } from "@/services/file-storage";
 import { getImageBlob, resolveImageUrl, setImageBlob } from "@/services/image-storage";
 import { downloadWebdavFile, uploadWebdavFile, WEBDAV_MANIFEST_FILE_NAME } from "@/services/webdav-sync";
@@ -53,6 +55,8 @@ type SyncDomainResult<T> = {
 
 export type AppSyncResult = {
     syncedAt: string;
+    /** true = 画布域被跳过（账号服务端模式：画布项目由 S3 同步负责，禁双真源） */
+    canvasSkipped?: boolean;
     mergedRemote: boolean;
     projects: number;
     assets: number;
@@ -85,18 +89,31 @@ export async function syncAppDataToWebdav(config: WebdavSyncConfig, onProgress?:
     emitProgress(onProgress, { stage: "等待本地数据加载" });
     await Promise.all([waitForHydration(useCanvasStore), waitForHydration(useAssetStore)]);
 
+    /**
+     * §2.5：**remote 模式禁用 WebDAV 画布域**。
+     *
+     * 两个真源不能并存：WebDAV 的 `applyData` 是整集 `replaceProjects`，它会把账号服务端刚合并下来的项目
+     * 按 WebDAV 清单回滚（并且 WebDAV 里的旧项目还会被 S3 当成「本地新增」重新推上服务端）。
+     * 账号模式下画布项目只由 `services/canvas-project-sync.ts` 负责，这里退化成「不读不写」的空域
+     * （资产/工作台日志照旧走 WebDAV，它们没有账号侧真源）。
+     */
+    const canvasRemote = isRemoteCanvasMode();
+    if (canvasRemote) emitProgress(onProgress, { domain: "canvas", label: "画布", stage: "账号模式下画布由服务端同步，跳过 WebDAV 画布域", status: "success" });
+
     const [canvas, assets, imageLogs, videoLogs] = await Promise.all([
-        syncDomain<CanvasDomainData>(config, onProgress, {
-            key: "canvas",
-            label: "画布",
-            emptyData: { projects: [], deleted: [] },
-            localData: async () => {
-                const { projects, deletedProjects } = useCanvasStore.getState();
-                return { projects, deleted: deletedProjects };
-            },
-            mergeData: mergeCanvasData,
-            applyData: async (data) => useCanvasStore.getState().replaceProjects(data.projects, data.deleted),
-        }),
+        canvasRemote
+            ? Promise.resolve<SyncDomainResult<CanvasDomainData>>({ data: { projects: [], deleted: [] }, mergedRemote: false, files: 0, manifestBytes: 0, uploadedFiles: 0, uploadedBytes: 0 })
+            : syncDomain<CanvasDomainData>(config, onProgress, {
+                  key: "canvas",
+                  label: "画布",
+                  emptyData: { projects: [], deleted: [] },
+                  localData: async () => {
+                      const { projects, deletedProjects } = useCanvasStore.getState();
+                      return { projects, deleted: deletedProjects };
+                  },
+                  mergeData: mergeCanvasData,
+                  applyData: async (data) => useCanvasStore.getState().replaceProjects(data.projects, data.deleted),
+              }),
         syncDomain<AssetDomainData>(config, onProgress, {
             key: "assets",
             label: "我的资产",
@@ -125,6 +142,8 @@ export async function syncAppDataToWebdav(config: WebdavSyncConfig, onProgress?:
 
     const result = {
         syncedAt: new Date().toISOString(),
+        /** remote 模式下画布域被跳过（两真源冲突，§2.5）：调用方据此不必报告「画布同步了 0 个项目」。 */
+        canvasSkipped: canvasRemote,
         mergedRemote: [canvas, assets, imageLogs, videoLogs].some((item) => item.mergedRemote),
         projects: canvas.data.projects.length,
         assets: assets.data.assets.length,
@@ -295,45 +314,13 @@ async function replaceStoredLogs(store: LogStore, logs: StoredLog[]) {
     });
 }
 
-function mergeCanvasData(local: CanvasDomainData, remote: CanvasDomainData): CanvasDomainData {
-    const localDeleted = local.deleted || [];
-    const remoteDeleted = remote.deleted || [];
-    const deletedAtById = new Map<string, string>();
-    for (const item of [...remoteDeleted, ...localDeleted]) {
-        if (!item.id || !item.deletedAt) continue;
-        const current = deletedAtById.get(item.id);
-        if (!current || item.deletedAt >= current) deletedAtById.set(item.id, item.deletedAt);
-    }
-
-    const projects = mergeById(local.projects || [], remote.projects || [], "updatedAt").filter((project) => {
-        const deletedAt = deletedAtById.get(project.id);
-        if (!deletedAt) return true;
-        if (getTime(project as Record<string, unknown>, "updatedAt") > Date.parse(deletedAt)) {
-            deletedAtById.delete(project.id);
-            return true;
-        }
-        return false;
-    });
-
-    return {
-        projects,
-        deleted: [...deletedAtById.entries()].map(([id, deletedAt]) => ({ id, deletedAt })),
-    };
-}
-
+/**
+ * 画布域合并的**实现已搬到 `@/lib/canvas/canvas-merge`**（S3-B2 原样搬出，语义逐字节不变）：
+ * 账号服务端同步与 WebDAV 同步必须共用同一份 `mergeCanvasData`（任务书 §2.1 红线 25），
+ * 搬进 lib 层还能避免 app-sync ↔ canvas-project-sync 互相 import。
+ */
 function mergeById<T extends { id?: string }>(local: T[], remote: T[], timeKey: string) {
-    const items = new Map<string, T>();
-    remote.forEach((item) => {
-        const id = item.id || "";
-        if (id) items.set(id, item);
-    });
-    local.forEach((item) => {
-        const id = item.id || "";
-        if (!id) return;
-        const current = items.get(id);
-        if (!current || getTime(item as Record<string, unknown>, timeKey) >= getTime(current as Record<string, unknown>, timeKey)) items.set(id, item);
-    });
-    return Array.from(items.values()).sort((a, b) => getTime(b as Record<string, unknown>, timeKey) - getTime(a as Record<string, unknown>, timeKey));
+    return mergeCanvasById(local, remote, timeKey);
 }
 
 function collectStorageKeys(value: unknown, keys = new Set<string>()) {

@@ -166,6 +166,8 @@ export function AppConfigPanel({ showDoneButton = false, initialTab = "channels"
             const result = await syncAppDataToWebdav(webdav, updateWebdavProgress);
             updateWebdavConfig("lastSyncedAt", result.syncedAt);
             message.success(t("config.webdav.completed", { projects: result.projects, assets: result.assets, records: result.imageLogs + result.videoLogs, files: result.uploadedFiles, bytes: formatBytes(result.uploadedBytes) }));
+            // S3-B2 §2.5：账号模式下画布域被跳过（两真源冲突）——必须说出来，不能让人以为画布也走 WebDAV 了
+            if (result.canvasSkipped) message.info(t("config.webdav.canvasSkipped"));
         } catch (error) {
             setWebdavSyncStatus(error instanceof Error ? error.message : t("config.webdav.failed"));
             message.error(error instanceof Error ? error.message : t("config.webdav.failed"));
