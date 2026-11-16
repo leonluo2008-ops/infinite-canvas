@@ -62,6 +62,10 @@ try:
     from wanrepro.ui import multiuser  # noqa: E402  仓根包形态（探针/测试导入）
 except ImportError:  # 脚本直跑形态：ui/ 在 sys.path[0]，直接平级导入（ROOT 下的嵌套 wanrepro/ 目录会遮蔽包名）
     import multiuser  # noqa: E402
+try:
+    from wanrepro.ui import channel_store  # noqa: E402  S2-B1 渠道持久化（MULTI_USER=0 不触发其任何依赖）
+except ImportError:  # noqa: E402
+    import channel_store  # type: ignore[no-redef]  # noqa: E402
 
 # 拆解产物根：与 replace.analysis_root / state 同一真源
 # （`WANREPRO_ANALYSIS_ROOT` 优先）。为什么画布链也要认它：清单是各链共写的
@@ -2156,13 +2160,18 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         self.dispatch("POST")
 
+    def do_PUT(self) -> None:
+        # S2-B1：渠道集全量替换（PUT /api/user/channels）。dispatch 仍把非 GET 交给
+        # route_post，路由内按 self.command 分流——新增 verb 只加这一层壳。
+        self.dispatch("PUT")
+
     def do_OPTIONS(self) -> None:
         origin = self.headers.get("Origin") or ""
         rmethod = (self.headers.get("Access-Control-Request-Method") or "").upper()
         if origin in CANVAS_ORIGINS and rmethod:
             self.send_response(204)
             self.send_header("Access-Control-Allow-Origin", origin)
-            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
             self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Filename")
             self.send_header("Access-Control-Max-Age", "86400")
             self.send_header("Content-Length", "0")
@@ -2181,7 +2190,7 @@ class Handler(BaseHTTPRequestHandler):
             if method == "GET":
                 self.route_get(path)
             else:
-                self.route_post(path)
+                self.route_post(path)      # POST/DELETE/PUT 都在这条道上，路由内按 self.command 分流
         except ApiError as err:
             self.send_json({"error": err.msg, **({"stage": err.stage} if err.stage else {}), **err.extra},
                            err.status)
@@ -2200,6 +2209,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def route_get(self, path: str) -> None:
         if multiuser.handle(self, "GET", path):
+            return
+        if channel_store.handle(self, "GET", path):
             return
         if multiuser.route_missing(path):
             raise ApiError(404, f"没有这个地址：{path}")
@@ -2393,6 +2404,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def route_post(self, path: str) -> None:
         if multiuser.handle(self, self.command, path):
+            return
+        if channel_store.handle(self, self.command, path):
             return
         if multiuser.route_missing(path):
             raise ApiError(404, f"没有这个地址：{path}")

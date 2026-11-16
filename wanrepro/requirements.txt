@@ -30,6 +30,11 @@ faster-whisper
 #   使用方：pipeline/reverse/analyze_audio.py
 ctranslate2
 
+# cryptography（AES-GCM）：多用户 SaaS 渠道 key 的服务端加密存储（S2-B1）
+#   使用方：ui/channel_store.py（函数内懒加载——MULTI_USER=0 单人形态不 import 本包，
+#   单人包/S0 生产位零第三方依赖不受影响；只有开了多用户并用渠道 CRUD 才需要装）
+cryptography
+
 # ---------------------------------------------------------------------------
 # 非 pip 依赖（装不上、也不该装进 requirements.txt）
 # ---------------------------------------------------------------------------

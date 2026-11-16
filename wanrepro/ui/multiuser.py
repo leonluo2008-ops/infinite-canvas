@@ -103,6 +103,16 @@ def _session_user(h: BaseHTTPRequestHandler) -> str | None:
     return row["username"] if row else None
 
 
+def user_id_for_username(username: str) -> int | None:
+    """username → users.id（S2-B1 渠道归属用；_session_user 只回用户名）。
+    只做一次 JOIN 口径的查找，不参与任何 S1 逻辑。"""
+    if not username:
+        return None
+    with connect() as db:
+        row = db.execute("SELECT id FROM users WHERE username=?", (username,)).fetchone()
+    return int(row["id"]) if row else None
+
+
 def handle(h: BaseHTTPRequestHandler, method: str, path: str) -> bool:
     if not enabled(): return False
     if path == "/multiuser/" and method == "GET":
