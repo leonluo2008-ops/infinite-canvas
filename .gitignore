@@ -24,3 +24,4 @@ wanrepro/scratch/
 wanrepro/**/__pycache__/
 wanrepro/uploads/
 wanrepro/automation/projects/
+wanrepro/web-dist/
