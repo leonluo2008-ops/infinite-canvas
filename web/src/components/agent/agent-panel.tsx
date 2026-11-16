@@ -4,6 +4,7 @@ import { useTranslation } from "react-i18next";
 
 import { LocalAgentPanel } from "./local-agent-panel";
 import { canvasThemes } from "@/lib/canvas-theme";
+import { useAgentEntryVisible } from "@/services/session-role";
 import { CANVAS_AGENT_PANEL_MOTION_MS, useAgentStore } from "@/stores/use-agent-store";
 import { useThemeStore } from "@/stores/use-theme-store";
 
@@ -18,6 +19,8 @@ export function AgentPanel() {
     const panelOpen = useAgentStore((state) => state.panelOpen);
     const panelClosing = useAgentStore((state) => state.panelClosing);
     const setAgentState = useAgentStore((state) => state.setAgentState);
+    // S2.5（B1.2 / V2）：Agent 面板整块受同一门控——普通用户/未登录访客即使被程序性 openPanel 也渲染不出来
+    const agentEntryVisible = useAgentEntryVisible();
     const startResize = (event: ReactPointerEvent<HTMLButtonElement>) => {
         event.preventDefault();
         const startX = event.clientX;
@@ -38,7 +41,7 @@ export function AgentPanel() {
         window.addEventListener("pointerup", onUp);
     };
 
-    if (!panelMounted) return null;
+    if (!panelMounted || !agentEntryVisible) return null;
 
     return (
         <motion.div

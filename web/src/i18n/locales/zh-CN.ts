@@ -568,6 +568,7 @@ export default {
             available: "本地代理连接正常（{{proxy}}）",
             missingUrl: "请先填写本地代理地址。",
             unreachable: "无法连接本地代理，请确认命令已启动且地址填写正确。",
+            serverManaged: "已登录用户由服务器代理接管网络请求，无需本地代理。",
         },
         localStorage: {
             title: "IndexedDB 存储使用情况",

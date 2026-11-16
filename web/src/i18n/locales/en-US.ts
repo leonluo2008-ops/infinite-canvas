@@ -568,6 +568,7 @@ export default {
             available: "Local proxy is reachable ({{proxy}})",
             missingUrl: "Enter the local proxy address first.",
             unreachable: "Local proxy is unreachable. Make sure the command is running and the address is correct.",
+            serverManaged: "Logged-in users are proxied by the server — no local proxy is needed.",
         },
         localStorage: {
             title: "IndexedDB storage usage",

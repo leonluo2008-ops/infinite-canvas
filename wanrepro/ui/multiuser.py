@@ -18,6 +18,10 @@ FAILURES: dict[str, list[float]] = {}
 REG_ATTEMPTS: dict[str, list[float]] = {}  # 注册限速（按来源 IP，3600s 窗口内 10 次）
 COOKIE = "wan_session"
 DUMMY_SALT = secrets.token_bytes(16)  # 未知用户也走一次等价 scrypt，抹平时序侧信道
+# S2.5（B1.2）：管理员种子账号。Agent 入口一期只对 owner 自用通道开放，
+# 判定走 users.role 列（DEFAULT 0，旧库 ALTER TABLE 迁移时按本名单回填 1）；
+# 名单本身作为兜底，保证「迁移前就存在、role 还没被回填」的旧库也立即正确。
+ADMIN_USERNAMES = frozenset({"owner", "owner2"})
 
 
 def _cap(d: dict, limit: int = 4096) -> None:
@@ -52,14 +56,38 @@ def connect() -> sqlite3.Connection:
     conn.execute("PRAGMA foreign_keys=ON")
     conn.executescript("""
       CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, username TEXT NOT NULL UNIQUE,
-        pwd_hash BLOB NOT NULL, salt BLOB NOT NULL, created_at INTEGER NOT NULL);
+        pwd_hash BLOB NOT NULL, salt BLOB NOT NULL, created_at INTEGER NOT NULL,
+        role INTEGER NOT NULL DEFAULT 0);
       CREATE TABLE IF NOT EXISTS invites(code TEXT PRIMARY KEY, max_uses INTEGER NOT NULL,
         used_count INTEGER NOT NULL DEFAULT 0, expires_at INTEGER, revoked INTEGER NOT NULL DEFAULT 0,
         created_by TEXT, created_at INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS sessions(token TEXT PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id),
         expires_at INTEGER NOT NULL, revoked INTEGER NOT NULL DEFAULT 0);
     """)
+    _migrate_role_column(conn)
     return conn
+
+
+def _migrate_role_column(conn: sqlite3.Connection) -> None:
+    """S2.5 最小扩展：旧库（S1 建表无 role 列）补列 + 种子管理员回填。
+
+    幂等：列已存在直接返回。CREATE TABLE IF NOT EXISTS 不会给已有表补列，
+    所以旧库必须走 ALTER；回填只在本函数内做一次，读路径（每个请求）只多一次 PRAGMA。
+    """
+    if "role" in {row["name"] for row in conn.execute("PRAGMA table_info(users)")}:
+        return
+    conn.execute("ALTER TABLE users ADD COLUMN role INTEGER NOT NULL DEFAULT 0")
+    marks = ",".join("?" * len(ADMIN_USERNAMES))
+    conn.execute(f"UPDATE users SET role=1 WHERE username IN ({marks})", tuple(ADMIN_USERNAMES))
+    conn.commit()
+
+
+def is_admin(username: str, role: int | None = None) -> bool:
+    """管理员判定（`/api/auth/me` 的 is_admin 唯一口径）。
+
+    role 列是权威来源；用户名名单是兜底（旧库里 role 尚未回填时也不能把 owner 挡在门外）。
+    """
+    return bool(role) or (username or "") in ADMIN_USERNAMES
 
 
 def issue_invite(max_uses: int = 1, expires_at: int | None = None, created_by: str = "") -> str:
@@ -125,8 +153,9 @@ def handle(h: BaseHTTPRequestHandler, method: str, path: str) -> bool:
         return False
     if method == "GET" and path == "/api/auth/me":
         with connect() as db:
-            row = db.execute("SELECT u.username,s.expires_at FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token=? AND s.revoked=0 AND s.expires_at>?", (_token(h), int(time.time()))).fetchone()
-        _send(h, {"username": row["username"], "expiresAt": row["expires_at"]} if row else {"error":"未登录"}, 200 if row else 401)
+            row = db.execute("SELECT u.username,u.role,s.expires_at FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token=? AND s.revoked=0 AND s.expires_at>?", (_token(h), int(time.time()))).fetchone()
+        # S2.5：is_admin 供前端 Agent 入口门控（owner/owner2 可见，普通账号 false）；未登录仍 401、字段不出现
+        _send(h, {"username": row["username"], "expiresAt": row["expires_at"], "is_admin": is_admin(row["username"], row["role"])} if row else {"error":"未登录"}, 200 if row else 401)
         return True
     if method != "POST":
         _send(h, {"error":"方法不允许"}, 405); return True

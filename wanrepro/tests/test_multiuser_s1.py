@@ -19,8 +19,11 @@ def enc_of(db, cid):
   r=c.execute('SELECT api_key_enc FROM user_channels WHERE id=?',(cid,)).fetchone()
   return bytes(r[0]) if r and r[0] else None
  finally: c.close()
-def serve(flag):
- os.environ['MULTI_USER']=flag; os.environ['WAN_TOKEN']='regression-token'; fd,path=tempfile.mkstemp(); os.close(fd); os.unlink(path); os.environ[multiuser.DB_PATH_ENV]=path
+def serve(flag, db=None):
+ os.environ['MULTI_USER']=flag; os.environ['WAN_TOKEN']='regression-token'
+ if db is None: fd,path=tempfile.mkstemp(); os.close(fd); os.unlink(path)
+ else: path=str(db)
+ os.environ[multiuser.DB_PATH_ENV]=path
  srv=ThreadingHTTPServer(('127.0.0.1',0),server.Handler); srv.daemon_threads=True; threading.Thread(target=srv.serve_forever,daemon=True).start(); return srv,'http://127.0.0.1:%d'%srv.server_port
 def req(base,path,method='GET',body=None,opener=None):
  q=Request(base+path,data=json.dumps(body).encode() if body is not None else None,method=method,headers={'Content-Type':'application/json'})
@@ -285,6 +288,96 @@ def phase_b2():
     return checks
 
 
+def phase_admin():
+    """S2.5（B1.2 / 判据 V7）：/api/auth/me 的 is_admin 三态 + 旧库 role 列 ALTER 迁移。
+
+    只碰 S1 既有的 auth/me 与 users 表（最小扩展），不触碰渠道/代转发任何断言。
+    """
+    checks = []
+    multiuser.FAILURES.clear(); multiuser.REG_ATTEMPTS.clear()
+    srv, base = serve('1')
+    try:
+        # --- 未登录：仍 401，且响应体不携带 is_admin（匿名侧不该看到管理员口径）---
+        st, body = req(base, '/api/auth/me')
+        assert st == 401, f'anon /api/auth/me must stay 401, got {st}'
+        assert b'is_admin' not in body, f'401 body must not carry is_admin: {body!r}'
+        checks.append('V7a: anon GET /api/auth/me -> 401, body has no is_admin key')
+
+        # --- admin 种子账号：/api/auth/me 返回 is_admin=true，且既有字段不变 ---
+        opA = build_opener(HTTPCookieProcessor(http.cookiejar.CookieJar()))
+        assert req(base, '/api/auth/register', 'POST', {'username': 'owner', 'password': 'password1'}, opA)[0] == 200
+        st, body = req(base, '/api/auth/me', opener=opA)
+        me = json.loads(body)
+        assert st == 200 and me.get('is_admin') is True, f'admin me must be is_admin=true, got {st} {me}'
+        assert me.get('username') == 'owner' and isinstance(me.get('expiresAt'), int), f'me must keep username/expiresAt: {me}'
+
+        # --- 普通账号：is_admin 显式 false（不是缺字段）---
+        opB = build_opener(HTTPCookieProcessor(http.cookiejar.CookieJar()))
+        assert req(base, '/api/auth/register', 'POST', {'username': 'plain', 'password': 'password1'}, opB)[0] == 200
+        st2, body2 = req(base, '/api/auth/me', opener=opB)
+        me2 = json.loads(body2)
+        assert st2 == 200 and me2.get('is_admin') is False, f'normal user me must be is_admin=false, got {st2} {me2}'
+        assert 'is_admin' in me2, 'is_admin must be present (not omitted) for a logged-in normal user'
+        checks.append('V7b: /api/auth/me is_admin = true for seeded admin (owner) / false for a plain account; username+expiresAt unchanged')
+
+        # --- 登出后 is_admin 不得残留 ---
+        assert req(base, '/api/auth/logout', 'POST', {}, opA)[0] == 200
+        st3, body3 = req(base, '/api/auth/me', opener=opA)
+        assert st3 == 401 and b'is_admin' not in body3, f'after logout me must be 401 w/o is_admin, got {st3} {body3!r}'
+        checks.append('V7c: after logout /api/auth/me is 401 again (is_admin never leaks past the session)')
+    finally:
+        srv.shutdown(); srv.server_close()
+
+    # --- 旧库迁移：S1 建表没有 role 列，connect() 必须 ALTER 补列并把 owner2 回填为 1 ---
+    legacy = Path(tempfile.mkdtemp()) / 'legacy.sqlite3'
+    now = int(time.time())
+    c = sqlite3.connect(str(legacy))
+    try:
+        c.executescript("""
+          CREATE TABLE users(id INTEGER PRIMARY KEY, username TEXT NOT NULL UNIQUE,
+            pwd_hash BLOB NOT NULL, salt BLOB NOT NULL, created_at INTEGER NOT NULL);
+          CREATE TABLE sessions(token TEXT PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id),
+            expires_at INTEGER NOT NULL, revoked INTEGER NOT NULL DEFAULT 0);
+        """)
+        for name, tok in (('owner2', 'legacytok_admin'), ('someone', 'legacytok_plain')):
+            c.execute("INSERT INTO users(username,pwd_hash,salt,created_at) VALUES(?,?,?,?)", (name, b'x', b'y', now))
+            uid = c.execute("SELECT id FROM users WHERE username=?", (name,)).fetchone()[0]
+            c.execute("INSERT INTO sessions(token,user_id,expires_at) VALUES(?,?,?)", (tok, uid, now + 86400))
+        c.commit()
+        pre_cols = {r[1] for r in c.execute("PRAGMA table_info(users)")}
+    finally:
+        c.close()
+    assert 'role' not in pre_cols, f'legacy fixture must start without role column: {pre_cols}'
+
+    srv, base = serve('1', db=legacy)
+    try:
+        def me_with(tok):
+            q = Request(base + '/api/auth/me', headers={'Cookie': 'wan_session=' + tok})
+            try:
+                r = build_opener().open(q); return r.status, json.loads(r.read())
+            except HTTPError as e:
+                return e.code, json.loads(e.read())
+
+        st_a, me_a = me_with('legacytok_admin')
+        st_p, me_p = me_with('legacytok_plain')
+        assert st_a == 200 and me_a['is_admin'] is True, f'legacy owner2 must be admin after ALTER backfill, got {st_a} {me_a}'
+        assert st_p == 200 and me_p['is_admin'] is False, f'legacy plain user must stay non-admin (DEFAULT 0), got {st_p} {me_p}'
+    finally:
+        srv.shutdown(); srv.server_close()
+
+    c = sqlite3.connect(str(legacy))
+    try:
+        cols = {r[1]: r for r in c.execute("PRAGMA table_info(users)")}
+        roles = dict(c.execute("SELECT username, role FROM users"))
+    finally:
+        c.close()
+    assert 'role' in cols, f'ALTER TABLE must add users.role, columns={sorted(cols)}'
+    assert cols['role'][3] == 1 and cols['role'][4] == '0', f'role must be NOT NULL DEFAULT 0, got {cols["role"]}'
+    assert roles == {'owner2': 1, 'someone': 0}, f'backfill must promote only seed admins, got {roles}'
+    checks.append('V7d: legacy S1 DB (no role column) -> ALTER TABLE adds role INTEGER NOT NULL DEFAULT 0, backfills owner/owner2=1 (plain stays 0), me reflects it')
+    return checks
+
+
 def main():
  checks=[]; srv,base=serve('0')
  try:
@@ -421,6 +514,7 @@ def main():
   checks.append('DELETE clears the user channel set; POST -> 405; anon PUT/DELETE still 401')
  finally: srv.shutdown(); srv.server_close()
  checks += phase_b2()
+ checks += phase_admin()
  print('SUMMARY: PASS %d/%d'%(len(checks),len(checks)))
  for c in checks: print('PASS: '+c)
  return 0
