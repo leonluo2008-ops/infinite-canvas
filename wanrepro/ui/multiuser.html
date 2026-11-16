@@ -25,6 +25,10 @@
  <label>密码（至少 8 位）</label><input id="password" type="password">
  <button id="go" onclick="go()">登录</button>
  <div id="msg" class="msg"></div>
+ <div id="logged" style="display:none;text-align:center;display:none">
+  <div style="margin-top:12px;font-size:13px;color:#9ca3af" id="logged-as"></div>
+  <button id="out" style="background:#374151">退出登录（再测一次）</button>
+ </div>
 </div>
 <script>
 const $=id=>document.getElementById(id);
@@ -46,5 +50,16 @@ async function go(){
  $('go').disabled=false;
 }
 $('password').addEventListener('keydown',e=>{if(e.key==='Enter')go()});
+// 已登录态：显示退出入口（已登录时打开登录页也不会被守卫弹走，本页无需登录）
+fetch('/api/auth/me').then(r=>r.ok?r.json():null).then(d=>{
+ if(!d)return;
+ $('logged').style.display='block';
+ $('logged-as').textContent='当前已登录：'+d.username;
+ $('go').disabled=true;
+});
+$('out').addEventListener('click',async()=>{
+ await fetch('/api/auth/logout',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
+ $('logged').style.display='none';$('go').disabled=false;msg('已退出，可以重新登录/注册');
+});
 </script>
 </body></html>
