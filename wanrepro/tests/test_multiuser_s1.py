@@ -795,6 +795,465 @@ def phase_s2_7():
     return checks
 
 
+def phase_s3_b1():
+    """S3-B1：画布项目服务端存储（user_projects + 逐项目 CRUD + 墓碑 + CAS）。
+
+    时间戳域（任务书 §2.1 v1.2，B1 审计 BL1/BL2）：全链路 **int epoch 毫秒**（`Date.now()` 口径）。
+    本相位的所有造数一律用 ms 级时间戳——秒级造数会让「单位断裂」在探针里完全看不出来：服务端把
+    2500 当版本、前端发 1750000000000 当版本，两边永远对不上而探针全绿。所以下面：
+      * `T0 = int(time.time()*1000)` 就是「现在」，一切更新/墓碑都落在它附近；
+      * 秒级值（`T0//1000`）、ISO 字符串、2**63、越界值必须被 422 拒收（服务端不做单位归一猜测）；
+      * DELETE 的 `deletedAt` 必填（ms），服务端不代填——否则服务端时钟会混进 LWW 判序。
+
+    判据（任务书 §2.1 / §三 V3-V6 的服务端半边）：
+      * CRUD 全动词：GET 清单（不含 content，回 unit:"ms"）/ GET 单项目 content / PUT upsert / DELETE 墓碑；
+      * 归属：B 读 A 的 id 与读不存在的 id **逐字节同形** 404；B 的清单不含 A 的任何行；同名 id 在
+        两个账号下互不影响（per-user 命名空间）；
+      * CAS：baseUpdatedAt 过时不通过 → 409 + 服务端版本；不带 base 也不许把 updatedAt 往回写；
+      * 体积：单项目 content 超 8MB → 413（含「声明长度超上限」的 413 必须真能送达客户端），且不落行；
+      * 墓碑：DELETE 写 deleted=1 而**不物理删**（盘上行还在、content 不下发）——跨设备用 ms 级 ts
+        验「旧设备 stale PUT 不复活」；显式 updatedAt > deletedAt 才复活（mergeCanvasData 既有语义）；
+        删一个从来不存在/瞎猜的 id：一律 200 但**不留幽灵墓碑行**（非 oracle 也不留可观测写入）；
+      * 未登录 401；MULTI_USER=0 全动词 404 且不建表、不写任何 owner 标记；
+      * 并发 upsert 不损行（不同 id 同时写全部落盘；同一 id 连打不出 500、不丢行）；
+      * keep-alive 不错帧：同一长连接上「带体的 404/405」之后继续 GET 必须照常 200（不是 400）；
+      * Content-Length 撒谎（短读）→ 400 且截断体绝不落库。
+    """
+    checks = []
+    multiuser.FAILURES.clear(); multiuser.REG_ATTEMPTS.clear()
+    os.environ.pop('WANREPRO_CHANNEL_KEY', None)      # 项目存储与渠道主密钥无关（零交叉依赖）
+    srv, base = serve('1')
+    db = Path(os.environ[multiuser.DB_PATH_ENV])
+    PROJ = '/api/user/projects'
+    T0 = int(time.time() * 1000)          # Date.now() 口径的唯一时间基准（ms）
+
+    def jreq(path, method='GET', body=None, op=None):
+        st, raw = req(base, path, method, body, op)
+        try:
+            return st, json.loads(raw), raw
+        except ValueError:
+            return st, {}, raw
+
+    def put(pid, payload, op=None):
+        return jreq(PROJ + '/' + pid, 'PUT', payload, op)
+
+    def rows(pid=None):
+        c = sqlite3.connect(str(db))
+        try:
+            q = 'SELECT * FROM user_projects' + (' WHERE project_id=?' if pid else '')
+            cur = c.execute(q, (pid,) if pid else ())
+            return cur.fetchall(), [d[0] for d in cur.description]
+        finally:
+            c.close()
+
+    def dev(method, path, payload, token):
+        """另一台设备：每次一条新连接（同一个 session cookie），用来造「跨设备」时序。"""
+        data = None if payload is None else json.dumps(payload).encode()
+        c = http.client.HTTPConnection('127.0.0.1', srv.server_port, timeout=20)
+        try:
+            hdrs = {'Cookie': 'wan_session=' + token}
+            if data is not None:
+                hdrs['Content-Type'] = 'application/json'; hdrs['Content-Length'] = str(len(data))
+            c.request(method, path, body=data, headers=hdrs)
+            r = c.getresponse(); raw = r.read()
+            try:
+                return r.status, json.loads(raw), raw
+            except ValueError:
+                return r.status, {}, raw
+        finally:
+            c.close()
+
+    jarA = http.cookiejar.CookieJar(); opA = build_opener(HTTPCookieProcessor(jarA))
+    opB = build_opener(HTTPCookieProcessor(http.cookiejar.CookieJar()))
+    try:
+        assert req(base, '/api/auth/register', 'POST',
+                   {'username': 'projA', 'password': 'password1'}, opA)[0] == 200
+        assert req(base, '/api/auth/register', 'POST',
+                   {'username': 'projB', 'password': 'password1'}, opB)[0] == 200
+        tokenA = [c.value for c in jarA if c.name == 'wan_session'][0]
+
+        # ---- S3-T1 登录态硬前置：未登录全动词 401（不是 404/405）----
+        for method, path, body in (('GET', PROJ, None), ('GET', PROJ + '/p1', None),
+                                   ('PUT', PROJ + '/p1', {'content': {'id': 'p1'}, 'updatedAt': T0}),
+                                   ('DELETE', PROJ + '/p1', {'deletedAt': T0}),
+                                   ('POST', PROJ, {}), ('POST', PROJ + '/p1', {})):
+            st, _, _ = jreq(path, method, body)
+            assert st == 401, f'anon {method} {path} must 401, got {st}'
+        checks.append('S3-T1 未登录：GET 清单/GET 单项目/PUT/DELETE/POST 全部 401（不是 404/405）')
+
+        # ---- S3-T2 PUT upsert + GET 单项目 content 往返（ms 时间戳）----
+        content1 = {'id': 'p1', 'name': '项目一', 'nodes': [{'id': 'n1', 'x': 1}], 'edges': []}
+        st, body, _ = put('p1', {'content': content1, 'updatedAt': T0}, opA)
+        assert st == 200 and body['ok'] is True, f'PUT p1: {st} {body}'
+        p = body['project']
+        assert p['id'] == 'p1' and p['updatedAt'] == T0 and p['version'] == T0, p
+        assert p['deleted'] is False and p['deletedAt'] == 0 and p['bytes'] > 0, p
+        assert p['name'] == '项目一', f'name must come from content.name when body.name is absent: {p}'
+        assert 'content' not in p, 'PUT 响应只回元数据（不回 content，避免 8MB 回显）'
+        st, body, _ = jreq(PROJ + '/p1', op=opA)
+        assert st == 200 and body['project']['content'] == content1, f'GET single round-trip: {st} {body}'
+        assert body['project']['version'] == T0, body['project']
+        checks.append('S3-T2 PUT /api/user/projects/p1 upsert（ms 时间戳；name 取 content.name，响应只回元数据）；'
+                      'GET 单项目 content 逐字段往返、version=updatedAt')
+
+        # ---- S3-T3 清单：不含 content + 单位自证 + 所有者判定辅助字段 ----
+        st, body, raw = jreq(PROJ, op=opA)
+        assert st == 200, f'GET list: {st} {body}'
+        items = body['projects']
+        assert len(items) == 1 and items[0]['id'] == 'p1', items
+        assert 'content' not in items[0] and 'content_json' not in items[0], f'清单不许带 content: {items[0]}'
+        assert len(raw) < 2048, f'清单必须是 KB 级（当前 {len(raw)} 字节）'
+        c = sqlite3.connect(str(db)); uid_a = c.execute("SELECT id FROM users WHERE username='projA'").fetchone()[0]; c.close()
+        assert body['owner'] == 'projA' and body['ownerId'] == uid_a, \
+            f'清单必须带所有者判定字段 owner/ownerId：{ {k: body[k] for k in ("owner", "ownerId")} }'
+        # 时间戳单位自证：serverTime 必须是 Date.now() 口径（ms），不是秒
+        assert body['unit'] == 'ms', f'清单必须回 unit:"ms"：{body.get("unit")}'
+        assert isinstance(body['serverTime'], int) and body['serverTime'] > 10 ** 11, body.get('serverTime')
+        assert abs(body['serverTime'] - int(time.time() * 1000)) < 60_000, \
+            f'serverTime 必须是 ms 级当前时刻：{body["serverTime"]}'
+        assert body['maxUpdatedAt'] == T0 and body['maxVersion'] == T0, body
+        assert body['count'] == 1 and body['liveCount'] == 1 and body['tombstoneCount'] == 0, body
+        checks.append('S3-T3 清单 KB 级（<2KB、无 content）+ 单位自证 unit:"ms"/serverTime 为 ms 级当前时刻 '
+                      '+ 所有者判定辅助字段 owner/ownerId/maxUpdatedAt/maxVersion/count/liveCount/tombstoneCount')
+
+        # ---- S3-T4 CAS：baseUpdatedAt 命中 → 200；过时 → 409 + 服务端版本；版本回退 → 409 ----
+        content2 = {'id': 'p1', 'name': '项目一', 'nodes': [{'id': 'n1', 'x': 2}], 'edges': []}
+        st, body, _ = put('p1', {'content': content2, 'updatedAt': T0 + 1000, 'baseUpdatedAt': T0}, opA)
+        assert st == 200 and body['project']['version'] == T0 + 1000, f'CAS hit: {st} {body}'
+        st, body, _ = put('p1', {'content': content2, 'updatedAt': T0 + 2000, 'baseUpdatedAt': T0}, opA)
+        assert st == 409 and body.get('conflict') is True, f'stale base must 409: {st} {body}'
+        assert body['server']['version'] == T0 + 1000 and body['server']['updatedAt'] == T0 + 1000, \
+            f'409 必须带服务端版本：{body.get("server")}'
+        assert 'content' not in body['server'], '409 不回 content（要内容就再 GET）'
+        st, body, _ = put('p1', {'content': content1, 'updatedAt': T0 + 500}, opA)
+        assert st == 409 and body['server']['updatedAt'] == T0 + 1000, \
+            f'不带 base 也不许回写更旧的 updatedAt: {st} {body}'
+        st, body, _ = jreq(PROJ + '/p1', op=opA)
+        assert body['project']['content'] == content2 and body['project']['updatedAt'] == T0 + 1000, \
+            '冲突后服务端内容不得被改'
+        checks.append('S3-T4 CAS（ms）：baseUpdatedAt=T0 命中→200(version T0+1000)；过时 base→409+server.version='
+                      'T0+1000（无 content）；不带 base 回写 updatedAt=T0+500→409；冲突零覆盖')
+
+        # ---- S3-T5 归属：B 读 A 的 id 与读不存在的 id 同形 404；清单隔离；同名 id 互不影响 ----
+        st_other, b_other, raw_other = jreq(PROJ + '/p1', op=opB)
+        st_ghost, b_ghost, raw_ghost = jreq(PROJ + '/no_such_project_xyz', op=opB)
+        assert st_other == 404 and st_ghost == 404, f'foreign/ghost must 404: {st_other}/{st_ghost}'
+        assert raw_other == raw_ghost, f'他人 id 与不存在必须逐字节同形：{raw_other!r} vs {raw_ghost!r}'
+        st, body, _ = jreq(PROJ, op=opB)
+        assert st == 200 and body['projects'] == [] and body['count'] == 0, f'B 的清单必须为空：{body}'
+        assert body['owner'] == 'projB', body['owner']
+        # 同一 project_id 在两个账号下是两行（per-user 命名空间），B 的写/删不碰 A 的行
+        st, body, _ = put('p1', {'content': {'id': 'p1', 'name': 'B的p1', 'nodes': []}, 'updatedAt': T0}, opB)
+        assert st == 200, f'B 写自己的 p1: {st} {body}'
+        st, body, _ = jreq(PROJ + '/p1', op=opA)
+        assert st == 200 and body['project']['content']['name'] == '项目一', 'A 的 p1 不得被 B 覆盖'
+        st, body, _ = jreq(PROJ + '/p1', op=opB)
+        assert body['project']['content']['name'] == 'B的p1', f'B 的 p1 必须是 B 自己的行: {body}'
+        allr, _ = rows('p1')
+        assert len(allr) == 2, f'同名 id 必须按 (user_id, project_id) 存两行：{len(allr)}'
+        checks.append('S3-T5 V6 归属：B GET A 的 id 404 与不存在逐字节同形；B 清单为空（owner=projB）；'
+                      '同一 id 在 A/B 各存一行、互不覆盖')
+
+        # ---- S3-T6 墓碑：DELETE 带客户端 ms deletedAt（服务端不代填）+ 不物理删 + content 不下发 ----
+        DEL_AT = T0 + 5000
+        st, body, _ = jreq(PROJ + '/p1', 'DELETE', {'deletedAt': DEL_AT}, opA)
+        assert st == 200 and body['project']['deleted'] is True and body['project']['deletedAt'] == DEL_AT, \
+            f'DELETE 必须回墓碑且 deletedAt 就是客户端给的值: {st} {body}'
+        deleted_at = body['project']['deletedAt']
+        allr, cols = rows('p1')
+        a_row = [r for r in allr if r[cols.index('user_id')] == uid_a]
+        assert len(a_row) == 1, f'墓碑必须留在盘上（不物理删）：{len(a_row)}'
+        assert a_row[0][cols.index('deleted')] == 1 and a_row[0][cols.index('deleted_at')] == deleted_at, \
+            'deleted=1 + deleted_at 必须落库'
+        st, body, _ = jreq(PROJ, op=opA)
+        tomb = [i for i in body['projects'] if i['id'] == 'p1'][0]
+        assert tomb['deleted'] is True and tomb['deletedAt'] == deleted_at, f'清单必须带墓碑：{tomb}'
+        assert body['liveCount'] == 0 and body['tombstoneCount'] == 1, body
+        st, body, _ = jreq(PROJ + '/p1', op=opA)
+        assert st == 200 and body['project']['deleted'] is True and body['project']['content'] is None, \
+            f'墓碑的 content 一律不下发: {st} {body}'
+        checks.append('S3-T6 墓碑：DELETE{deletedAt:<ms>} → deleted=1+deletedAt 落盘（值=客户端给的 ms，'
+                      '服务端零代填；盘上行仍在，不物理删）；清单带墓碑；单项目 GET 回 deleted:true 且 content=null')
+
+        # ---- S3-T7 V3（ms 级复验）：旧设备 stale PUT 不复活；updatedAt>deletedAt 才复活 ----
+        st, body, _ = put('p1', {'content': content1, 'updatedAt': DEL_AT - 1000}, opA)
+        assert st == 409 and body['server']['deleted'] is True, f'stale PUT 不得复活墓碑: {st} {body}'
+        allr, cols = rows('p1')
+        a_row = [r for r in allr if r[cols.index('user_id')] == uid_a][0]
+        assert a_row[cols.index('deleted')] == 1 and a_row[cols.index('deleted_at')] == deleted_at, \
+            'stale PUT 之后墓碑必须原样（不复活、不改 deleted_at）'
+        st, body, _ = put('p1', {'content': {'id': 'p1', 'name': '复活', 'nodes': []},
+                                 'updatedAt': deleted_at + 1000, 'baseUpdatedAt': deleted_at}, opA)
+        assert st == 200 and body['project']['deleted'] is False and body['project']['deletedAt'] == 0, \
+            f'updatedAt > deletedAt 应复活: {st} {body}'
+        assert body['project']['version'] == deleted_at + 1000, body['project']
+        checks.append('S3-T7 V3 墓碑优先（ms 级造数）：updatedAt=deletedAt-1000 的旧设备 PUT → 409 且墓碑原样'
+                      '（不复活、deleted_at 不动）；updatedAt=deletedAt+1000 + base=墓碑版本 → 复活（deleted=0/deletedAt=0）')
+
+        # ---- S3-T8 体积：content 超 8MB → 413 且不落行 ----
+        big = {'id': 'pbig', 'name': '巨大', 'blob': 'x' * (8 * 1024 * 1024)}
+        st, body, _ = put('pbig', {'content': big, 'updatedAt': T0 + 9000}, opA)
+        assert st == 413, f'超 8MB 必须 413, got {st} {str(body)[:200]}'
+        allr, _ = rows('pbig')
+        assert not allr, '413 之后不许落任何行'
+        st, body, _ = jreq(PROJ, op=opA)
+        assert all(i['id'] != 'pbig' for i in body['projects']), '清单不得出现被拒的项目'
+        checks.append('S3-T8 单项目 content 超 8MB → 413（不落行、不出现在清单）')
+
+        # ---- S3-T9 并发 upsert 不损行 ----
+        errs = []
+
+        def cput(pid, ts, tag):
+            payload = json.dumps({'content': {'id': pid, 'tag': tag, 'nodes': []}, 'updatedAt': ts}).encode()
+            conn = http.client.HTTPConnection('127.0.0.1', srv.server_port, timeout=20)
+            try:
+                conn.request('PUT', PROJ + '/' + pid, body=payload,
+                             headers={'Content-Type': 'application/json',
+                                      'Content-Length': str(len(payload)),
+                                      'Cookie': 'wan_session=' + tokenA})
+                r = conn.getresponse(); r.read()
+                if r.status not in (200, 409):
+                    errs.append((pid, r.status))
+            except Exception as exc:                      # noqa: BLE001 - 探针要区分「网络炸了」
+                errs.append((pid, repr(exc)))
+            finally:
+                conn.close()
+
+        threads = [threading.Thread(target=cput, args=('p_cc%d' % i, T0 + 10000 + i, 't%d' % i))
+                   for i in range(6)]
+        threads += [threading.Thread(target=cput, args=('p_hot', T0 + 20000 + i, 'h%d' % i)) for i in range(4)]
+        for t in threads: t.start()
+        for t in threads: t.join()
+        assert not errs, f'并发 upsert 出现 500/异常：{errs}'
+        st, body, _ = jreq(PROJ, op=opA)
+        ids = {i['id'] for i in body['projects']}
+        assert {'p_cc%d' % i for i in range(6)} <= ids, f'并发写不同 id 有丢行：{sorted(ids)}'
+        hot = [i for i in body['projects'] if i['id'] == 'p_hot'][0]
+        assert T0 + 20000 <= hot['updatedAt'] <= T0 + 20003, f'同一 id 连打后版本必须是某个成功写的值：{hot}'
+        allr, _ = rows('p_hot')
+        assert len(allr) == 1, f'同一 id 只许一行：{len(allr)}'
+        checks.append('S3-T9 并发 upsert：6 个不同 id 同时写全部落盘（零 500）；同一 id 4 连打只留一行、'
+                      '版本落在成功写集合内（BEGIN IMMEDIATE 串行化）')
+
+        # ---- S3-T10 方法/ID 卫生 ----
+        st, _, _ = jreq(PROJ, 'POST', {}, opA)
+        assert st == 405, f'POST 清单必须 405, got {st}'
+        st, _, _ = jreq(PROJ + '/p1', 'POST', {}, opA)
+        assert st == 405, f'POST 单项目必须 405, got {st}'
+        st, _raw_bad = req(base, PROJ + '/bad%2Fid', 'GET', None, opA)      # 解码后含 '/' → 不当成 id
+        assert st == 404, f'非法 id 必须 404（与不存在同形）, got {st}'
+        st, nb, _ = put('p_nobase', {'content': {'id': 'p_nobase'}}, opA)
+        assert st == 422 and 'updatedAt' in nb.get('error', ''), f'缺 updatedAt 必须 422: {st} {nb}'
+        checks.append('S3-T10 方法/入参卫生：POST 清单与单项目 405；非法 id 404（同形）；缺 updatedAt 422'
+                      '（服务端不代填时间戳）')
+
+        # ---- S3-T12 BL1 时间戳域：秒级/ISO/2**63/越界一律 422，边界值本身合法 ----
+        bad_ts = [('秒级 10 位', T0 // 1000), ('1e11 下界-1', 10 ** 11 - 1),
+                  ('4e15 上界+1', 4 * 10 ** 15 + 1), ('2**63', 2 ** 63),
+                  ('ISO 字符串', '2026-11-16T10:00:00.000Z'), ('浮点半毫秒', T0 + 0.5),
+                  ('负值', -T0)]
+        for label, ts in bad_ts:
+            st, nb, _ = put('p_ts', {'content': {'id': 'p_ts'}, 'updatedAt': ts}, opA)
+            assert st == 422 and 'updatedAt' in nb.get('error', ''), \
+                f'updatedAt={label} 必须 422（不做单位归一猜测），got {st} {nb}'
+        assert not rows('p_ts')[0], '被 422 拒收的时间戳不许落任何行'
+        # 域边界本身合法（1e11 与 4e15 都收）
+        st, nb, _ = put('p_edge', {'content': {'id': 'p_edge'}, 'updatedAt': 10 ** 11}, opA)
+        assert st == 200 and nb['project']['updatedAt'] == 10 ** 11, f'下界应合法: {st} {nb}'
+        st, nb, _ = put('p_edge', {'content': {'id': 'p_edge'}, 'updatedAt': 4 * 10 ** 15,
+                                   'baseUpdatedAt': 10 ** 11}, opA)
+        assert st == 200 and nb['project']['updatedAt'] == 4 * 10 ** 15, f'上界应合法: {st} {nb}'
+        # baseUpdatedAt 同域：秒级 base → 422（不是「当成另一个单位」）
+        st, nb, _ = put('p_edge', {'content': {'id': 'p_edge'}, 'updatedAt': T0 + 1000,
+                                   'baseUpdatedAt': T0 // 1000}, opA)
+        assert st == 422 and 'baseUpdatedAt' in nb.get('error', ''), f'秒级 baseUpdatedAt 必须 422: {st} {nb}'
+        checks.append('S3-T12 BL1 时间戳域：updatedAt 秒级/1e11-1/4e15+1/2**63/ISO 串/浮点/负值 → 全部 422 且不落行'
+                      '（零单位猜测）；边界 1e11 与 4e15 合法；baseUpdatedAt 同域（秒级 base → 422）')
+
+        # ---- S3-T13 BL2 DELETE 必带 ms deletedAt：缺/非法一律 422，服务端不代填 ----
+        st, _, _ = put('p_del', {'content': {'id': 'p_del', 'name': '待删'}, 'updatedAt': T0 + 100}, opA)
+        assert st == 200, f'准备 p_del: {st}'
+        for label, payload in (('无体', None), ('空对象', {}),
+                               ('ISO 字符串', {'deletedAt': '2026-11-16T10:00:00.000Z'}),
+                               ('秒级', {'deletedAt': T0 // 1000}), ('2**63', {'deletedAt': 2 ** 63}),
+                               ('null', {'deletedAt': None})):
+            st, nb, _ = jreq(PROJ + '/p_del', 'DELETE', payload, opA)
+            assert st == 422 and 'deletedAt' in nb.get('error', ''), \
+                f'DELETE deletedAt={label} 必须 422（服务端不代填），got {st} {nb}'
+        allr, cols = rows('p_del')
+        assert len(allr) == 1 and allr[0][cols.index('deleted')] == 0 and allr[0][cols.index('deleted_at')] is None, \
+            f'被 422 拒收的 DELETE 不许改动这一行：{allr}'
+        checks.append('S3-T13 BL2 DELETE 必带 deletedAt（ms）：无体/空对象/ISO 串/秒级/2**63/null 全部 422，'
+                      '且服务端那一行原样（不代填时间戳、不落墓碑）')
+
+        # ---- S3-T14 跨设备墓碑（ms 级）：另一台设备删除后，旧设备的 stale PUT 不复活 ----
+        DT = T0 + 30000
+        st, _, _ = dev('PUT', PROJ + '/p_tomb', {'content': {'id': 'p_tomb', 'name': '跨设备'}, 'updatedAt': T0 + 20000},
+                       tokenA)
+        assert st == 200, f'设备A 建 p_tomb: {st}'
+        st, body, _ = dev('DELETE', PROJ + '/p_tomb', {'deletedAt': DT}, tokenA)   # 设备B（另一条连接）
+        assert st == 200 and body['project']['deletedAt'] == DT, f'设备B 删除: {st} {body}'
+        for stale in (T0 + 21000, DT - 1):          # 旧设备仍以为它活着 / 只差一毫秒
+            st, body, _ = dev('PUT', PROJ + '/p_tomb', {'content': {'id': 'p_tomb', 'name': '旧设备'}, 'updatedAt': stale},
+                              tokenA)
+            assert st == 409 and body['server']['deleted'] is True and body['server']['deletedAt'] == DT, \
+                f'旧设备 updatedAt={stale} 不得复活墓碑: {st} {body}'
+        allr, cols = rows('p_tomb')
+        assert allr[0][cols.index('deleted')] == 1 and allr[0][cols.index('deleted_at')] == DT, '墓碑必须原样'
+        st, body, _ = dev('PUT', PROJ + '/p_tomb',
+                          {'content': {'id': 'p_tomb', 'name': '显式复活'}, 'updatedAt': DT + 1000,
+                           'baseUpdatedAt': DT}, tokenA)
+        assert st == 200 and body['project']['deleted'] is False and body['project']['version'] == DT + 1000, \
+            f'ms 级显式更新的 updatedAt 才复活: {st} {body}'
+        checks.append('S3-T14 跨设备墓碑（ms）：设备B DELETE{deletedAt:DT} 后，设备A 的 updatedAt=T0+21000 与 '
+                      'DT-1 两次 PUT 均 409 且 deleted_at 仍=DT；updatedAt=DT+1000+base=DT 才复活')
+
+        # ---- S3-T15 BL3 keep-alive：带体的早退（404/405）之后，同一连接继续 GET 不得收到 400 ----
+        def kl_probe(method, path, payload, want):
+            conn = http.client.HTTPConnection('127.0.0.1', srv.server_port, timeout=20)
+            try:
+                data = json.dumps(payload).encode()
+                conn.request(method, path, body=data,
+                             headers={'Content-Type': 'application/json',
+                                      'Content-Length': str(len(data)),
+                                      'Cookie': 'wan_session=' + tokenA})
+                r1 = conn.getresponse(); b1 = r1.read()
+                assert r1.status == want, f'{method} {path} 应 {want}, got {r1.status} {b1[:200]}'
+                assert 'close' in (r1.getheader('Connection') or '').lower(), \
+                    f'早退响应必须发 Connection: close（体没读），got {r1.getheader("Connection")!r}'
+                # 同一连接继续发（客户端按 Connection: close 重连）：绝不允许 400 错帧
+                conn.request('GET', PROJ, headers={'Cookie': 'wan_session=' + tokenA})
+                r2 = conn.getresponse(); b2 = r2.read()
+                assert r2.status == 200, f'早退后同连接 GET 必须 200（不许 400 错帧），got {r2.status} {b2[:200]}'
+                assert b'Bad request' not in b2 and json.loads(b2)['owner'] == 'projA', '响应必须完整且是自己的清单'
+            finally:
+                conn.close()
+
+        kl_probe('PUT', PROJ + '/bad%2Fid', {'content': {'id': 'x'}, 'updatedAt': T0}, 404)
+        kl_probe('POST', PROJ, {'content': {'id': 'x'}, 'updatedAt': T0}, 405)
+        checks.append('S3-T15 BL3 keep-alive 不错帧：带体的 PUT 非法pid(404) 与 POST 清单(405) 之后，同一条连接'
+                      '继续 GET 仍是 200 且响应完整（早退一律 Connection: close，残留体不会串成下一个请求行）')
+
+        # ---- S3-T16 BL3 短读：Content-Length 撒谎 → 400 且截断体绝不落库 ----
+        short = json.dumps({'content': {'id': 'p_short', 'blob': 'y' * 200}, 'updatedAt': T0}).encode()
+        s = socket.create_connection(('127.0.0.1', srv.server_port), timeout=20)
+        try:
+            head = ('PUT %s/p_short HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n'
+                    'Content-Length: %d\r\nCookie: wan_session=%s\r\n\r\n'
+                    % (PROJ, len(short) + 64, tokenA)).encode()
+            s.sendall(head + short[:len(short) // 2])       # 只发一半，然后半关写端
+            s.shutdown(socket.SHUT_WR)
+            resp = b''
+            while True:
+                chunk = s.recv(65536)
+                if not chunk:
+                    break
+                resp += chunk
+        finally:
+            s.close()
+        assert b' 400 ' in resp.split(b'\r\n')[0], f'短读必须 400，got {resp.split(chr(13).encode())[0][:120]!r}'
+        allr, _ = rows('p_short')
+        assert not allr, f'截断的体绝不许落库：{allr}'
+        checks.append('S3-T16 BL3 短读：Content-Length 撒谎（声明 %d 实发 %d 后半关）→ 400 + 连接关闭，'
+                      '截断体零落库' % (len(short) + 64, len(short) // 2))
+
+        # ---- S3-T17 impl②：PUT 未带 name 且 content 无 name → 保留旧行 name（不许清空）----
+        st, b, _ = put('p_name', {'content': {'id': 'p_name', 'name': '旧名'}, 'updatedAt': T0 + 40000}, opA)
+        assert st == 200 and b['project']['name'] == '旧名', f'初建 p_name: {st} {b}'
+        st, b, _ = put('p_name', {'content': {'id': 'p_name', 'nodes': []}, 'updatedAt': T0 + 40001}, opA)
+        assert st == 200 and b['project']['name'] == '旧名', f'未带 name 必须保留旧名（不许清空）: {b}'
+        st, b, _ = put('p_name', {'content': {'id': 'p_name'}, 'updatedAt': T0 + 40002, 'name': ''}, opA)
+        assert st == 200 and b['project']['name'] == '旧名', f'空字符串 name 也必须保留旧名: {b}'
+        st, b, _ = put('p_name', {'content': {'id': 'p_name'}, 'updatedAt': T0 + 40003, 'name': '新名'}, opA)
+        assert st == 200 and b['project']['name'] == '新名', f'body.name 必须生效: {b}'
+        st, b, _ = put('p_name', {'content': {'id': 'p_name', 'name': '内容名'}, 'updatedAt': T0 + 40004}, opA)
+        assert st == 200 and b['project']['name'] == '内容名', f'content.name 必须生效: {b}'
+        allr, cols = rows('p_name')
+        assert allr[0][cols.index('name')] == '内容名', allr
+        checks.append('S3-T17 impl② name 保全：未带 name 且 content 无 name / name="" → 保留旧行 name（事务内取旧值）；'
+                      'body.name 与 content.name 仍各自生效')
+
+        # ---- S3-T18 polish：DELETE 一个从未存在的 id → 200 但零幽灵墓碑行（非 oracle 也不留写入痕迹）----
+        st, b, _ = jreq(PROJ + '/p_never_existed', 'DELETE', {'deletedAt': T0 + 50000}, opA)
+        assert st == 200 and b['project']['deleted'] is True and b['project']['deletedAt'] == T0 + 50000, \
+            f'删不存在的 id 仍一律 200（非 oracle）: {st} {b}'
+        allr, _ = rows('p_never_existed')
+        assert not allr, f'不存在就不许建幽灵墓碑行：{allr}'
+        st, body, _ = jreq(PROJ, op=opA)
+        assert all(i['id'] != 'p_never_existed' for i in body['projects']), '幽灵行不许出现在清单里'
+        st, _, _ = jreq(PROJ + '/p_never_existed', op=opA)
+        assert st == 404, f'删过的不存在 id GET 仍 404（与从未存在同形），got {st}'
+        checks.append('S3-T18 polish：DELETE 从未存在的 id → 200（非 oracle，回调用方给的墓碑视图），'
+                      '但盘上零行、清单零项（不建幽灵墓碑行）')
+
+        # ---- S3-T19 impl④ 413 drain：声明长度超 BODY_LIMIT 时，服务端必须先把体读走再回 413 ----
+        # 判据设计：只发一半声明体 → 服务端**不许**已经回响应（说明它在 drain；修复前是「立刻关」，
+        # 真机上带未读数据 close 会发 RST，客户端根本收不到 413）。补发剩余体后才许收到 413。
+        TOTAL19 = 9 * 1024 * 1024
+        s19 = socket.create_connection(('127.0.0.1', srv.server_port), timeout=30)
+        try:
+            s19.sendall(('PUT %s/p_cl HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n'
+                         'Content-Length: %d\r\nCookie: wan_session=%s\r\n\r\n'
+                         % (PROJ, TOTAL19, tokenA)).encode())
+            sent = 1024 * 1024
+            s19.sendall(b'x' * sent)
+            s19.settimeout(0.8)
+            try:
+                early = s19.recv(1)
+            except socket.timeout:
+                early = b''
+            assert early == b'', \
+                f'只发了 {sent}/{TOTAL19} 字节就收到响应/断开 → 服务端没 drain 就关连接（真机上 413 会被 RST 吞掉）'
+            s19.settimeout(30)
+            while sent < TOTAL19:                       # 补发剩余体：drain 读满后才会回 413
+                n = min(1024 * 1024, TOTAL19 - sent)
+                s19.sendall(b'x' * n); sent += n
+            resp = b''
+            while b'\r\n\r\n' not in resp:
+                chunk = s19.recv(65536)
+                if not chunk:
+                    break
+                resp += chunk
+            head, _, tail = resp.partition(b'\r\n\r\n')
+            while b'\r\n\r\n' in resp and len(tail) < 200:   # 413 文案很短，读满一屏即可
+                chunk = s19.recv(65536)
+                if not chunk:
+                    break
+                tail += chunk
+        finally:
+            s19.close()
+        assert b' 413 ' in head.split(b'\r\n')[0], f'声明 {TOTAL19} 字节必须收到 413，got {head[:120]!r}'
+        assert '8MB' in tail.decode('utf-8', 'replace'), f'413 文案必须说清 8MB 上限：{tail[:200]!r}'
+        assert not rows('p_cl')[0], '413 之后不许落行'
+        checks.append('S3-T19 impl④ 413 drain：声明 %d 字节（> BODY_LIMIT）只发 1MB 时服务端无响应（仍在 drain，'
+                      '不是立刻关连接）/ 补满后收到 413+8MB 文案 / 零落行' % TOTAL19)
+    finally:
+        srv.shutdown(); srv.server_close()
+
+    # ---- S3-T11 单人模式零改动：全动词 404 + 不建表（零 owner 标记写入）----
+    multiuser.REG_ATTEMPTS.clear(); multiuser.FAILURES.clear()
+    srv, base = serve('0')
+    db2 = Path(os.environ[multiuser.DB_PATH_ENV])
+    try:
+        for method, path, body in (('GET', PROJ, None), ('GET', PROJ + '/p1', None),
+                                   ('PUT', PROJ + '/p1', {'content': {'id': 'p1'}, 'updatedAt': T0}),
+                                   ('DELETE', PROJ + '/p1', {'deletedAt': T0}),
+                                   ('GET', PROJ + '/a/b/c', None)):
+            st, _, _ = jreq(path, method, body)
+            assert st == 404, f'MULTI_USER=0 {method} {path} must 404, got {st}'
+        c = sqlite3.connect(str(db2))
+        try:
+            tables = {r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        finally:
+            c.close()
+        assert 'user_projects' not in tables, f'单人模式不得建 user_projects（零 owner 标记写入）：{sorted(tables)}'
+    finally:
+        srv.shutdown(); srv.server_close()
+    checks.append('S3-T11 单人模式零改动：GET 清单/GET 单项目/PUT/DELETE/深层子路径全部 404，'
+                  '且 user_projects 表根本没被建出来（零 owner 标记写入）')
+    return checks
+
+
 def main():
  checks=[]; srv,base=serve('0')
  try:
@@ -934,6 +1393,7 @@ def main():
  checks += phase_admin()
  checks += phase_s2_6()
  checks += phase_s2_7()
+ checks += phase_s3_b1()
  print('SUMMARY: PASS %d/%d'%(len(checks),len(checks)))
  for c in checks: print('PASS: '+c)
  return 0

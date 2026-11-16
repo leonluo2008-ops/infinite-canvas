@@ -67,6 +67,10 @@ try:
 except ImportError:  # noqa: E402
     import channel_store  # type: ignore[no-redef]  # noqa: E402
 try:
+    from wanrepro.ui import project_store  # noqa: E402  S3-B1 画布项目按用户隔离（MULTI_USER=0 时整条路由不存在）
+except ImportError:  # noqa: E402
+    import project_store  # type: ignore[no-redef]  # noqa: E402
+try:
     from wanrepro.ui import lapian_timing  # noqa: E402  S2.7 拆解耗时分解（server 侧包装，引擎零改动）
 except ImportError:  # noqa: E402
     import lapian_timing  # type: ignore[no-redef]  # noqa: E402
@@ -2299,6 +2303,8 @@ class Handler(BaseHTTPRequestHandler):
             return
         if channel_store.handle(self, "GET", path):
             return
+        if project_store.handle(self, "GET", path):
+            return
         if multiuser.route_missing(path):
             raise ApiError(404, f"没有这个地址：{path}")
         if multiuser.login_guard(self, "GET", path):
@@ -2498,6 +2504,8 @@ class Handler(BaseHTTPRequestHandler):
         if multiuser.handle(self, self.command, path):
             return
         if channel_store.handle(self, self.command, path):
+            return
+        if project_store.handle(self, self.command, path):
             return
         if multiuser.route_missing(path):
             raise ApiError(404, f"没有这个地址：{path}")
