@@ -2203,6 +2203,8 @@ class Handler(BaseHTTPRequestHandler):
             return
         if multiuser.route_missing(path):
             raise ApiError(404, f"没有这个地址：{path}")
+        if multiuser.login_guard(self, "GET", path):
+            return
         if path == "/api/lapian/slot":
             # 拆解槽真相（只读）：hub 侧用它把「槽忙」翻成人话（在等谁的远程返回、预计还需多久）
             self.send_json(lapian_slot_view())

@@ -1,7 +1,50 @@
-<!doctype html><meta charset="utf-8"><title>Multi-user auth probe</title>
-<h1>账号骨架验收</h1>
-<label>用户名 <input id="u"></label><label>密码 <input id="p" type="password"></label><label>邀请码 <input id="i"></label>
-<button onclick="act('/api/auth/register',{username:u.value,password:p.value,inviteCode:i.value})">注册</button>
-<button onclick="act('/api/auth/login',{username:u.value,password:p.value})">登录</button>
-<button onclick="fetch('/api/auth/me').then(show)">查看会话</button><pre id="out"></pre>
-<script>async function act(path,body){show(await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}))}async function show(r){out.textContent=JSON.stringify(await r.json(),null,2)}</script>
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<title>登录 · 画布</title>
+<style>
+ body{font-family:system-ui,sans-serif;background:#111827;color:#e5e7eb;display:flex;justify-content:center;padding-top:10vh;margin:0}
+ .card{background:#1f2937;border-radius:12px;padding:32px;width:340px;box-shadow:0 8px 24px rgba(0,0,0,.4)}
+ h1{font-size:20px;margin:0 0 20px;text-align:center}
+ label{display:block;margin:12px 0 4px;font-size:13px;color:#9ca3af}
+ input{width:100%;box-sizing:border-box;padding:10px;border:1px solid #374151;border-radius:8px;background:#111827;color:#e5e7eb;font-size:14px}
+ button{width:100%;margin-top:18px;padding:11px;border:0;border-radius:8px;background:#3b82f6;color:#fff;font-size:15px;cursor:pointer}
+ button:disabled{background:#374151;cursor:wait}
+ .msg{margin-top:14px;font-size:13px;min-height:18px;text-align:center}
+ .msg.err{color:#f87171}.msg.ok{color:#4ade80}
+ .tabs{display:flex;margin-bottom:6px}
+ .tabs button{flex:1;background:none;color:#9ca3af;margin:0;padding:8px;font-size:14px;border-radius:0}
+ .tabs button.on{color:#3b82f6;border-bottom:2px solid #3b82f6}
+</style></head><body>
+<div class="card">
+ <h1>画布工作台</h1>
+ <div class="tabs">
+  <button id="tab-login" class="on" onclick="tab('login')">登录</button>
+  <button id="tab-reg" onclick="tab('reg')">注册新账号</button>
+ </div>
+ <label>用户名</label><input id="username" autocomplete="username">
+ <label>密码（至少 8 位）</label><input id="password" type="password">
+ <button id="go" onclick="go()">登录</button>
+ <div id="msg" class="msg"></div>
+</div>
+<script>
+const $=id=>document.getElementById(id);
+function tab(w){for(const t of['login','reg']){$('tab-'+t).classList.toggle('on',t===w)}
+ $('go').textContent=w==='login'?'登录':'注册并进入';}
+function msg(t,ok){const m=$('msg');m.textContent=t;m.className='msg '+(ok?'ok':'err');}
+async function go(){
+ const u=$('username').value.trim(),p=$('password').value;
+ if(!u){msg('请输入用户名');return}
+ if(p.length<8){msg('密码至少 8 位');return}
+ const reg=!$('tab-login').classList.contains('on');
+ $('go').disabled=true;msg(reg?'注册中…':'登录中…');
+ try{
+  const r=await fetch('/api/auth/'+(reg?'register':'login'),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:u,password:p})});
+  const d=await r.json().catch(()=>({}));
+  if(r.ok){msg('成功，正在进入画布…',true);setTimeout(()=>location.href='/',600);return}
+  msg(d.error||('失败（'+r.status+'）'));
+ }catch(e){msg('网络错误：'+e)}
+ $('go').disabled=false;
+}
+$('password').addEventListener('keydown',e=>{if(e.key==='Enter')go()});
+</script>
+</body></html>

@@ -96,6 +96,13 @@ def _token(h: BaseHTTPRequestHandler) -> str:
     return ""
 
 
+def _session_user(h: BaseHTTPRequestHandler) -> str | None:
+    """有效会话返回用户名，否则 None（登录态守卫用）。"""
+    with connect() as db:
+        row = db.execute("SELECT u.username FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token=? AND s.revoked=0 AND s.expires_at>?", (_token(h), int(time.time()))).fetchone()
+    return row["username"] if row else None
+
+
 def handle(h: BaseHTTPRequestHandler, method: str, path: str) -> bool:
     if not enabled(): return False
     if path == "/multiuser/" and method == "GET":
@@ -103,6 +110,7 @@ def handle(h: BaseHTTPRequestHandler, method: str, path: str) -> bool:
         h.send_response(200); h.send_header("Content-Type", "text/html; charset=utf-8")
         h.send_header("Content-Length", str(len(page))); h.end_headers(); h.wfile.write(page)
         return True
+    # 登录态守卫已并入 login_guard（route_get 入口处调用）
     if path not in ("/api/auth/register", "/api/auth/login", "/api/auth/logout", "/api/auth/me"):
         return False
     if method == "GET" and path == "/api/auth/me":
@@ -130,25 +138,12 @@ def handle(h: BaseHTTPRequestHandler, method: str, path: str) -> bool:
             _cap(REG_ATTEMPTS)
             if len(att) >= 10:
                 _send(h, {"error": "注册尝试过于频繁，请稍后再试"}, 429); return True
-        code = str(body.get("inviteCode") or "")
         now = int(time.time())
-        # 邀请码先行只读校验：无效码不做 scrypt（省 CPU，时序差异不泄露码内容）
-        with connect() as db:
-            inv = db.execute("SELECT * FROM invites WHERE code=?", (code,)).fetchone()
-        if not inv or inv["revoked"] or inv["used_count"] >= inv["max_uses"] or (inv["expires_at"] is not None and inv["expires_at"] <= now):
-            _send(h, {"error": "邀请码无效、过期、已撤销或已用尽"}, 403); return True
         salt = secrets.token_bytes(16)
         pwd = hashlib.scrypt(password.encode(), salt=salt, n=2**15, r=8, p=1, dklen=32, maxmem=64*1024*1024)
         try:
             with connect() as db:
                 db.execute("BEGIN IMMEDIATE")
-                # 条件更新 + rowcount 复核：限额不依赖先读后写
-                cur = db.execute(
-                    "UPDATE invites SET used_count=used_count+1 WHERE code=? AND revoked=0"
-                    " AND used_count<max_uses AND (expires_at IS NULL OR expires_at>?)",
-                    (code, now))
-                if cur.rowcount != 1:
-                    db.rollback(); _send(h, {"error": "邀请码无效、过期、已撤销或已用尽"}, 403); return True
                 db.execute("INSERT INTO users(username,pwd_hash,salt,created_at) VALUES(?,?,?,?)", (username,pwd,salt,now))
                 uid = db.execute("SELECT id FROM users WHERE username=?", (username,)).fetchone()[0]
                 token = secrets.token_urlsafe(32); expiry = now + 30*24*3600
@@ -179,3 +174,14 @@ def handle(h: BaseHTTPRequestHandler, method: str, path: str) -> bool:
 
 def route_missing(path: str) -> bool:
     return path.startswith("/api/auth/") or path.startswith("/multiuser/")
+
+
+def login_guard(h: BaseHTTPRequestHandler, method: str, path: str) -> bool:
+    """MULTI_USER=1 时：未登录访问任何页面路径（非 /api、非 /multiuser）一律 302 跳登录页；
+    已登录返回 False 交回既有链路——画布静态产物由 server 既有 web-dist 机制负责（复用，不另造）。"""
+    if method != "GET" or path.startswith("/api/") or path.startswith("/multiuser/"):
+        return False
+    if _session_user(h) is not None:
+        return False
+    h.send_response(302); h.send_header("Location", "/multiuser/"); h.send_header("Content-Length", "0"); h.end_headers()
+    return True
