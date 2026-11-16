@@ -497,6 +497,11 @@ export default {
         lightTheme: "切换到浅色主题",
         darkTheme: "切换到深色主题",
     },
+    account: {
+        login: "登录",
+        logout: "退出登录",
+        loggedIn: "当前登录",
+    },
     home: {
         promptError: "获取提示词失败",
         description: "在 <canvas>无限画布</canvas> 中生成、连接和重组 <content>图片、文字与图形</content>，让创作从单次生成变成连续推演。",
