@@ -571,6 +571,230 @@ def phase_s2_6():
     return checks
 
 
+def phase_s2_7():
+    """S2.7：拆解耗时分解（耗时.json + GET /api/lapian/timing）。
+
+    判据（对应任务书 ④/⑤）：
+      * 耗时.json 生成、字段完整（总耗时/抽帧耗时/大拆解等待/门禁重拆轮次/阶段/归属/退出码）；
+      * 端点三态鉴权：未登录 401、他人任务与不存在**同形** 404、自己的任务 200 available:true；
+      * 引擎产物未被污染：拆解/看帧/门禁/门禁诊断/frames 的 mtime 与内容在 job 结束后逐字节不变，
+        产物目录里只多 耗时.json（+多账户下的 .归属.json）；
+      * 单人模式无感：/api/lapian/run argv/返回体不变、端点 404、无归属侧车、job 响应字段不变；
+      * 监控口约：耗时.json 缺失/坏 JSON/字段缺失 → 200 + available:false（绝不 500）。
+
+    夹具：`server.run_py` 换成「按引擎真实口径落产物」的假子进程（写 进度.json 三个阶段的
+    心跳、frames 两帧带可控 mtime、门禁诊断-第1轮.md、门禁.json）——采集读的就是这些真文件；
+    不调模型、不出网、不花钱。
+    """
+    import hashlib
+
+    def sha(path):
+        return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+    def snapshot(d: Path):
+        """引擎产物快照（不含监控自己的 耗时.json / .归属.json）。"""
+        out = {}
+        for p in sorted(d.rglob('*')):
+            if not p.is_file() or p.name in ('耗时.json', '.归属.json'):
+                continue
+            st = p.stat()
+            out[p.relative_to(d).as_posix()] = (st.st_mtime_ns, st.st_size, sha(p))
+        return out
+
+    def make_fixture(task_id: str, frames_span=(0.0, 4.0)):
+        vid_dir = server.ROOT / 'uploads' / 'probe-s2-7'
+        vid_dir.mkdir(parents=True, exist_ok=True)
+        video = vid_dir / 'clip.mp4'
+        video.write_bytes(b'\x00\x00\x00\x18ftypmp42' + b'\x00' * 64)
+        tdir = server.ANALYSIS / task_id
+        (tdir / 'frames').mkdir(parents=True, exist_ok=True)
+        (tdir / '.源视频指纹.json').write_text(
+            json.dumps({'路径': video.relative_to(server.ROOT).as_posix()}, ensure_ascii=False),
+            encoding='utf-8')
+        return video, tdir
+
+    checks = []
+    multiuser.FAILURES.clear(); multiuser.REG_ATTEMPTS.clear()
+    os.environ['WANREPRO_CHANNEL_KEY'] = base64.b64encode(bytes(range(32))).decode()
+    srv, base = serve('1')
+    opA = build_opener(HTTPCookieProcessor(http.cookiejar.CookieJar()))
+    opB = build_opener(HTTPCookieProcessor(http.cookiejar.CookieJar()))
+    real_run_py = server.run_py
+    seen: list[dict] = []
+
+    def write_progress(tdir: Path, stage: str):
+        (tdir / '进度.json').write_text(json.dumps({'stage': stage, 'ts': int(time.time())},
+                                                   ensure_ascii=False), encoding='utf-8')
+
+    def engine_like_run_py(stage_sleep=1.1, rounds=1, frames_span=(0.0, 4.0)):
+        """按引擎口径落产物后返回退出码 0；阶段之间留出采样窗口。"""
+        def fake(args, timeout, extra_env=None):
+            seen.append({'args': list(args), 'env': dict(extra_env or {})})
+            tdir = server.ANALYSIS / args[args.index('--id') + 1]
+            (tdir / '拆解.md').write_text('# 拆解\n## 一 结构\n内容\n', encoding='utf-8')
+            (tdir / '看帧.json').write_text(json.dumps({'秒': [{'秒': 1, '判定': '产品'}],
+                                                        '看帧判定哈希': 'x'}, ensure_ascii=False),
+                                            encoding='utf-8')
+            base_ts = 1_700_000_000
+            for index in range(2):
+                p = tdir / 'frames' / f'f_{index:04d}s.jpg'
+                p.write_bytes(b'jpg')
+                os.utime(p, (base_ts + frames_span[index], base_ts + frames_span[index]))
+            write_progress(tdir, '抽帧'); time.sleep(stage_sleep)
+            write_progress(tdir, '大拆解'); time.sleep(stage_sleep)
+            write_progress(tdir, '汇总'); time.sleep(1.3)
+            for round_no in range(1, rounds + 1):
+                (tdir / f'门禁诊断-第{round_no}轮.md').write_text('诊断\n', encoding='utf-8')
+            (tdir / '门禁.json').write_text(json.dumps({'轮次': rounds, '状态': '通过'},
+                                                       ensure_ascii=False), encoding='utf-8')
+            write_progress(tdir, '完成')
+            return 0, '', ''
+        return fake
+
+    def wait_job(job_id, timeout=20.0):
+        end = time.time() + timeout
+        while time.time() < end:
+            with server.JOBS_LOCK:
+                rec = dict(server.JOBS.get(job_id) or {})
+            if rec.get('status') in ('done', 'error', 'failed'):
+                return rec
+            time.sleep(0.05)
+        raise AssertionError(f'job {job_id} {timeout}s 内没结束')
+
+    try:
+        assert req(base, '/api/auth/register', 'POST',
+                   {'username': 'ta', 'password': 'password1'}, opA)[0] == 200
+        assert req(base, '/api/auth/register', 'POST',
+                   {'username': 'tb', 'password': 'password1'}, opB)[0] == 200
+        video, tdir = make_fixture('s27task')
+        server.run_py = engine_like_run_py()
+
+        # ---- T1：多账户下跑一次拆解 → 耗时.json 落盘且字段完整 ----
+        st, body = req(base, '/api/lapian/run', 'POST', {'id': 's27task', 'intent': '看产品'},
+                       opA)
+        assert st == 200, f'lapian run: {st} {body[:200]}'
+        rec = wait_job(json.loads(body)['job'])
+        assert rec.get('status') == 'done', f'job must finish: {rec}'
+        timing_path = tdir / '耗时.json'
+        assert timing_path.is_file(), '耗时.json must be written at job end'
+        data = json.loads(timing_path.read_text(encoding='utf-8'))
+        for key in ('总耗时', '抽帧耗时', '大拆解等待', '门禁重拆轮次', '阶段', '归属', '退出码', '采集'):
+            assert key in data, f'耗时.json missing {key}: {sorted(data)}'
+        assert data['归属'] == 'ta', f"owner must be the initiator: {data.get('归属')!r}"
+        assert data['退出码'] == 0, data['退出码']
+        assert isinstance(data['总耗时'], (int, float)) and data['总耗时'] > 0, data['总耗时']
+        assert abs(float(data['抽帧耗时']) - 4.0) < 0.01, f"抽帧耗时 must follow frame mtimes: {data['抽帧耗时']}"
+        assert data['抽帧']['帧数'] == 2, data['抽帧']
+        assert isinstance(data['大拆解等待'], (int, float)) and data['大拆解等待'] > 0.5, \
+            f"大拆解等待 must come from the 大拆解 stage window: {data['大拆解等待']}"
+        assert data['门禁重拆轮次'] == 1, data['门禁重拆轮次']
+        stages = [str(w.get('阶段')) for w in data['阶段']]
+        assert stages[:3] == ['抽帧', '大拆解', '汇总'], f'stage timeline: {stages}'
+        assert data['采集']['样本数'] >= 1, data['采集']
+        checks.append('S2.7-T1 耗时.json: 总耗时/抽帧耗时(帧 mtime 极差=4.0s)/大拆解等待(阶段窗口)/'
+                      '门禁重拆轮次=1/阶段序列[抽帧,大拆解,汇总]/归属=发起来源/退出码=0')
+
+        # ---- T2：端点三态鉴权（自己 200 / 他人 404 / 不存在 404 同形 / 未登录 401）----
+        st, body = req(base, '/api/lapian/timing?task=s27task', opener=opA)
+        own = json.loads(body)
+        assert st == 200 and own.get('available') is True, f'owner timing: {st} {body[:200]}'
+        assert own.get('总耗时') == data['总耗时'] and own.get('task') == 's27task', own
+        st_other, b_other = req(base, '/api/lapian/timing?task=s27task', opener=opB)
+        st_ghost, b_ghost = req(base, '/api/lapian/timing?task=s27ghost', opener=opB)
+        assert st_other == 404 and st_ghost == 404, f'other/ghost must 404: {st_other}/{st_ghost}'
+        assert b_other == b_ghost, f'他人任务与不存在必须同形：{b_other!r} vs {b_ghost!r}'
+        st_anon, b_anon = req(base, '/api/lapian/timing?task=s27task')
+        assert st_anon == 401, f'anon must 401, got {st_anon}'
+        assert 'ta' not in b_anon.decode() and 'ta' not in b_other.decode(), 'error bodies must not leak owner'
+        # 无归属记录的存量任务（多账户下）同样 404：不猜归属
+        stale = server.ANALYSIS / 's27stale'
+        stale.mkdir(parents=True, exist_ok=True)
+        (stale / '耗时.json').write_text(json.dumps({'总耗时': 1, '阶段': []}), encoding='utf-8')
+        assert req(base, '/api/lapian/timing?task=s27stale', opener=opA)[0] == 404, \
+            'ownerless legacy task must 404 (no owner guessing)'
+        checks.append('S2.7-T2 /api/lapian/timing 三态：自己 200 available:true(总耗时与文件一致)、'
+                      '他人与不存在 404 逐字节同形、未登录 401、无归属存量任务 404（不猜归属）')
+
+        # ---- T3：引擎产物未被污染（mtime/内容逐字节不变；目录只多耗时.json/.归属.json）----
+        assert data['采集']['样本数'] >= 1
+        before = snapshot(tdir)
+        for _ in range(2):
+            assert req(base, '/api/lapian/timing?task=s27task', opener=opA)[0] == 200
+        after = snapshot(tdir)
+        assert before == after, f'timing endpoint must be read-only: {set(before.items()) ^ set(after.items())}'
+        files = {p.name for p in tdir.iterdir() if p.is_file()}
+        extra = files - {'.源视频指纹.json', '意图.txt', '进度.json', '拆解.md', '看帧.json',
+                         '门禁.json', '门禁诊断-第1轮.md', '耗时.json', '.归属.json'}
+        assert not extra, f'采集不得新增别的文件：{sorted(extra)}'
+        assert (tdir / '.归属.json').is_file(), '多账户模式必须写归属侧车'
+        # 采集器不改引擎写点的关键证据：frames mtime 仍是夹具设定值（1_700_000_000/4）
+        stamps = sorted(p.stat().st_mtime for p in (tdir / 'frames').iterdir())
+        assert abs(stamps[0] - 1_700_000_000) < 1 and abs(stamps[-1] - 1_700_000_004) < 1, stamps
+        checks.append('S2.7-T3 产物零污染：端点只读(两次调用前后 mtime/sha256 全等)、目录只多 耗时.json 与 .归属.json、'
+                      'frames mtime 仍为夹具设定值')
+
+        # ---- T4：可用性口径（缺失/坏 JSON/字段缺失 → 200 + available:false，绝不 500）----
+        good = timing_path.read_text(encoding='utf-8')
+        timing_path.unlink()
+        st, body = req(base, '/api/lapian/timing?task=s27task', opener=opA)
+        miss = json.loads(body)
+        assert st == 200 and miss.get('available') is False and miss.get('missing'), \
+            f'missing 耗时.json must be available:false: {st} {body[:200]}'
+        timing_path.write_text('{不是 JSON', encoding='utf-8')
+        st, body = req(base, '/api/lapian/timing?task=s27task', opener=opA)
+        assert st == 200 and json.loads(body).get('available') is False, f'broken JSON: {st} {body[:200]}'
+        partial = json.loads(good)
+        partial.pop('门禁重拆轮次')
+        timing_path.write_text(json.dumps(partial, ensure_ascii=False), encoding='utf-8')
+        st, body = req(base, '/api/lapian/timing?task=s27task', opener=opA)
+        got = json.loads(body)
+        assert st == 200 and got.get('available') is False and '门禁重拆轮次' in got.get('missing', []), \
+            f'missing field must be available:false: {st} {body[:200]}'
+        timing_path.write_text(good, encoding='utf-8')
+        checks.append('S2.7-T4 监控口约：耗时.json 缺失/坏 JSON/字段缺失 → 200 + available:false + missing 清单（无 500）')
+
+        # ---- T5：写盘失败不影响拆解主链（零兜底）----
+        broken_dir = server.ANALYSIS / 's27nofile'
+        video2, _ = make_fixture('s27nofile')
+        # 让 耗时.json 指向一个目录：os.replace 必失败 → 采集静默跳过，job 照常 done
+        (broken_dir / '耗时.json').mkdir(parents=True, exist_ok=True)
+        server.run_py = engine_like_run_py(stage_sleep=0.05, rounds=0)
+        st, body = req(base, '/api/lapian/run', 'POST', {'id': 's27nofile', 'intent': 'x'}, opA)
+        assert st == 200, f'{st} {body[:200]}'
+        rec = wait_job(json.loads(body)['job'])
+        assert rec.get('status') == 'done', f'timing write failure must not break the job: {rec}'
+        checks.append('S2.7-T5 零兜底：耗时.json 写不出来（路径被目录占住）→ 拆解照常 done，采集静默跳过')
+
+        # ---- T6：单人模式无感（argv/返回体不变、端点 404、无归属侧车）----
+        srv.shutdown(); srv.server_close()
+        srv, base = serve('0')
+        video3, tdir3 = make_fixture('s27single')
+        server.run_py = engine_like_run_py(stage_sleep=0.05, rounds=0)
+        seen.clear()
+        st, body = req(base, '/api/lapian/run', 'POST', {'id': 's27single', 'intent': 'x'})
+        assert st == 200, f'single-user lapian run: {st} {body[:200]}'
+        job_id = json.loads(body)['job']
+        assert json.loads(body) == {'job': job_id}, f'run response must stay {{job}} only: {body[:120]}'
+        rec = wait_job(job_id)
+        assert rec.get('status') == 'done', rec
+        assert seen and seen[-1]['args'] == ['analyze.py', video3.relative_to(server.ROOT).as_posix(),
+                                            '--id', 's27single', '--yes', '--intent', 'x'], seen[-1]['args']
+        assert seen[-1]['env'] == {}, 'single-user mode must inject zero extra env'
+        st, body = req(base, '/api/lapian/timing?task=s27single')
+        assert st == 404, f'MULTI_USER=0 timing endpoint must 404 (single-user baseline), got {st}'
+        st, body = req(base, f'/api/job/{job_id}')
+        job_view = json.loads(body)
+        assert set(job_view) == {'status', 'result', 'elapsed'}, f'/api/job must keep its shape: {sorted(job_view)}'
+        assert (tdir3 / '耗时.json').is_file(), '单人模式同样落 耗时.json（可直接开文件看，端点不开放）'
+        assert not (tdir3 / '.归属.json').exists(), '单人模式不得写归属侧车'
+        checks.append('S2.7-T6 单人模式无感：/api/lapian/run argv+返回体不变、零附加 env、/api/job 字段集合不变、'
+                      '/api/lapian/timing 404、无 .归属.json（仅多一个 耗时.json 文件）')
+    finally:
+        server.run_py = real_run_py
+        srv.shutdown(); srv.server_close()
+    return checks
+
+
 def main():
  checks=[]; srv,base=serve('0')
  try:
@@ -709,6 +933,7 @@ def main():
  checks += phase_b2()
  checks += phase_admin()
  checks += phase_s2_6()
+ checks += phase_s2_7()
  print('SUMMARY: PASS %d/%d'%(len(checks),len(checks)))
  for c in checks: print('PASS: '+c)
  return 0

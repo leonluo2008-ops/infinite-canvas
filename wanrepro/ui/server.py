@@ -66,6 +66,10 @@ try:
     from wanrepro.ui import channel_store  # noqa: E402  S2-B1 渠道持久化（MULTI_USER=0 不触发其任何依赖）
 except ImportError:  # noqa: E402
     import channel_store  # type: ignore[no-redef]  # noqa: E402
+try:
+    from wanrepro.ui import lapian_timing  # noqa: E402  S2.7 拆解耗时分解（server 侧包装，引擎零改动）
+except ImportError:  # noqa: E402
+    import lapian_timing  # type: ignore[no-redef]  # noqa: E402
 
 # 拆解产物根：与 replace.analysis_root / state 同一真源
 # （`WANREPRO_ANALYSIS_ROOT` 优先）。为什么画布链也要认它：清单是各链共写的
@@ -1223,6 +1227,19 @@ def sdgf_mode_name(mode: str, image_count: int) -> str:
     return "参考生视频"
 
 
+def request_username(h: BaseHTTPRequestHandler) -> str:
+    """当前请求的登录用户名（S2.7 归属/隔离用）；单人模式或未登录 → 空串。
+
+    只读一次会话表，异常一律降级成空串——归属采集失败绝不能把拆解请求打成 500。
+    """
+    try:
+        if not multiuser.enabled():
+            return ""
+        return str(multiuser._session_user(h) or "")
+    except Exception:                       # noqa: BLE001 —— 归属是附加信息，读不到就当没有
+        return ""
+
+
 def user_channel_for_request(h: BaseHTTPRequestHandler, payload: dict) -> dict | None:
     """S2.6：`payload.channelId` → **该登录用户**的渠道（已解密）。无 channelId → None。
 
@@ -2290,6 +2307,11 @@ class Handler(BaseHTTPRequestHandler):
             # 拆解槽真相（只读）：hub 侧用它把「槽忙」翻成人话（在等谁的远程返回、预计还需多久）
             self.send_json(lapian_slot_view())
             return
+        if path == "/api/lapian/timing":
+            # S2.7 拆解耗时分解（只读）：总/抽帧/大拆解等待/门禁重拆轮次 + 阶段明细。
+            # 必须排在 /api/lapian/<id> 之前——否则 "timing" 会被当成任务号。
+            self.send_json(lapian_timing_view(self, self.query_param("task") or ""))
+            return
         m = re.fullmatch(r"/api/frame-file/([^/]+)/([^/]+)", path)
         if m:
             # 帧缓存取图（只认 frames 缓存目录里的 png/jpg，不认目录穿越）。
@@ -2497,7 +2519,8 @@ class Handler(BaseHTTPRequestHandler):
             # M6-T7-C：可选 分析模型/渠道 透传（不传 → 与旧版完全一致）
             extra_args, extra_env = lapian_channel_passthrough(payload, user_channel)
             self.send_json(start_analyze_job(str(rel), str(payload.get("intent") or ""), tid,
-                                             extra_args=extra_args, extra_env=extra_env))
+                                             extra_args=extra_args, extra_env=extra_env,
+                                             owner=request_username(self)))
             return
         if path == "/api/wan/video/run":
             self.do_wan_video_run()
@@ -2510,7 +2533,8 @@ class Handler(BaseHTTPRequestHandler):
             intent = str(payload.get("intent") or "")
             task_id = str(payload.get("id") or "")
             # 公网口径：立刻回 job id，前端轮询 /api/job/<id>；同步跑会被边缘 100s 掐断
-            self.send_json(start_analyze_job(str(payload.get("video") or ""), intent, task_id))
+            self.send_json(start_analyze_job(str(payload.get("video") or ""), intent, task_id,
+                                             owner=request_username(self)))
             return
         m = re.fullmatch(r"/api/name/([^/]+)", path)
         if m:
@@ -3517,10 +3541,48 @@ def lapian_slot_view() -> dict:
     }
 
 
+def lapian_timing_view(h: BaseHTTPRequestHandler, task_id: str) -> dict:
+    """`GET /api/lapian/timing?task=<id>` —— 拆解耗时分解（S2.7，只读、零副作用）。
+
+    三态鉴权（与 S2.6 渠道同口径，零泄露）：
+
+      * 单人模式（MULTI_USER=0）→ 404：这一层根本不存在（单人模式零改动，行为与 S2.6 前一致）；
+      * 未登录 → 401；
+      * 他人任务 / 任务不存在 / 任务没有归属记录 → **同一个** 404 响应（不泄露存在性）；
+      * 自己的任务 → 200，`available:true` + 耗时字段；耗时.json 缺失/字段不全 → 200 +
+        `available:false`（**绝不** 500：监控文件坏了不是服务故障）。
+    """
+    if not multiuser.enabled():
+        raise ApiError(404, "没有这个地址：/api/lapian/timing")
+    username = request_username(h)
+    if not username:
+        raise ApiError(401, "未登录：耗时数据按登录用户隔离")
+    tid = (task_id or "").strip()
+    # 同形 404：文案不带任务号，他人任务与不存在的响应逐字节一致
+    missing = ApiError(404, "任务不存在")
+    if not tid or ".." in tid or "/" in tid or "\\" in tid or not ID_RE.match(tid):
+        raise missing
+    outdir = ANALYSIS / tid
+    if not outdir.is_dir():
+        raise missing
+    owner = lapian_timing.read_owner(outdir)
+    if not owner or owner != username:
+        # 无归属记录的存量任务在多账户下同样不给看（不猜归属 = 不泄露）
+        raise missing
+    view = lapian_timing.view(outdir)
+    view["task"] = tid
+    return view
+
+
 def start_analyze_job(video: str, intent: str = "", requested_task_id: str = "",
                       extra_args: list[str] | None = None,
-                      extra_env: dict | None = None) -> dict:
-    """提交拆解任务，立刻返回 job id；真正的 analyze.py 在后台线程里跑。"""
+                      extra_env: dict | None = None,
+                      owner: str = "") -> dict:
+    """提交拆解任务，立刻返回 job id；真正的 analyze.py 在后台线程里跑。
+
+    owner（S2.7）：发起人用户名（单人模式为空串）。只用于 耗时.json 的「归属」与任务归属
+    侧车，**不参与**任何拆解逻辑；归属写不出来不影响任务本身。
+    """
     if not ANALYZE_BUSY.acquire(blocking=False):
         # 409 语义写死：**排队**，不是失败。extra.slot 把「谁在占、跑了多久」交给调用方，
         # 调用方（automation/discuss.py 的排队循环 / hub 重试入口）据此说人话，而不是刷计数。
@@ -3534,6 +3596,11 @@ def start_analyze_job(video: str, intent: str = "", requested_task_id: str = "",
                 JOBS.pop(stale, None)
         JOBS[job_id] = {"status": "running", "started": now}
 
+    # S2.7 耗时分解：采集器跟着这一次 job 走（子进程起止 + 1Hz 采样 进度.json）。
+    # 它挂在引擎**外面**：不 import 引擎写点、不改任何产物目录里已有的文件。
+    recorder = lapian_timing.TimingRecorder(started=now)
+    task_holder: dict[str, str] = {}
+
     def run() -> None:
         def on_task(task_id: str) -> None:
             """job→task 映射（M6-T6F）：analyze_video 把任务 id 定下来就回填，
@@ -3542,21 +3609,43 @@ def start_analyze_job(video: str, intent: str = "", requested_task_id: str = "",
                 rec = JOBS.get(job_id)
                 if rec is not None:
                     rec["task_id"] = task_id
+            # S2.7：任务目录定了才开始采样（此前产物还没落盘）。归属侧车只首占写一次。
+            if task_id and task_holder.get("id") != task_id:
+                task_holder["id"] = task_id
+                try:
+                    outdir = ANALYSIS / task_id
+                    lapian_timing.write_owner(outdir, owner)
+                    recorder.attach(outdir, owner)
+                except Exception:               # noqa: BLE001 —— 监控失败不算拆解失败
+                    pass
 
+        error = ""
         try:
             result = analyze_video(video, intent, requested_task_id, on_task,
-                                   extra_args=extra_args, extra_env=extra_env)
+                                   extra_args=extra_args, extra_env=extra_env,
+                                   on_exit=recorder.set_exit)
             rec = {"status": "done", "result": result, "started": now,
                    "elapsed": round(time.time() - now, 1)}
         except ApiError as err:
+            error = err.msg
             rec = {"status": "error", "error": err.msg, "started": now,
                    "elapsed": round(time.time() - now, 1)}
         except Exception as exc:                    # noqa: BLE001
             traceback.print_exc()
+            error = f"服务内部异常：{exc}"
             rec = {"status": "error", "error": f"服务内部异常：{exc}", "started": now,
                    "elapsed": round(time.time() - now, 1)}
         finally:
             ANALYZE_BUSY.release()
+            # 收尾写 耗时.json（成功/失败都写——失败时「时间花在哪」同样要看），异常全吞
+            try:
+                timing = recorder.finish(error)
+            except Exception:                       # noqa: BLE001
+                timing = None
+            if timing is not None:
+                rec["timing"] = {"抽帧耗时": timing.get("抽帧耗时"),
+                                 "大拆解等待": timing.get("大拆解等待"),
+                                 "门禁重拆轮次": timing.get("门禁重拆轮次")}
         with JOBS_LOCK:
             JOBS[job_id] = rec
 
@@ -3566,8 +3655,11 @@ def start_analyze_job(video: str, intent: str = "", requested_task_id: str = "",
 
 def analyze_video(video: str, intent: str = "", requested_task_id: str = "",
                   on_task=None, extra_args: list[str] | None = None,
-                  extra_env: dict | None = None) -> dict:
-    """跑一次拆解。on_task：任务 id 定下来时的回调（job→task 映射，可空）。"""
+                  extra_env: dict | None = None, on_exit=None) -> dict:
+    """跑一次拆解。on_task：任务 id 定下来时的回调（job→task 映射，可空）。
+
+    on_exit（S2.7）：analyze.py 退出码回调（耗时监控用，可空）。不传时行为与旧版完全一致。
+    """
     if not video:
         raise ApiError(400, "缺 video")
     path = Path(video)
@@ -3621,10 +3713,20 @@ def analyze_video(video: str, intent: str = "", requested_task_id: str = "",
         code, out, err = run_py(analyze_argv(rel, task_id, intent, extra_args),
                                 timeout=1800, extra_env=extra_env)
     except subprocess.TimeoutExpired:
+        if on_exit is not None:
+            try:
+                on_exit(-1)              # 超时没有退出码：用 -1 标出来（仅耗时监控看）
+            except Exception:            # noqa: BLE001
+                pass
         raise ApiError(500, "analyze.py 超过 1800s 没跑完（长片超引擎上限，需拆段输入）") from None
     finally:
         with WRITE_LOCK:
             ANALYZING.discard(task_id)
+    if on_exit is not None:
+        try:
+            on_exit(code)                # S2.7：退出码只交给监控，不改变任何判定
+        except Exception:                # noqa: BLE001
+            pass
     if code != 0:
         raise ApiError(500, f"analyze.py 退出 {code}：{tail(err) or tail(out)}")
     return {"id": task_id, "elapsed": round(time.time() - started, 1),

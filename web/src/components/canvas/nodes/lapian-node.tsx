@@ -8,6 +8,8 @@ import { useEffect, useRef, useState } from "react";
 import { canvasThemes } from "@/lib/canvas-theme";
 import { decodeChannelModelRef } from "@/lib/canvas/lapian-model";
 import { fetchLapianMarkdown, LapianProjectionError } from "@/lib/canvas/lapian-execute";
+import { buildTimingSummary, buildTimingTitle, fetchLapianTiming, type LapianTimingView } from "@/lib/canvas/lapian-timing";
+import { useConfigStore } from "@/stores/use-config-store";
 import type { CanvasNodeData } from "@/types/canvas";
 
 const BRIDGE = ""; // 同域相对路径：本地 dev 由 vite proxy 转发，公网由隧道同域转发
@@ -32,6 +34,9 @@ export function LapianNodeContent({ node, onContentChange }: { node: CanvasNodeD
     const [stage, setStage] = useState("");
     const [message, setMessage] = useState("");
     const [markdown, setMarkdown] = useState("");
+    // S2.7 耗时摘要：只有服务端渠道模式（多账户登录态）才有这个端点；单人模式永远 null → 不渲染
+    const [timing, setTiming] = useState<LapianTimingView | null>(null);
+    const remoteMode = useConfigStore((state) => state.config.channelMode === "remote");
     const timerRef = useRef<number | null>(null);
     const startedRef = useRef(Date.now());
     const netErrRef = useRef(0);
@@ -97,6 +102,22 @@ export function LapianNodeContent({ node, onContentChange }: { node: CanvasNodeD
         return () => window.clearInterval(t);
     }, [phase]);
 
+    // S2.7 耗时摘要：完成态拉一次分解（总/抽帧/模型等待/重拆轮次）。
+    // 只在服务端渠道模式发请求——单人模式该端点 404，连这一次请求都不发（零改动）。
+    useEffect(() => {
+        if (!remoteMode || phase !== "done" || !taskId) {
+            setTiming(null);
+            return;
+        }
+        let alive = true;
+        void fetchLapianTiming(taskId, { fetch: (url, init) => fetch(url, init) }).then((view) => {
+            if (alive) setTiming(view);
+        });
+        return () => {
+            alive = false;
+        };
+    }, [remoteMode, phase, taskId]);
+
     const requery = async () => {
         setPhase("loading"); setElapsed(0); setStage(""); startedRef.current = Date.now();
         try {
@@ -130,7 +151,14 @@ export function LapianNodeContent({ node, onContentChange }: { node: CanvasNodeD
                 {phase === "lost" && <div data-lapian-lost style={{ color: "#fbbf24" }}>{message}</div>}
                 {phase === "error" && <div data-lapian-error style={{ color: "#f87171" }}>{message}</div>}
                 {phase === "done" && (
-                    <pre className="whitespace-pre-wrap break-words" style={{ fontFamily: "inherit" }} data-lapian-body>{markdown}</pre>
+                    <>
+                        {buildTimingSummary(timing) ? (
+                            <div className="mb-1" style={{ color: theme.node.faint }} data-lapian-timing title={buildTimingTitle(timing)}>
+                                {buildTimingSummary(timing)}
+                            </div>
+                        ) : null}
+                        <pre className="whitespace-pre-wrap break-words" style={{ fontFamily: "inherit" }} data-lapian-body>{markdown}</pre>
+                    </>
                 )}
             </div>
         </div>
