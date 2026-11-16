@@ -1,16 +1,16 @@
 from __future__ import annotations
-import base64, http.cookiejar, json, os, sqlite3, sys, tempfile, threading, time
+import base64, contextlib, http.client, http.cookiejar, io, json, os, socket, sqlite3, sys, tempfile, threading, time
 import urllib.request
 from urllib.error import HTTPError
 from urllib.request import Request, build_opener, HTTPCookieProcessor
-from http.server import ThreadingHTTPServer
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 import sys; sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 # server.py 的 TOKEN 在 import 期读 WAN_TOKEN，必须先设 env 再 import，否则 gate 断言恒真
 os.environ['WAN_TOKEN']='regression-token'
 # S2-B1：先立「没有主密钥 env」的基线——无 key 时 MULTI_USER=0 必须照常启动（B-03 回归）
 os.environ.pop('WANREPRO_CHANNEL_KEY', None)
-from wanrepro.ui import multiuser, server
+from wanrepro.ui import multiuser, server, channel_store
 CHANNELS='/api/user/channels'
 def enc_of(db, cid):
  # 直读 SQLite 取密文原件（WAL 已提交，另一连接可见）：断言「密文没被 masked 回写覆盖」
@@ -28,6 +28,263 @@ def req(base,path,method='GET',body=None,opener=None):
  except HTTPError as e: return e.code,e.read()
 class NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, *a, **k): return None
+PUB_IP = 'https://93.184.216.34'   # 公网字面 IP：探针不依赖 DNS
+PKEY = 'sk-proxy-probe-0123456789abcdef'
+
+
+class _Echo(BaseHTTPRequestHandler):
+    """B2 夹具：本地「上游渠道」，回显收到的头/路径/体，/sse 逐块吐事件，/slow 慢响应，/redir 3xx。"""
+    protocol_version = 'HTTP/1.1'
+    seen = []
+
+    def log_message(self, *a):
+        pass
+
+    def do_GET(self): self._any()
+    def do_POST(self): self._any()
+    def do_PUT(self): self._any()
+    def do_PATCH(self): self._any()
+    def do_DELETE(self): self._any()
+
+    def _any(self):
+        n = int(self.headers.get('Content-Length') or 0)
+        body = self.rfile.read(n) if n else b''
+        rec = {'method': self.command, 'path': self.path,
+               'headers': {k.lower(): v for k, v in self.headers.items()},
+               'body': body.decode('utf-8', 'replace')}
+        _Echo.seen.append(rec)
+        if self.path.startswith('/sse'):
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/event-stream')
+            self.send_header('Cache-Control', 'no-cache')
+            self.send_header('Connection', 'close')
+            self.end_headers()
+            for i in range(5):
+                self.wfile.write(b'data: {"i": %d}\n\n' % i)
+                self.wfile.flush()
+                time.sleep(0.4)
+            self.close_connection = True
+            return
+        if self.path.startswith('/slow'):
+            time.sleep(0.8)
+        if self.path.startswith('/redir'):
+            self.send_response(302)
+            self.send_header('Location', 'https://elsewhere.invalid/x')
+            self.send_header('Content-Length', '0')
+            self.end_headers()
+            return
+        payload = json.dumps(rec, ensure_ascii=False).encode()
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+
+def phase_b2():
+    """S2-B2：代转发 /api/proxy/<channelId>/<path>（V9/V10/V11 + 头白名单 + SSE + IF-C）。"""
+    checks = []
+    multiuser.FAILURES.clear(); multiuser.REG_ATTEMPTS.clear()
+    _Echo.seen.clear()
+    echo = ThreadingHTTPServer(('127.0.0.1', 0), _Echo); echo.daemon_threads = True
+    threading.Thread(target=echo.serve_forever, daemon=True).start()
+    eport = echo.server_port
+    srv, base = serve('1')
+    orig_pinned = channel_store._pinned_connection
+
+    def _pin_fixture(host, port, ip):
+        # 探针专用：把「按解析出的 IP + TLS/SNI 建连」换成指向本地明文 echo 上游。
+        # 「按 IP 拨号、SNI/Host 仍用域名」由 _pin_dial() 结构化断言覆盖（不依赖自签证书）。
+        return http.client.HTTPConnection('127.0.0.1', eport, timeout=30)
+
+    channel_store._pinned_connection = _pin_fixture
+    jarA = http.cookiejar.CookieJar(); opA = build_opener(HTTPCookieProcessor(jarA))
+    jarB = http.cookiejar.CookieJar(); opB = build_opener(HTTPCookieProcessor(jarB))
+    try:
+        assert req(base, '/api/auth/register', 'POST', {'username': 'proxA', 'password': 'password1'}, opA)[0] == 200
+        assert req(base, '/api/auth/register', 'POST', {'username': 'proxB', 'password': 'password1'}, opB)[0] == 200
+        token = [c.value for c in jarA if c.name == 'wan_session'][0]
+        st, b = req(base, CHANNELS, 'PUT', {'channels': [
+            {'id': 'ch_p', 'name': '代理', 'baseUrl': PUB_IP, 'apiFormat': 'openai', 'models': ['m'], 'apiKey': PKEY},
+            {'id': 'ch_g', 'name': '双子', 'baseUrl': PUB_IP, 'apiFormat': 'gemini', 'apiKey': PKEY + 'g'}]}, opA)
+        assert st == 200, f'B2 setup channels failed: {st} {b}'
+
+        def raw(path, method='GET', headers=None, body=None, timeout=20, send_len=True):
+            c = http.client.HTTPConnection('127.0.0.1', srv.server_port, timeout=timeout)
+            c.putrequest(method, path)
+            for k, v in (headers or {}).items():
+                c.putheader(k, v)
+            if body is not None:
+                c.putheader('Content-Length', str(len(body)))
+            c.endheaders()
+            if body:
+                c.send(body)
+            return c, c.getresponse()
+
+        # --- 登录态硬前置：未登录一律 401 ---
+        for m in ('GET', 'POST'):
+            st, _ = req(base, '/api/proxy/ch_p/v1/models', m, {} if m == 'POST' else None)
+            assert st == 401, f'anon {m} proxy must 401, got {st}'
+        checks.append('proxy: unauthenticated GET/POST /api/proxy/<cid>/<path> -> 401')
+
+        # --- V9：他人 channelId = 404，且与「不存在」同形（不泄露存在性）---
+        st_a, body_a = req(base, '/api/proxy/ch_p/v1/models', opener=opB)
+        st_x, body_x = req(base, '/api/proxy/no_such_channel/v1/models', opener=opB)
+        assert st_a == 404 and st_x == 404, f'foreign/missing channelId must 404, got {st_a}/{st_x}'
+        assert json.loads(body_a) == json.loads(body_x), 'foreign channelId must be indistinguishable from missing'
+        checks.append('V9: user B proxying user A channelId -> 404, body identical to a nonexistent channelId')
+
+        # --- V11 + 头白名单 + key 注入：Cookie/Origin/Referer/XFF/X-Real-IP 一律不上游 ---
+        c, r = raw('/api/proxy/ch_p/v1/chat?foo=bar', 'POST',
+                   {'Cookie': 'wan_session=' + token, 'Origin': 'https://evil.example',
+                    'Referer': 'https://evil.example/p', 'X-Forwarded-For': '1.2.3.4',
+                    'X-Real-IP': '1.2.3.4', 'Content-Type': 'application/json',
+                    'Accept': 'application/json', 'X-Biz': 'trace-1'}, b'{"hello":1}')
+        body = r.read(); c.close()
+        assert r.status == 200, f'proxy POST should 200, got {r.status} {body}'
+        rec = _Echo.seen[-1]; up = rec['headers']
+        assert rec['method'] == 'POST' and rec['path'].startswith('/v1/chat?foo=bar'), f'path/query not forwarded: {rec["path"]}'
+        assert up.get('authorization') == 'Bearer ' + PKEY, 'server must inject Authorization: Bearer <decrypted key>'
+        assert up.get('content-type') == 'application/json' and up.get('x-biz') == 'trace-1', f'whitelist dropped legit headers: {up}'
+        for bad in ('cookie', 'origin', 'referer', 'x-forwarded-for', 'x-real-ip'):
+            assert bad not in up, f'{bad} must be stripped before hitting the upstream: {up}'
+        assert token not in json.dumps(up), 'wan_session token must never reach the upstream'
+        assert rec['body'] == '{"hello":1}', 'request body must be forwarded verbatim'
+        checks.append('V11: proxy strips Cookie/Origin/Referer/X-Forwarded-*/X-Real-IP (no wan_session upstream), '
+                      'keeps Content-Type/x-*, injects Authorization: Bearer <key>, forwards body+query')
+
+        # --- gemini 型：key 走 ?key=，不发 Authorization ---
+        c, r = raw('/api/proxy/ch_g/v1beta/models', 'GET', {'Cookie': 'wan_session=' + token})
+        r.read(); c.close()
+        rec = _Echo.seen[-1]
+        assert r.status == 200 and 'key=' + PKEY + 'g' in rec['path'], f'gemini key not injected into query: {rec["path"]}'
+        assert 'authorization' not in rec['headers'], 'gemini channel must not send Authorization header'
+        checks.append('gemini-type channel injects ?key=<decrypted key> (no Authorization header)')
+
+        # --- V10：日志零泄露（log_request/log_message 已覆写）---
+        time.sleep(0.3)   # 先让前几个请求的日志行落盘，别混进本段捕获
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            c, r = raw('/api/proxy/ch_p/v1/chat?secret_query=abc', 'POST',
+                       {'Cookie': 'wan_session=' + token, 'Content-Type': 'application/json'}, b'{}')
+            r.read(); c.close()
+            # 日志行在服务端线程的 finally 里写，可能晚于客户端读完——等它落盘再收网
+            deadline = time.time() + 3
+            while 'POST ch_p' not in buf.getvalue() and time.time() < deadline:
+                time.sleep(0.05)
+        log = buf.getvalue()
+        assert r.status == 200, f'log-probe request should 200, got {r.status}'
+        assert '[proxy]' in log and 'ch_p' in log, f'proxy must log channelId: {log!r}'
+        for bad in (PKEY, 'Bearer', token, 'wan_session', 'secret_query', '/v1/chat'):
+            assert bad not in log, f'log leaked {bad!r}: {log!r}'
+        checks.append('V10: proxy log has time/method/channelId/status/duration only '
+                      '(no key, no Authorization, no wan_session, no query, no path)')
+
+        # --- V5：SSE 逐块到达（不设 Content-Length、逐块 flush；不能一次性到齐）---
+        c, r = raw('/api/proxy/ch_p/sse', 'GET',
+                   {'Cookie': 'wan_session=' + token, 'Accept': 'text/event-stream'}, timeout=20)
+        assert r.status == 200, f'SSE should 200, got {r.status}'
+        assert r.getheader('Content-Length') is None, 'SSE response must not carry Content-Length (IF-4)'
+        t0 = time.time(); arrivals = []; payload = b''
+        while True:
+            chunk = r.read1(4096)
+            if not chunk:
+                break
+            payload += chunk
+            arrivals.append(time.time() - t0)
+        c.close()
+        assert payload.count(b'data:') == 5, f'SSE body incomplete: {payload!r}'
+        assert len(arrivals) >= 3, f'SSE must arrive in >=3 separate chunks, got {len(arrivals)}'
+        assert arrivals[-1] - arrivals[0] > 0.8, f'SSE arrived all at once ({arrivals[-1]-arrivals[0]:.2f}s) — buffered, not streamed'
+        checks.append('V5: SSE streams chunk-by-chunk (%d arrivals spanning %.2fs, no Content-Length, Connection: close)'
+                      % (len(arrivals), arrivals[-1] - arrivals[0]))
+
+        # --- 禁重定向：3xx 原样透传（不跟随）---
+        try:
+            st_red = build_opener(NoRedirect()).open(Request(base + '/api/proxy/ch_p/redir',
+                                                             headers={'Cookie': 'wan_session=' + token}))
+            st_red, loc_red = st_red.status, st_red.headers.get('Location')
+        except HTTPError as e:
+            st_red, loc_red = e.code, e.headers.get('Location')
+        assert st_red == 302 and loc_red == 'https://elsewhere.invalid/x', f'3xx must pass through verbatim, got {st_red} {loc_red}'
+        checks.append('proxy does not follow redirects: upstream 302 + Location relayed verbatim')
+
+        # --- 请求体 8MB 上限（先判长度，不读体）---
+        c, r = raw('/api/proxy/ch_p/echo', 'POST',
+                   {'Cookie': 'wan_session=' + token, 'Content-Length': str(8 * 1024 * 1024 + 1)})
+        st_over = r.status; r.read(); c.close()
+        assert st_over == 413, f'oversized body must 413, got {st_over}'
+        checks.append('proxy rejects request bodies over 8MB (413)')
+
+        # --- 单用户并发 2：第 3 个并发 429，结束后释放 ---
+        out = {}
+        def slow(k):
+            c, r = raw('/api/proxy/ch_p/slow', 'GET', {'Cookie': 'wan_session=' + token}, timeout=30)
+            out[k] = r.status; r.read(); c.close()
+        threads = [threading.Thread(target=slow, args=(i,)) for i in range(2)]
+        for t in threads: t.start()
+        time.sleep(0.3)
+        st3, _ = req(base, '/api/proxy/ch_p/slow', opener=opA)
+        for t in threads: t.join()
+        assert st3 == 429, f'3rd concurrent proxy for the same user must 429, got {st3}'
+        assert out == {0: 200, 1: 200}, f'first two concurrent requests must both succeed: {out}'
+        assert req(base, '/api/proxy/ch_p/v1/models', opener=opA)[0] == 200, 'slots must be released after the burst'
+        checks.append('per-user concurrency limit 2: 3rd concurrent proxy -> 429, slots released afterwards')
+
+        # --- IF-C：请求时重新解析 + 校验（保存时的公网 IP 不代表请求时还是）---
+        real_gai = socket.getaddrinfo
+        def rebind_gai(host, port, *a, **k):
+            if host == '93.184.216.34':
+                return [(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, '', ('169.254.169.254', port))]
+            return real_gai(host, port, *a, **k)
+        socket.getaddrinfo = rebind_gai
+        try:
+            st_rb, body_rb = req(base, '/api/proxy/ch_p/v1/models', opener=opA)
+        finally:
+            socket.getaddrinfo = real_gai
+        assert st_rb == 403, f'DNS rebinding to link-local must 403 at proxy time, got {st_rb} {body_rb}'
+        assert b'169.254.169.254' in body_rb, 'rejection must name the blocked address'
+        checks.append('IF-C: proxy re-resolves at request time and rejects a rebound link-local IP (403)')
+
+        # --- IF-C 结构化：connect 拨解析出的 IP，SNI/Host 仍是域名 ---
+        pin = channel_store._PinnedHTTPSConnection('api.example.com', 443, '203.0.113.9', 5,
+                                                   __import__('ssl').create_default_context())
+        dialed = {}
+        real_cc = socket.create_connection
+        def fake_cc(addr, timeout=None, **k):
+            dialed['addr'] = addr
+            raise OSError('probe-stop')
+        socket.create_connection = fake_cc
+        try:
+            try:
+                pin.connect()
+            except OSError:
+                pass
+        finally:
+            socket.create_connection = real_cc
+        assert dialed.get('addr', (None,))[0] == '203.0.113.9', f'connect must dial the resolved IP, not the hostname: {dialed}'
+        assert pin.host == 'api.example.com', 'SNI/Host must stay the original domain (TLS cert still domain-checked)'
+        checks.append('IF-C: _PinnedHTTPSConnection dials the resolved IP while keeping Host/SNI = channel domain')
+
+        # --- IF-A：单行密文损坏降级，不整页 500 ---
+        db = Path(os.environ[multiuser.DB_PATH_ENV])
+        con = sqlite3.connect(str(db)); con.execute("UPDATE user_channels SET api_key_enc=? WHERE id='ch_g'",
+                                                    (b'\x01' + b'\x00' * 40,)); con.commit(); con.close()
+        st_ia, body_ia = req(base, CHANNELS, opener=opA)
+        rows = json.loads(body_ia)['channels'] if st_ia == 200 else []
+        broken = [r for r in rows if r['id'] == 'ch_g']
+        assert st_ia == 200 and len(rows) == 2, f'one broken row must not 500 the whole list: {st_ia} {body_ia[:200]}'
+        assert broken and broken[0]['apiKey'] == '***?' and broken[0].get('keyBroken') is True, f'broken row must degrade to ***?: {broken}'
+        assert [r for r in rows if r['id'] == 'ch_p'][0]['apiKey'] == '***' + PKEY[-4:], 'healthy row must stay intact'
+        checks.append('IF-A: a corrupted ciphertext row degrades to ***? (keyBroken) instead of 500-ing the whole GET')
+
+    finally:
+        channel_store._pinned_connection = orig_pinned
+        srv.shutdown(); srv.server_close()
+        echo.shutdown(); echo.server_close()
+    return checks
+
+
 def main():
  checks=[]; srv,base=serve('0')
  try:
@@ -39,7 +296,11 @@ def main():
    assert st==404, f'MULTI_USER=0 {method} {CHANNELS} must 404, got {st}'
   assert os.environ.get('WANREPRO_CHANNEL_KEY') is None
   assert 'cryptography' not in sys.modules, 'MULTI_USER=0 must not import cryptography'
-  checks.append('MULTI_USER=0: GET/POST/PUT/DELETE %s all 404; boots with no WANREPRO_CHANNEL_KEY; cryptography never imported'%CHANNELS)
+  # S2-B2 单人回归：代转发端点也必须整条不存在（否则单人包凭空多一个 SSRF 面）
+  for method in ('GET','POST'):
+   st,_=req(base,'/api/proxy/ch_any/v1/models',method,{} if method=='POST' else None)
+   assert st==404, f'MULTI_USER=0 {method} /api/proxy/... must 404, got {st}'
+  checks.append('MULTI_USER=0: GET/POST/PUT/DELETE %s all 404; GET/POST /api/proxy/* 404; boots with no WANREPRO_CHANNEL_KEY; cryptography never imported'%CHANNELS)
   # WAN_TOKEN 强制探针：公网来源 XFF + 非 localhost Host，无 token 401、带 token 302（种 cookie 合同）
   pub=dict(XFF='8.8.8.8', HOST='canvas.example.com')
   q=Request(base+'/api/tasks',headers={'X-Forwarded-For':pub['XFF'],'Host':pub['HOST']})
@@ -159,6 +420,7 @@ def main():
   assert st==200 and json.loads(req(base,CHANNELS,opener=opA)[1])['channels']==[], 'DELETE must clear the channel set'
   checks.append('DELETE clears the user channel set; POST -> 405; anon PUT/DELETE still 401')
  finally: srv.shutdown(); srv.server_close()
+ checks += phase_b2()
  print('SUMMARY: PASS %d/%d'%(len(checks),len(checks)))
  for c in checks: print('PASS: '+c)
  return 0
