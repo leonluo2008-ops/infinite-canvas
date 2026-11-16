@@ -19,6 +19,7 @@ import i18n from "@/i18n";
 import { normalizeLapianDefaultModel, normalizeLapianModelList } from "@/lib/canvas/lapian-model";
 import { maybeImportBootstrapConfig } from "@/lib/config/bootstrap-config";
 import { createModelChannel, modelOptionsFromChannels, normalizeModelOptionValue, useConfigStore, type AiConfig, type ModelChannel } from "@/stores/use-config-store";
+import { isMaskedKeyValue } from "./api/channel-proxy";
 
 const AUTH_ME_ENDPOINT = "/api/auth/me";
 const CHANNELS_ENDPOINT = "/api/user/channels";
@@ -49,9 +50,11 @@ export type ChannelSyncSnapshot = {
     migrating: boolean;
     /** 最近一次加载/迁移/保存的失败文案（空 = 无错）。 */
     error: string;
+    /** 最近一次迁移的提示（被跳过的渠道清单：wan / 无 key / 非 https / 重名），配置页只读展示。 */
+    notice: string;
 };
 
-export const useChannelSyncStore = create<ChannelSyncSnapshot>(() => ({ phase: "idle", mode: "local", username: "", migrating: false, error: "" }));
+export const useChannelSyncStore = create<ChannelSyncSnapshot>(() => ({ phase: "idle", mode: "local", username: "", migrating: false, error: "", notice: "" }));
 
 function setSync(patch: Partial<ChannelSyncSnapshot>) {
     useChannelSyncStore.setState(patch);
@@ -155,7 +158,8 @@ export function toModelChannels(serverChannels: ServerChannel[]): ModelChannel[]
  *  * 渠道名唯一（服务端 (user_id,name) 唯一约束，重复整批 422）
  */
 export function selectMigratableChannels(channels: ModelChannel[]): ModelChannel[] {
-    const names = new Set<string>();
+    const names = new Set<string>();       // 服务端重名判定（大小写敏感口径，与 _replace_channels 一致）
+    const lowerNames = new Set<string>();  // 大小写探测（IMPL-4 预检：仅大小写不同的名字在部分库排序规则下会撞 UNIQUE(user_id,name)）
     const result: ModelChannel[] = [];
     for (const channel of channels || []) {
         const id = (channel?.id || "").trim();
@@ -163,14 +167,57 @@ export function selectMigratableChannels(channels: ModelChannel[]): ModelChannel
         const baseUrl = (channel?.baseUrl || "").trim();
         const apiKey = (channel?.apiKey || "").trim();
         if (!id || !name || !baseUrl || !apiKey) continue;
-        if (apiKey.startsWith("***")) continue; // 已是 masked 值（缓存的服务端视图），不是明文
+        if (isMaskedKeyValue(apiKey)) {
+            // IMPL-4 告警：masked 值被静默过滤过一次，用户很可能以为这条渠道已经「迁过去了」
+            console.warn(`[channel-sync] 渠道「${name}」的 API Key 是掩码值（${apiKey.slice(0, 3)}…），不是明文——迁移时跳过，请重新输入完整 API Key`);
+            continue;
+        }
         if (channel.apiFormat === "wan") continue;
         if (!/^https:\/\//i.test(baseUrl)) continue;
         if (names.has(name)) continue;
+        const lower = name.toLowerCase();
+        if (lowerNames.has(lower)) {
+            // IMPL-4：重名大小写探测（迁移前预检）——重名会让服务端整批 422，先跳过并在结果里点名
+            console.warn(`[channel-sync] 渠道「${name}」与已选渠道仅大小写不同，迁移时跳过（服务端重名整批 422）`);
+            continue;
+        }
         names.add(name);
+        lowerNames.add(lower);
         result.push(channel);
     }
     return result;
+}
+
+/**
+ * 「仅本地模式」渠道的运行时推导（B3.5 IMPL-3，**不加 store 字段**——store 结构不动）：
+ *  * wan 型：万相 CLI bridge 同源零 key，服务端明确 422；
+ *  * 无 key：bootstrap 预置渠道 / 还没填 key 的草稿，服务端必 422；
+ *  * 有真 key 但非 https：服务端 SSRF 收口只收 https；
+ *  * 掩码 key → **不是**仅本地（那是服务端渠道的本地缓存视图，服务端权威）。
+ * 它们永远进不了服务端渠道表，remote 模式下保留在本地：可见、标「仅本地模式」、不进 PUT、模型不可选，但**不清除**。
+ */
+export function isLocalOnlyChannel(channel: ModelChannel | null | undefined): boolean {
+    if (!channel) return true;
+    const apiKey = (channel.apiKey || "").trim();
+    if (channel.apiFormat === "wan") return true;
+    if (!apiKey) return true;
+    if (isMaskedKeyValue(apiKey)) return false;
+    return !/^https:\/\//i.test((channel.baseUrl || "").trim());
+}
+
+/**
+ * 服务端渠道 + 本地专有渠道合并（服务端在前=权威顺序，本地专有附在后面）。
+ * id 已在服务端出现的一律以服务端视图为准，避免同一渠道出现两份。
+ */
+export function mergeLocalOnlyChannels(serverChannels: ModelChannel[], localChannels: ModelChannel[]): ModelChannel[] {
+    const ids = new Set(serverChannels.map((channel) => channel.id));
+    return [...serverChannels, ...(localChannels || []).filter((channel) => !ids.has(channel.id) && isLocalOnlyChannel(channel))];
+}
+
+/** 「仅本地模式」保留渠道的配置页提示（IMPL-3/IMPL-4：迁移后必须让人看见哪些渠道没上去）。 */
+function localOnlyNotice(channels: ModelChannel[]): string {
+    const names = channels.map((channel) => channel.name).filter(Boolean);
+    return names.length ? i18n.t("channelSync.localOnlyKept", { names: names.join("、") }) : "";
 }
 
 // ------------------------------------------------------------------ store 落地
@@ -180,7 +227,10 @@ export function selectMigratableChannels(channels: ModelChannel[]): ModelChannel
  * 服务端模式下**清空顶层 apiKey**（那是单渠道兼容字段，留着等于把明文 key 留在 localStorage → V2）。
  */
 export function buildConfigWithChannels(current: AiConfig, channels: ModelChannel[], mode: AiConfig["channelMode"]): AiConfig {
-    const models = modelOptionsFromChannels(channels);
+    // 服务端模式下「仅本地模式」渠道（wan / 无 key / 非 https）照旧留在 channels 里可见，但模型不进候选（不可选）
+    const pickable = mode === "remote" ? channels.filter((channel) => !isLocalOnlyChannel(channel)) : channels;
+    const primary = pickable[0];
+    const models = modelOptionsFromChannels(pickable);
     const lapianModels = normalizeLapianModelList(current.lapianModels, channels);
     const lapianDefaultModel = normalizeLapianDefaultModel(current.lapianDefaultModel, lapianModels, channels);
     return {
@@ -188,16 +238,16 @@ export function buildConfigWithChannels(current: AiConfig, channels: ModelChanne
         channelMode: mode,
         channels,
         models,
-        baseUrl: channels[0]?.baseUrl || current.baseUrl,
-        apiFormat: channels[0]?.apiFormat || current.apiFormat,
+        baseUrl: primary?.baseUrl || current.baseUrl,
+        apiFormat: primary?.apiFormat || current.apiFormat,
         ...(mode === "remote" ? { apiKey: "" } : {}),
         lapianModels,
         lapianDefaultModel,
-        model: normalizeModelOptionValue(current.model || current.imageModel, channels),
-        imageModel: normalizeModelOptionValue(current.imageModel || current.model, channels),
-        videoModel: normalizeModelOptionValue(current.videoModel, channels),
-        textModel: normalizeModelOptionValue(current.textModel || current.model, channels),
-        audioModel: normalizeModelOptionValue(current.audioModel, channels),
+        model: normalizeModelOptionValue(current.model || current.imageModel, pickable),
+        imageModel: normalizeModelOptionValue(current.imageModel || current.model, pickable),
+        videoModel: normalizeModelOptionValue(current.videoModel, pickable),
+        textModel: normalizeModelOptionValue(current.textModel || current.model, pickable),
+        audioModel: normalizeModelOptionValue(current.audioModel, pickable),
     };
 }
 
@@ -217,11 +267,29 @@ export function splitSavableChannels(channels: ModelChannel[]): { savable: Model
     const savable: ModelChannel[] = [];
     const skipped: ModelChannel[] = [];
     for (const channel of channels || []) {
+        // 「仅本地模式」渠道（wan / 无 key / 非 https）永远不进 PUT：服务端会整批 422，拖死合法渠道
+        if (isLocalOnlyChannel(channel)) {
+            skipped.push(channel);
+            continue;
+        }
         const hasKey = Boolean((channel.apiKey || "").trim());
         if (!hasKey && !knownServerIds.has(channel.id)) skipped.push(channel);
         else savable.push(channel);
     }
     return { savable, skipped };
+}
+
+/**
+ * 未提交渠道的提示文案：区分「还没填 key」（用户要补）与「仅本地模式」（服务端根本不收）。
+ * 两条都是配置页可见的提示，不能合成一句骗人的「没填 key」。
+ */
+export function describeSkippedChannels(skipped: ModelChannel[]): string {
+    const missingKey = skipped.filter((channel) => !(channel.apiKey || "").trim()).map((channel) => channel.name).filter(Boolean);
+    const localOnly = skipped.filter((channel) => Boolean((channel.apiKey || "").trim())).map((channel) => channel.name).filter(Boolean);
+    const parts: string[] = [];
+    if (missingKey.length) parts.push(i18n.t("channelSync.missingKey", { names: missingKey.join("、") }));
+    if (localOnly.length) parts.push(i18n.t("channelSync.localOnlyKept", { names: localOnly.join("、") }));
+    return parts.join("；");
 }
 
 function applyChannels(channels: ModelChannel[], mode: AiConfig["channelMode"]) {
@@ -262,8 +330,8 @@ export async function flushChannelSync(): Promise<void> {
     pendingChannels = null;
     const { savable, skipped } = splitSavableChannels(channels);
     if (!savable.length) {
-        // 全部是还没填 key 的新草稿渠道：不发 PUT（发了必 422），只提示
-        setSync({ error: i18n.t("channelSync.missingKey", { names: skipped.map((channel) => channel.name).join("、") }) });
+        // 全部是仅本地/未填 key 的渠道：不发 PUT（发了必 422），只提示
+        setSync({ error: describeSkippedChannels(skipped) });
         return;
     }
     const run = (async () => {
@@ -272,7 +340,7 @@ export async function flushChannelSync(): Promise<void> {
             rememberServerIds(saved);
             // 回写服务端视图（masked key），未保存的草稿渠道原样留在本地继续编辑
             applyChannels([...toModelChannels(saved), ...skipped], "remote");
-            setSync({ error: skipped.length ? i18n.t("channelSync.missingKey", { names: skipped.map((channel) => channel.name).join("、") }) : "" });
+            setSync({ error: describeSkippedChannels(skipped) });
         } catch (error) {
             // 失败不丢本地数据：留着 pending 等下次变更/下一次 flush 重试，错误文案给配置页
             pendingChannels = pendingChannels || channels;
@@ -287,17 +355,48 @@ export async function flushChannelSync(): Promise<void> {
     }
 }
 
+/**
+ * keepalive 请求体上限：浏览器对 keepalive 请求的 body 有约 64KB 的硬上限，超了整个请求直接被拒
+ * （静默丢改动）。渠道 models 很大时先判体积，跳过并留痕，别让「有 flush 代码」变成假安心。
+ */
+export const KEEPALIVE_BODY_LIMIT = 64 * 1024;
+
+function byteLength(text: string): number {
+    if (typeof TextEncoder !== "undefined") return new TextEncoder().encode(text).length;
+    return text.length; // 兜底：探针/老环境没有 TextEncoder 时按字符数（只会更宽松，不会误判成超限）
+}
+
+/**
+ * 卸载回写的请求体（纯函数，便于探针断言）：
+ *  * 先按 flushChannelSync 同一套规则分拣，未填 key 的新草稿 / 仅本地渠道不进 PUT；
+ *  * 体积超过 keepalive 上限 → `too-large`（连一个合法渠道都没有 → `empty`）。
+ */
+export function buildUnloadPayload(channels: ModelChannel[]): { ok: true; body: string } | { ok: false; reason: "empty" | "too-large"; bytes: number } {
+    const { savable } = splitSavableChannels(channels);
+    if (!savable.length) return { ok: false, reason: "empty", bytes: 0 };
+    const body = JSON.stringify({ channels: toPutPayload(savable) });
+    const bytes = byteLength(body);
+    if (bytes > KEEPALIVE_BODY_LIMIT) return { ok: false, reason: "too-large", bytes };
+    return { ok: true, body };
+}
+
 /** 页面卸载时的最后一抖：fetch keepalive（sendBeacon 只能 POST，PUT 必须走 keepalive fetch）。 */
 function flushOnUnload() {
     if (!pendingChannels) return;
-    const body = JSON.stringify({ channels: toPutPayload(pendingChannels) });
+    const payload = buildUnloadPayload(pendingChannels);
     pendingChannels = null;
+    if (!payload.ok) {
+        if (payload.reason === "too-large") {
+            console.warn(`[channel-sync] 卸载回写体过大（${payload.bytes} 字节 > ${KEEPALIVE_BODY_LIMIT}），已跳过 keepalive 回写；改动仍留在本地，下次打开会重新提交`);
+        }
+        return;
+    }
     try {
         void fetch(CHANNELS_ENDPOINT, {
             method: "PUT",
             headers: { "Content-Type": "application/json" },
             credentials: "same-origin",
-            body,
+            body: payload.body,
             keepalive: true,
         });
     } catch {
@@ -340,7 +439,7 @@ export async function bootstrapChannelSync(options: BootstrapOptions = {}): Prom
     if (typeof window === "undefined") return channelSyncSnapshot();
     const timeoutMs = options.timeoutMs ?? BOOTSTRAP_TIMEOUT_MS;
     const client = options.fetchImpl ?? fetch;
-    setSync({ phase: "loading", mode: "local", username: "", migrating: false, error: "" });
+    setSync({ phase: "loading", mode: "local", username: "", migrating: false, error: "", notice: "" });
 
     let probe: SessionProbe;
     try {
@@ -372,21 +471,28 @@ export async function bootstrapChannelSync(options: BootstrapOptions = {}): Prom
     }
 
     rememberServerIds(server);
+    const localChannels = useConfigStore.getState().config.channels;
     if (server.length) {
-        // B3.3：服务端非空 → 丢弃本地缓存，不迁移
-        applyChannels(toModelChannels(server), "remote");
-        setSync({ phase: "ready", mode: "remote", username: probe.username, error: "" });
+        // B3.3：服务端非空 → 丢弃本地缓存（服务端权威、不迁移），但「仅本地模式」渠道（wan / 无 key / 非 https）
+        // 永远进不了服务端渠道表，丢掉就再也找不回来 → 合并保留（IMPL-3：可见、标仅本地、不可选、不清除）
+        const serverView = toModelChannels(server);
+        const merged = mergeLocalOnlyChannels(serverView, localChannels);
+        const keptLocalOnly = merged.slice(serverView.length);
+        applyChannels(merged, "remote");
+        setSync({ phase: "ready", mode: "remote", username: probe.username, error: "", notice: localOnlyNotice(keptLocalOnly) });
         startChannelAutoSave({ ...options, fetchImpl: client });
         return channelSyncSnapshot();
     }
 
     // 服务端为空 → 一次性迁移
-    const localChannels = useConfigStore.getState().config.channels;
     const eligible = selectMigratableChannels(localChannels);
+    const migratedIds = new Set(eligible.map((channel) => channel.id));
+    // 迁移不上去的本地渠道：仅本地口径的留着（可见、不清除），其余（有真 key 的 https 渠道）视为下次再迁
+    const retained = localChannels.filter((channel) => !migratedIds.has(channel.id) && isLocalOnlyChannel(channel));
     if (!eligible.length) {
         // 没有可迁候选（全是预置无 key 渠道 / wan 型 / http 地址）→ 服务端就是空的
-        applyChannels([], "remote");
-        setSync({ phase: "ready", mode: "remote", username: probe.username, error: "" });
+        applyChannels(retained, "remote");
+        setSync({ phase: "ready", mode: "remote", username: probe.username, error: "", notice: localOnlyNotice(retained) });
         startChannelAutoSave({ ...options, fetchImpl: client });
         return channelSyncSnapshot();
     }
@@ -395,15 +501,17 @@ export async function bootstrapChannelSync(options: BootstrapOptions = {}): Prom
     try {
         const saved = await withTimeout(putServerChannels(eligible, client), timeoutMs, "渠道迁移");
         rememberServerIds(saved);
-        applyChannels(toModelChannels(saved.length ? saved : eligible), "remote");
-        setSync({ migrating: false, phase: "ready", mode: "remote", username: probe.username, error: "" });
-        console.info(`[channel-sync] 已迁移 ${eligible.length} 个渠道到服务端账号`);
+        const serverView = toModelChannels(saved.length ? saved : eligible);
+        applyChannels([...serverView, ...retained], "remote");
+        // IMPL-4：迁移结果列出被跳过渠道清单（配置页可见）
+        setSync({ migrating: false, phase: "ready", mode: "remote", username: probe.username, error: "", notice: localOnlyNotice(retained) });
+        console.info(`[channel-sync] 已迁移 ${eligible.length} 个渠道到服务端账号${retained.length ? `；仅本地保留：${retained.map((channel) => channel.name).join("、")}` : ""}`);
         startChannelAutoSave({ ...options, fetchImpl: client });
     } catch (error) {
         // 迁移失败：绝不把用户本地 key 弄丢 —— 保持本地数据与本地模式（下次登录重试迁移）
         const message = error instanceof Error ? error.message : String(error);
         console.warn("[channel-sync] 渠道迁移失败，保持本地模式", error);
-        setSync({ migrating: false, phase: "ready", mode: "local", username: probe.username, error: message });
+        setSync({ migrating: false, phase: "ready", mode: "local", username: probe.username, error: message, notice: "" });
     }
     return channelSyncSnapshot();
 }

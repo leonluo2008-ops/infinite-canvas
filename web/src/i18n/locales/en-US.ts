@@ -502,6 +502,7 @@ export default {
         missingKey: "Provider “{{names}}” has no API key yet and was not saved to the server",
         loadFailed: "Failed to load channels from the server (HTTP {{status}}). Refresh and retry, or check your sign-in state.",
         saveFailed: "Failed to save channels to the server (HTTP {{status}}). Changes stay local and will be retried.",
+        localOnlyKept: "Provider “{{names}}” is available in local mode only (wan / no API key / not https) and is not saved to your account",
     },
     account: {
         login: "Log in",
@@ -667,6 +668,7 @@ export default {
             indexedName: "Provider {{index}}",
             serverModeHint: "Provider settings are stored in your account (server mode): sign in on another device to see them. API keys are encrypted on the server only and shown masked here; generation requests are proxied by the server.",
             scriptLocalOnly: "Custom script providers are available in local mode only",
+            localOnly: "Local mode only",
             loading: "Loading provider settings from your account…",
             saveError: "Failed to save providers to the server: {{message}}",
         },

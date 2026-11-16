@@ -14,6 +14,8 @@
  *  5. 已登录 + 迁移失败：不丢本地数据、退回 local（下次登录重试）
  *  6. 服务端模式变更 → 防抖 PUT（一次），回写 masked 视图
  *  7. 请求层：/api/proxy/<channelId>/… 路径拼接 + 服务端模式零鉴权头 + 本地模式与基线一致
+ *  8. B3.5：仅本地渠道保留/不可选（IMPL-3）、卸载回写分拣与 keepalive 体积上限（IMPL-2）、
+ *     迁移前重名大小写预检与 masked 误杀告警（IMPL-4）
  */
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -195,7 +197,10 @@ shim.setRoute(async (url, init) => {
 snap = await sync.bootstrapChannelSync({ timeoutMs: 2000, debounceMs: 10 });
 const after3 = store.useConfigStore.getState().config;
 equal("3. 模式=remote", snap.mode, "remote");
-equal("3. 渠道=服务端视图", after3.channels.map((c) => c.id), ["srv-only"]);
+// B3.5 IMPL-3：服务端权威（不迁移、不 PUT），但仅本地渠道（wan/无 key/非 https）保留可见、不清除
+equal("3. 渠道=服务端视图 + 仅本地保留", after3.channels.map((c) => c.id), ["srv-only", "preset", "wan-ch", "http-ch"]);
+check("3. 提示列出仅本地保留渠道", String(snap.notice).includes("预置渠道") && String(snap.notice).includes("万相"), snap.notice);
+check("3. 仅本地渠道模型不进候选（remote 不可选）", !after3.models.some((m) => m.includes("wan-ch") || m.includes("preset")), JSON.stringify(after3.models));
 equal("3. key 只剩 masked", after3.channels[0].apiKey, "***abcd");
 equal("3. 顶层 apiKey 清空（V2 本地不留明文）", after3.apiKey, "");
 check("3. 未发 PUT", !shim.calls.fetch.some((c) => c.method === "PUT"), JSON.stringify(shim.calls.fetch.map((c) => `${c.method} ${c.url}`)));
@@ -224,7 +229,12 @@ equal("4. 迁移候选=只带 key 的非 wan https 渠道", putBody?.channels.ma
 check("4. 预置无 key 渠道未上服务端（V6）", !putBody.channels.some((c) => c.id === "preset"), JSON.stringify(putBody.channels.map((c) => c.id)));
 check("4. wan 型未上服务端", !putBody.channels.some((c) => c.id === "wan-ch"), JSON.stringify(putBody.channels.map((c) => c.id)));
 check("4. http 渠道未上服务端（服务端只收 https）", !putBody.channels.some((c) => c.id === "http-ch"), JSON.stringify(putBody.channels.map((c) => c.id)));
-equal("4. 迁移后 store 只留服务端渠道", after4.channels.map((c) => c.id), ["srv-ready"]);
+// B3.5 IMPL-3：迁移后被排除渠道仍在本地 store（wan / 预置无 key / 非 https），标仅本地、不进 PUT
+equal("4. 迁移后 store=服务端渠道+被排除渠道（仍在本地）", after4.channels.map((c) => c.id), ["srv-ready", "preset", "wan-ch", "http-ch"]);
+check("4. 迁移结果提示列出被跳过渠道（配置页可见）", String(snap.notice).includes("预置渠道") && String(snap.notice).includes("万相") && String(snap.notice).includes("明文渠道"), snap.notice);
+equal("4. isLocalOnlyChannel 判定", after4.channels.map((c) => sync.isLocalOnlyChannel(c)), [false, true, true, true]);
+check("4. 仅本地渠道模型不可选（remote）", !after4.models.some((m) => m.includes("wan-ch") || m.includes("preset") || m.includes("http-ch")), JSON.stringify(after4.models));
+check("4. 服务端渠道模型仍可选", after4.models.some((m) => m.includes("srv-ready")), JSON.stringify(after4.models));
 equal("4. 迁移后 key 变 masked", after4.channels[0].apiKey, "***5678");
 check("4. 迁移后 localStorage 无明文 key", !(shim.storage.get(configStoreKey) || "").includes("sk-live-12345678"), "localStorage 仍含明文 key");
 
@@ -237,7 +247,7 @@ await new Promise((resolve) => setTimeout(resolve, 120));
 await sync.flushChannelSync();
 const puts = shim.calls.fetch.filter((c) => c.method === "PUT");
 equal("4b. 变更后只 POST 一次 PUT", puts.length, 1);
-equal("4b. PUT 是整集全量", JSON.parse(puts[0].body).channels.map((c) => c.id), ["srv-ready"]);
+equal("4b. PUT 只含可提交渠道（仅本地渠道不进 PUT）", JSON.parse(puts[0].body).channels.map((c) => c.id), ["srv-ready"]);
 equal("4b. masked key 原样回写（服务端按 id 沿用密文）", JSON.parse(puts[0].body).channels[0].apiKey, "***5678");
 equal("4b. 回写后 store 与响应一致", store.useConfigStore.getState().config.channels[0].name, "改名后的渠道");
 
@@ -310,6 +320,58 @@ try {
     threw = String(error.message).length > 0;
 }
 check("7b. 无 channelId 时明确报错（不发裸上游请求）", threw, "未抛错");
+
+
+// ---------------------------------------------------------------------------
+// 8. B3.5：仅本地渠道（IMPL-3）/ 卸载回写分拣与体积上限（IMPL-2）/ 迁移预检（IMPL-4）
+// ---------------------------------------------------------------------------
+const ch = (over) => ({ id: "x", name: "渠道", baseUrl: "https://api.example.com", apiKey: "sk-real-key", apiFormat: "openai", models: [], ...over });
+// 8a. 仅本地判定：wan / 无 key / 非 https 为真；masked key 的 https 渠道为假（那是服务端视图缓存）
+equal("8a. 仅本地判定", [
+    sync.isLocalOnlyChannel(ch({ id: "a", apiFormat: "wan" })),
+    sync.isLocalOnlyChannel(ch({ id: "b", apiKey: "" })),
+    sync.isLocalOnlyChannel(ch({ id: "c", baseUrl: "http://insecure.example.com" })),
+    sync.isLocalOnlyChannel(ch({ id: "d", apiKey: "***abcd" })),
+    sync.isLocalOnlyChannel(ch({ id: "e" })),
+], [true, true, true, false, false]);
+
+// 8b. 分拣：仅本地渠道不进 PUT；masked key 的服务端渠道照常提交（服务端沿用密文）
+const split = sync.splitSavableChannels([
+    ch({ id: "keep-1" }),
+    ch({ id: "keep-2", apiKey: "***5678" }),
+    ch({ id: "skip-wan", apiFormat: "wan" }),
+    ch({ id: "skip-nokey", apiKey: "" }),
+    ch({ id: "skip-http", baseUrl: "http://insecure.example.com" }),
+]);
+equal("8b. 可提交渠道", split.savable.map((c) => c.id), ["keep-1", "keep-2"]);
+equal("8b. 被跳过渠道", split.skipped.map((c) => c.id), ["skip-wan", "skip-nokey", "skip-http"]);
+check("8b. 跳过提示区分未填 key 与仅本地", String(sync.describeSkippedChannels(split.skipped)).includes("还没填写 API Key") && String(sync.describeSkippedChannels(split.skipped)).includes("仅本地模式"), sync.describeSkippedChannels(split.skipped));
+
+// 8c. 卸载回写：草稿不入 body；超大 models 体跳过并留痕（keepalive 64KB 上限）
+const unloadEmpty = sync.buildUnloadPayload([ch({ id: "draft", apiKey: "" })]);
+equal("8c. 只有草稿时不发卸载回写", [unloadEmpty.ok, unloadEmpty.reason], [false, "empty"]);
+const unloadOk = sync.buildUnloadPayload([ch({ id: "keep-1" }), ch({ id: "draft", apiKey: "" })]);
+check("8c. 卸载回写 body 只含可提交渠道", unloadOk.ok && JSON.parse(unloadOk.body).channels.map((c) => c.id).join(",") === "keep-1", JSON.stringify(unloadOk));
+const bigModels = Array.from({ length: 400 }, (_, index) => ({ name: `model-${index}-${"x".repeat(200)}`, capability: "image" }));
+const unloadBig = sync.buildUnloadPayload([ch({ id: "keep-big", models: bigModels })]);
+equal("8c. 超过 keepalive 上限时跳过回写", [unloadBig.ok, unloadBig.reason], [false, "too-large"]);
+check("8c. 被跳过的体积确实超过 64KB", unloadBig.bytes > sync.KEEPALIVE_BODY_LIMIT, String(unloadBig.bytes));
+
+// 8d. 迁移预检：重名仅大小写不同 → 只迁一个；masked key → 过滤
+const migratable = sync.selectMigratableChannels([
+    ch({ id: "n1", name: "MyChan" }),
+    ch({ id: "n2", name: "mychan" }),
+    ch({ id: "n3", name: "掩码渠道", apiKey: "***abcd" }),
+    ch({ id: "n4", name: "正常渠道" }),
+]);
+equal("8d. 大小写重名只迁第一个 + masked 被过滤", migratable.map((c) => c.id), ["n1", "n4"]);
+
+// 8e. 合并：服务端渠道在前，仅本地渠道附后且不覆盖同 id 服务端渠道
+const merged = sync.mergeLocalOnlyChannels(
+    [{ id: "srv", name: "服务端" }],
+    [ch({ id: "srv", name: "服务端副本" }), ch({ id: "wan-1", apiFormat: "wan" }), ch({ id: "plain" })],
+);
+equal("8e. 合并顺序与去重", merged.map((c) => c.id), ["srv", "wan-1"]);
 
 console.warn = originalWarn;
 console.info = originalInfo;

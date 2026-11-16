@@ -19,7 +19,7 @@ import { audioFormatOptions, audioVoiceOptions, normalizeAudioSpeedValue } from 
 import { computeMediaSize, inferMediaRatio, inferMediaScale, mediaScaleOptions, parseVideoResolution } from "@/lib/media-size";
 import { createModelChannel, modelOptionsFromChannels, normalizeModelOptionValue, selectableModelsByCapability, useConfigStore, type AiConfig, type ApiCallFormat, type ConfigTabKey, type ModelCapability, type ModelChannel } from "@/stores/use-config-store";
 import { normalizeLapianDefaultModel, normalizeLapianModelList } from "@/lib/canvas/lapian-model";
-import { useChannelSyncStore } from "@/services/channel-sync";
+import { isLocalOnlyChannel, useChannelSyncStore } from "@/services/channel-sync";
 
 type ModelGroup = {
     capability: ModelCapability;
@@ -66,6 +66,7 @@ export function AppConfigPanel({ showDoneButton = false, initialTab = "channels"
     // S2-B3.4 渲染门控：启动门（登录态 + 服务端渠道）完成前，配置页不得用本地陈旧数据完成首次渲染
     const syncPhase = useChannelSyncStore((state) => state.phase);
     const syncError = useChannelSyncStore((state) => state.error);
+    const syncNotice = useChannelSyncStore((state) => state.notice);
     const serverMode = config.channelMode === "remote";
     const webdav = useConfigStore((state) => state.webdav);
     const updateConfig = useConfigStore((state) => state.updateConfig);
@@ -211,19 +212,23 @@ export function AppConfigPanel({ showDoneButton = false, initialTab = "channels"
                                     </div>
                                     {serverMode ? <div className="mb-3 rounded-lg bg-stone-100 px-3 py-2 text-xs text-stone-600 dark:bg-stone-900 dark:text-stone-300">{t("config.channels.serverModeHint")}</div> : null}
                                     {syncError ? <div className="mb-3 rounded-lg bg-red-50 px-3 py-2 text-xs text-red-600 dark:bg-red-950/40 dark:text-red-300">{t("config.channels.saveError", { message: syncError })}</div> : null}
+                                    {syncNotice ? <div className="mb-3 rounded-lg bg-amber-50 px-3 py-2 text-xs text-amber-700 dark:bg-amber-950/40 dark:text-amber-300">{syncNotice}</div> : null}
                                     <div className="space-y-2">
                                         {config.channels.map((channel) => {
                                             // 自定义脚本渠道：脚本自己拿 key 发任意请求，服务端模式下无法代转发 → 置灰（B3.5③）
                                             const scriptLocalOnly = serverMode && channel.models.some((model) => Boolean(model.script?.trim()));
+                                            // IMPL-3：仅本地模式渠道（wan / 无 key / 非 https）服务端收不了 → remote 下可见但不可选、不清除
+                                            const localOnly = isLocalOnlyChannel(channel);
                                             return (
                                                 <div
                                                     key={channel.id}
-                                                    className={`flex items-center justify-between gap-3 rounded-lg border border-stone-200 px-4 py-3 dark:border-stone-800 ${scriptLocalOnly ? "opacity-60" : ""}`}
+                                                    className={`flex items-center justify-between gap-3 rounded-lg border border-stone-200 px-4 py-3 dark:border-stone-800 ${scriptLocalOnly || localOnly ? "opacity-60" : ""}`}
                                                 >
                                                     <div className="min-w-0">
                                                         <div className="flex min-w-0 items-center gap-2">
                                                             <span className="truncate text-sm font-semibold">{channel.name || t("config.channels.unnamed")}</span>
                                                             {scriptLocalOnly ? <Tag className="shrink-0">{t("config.channels.scriptLocalOnly")}</Tag> : null}
+                                                            {localOnly ? <Tag className="shrink-0">{t("config.channels.localOnly")}</Tag> : null}
                                                         </div>
                                                         <div className="mt-1 truncate text-xs text-stone-500">
                                                             {apiFormatLabel(channel.apiFormat)} · {t("config.channels.modelCount", { count: channel.models.length })} · {channel.baseUrl || t("config.channels.missingUrl")}

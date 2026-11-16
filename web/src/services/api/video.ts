@@ -8,7 +8,7 @@ import { readVideoTaskProgress, waitForVideoTaskOutput } from "@/lib/canvas/vide
 import { getMediaBlob, resolveMediaUrl, uploadMediaFile, type UploadedFile } from "@/services/file-storage";
 import { imageToDataUrl } from "@/services/image-storage";
 import { boolConfig, modelOptionName, resolveModelRequestConfig, resolveModelScript, withLocalProxy, type AiConfig } from "@/stores/use-config-store";
-import { channelAbsoluteUrl, channelApiUrl, channelAuthHeaders, geminiChannelHeaders, type ChannelTarget } from "./channel-proxy";
+import { channelAbsoluteUrl, channelApiUrl, channelAuthHeaders, channelMediaUrl, geminiChannelHeaders, isMaskedKeyValue, isServerChannelMode, type ChannelTarget } from "./channel-proxy";
 import { lookupProjectWanFileTask, rememberProjectWanFileTask } from "@/lib/canvas/wan-file-task-project";
 import { toLegacyPayload } from "@/lib/canvas/wan-file-task-map";
 import { runModelPlugin } from "./model-plugin";
@@ -291,7 +291,7 @@ async function pollSdgfVideoTask(config: AiConfig, task: VideoGenerationTask, op
         if (status === "completed") {
             sdgfEarlyProbeStreaks.delete(task.id);
             options?.onPhase?.("downloading");
-            if (url) return { status: "completed", result: await videoResultFromUrl(url, options) };
+            if (url) return { status: "completed", result: await videoResultFromUrl(config, url, options) };
             const content = await axios.get<Blob>(aiApiUrl(config, `/videos/${task.id}/content`), { headers: aiHeaders(config), responseType: "blob", signal: options?.signal });
             await assertVideoBlob(content.data);
             return { status: "completed", result: { blob: content.data } };
@@ -309,7 +309,7 @@ async function pollSdgfVideoTask(config: AiConfig, task: VideoGenerationTask, op
         if (streak >= SDGF_EARLY_PROBE_STREAK_LIMIT && progress !== undefined && progress >= 90) {
             try {
                 options?.onPhase?.("downloading");
-                if (url) return { status: "completed", result: await videoResultFromUrl(url, options) };
+                if (url) return { status: "completed", result: await videoResultFromUrl(config, url, options) };
                 const content = await axios.get<Blob>(aiApiUrl(config, `/videos/${task.id}/content`), { headers: aiHeaders(config), responseType: "blob", signal: options?.signal });
                 await assertVideoBlob(content.data);
                 sdgfEarlyProbeStreaks.delete(task.id);
@@ -502,7 +502,7 @@ async function pollOpenAIVideoTask(config: AiConfig, task: VideoGenerationTask, 
     try {
         const video = unwrapVideoResponse((await axios.get<ApiVideoResponse>(aiApiUrl(config, `/videos/${task.id}`), { headers: aiHeaders(config), signal: options?.signal })).data);
         const url = videoResultUrl(video);
-        if (url) return { status: "completed", result: await videoResultFromUrl(url, options) };
+        if (url) return { status: "completed", result: await videoResultFromUrl(config, url, options) };
         if (video.status === "completed") {
             const content = await axios.get<Blob>(aiApiUrl(config, `/videos/${task.id}/content`), { headers: aiHeaders(config), responseType: "blob", signal: options?.signal });
             await assertVideoBlob(content.data);
@@ -515,14 +515,23 @@ async function pollOpenAIVideoTask(config: AiConfig, task: VideoGenerationTask, 
     }
 }
 
-async function videoResultFromUrl(url: string, options?: RequestOptions): Promise<VideoGenerationResult> {
+/**
+ * 成片下载（B3.5 IMPL-1）。地址择路交给 `channelMediaUrl`：
+ *  * 本地模式 → `withLocalProxy(url)`，与基线字节级一致；
+ *  * 服务端模式 → 剥掉掩码 key 后同源走 `/api/proxy/<channelId>/…`（key 由服务端注入），
+ *    自含凭据的签发直链 / 异源 CDN 原样直连（理由见 `channelMediaUrl` 注释）。
+ * 拿不到 blob（CORS / 代转发不可用）时回落到把**同一个安全地址**交给 `<video>` 播放——
+ * 绝不回落到裸上游地址，更不会把 key 拼回前端。
+ */
+async function videoResultFromUrl(config: AiConfig & ChannelTarget, url: string, options?: RequestOptions): Promise<VideoGenerationResult> {
+    const target = channelMediaUrl(config, url);
     try {
-        const response = await axios.get<Blob>(withLocalProxy(url), { responseType: "blob", signal: options?.signal });
+        const response = await axios.get<Blob>(target.url, { responseType: "blob", signal: options?.signal });
         await assertVideoBlob(response.data);
         return { blob: response.data };
     } catch (error) {
         if (axios.isCancel(error) || options?.signal?.aborted) throw error;
-        return { url, mimeType: "video/mp4" };
+        return { url: target.url, mimeType: "video/mp4" };
     }
 }
 
@@ -566,11 +575,25 @@ async function pollGeminiVideoTask(config: AiConfig, task: VideoGenerationTask, 
         if (!state.done) return { status: "pending" };
         const uri = state.response?.generateVideoResponse?.generatedSamples?.[0]?.video?.uri;
         if (!uri) return { status: "failed", error: apiText("noPlayableVideo") };
-        const url = uri.includes("key=") ? uri : `${uri}${uri.includes("?") ? "&" : "?"}key=${config.apiKey}`;
-        return { status: "completed", result: await videoResultFromUrl(url, options) };
+        return { status: "completed", result: await videoResultFromUrl(config, geminiResultUrl(config, uri), options) };
     } catch (error) {
         throw new Error(readAxiosError(error, apiText("videoTaskQueryFailed")));
     }
+}
+
+/**
+ * 上游 gemini 成片 uri → 可下载地址（B3.5 IMPL-1）。
+ *  * 服务端模式：**不拼任何 key**——uri 若自带掩码 `key=` 由 `channelMediaUrl` 剥掉，改走代转发由服务端注入真 key；
+ *  * 本地模式：与基线一致（uri 已带 `key=` 就原样用，否则拼本地真 key）。
+ */
+function geminiResultUrl(config: AiConfig & ChannelTarget, uri: string): string {
+    if (isServerChannelMode(config) || uri.includes("key=")) return uri;
+    if (isMaskedKeyValue(config.apiKey)) {
+        // IMPL-4 同源告警：本地模式却只有掩码 key（服务端渠道视图漏到本地态），拼上去只会让上游收到 `***`
+        console.warn("[video] 当前 API Key 是掩码值（不是明文），成片地址不拼 key——请重新输入完整 API Key");
+        return uri;
+    }
+    return `${uri}${uri.includes("?") ? "&" : "?"}key=${config.apiKey}`;
 }
 
 function assertVideoConfig(config: AiConfig, model: string) {

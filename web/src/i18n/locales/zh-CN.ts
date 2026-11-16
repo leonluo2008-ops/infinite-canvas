@@ -502,6 +502,7 @@ export default {
         missingKey: "渠道「{{names}}」还没填写 API Key，暂未保存到服务端",
         loadFailed: "读取服务端渠道失败（HTTP {{status}}）：请刷新重试或检查登录状态",
         saveFailed: "保存渠道到服务端失败（HTTP {{status}}）：改动已留在本地，稍后会自动重试",
+        localOnlyKept: "渠道「{{names}}」仅本地模式可用（wan/未填 key/非 https），不会保存到服务端账号",
     },
     account: {
         login: "登录",
@@ -667,6 +668,7 @@ export default {
             indexedName: "渠道 {{index}}",
             serverModeHint: "渠道配置保存在你的账号下（服务端模式）：换设备登录即可看到；API Key 只在服务端加密保存、前端只显示掩码，生成请求由服务端代转发。",
             scriptLocalOnly: "自定义脚本渠道仅本地模式可用",
+            localOnly: "仅本地模式",
             loading: "正在读取账号下的渠道配置…",
             saveError: "渠道保存到服务端失败：{{message}}",
         },
