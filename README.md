@@ -4,7 +4,7 @@
 
 <h1 align="center">wan-repro · 电商视频生产画布</h1>
 
-> ⚠️ **分支身份牌（2026-11-17）**：你正在看 **`feat/saas-multiuser` 分支 = 多用户 SaaS 版**（当前主力开发线）。含：账号注册/登录、渠道服务端加密存储+代转发（BYOK）、画布项目按用户隔离同步、预置模板版本化。本机工作树 `E:/User/GitHub/infinite-canvas-saas`，**部署测试实例 :8780 用本分支**（Surface `/home/luo/wanrepro-s1-test`，重启必须 `WANREPRO_CHANNEL_KEY=$(cat ~/.config/wanrepro-channel-key.env)` 显式注入）。单人完整版在 `dev` 分支（:3001 生产）；分支模型详见 canvas-forge 仓 `docs/项目适配包.md`。本 README 其余段落是旧交付线文案，以本牌为准。
+> ⚠️ **分支身份牌（2026-11-17）**：你正在看 **`dev` 分支 = 多用户 SaaS 开发线**（当前主力开发分支，与 `feat/saas-multiuser` 同源同步推进）。含：账号注册/登录、渠道服务端加密存储+代转发（BYOK）、画布项目按用户隔离同步、预置模板版本化。本机工作树 `E:/User/GitHub/infinite-canvas`，**部署测试实例 :8780 用这条线**（Surface `/home/luo/wanrepro-s1-test`，重启必须 `WANREPRO_CHANNEL_KEY=$(cat ~/.config/wanrepro-channel-key.env)` 显式注入）。**冻结的单机完整版在 `standalone-v1.2.0` 分支**（原 dev，:3001 生产用）。分支模型详见 canvas-forge 仓 `docs/项目适配包.md`。本 README 其余段落是旧交付线文案，以本牌为准。
 
 > 基于无限画布（infinite-canvas）二次开发的视频生产工具：参考视频 → 九层拆解 → 提示词 → 生成出片。本分支（`feat/sdgf-video-node`）为交付主线。
 
