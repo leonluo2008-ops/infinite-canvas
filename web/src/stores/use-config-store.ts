@@ -5,6 +5,7 @@ import { nanoid } from "nanoid";
 
 import i18n from "@/i18n";
 import { normalizeLapianDefaultModel, normalizeLapianModelList } from "@/lib/canvas/lapian-model";
+import { resolvePresetAliasId } from "@/lib/config/preset-meta";
 
 export type ApiCallFormat = "openai" | "gemini" | "sdgf" | "wan"; // sdgf=聚鑫 SD GF 统一视频 API（/v1/videos）；wan=万相 CLI bridge（/api/wan/video/*）
 export type ModelCapability = "image" | "video" | "text" | "audio";
@@ -419,7 +420,10 @@ export function isChannelModelValue(value: string) {
 export function decodeChannelModel(value: string) {
     const index = value.indexOf(CHANNEL_MODEL_SEPARATOR);
     if (index < 0) return null;
-    return { channelId: value.slice(0, index), model: value.slice(index + CHANNEL_MODEL_SEPARATOR.length) };
+    // S3.5：升格派生 id 的 **lazy 自愈**（任务书 §2.3 方案 b）——模板渠道填 key 后 id 换成 mintedId，
+    // 存量项目/节点里的 `templateId::model` 引用在这里按 preset_meta.aliases 换新 id；
+    // 不做全量项目重写（不碰项目同步链路），项目下次自然保存即带新 id。
+    return { channelId: resolvePresetAliasId(value.slice(0, index)), model: value.slice(index + CHANNEL_MODEL_SEPARATOR.length) };
 }
 
 export function modelOptionName(value: string) {
@@ -443,7 +447,11 @@ export function normalizeModelOptionValue(value: string | undefined, channels: M
     const decoded = decodeChannelModel(model);
     if (decoded) {
         const channel = channels.find((item) => item.id === decoded.channelId);
-        return channel && channel.models.some((item) => item.name === decoded.model) ? model : "";
+        if (!(channel && channel.models.some((item) => item.name === decoded.model))) return "";
+        // S3.5：alias 命中时 decoded.channelId 已是 mintedId —— 回写规范引用（lazy 自愈），
+        // 否则解得出渠道却把旧共享 id 原地留下，等于没治。
+        const canonical = encodeChannelModel(channel.id, decoded.model);
+        return canonical === model ? model : canonical;
     }
     const channel = channels.find((item) => item.models.some((entry) => entry.name === model)) || channels[0];
     return channel && channel.models.some((item) => item.name === model) ? encodeChannelModel(channel.id, model) : model;

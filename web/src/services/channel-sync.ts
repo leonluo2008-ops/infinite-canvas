@@ -13,13 +13,29 @@
  *
  * 单人模式（MULTI_USER=0）零改动：探针拿不到登录态、一条 setState 都不做，store 保持 persist 出来的原样。
  */
+import { nanoid } from "nanoid";
 import { create } from "zustand";
 
 import i18n from "@/i18n";
 import { normalizeLapianDefaultModel, normalizeLapianModelList } from "@/lib/canvas/lapian-model";
-import { maybeImportBootstrapConfig } from "@/lib/config/bootstrap-config";
+import { fetchPresetPayload, maybeImportBootstrapConfig, PRESET_PLACEHOLDER_ID, type BootstrapPresetPayload } from "@/lib/config/bootstrap-config";
+import { channelNameKey, hasAnyKey, hasUsableKey, mergePresetChannels, mintPromotedChannels, rewriteChannelRefs, serverNameKey } from "@/lib/config/preset-merge";
+import {
+    isPresetTemplateId,
+    presetAliases,
+    presetTemplateIdList,
+    readPresetMeta,
+    recordAlias,
+    recordTombstone,
+    setLastPresetVersion,
+    setPresetTemplateIdList,
+    templateIdOfMinted,
+    type PresetMeta,
+} from "@/lib/config/preset-meta";
 import { createModelChannel, modelOptionsFromChannels, normalizeModelOptionValue, useConfigStore, type AiConfig, type ModelChannel } from "@/stores/use-config-store";
 import { isMaskedKeyValue } from "./api/channel-proxy";
+
+// S3.5：预置层纯函数在 @/lib/config/preset-merge（探针直接 import 该模块断言）。
 
 const AUTH_ME_ENDPOINT = "/api/auth/me";
 const CHANNELS_ENDPOINT = "/api/user/channels";
@@ -220,6 +236,262 @@ function localOnlyNotice(channels: ModelChannel[]): string {
     return names.length ? i18n.t("channelSync.localOnlyKept", { names: names.join("、") }) : "";
 }
 
+// ------------------------------------------------------------------ 预置模板层（S3.5）
+
+/** 启动时拉到的预置载荷（每次 boot 一份；失败 null = 本地照常起，不进 withTimeout 失败路径）。 */
+let presetPayload: BootstrapPresetPayload | null = null;
+/** 当前模板渠道 id 集合（探针/测试读）：真源在 preset-meta（单人/登录两条启动路径共用）。 */
+export function presetTemplateIds(): string[] {
+    return presetTemplateIdList();
+}
+
+/** id 是否属于当前模板（用户删它要记墓碑；填了 key 要升格换 id）。 */
+export function isTemplateChannelId(id: string | undefined | null): boolean {
+    return isPresetTemplateId(id);
+}
+
+/** 最近一次拉到的模板版本（空 = 端点没给版本，按「版本未知」处理）。 */
+export function presetPayloadVersion(): string {
+    return presetPayload?.presetVersion || "";
+}
+
+function rememberPresetPayload(payload: BootstrapPresetPayload | null) {
+    presetPayload = payload;
+    // 拉取成功才更新模板 id 集合（失败不动上一份，别让一次网络抖动把墓碑/升格判定清空）
+    if (payload) setPresetTemplateIdList(payload.channels.map((channel) => channel.id));
+}
+
+function presetChannelNames(channels: ModelChannel[], ids: string[]): string {
+    const lookup = new Map((channels || []).map((channel) => [channel.id, channel.name]));
+    return ids.map((id) => lookup.get(id) || id).filter(Boolean).join("、");
+}
+
+/**
+ * 预置合并的可见提示（复用 localOnly 的 notice 单通道，配置页只读展示）。
+ * `localChannels` 是合并**前**的本地视图——让位的占位渠道已经不在 merged.channels 里，点名要从这里查。
+ */
+function presetMergeNotice(merged: ReturnType<typeof mergePresetChannels>, preset: ModelChannel[], localChannels: ModelChannel[]): string {
+    const parts: string[] = [];
+    if (merged.added.length) parts.push(i18n.t("channelSync.presetMerged", { count: merged.added.length, names: presetChannelNames(preset, merged.added) }));
+    if (merged.updated.length) parts.push(i18n.t("channelSync.presetRefreshed", { count: merged.updated.length, names: presetChannelNames(preset, merged.updated) }));
+    if (merged.skippedSameName.length) parts.push(i18n.t("channelSync.presetSameNameSkipped", { names: presetChannelNames(preset, merged.skippedSameName) }));
+    if (merged.skippedEmptyName.length) parts.push(i18n.t("channelSync.presetEmptyNameSkipped", { count: merged.skippedEmptyName.length }));
+    if (merged.droppedPlaceholder.length) parts.push(i18n.t("channelSync.presetPlaceholderDropped", { names: presetChannelNames(localChannels, merged.droppedPlaceholder) }));
+    return parts.join("；");
+}
+
+
+function joinNotices(...parts: string[]): string {
+    return parts.filter(Boolean).join("；");
+}
+
+/**
+ * 登录模式预置层：`服务端视图 → localOnly → preset 队尾`（任务书 §2.4）。
+ * **版本相同 → 零写入**：直接返回原数组（调用方据此跳过 applyChannels，config 引用不变、subscribe 不触发）。
+ */
+export function mergePresetLayer(channels: ModelChannel[]): { channels: ModelChannel[]; notice: string; changed: boolean; version: string } {
+    const payload = presetPayload;
+    if (!payload) return { channels, notice: "", changed: false, version: "" };
+    const meta: PresetMeta = readPresetMeta();
+    if (payload.presetVersion && payload.presetVersion === meta.lastPresetVersion) {
+        return { channels, notice: "", changed: false, version: payload.presetVersion };
+    }
+    const merged = mergePresetChannels(channels, payload.channels, {
+        tombstones: meta.tombstones,
+        aliases: meta.aliases,
+        // 内置占位渠道让位（V1「旧占位消失」）与单人路径**共用同一个回调**——登录模式漏传时
+        // 存量浏览器的旧「默认渠道」会永远留在配置页（B2.5 IF2）。
+        dropPlaceholder: (channel) => channel.id === PRESET_PLACEHOLDER_ID,
+    });
+    commitAliasClaims(merged.aliasClaims);
+    return { channels: merged.changed ? merged.channels : channels, notice: presetMergeNotice(merged, payload.channels, channels), changed: merged.changed, version: payload.presetVersion };
+}
+
+/**
+ * 同名跳过分支认领的 alias 落盘（跨设备：设备 B 没有 A 的 alias，靠这条让画布旧引用 lazy 自愈）。
+ * 写盘失败不致命（下次启动再认领一次），绝不让它打断启动门。
+ */
+function commitAliasClaims(claims: Array<{ from: string; to: string }> | undefined) {
+    if (!claims || !claims.length) return;
+    for (const claim of claims) {
+        try {
+            recordAlias(claim.from, claim.to);
+        } catch {
+            // 配额/隐私模式：alias 记不下只会让下次启动再认领一遍（幂等）
+        }
+    }
+}
+
+
+/**
+ * 预置层 + 启动 normalize 升格一起算完：返回最终渠道视图、notice、模板版本。
+ * @returns changed=false 时 channels 引用与入参一致（调用方据此零写入）
+ */
+export function applyPresetLayer(channels: ModelChannel[], localOnlyNoticeText = ""): { channels: ModelChannel[]; notice: string; version: string; changed: boolean } {
+    const layer = mergePresetLayer(channels);
+    const minted = mintPromotedOnBoot(layer.channels);
+    return {
+        channels: minted,
+        notice: joinNotices(localOnlyNoticeText, layer.notice),
+        version: layer.version,
+        changed: layer.changed || minted !== layer.channels,
+    };
+}
+
+/** 模板版本落地：合并路径真正走完（没有退回 local 模式）后才记，写失败不致命。 */
+export function commitPresetVersion(version: string) {
+    if (!version) return;
+    try {
+        // 版本没变就不 setItem（V6「零写入」的毛边：内容相同也算一次写盘，配额紧张时白耗）
+        if (readPresetMeta().lastPresetVersion === version) return;
+        setLastPresetVersion(version);
+    } catch {
+        // 记不下版本只会让下次启动再评估一遍（幂等无副作用）
+    }
+}
+
+/**
+ * 启动 normalize 的升格（任务书 §2.3）：`templateId ∧ hasKey → 立即 mint`。
+ * 只处理**明文** key（masked 是服务端视图缓存，换 id 需服务端行迁移，交给两处 PUT 入口的防御）。
+ */
+function mintPromotedOnBoot(channels: ModelChannel[]): ModelChannel[] {
+    const templateIds = presetTemplateIdList();
+    if (!templateIds.length) return channels;
+    const { channels: minted, minted: promotions } = mintPromotedChannels(channels, {
+        templateIds,
+        aliases: presetAliases(),
+        mintId: () => nanoid(),
+    });
+    if (!promotions.length) return channels;
+    for (const item of promotions) recordAlias(item.from, item.to);
+    return minted;
+}
+
+function aliasMapOf(promotions: Array<{ from: string; to: string }>): Record<string, string> {
+    const map: Record<string, string> = {};
+    for (const item of promotions) map[item.from] = item.to;
+    return map;
+}
+
+/**
+ * 两处 PUT 入口的防御断言：`id ∈ 模板 id 集合` 一律先 mint 再提交。
+ * 迁移分支（selectMigratableChannels → putServerChannels）与 flushChannelSync 都从这里过，
+ * 防「模板共享常量 id 进全局主键表」的 409 死循环（任务书 §2.3 第三道防线）。
+ */
+export function mintTemplateIdsBeforePut(channels: ModelChannel[]): ModelChannel[] {
+    if (!presetTemplateIdList().length) return channels;
+    const aliases = presetAliases();
+    const used = new Set((channels || []).map((channel) => channel.id));
+    const aliasMap: Record<string, string> = {};
+    let touched = false;
+    const next = (channels || []).map((channel) => {
+        if (!channel || !isPresetTemplateId(channel.id)) return channel;
+        let to = aliases[channel.id];
+        if (!to) {
+            to = nanoid();
+            while (used.has(to)) to = nanoid();
+            used.add(to);
+            recordAlias(channel.id, to);
+        }
+        aliasMap[channel.id] = to;
+        touched = true;
+        return { ...channel, id: to };
+    });
+    if (!touched) return channels;
+    // ① 先把 store 的 channels/引用换新（挂起自动回写防回环）；
+    //    必须包进 mintingGuard：store 写入会触发预置 watch，不屏蔽时墓碑分支会把「模板 id 消失」
+    //    误判成「用户删除」→ 记下模板 id 墓碑 → 该模板渠道以后永不复活（B2.5 IF5）。
+    const previousGuard = mintingGuard;
+    mintingGuard = true;
+    try {
+        applyAliasesToStore(aliasMap);
+    } finally {
+        mintingGuard = previousGuard;
+    }
+    // ② 防抖窗口里的待写批次同步换 id（少一层「旧 id 被防御断言再 mint 一次」的耦合，P3）
+    remapPendingChannels(aliasMap);
+    return next;
+}
+
+/** 待写批次里的渠道 id 同步换新（防抖窗口内 mint 时用；pendingChannels 是模块内队列，不是第二个真源）。 */
+function remapPendingChannels(aliasMap: Record<string, string>) {
+    if (!pendingChannels) return;
+    pendingChannels = pendingChannels.map((channel) => (channel && aliasMap[channel.id] ? { ...channel, id: aliasMap[channel.id] } : channel));
+}
+
+
+/** 把 alias 落到 store（channels id + config 七处引用串），期间挂起自动回写防回环。 */
+function applyAliasesToStore(aliasMap: Record<string, string>) {
+    if (!Object.keys(aliasMap).length) return;
+    suspendAutoSave = true;
+    try {
+        useConfigStore.setState((state) => ({
+            config: rewriteChannelRefs({ ...state.config, channels: state.config.channels.map((channel) => (aliasMap[channel.id] ? { ...channel, id: aliasMap[channel.id] } : channel)) }, aliasMap),
+        }));
+    } finally {
+        suspendAutoSave = false;
+    }
+}
+
+// ---- store 写入边界监听：墓碑记录 + 升格 mint（任务书 §2.3 / §2.5）----
+
+let presetWatchUnsubscribe: (() => void) | null = null;
+let mintingGuard = false;
+
+/** 监听渠道集合变化：删模板渠道记墓碑；模板渠道 key 空 → 非空时 mint 换 id。 */
+export function startPresetWatch() {
+    if (typeof window === "undefined") return;
+    if (presetWatchUnsubscribe) return;
+    presetWatchUnsubscribe = useConfigStore.subscribe((state, previous) => {
+        if (mintingGuard) return;
+        if (state.config.channels === previous.config.channels) return;
+        const before = previous.config.channels || [];
+        const after = state.config.channels || [];
+        // ① 墓碑：用户删了 id ∈ 当前模板 id 集合的渠道（升格后的 mintedId 反查模板 id 一并记）
+        const remaining = new Set(after.map((channel) => channel.id));
+        for (const channel of before) {
+            if (!channel?.id || remaining.has(channel.id)) continue;
+            if (isPresetTemplateId(channel.id)) recordTombstone(channel.id);
+            else {
+                const templateId = templateIdOfMinted(channel.id);
+                if (templateId) recordTombstone(templateId);
+            }
+        }
+        // ② 升格 mint：只在登录态（有服务端渠道表=有全局主键约束）做
+        if (state.config.channelMode !== "remote" || !presetTemplateIdList().length) return;
+        const beforeById = new Map(before.map((channel) => [channel.id, channel]));
+        const promotions = after.filter((channel) => channel && isPresetTemplateId(channel.id) && hasUsableKey(channel) && !hasAnyKey(beforeById.get(channel.id)));
+        if (!promotions.length) return;
+        // 推迟一轮：本次 setState 的监听器快照里还有自动回写（它拿的是旧 channels），
+        // 同步 setState 会让自动回写用旧模板 id 排一次 PUT。
+        const run = () => {
+            if (mintingGuard) return;
+            const current = useConfigStore.getState().config;
+            const { channels: minted, minted: aliases } = mintPromotedChannels(current.channels, {
+                templateIds: presetTemplateIdList(),
+                aliases: presetAliases(),
+                mintId: () => nanoid(),
+            });
+            if (!aliases.length) return;
+            for (const item of aliases) recordAlias(item.from, item.to);
+            mintingGuard = true;
+            try {
+                applyAliasesToStore(aliasMapOf(aliases));
+            } finally {
+                mintingGuard = false;
+            }
+            void minted;
+        };
+        if (typeof queueMicrotask === "function") queueMicrotask(run);
+        else setTimeout(run, 0);
+    });
+}
+
+export function stopPresetWatch() {
+    presetWatchUnsubscribe?.();
+    presetWatchUnsubscribe = null;
+}
+
 // ------------------------------------------------------------------ store 落地
 
 /**
@@ -263,20 +535,124 @@ function rememberServerIds(channels: ServerChannel[]) {
  * 分拣可提交渠道：新渠道还没填 key 时提交会让服务端整批 422（B1 masked 回写护栏的硬语义），
  * 那会把「其它渠道的正常改动」一起拖死——所以这种草稿渠道先留在本地，不参与 PUT。
  */
-export function splitSavableChannels(channels: ModelChannel[]): { savable: ModelChannel[]; skipped: ModelChannel[] } {
+export type SavableChannelSplit = {
+    savable: ModelChannel[];
+    skipped: ModelChannel[];
+    /** trim 后无名的渠道：服务端 (user_id,name) 会整批 422，单条不提交（S3.5 §2.2）。 */
+    unnamedSkipped: ModelChannel[];
+};
+
+export function splitSavableChannels(channels: ModelChannel[]): SavableChannelSplit {
     const savable: ModelChannel[] = [];
     const skipped: ModelChannel[] = [];
+    const unnamedSkipped: ModelChannel[] = [];
     for (const channel of channels || []) {
         // 「仅本地模式」渠道（wan / 无 key / 非 https）永远不进 PUT：服务端会整批 422，拖死合法渠道
         if (isLocalOnlyChannel(channel)) {
             skipped.push(channel);
             continue;
         }
+        // S3.5 §2.2：trim 后空名挡在提交前（服务端重名校验会 422 整批回滚）
+        if (!channelNameKey(channel?.name)) {
+            unnamedSkipped.push(channel);
+            continue;
+        }
         const hasKey = Boolean((channel.apiKey || "").trim());
         if (!hasKey && !knownServerIds.has(channel.id)) skipped.push(channel);
         else savable.push(channel);
     }
-    return { savable, skipped };
+    return { savable, skipped, unnamedSkipped };
+}
+
+/**
+ * S3.5 §2.2：待提交集内的重名预检。**判重口径 = 服务端 UNIQUE(user_id,name)**（`serverNameKey`：
+ * strip 后**完全相等**，大小写敏感——服务端是 SQLite BINARY，`MyChan`/`mychan` 两条都收）。
+ *
+ * 三种重名后果完全不同，必须分开：
+ *  * `duplicates` 纯本地草稿互相重名（整组都不在服务端表里）：单条跳过，不提交也不删任何行；
+ *  * `caseVariants` 仅大小写不同：服务端视为不同名，**两条都进提交体**，只进提示文案；
+ *  * `conflicts` 重名组里**任一条 id ∈ 服务端已有行**：PUT 是整集全量替换，把重名者剔掉提交
+ *    等于**静默删掉服务端那一行**（B2.5 BL②）。这种批次一条都不许提交，整批走错误通道。
+ *
+ * 独立成函数（而不是塞进 splitSavableChannels 的分拣条件）的原因：分拣只回答
+ * 「这条渠道能不能上服务端」，重名是「同一批内部互相撞」——批量层面的判据，
+ * 由两个 PUT 入口（flushChannelSync / 卸载回写）显式调用。
+ */
+export type SavableDedupe = {
+    savable: ModelChannel[];
+    /** 纯本地草稿重名：单条跳过（不涉及服务端已有行，跳过不删任何行）。 */
+    duplicates: ModelChannel[];
+    /** 重名且涉及服务端已有行：整批不得提交（否则整集替换会删掉服务端那一行）。 */
+    conflicts: ModelChannel[];
+    /** 仅大小写不同（服务端 BINARY 照收）：两条都在 savable 里，只进提示。 */
+    caseVariants: ModelChannel[];
+};
+
+export function dedupeSavableChannels(channels: ModelChannel[], serverIds: Iterable<string> = knownServerIds): SavableDedupe {
+    const serverIdSet = serverIds instanceof Set ? serverIds : new Set(serverIds);
+    const groups = new Map<string, ModelChannel[]>();
+    for (const channel of channels || []) {
+        if (!channel) continue;
+        const key = serverNameKey(channel.name);
+        const bucket = groups.get(key);
+        if (bucket) bucket.push(channel);
+        else groups.set(key, [channel]);
+    }
+
+    const savable: ModelChannel[] = [];
+    const duplicates: ModelChannel[] = [];
+    const conflicts: ModelChannel[] = [];
+    for (const bucket of groups.values()) {
+        if (bucket.length === 1) {
+            savable.push(bucket[0]);
+            continue;
+        }
+        // 重名组里只要有一条是服务端已有行 → 整批不能提交（剔谁都是删行）
+        if (bucket.some((channel) => serverIdSet.has(channel.id))) {
+            conflicts.push(...bucket);
+            continue;
+        }
+        savable.push(bucket[0]);
+        duplicates.push(...bucket.slice(1));
+    }
+
+    // 仅大小写不同的一对对：服务端 BINARY 收得下，两条都在 savable 里，只为提示文案记一笔
+    const lowerSeen = new Map<string, ModelChannel[]>();
+    for (const channel of savable) {
+        const key = serverNameKey(channel.name).toLowerCase();
+        const bucket = lowerSeen.get(key);
+        if (bucket) bucket.push(channel);
+        else lowerSeen.set(key, [channel]);
+    }
+    const caseVariants: ModelChannel[] = [];
+    for (const bucket of lowerSeen.values()) {
+        if (bucket.length < 2) continue;
+        const keys = new Set(bucket.map((channel) => serverNameKey(channel.name)));
+        if (keys.size > 1) caseVariants.push(...bucket);
+    }
+    return { savable, duplicates, conflicts, caseVariants };
+}
+
+/** 重名且涉及服务端已有行：整批未提交的显式报错（说清真实后果：服务端那一行没被删）。 */
+export function describeSaveConflict(conflicts: ModelChannel[]): string {
+    const names = Array.from(new Set((conflicts || []).map((channel) => channel.name).filter(Boolean)));
+    return names.length ? i18n.t("channelSync.duplicateNameBlocked", { names: names.join("、") }) : "";
+}
+
+/** 仅大小写不同的渠道：服务端按大小写区分，两条都会保存（只是提示，不是错误）。 */
+export function describeCaseVariants(caseVariants: ModelChannel[]): string {
+    const names = Array.from(new Set((caseVariants || []).map((channel) => channel.name).filter(Boolean)));
+    return names.length ? i18n.t("channelSync.caseVariantNames", { names: names.join("、") }) : "";
+}
+
+
+/** 保存链被跳过渠道的提示：未填 key / 仅本地 / 重名 / 无名各自点名（不许合成一句骗人的「没填 key」）。 */
+export function describeSaveSkips(duplicates: ModelChannel[], unnamed: ModelChannel[]): string {
+    const parts: string[] = [];
+    const dupNames = (duplicates || []).map((channel) => channel.name).filter(Boolean);
+    if (dupNames.length) parts.push(i18n.t("channelSync.duplicateName", { names: dupNames.join("、") }));
+    if ((unnamed || []).length) parts.push(i18n.t("channelSync.unnamedSkipped", { count: unnamed.length }));
+    return parts.join("；");
 }
 
 /**
@@ -292,13 +668,29 @@ export function describeSkippedChannels(skipped: ModelChannel[]): string {
     return parts.join("；");
 }
 
-function applyChannels(channels: ModelChannel[], mode: AiConfig["channelMode"]) {
+/** 渠道域字段白名单：只有这些字段的变化才值得写一次 store（V6「config 引用相等」的判据）。 */
+const CHANNEL_DOMAIN_FIELDS = ["channelMode", "channels", "models", "baseUrl", "apiFormat", "apiKey", "lapianModels", "lapianDefaultModel", "model", "imageModel", "videoModel", "textModel", "audioModel"] as const;
+
+function channelDomainEqual(a: AiConfig, b: AiConfig): boolean {
+    return CHANNEL_DOMAIN_FIELDS.every((field) => JSON.stringify(a[field] ?? null) === JSON.stringify(b[field] ?? null));
+}
+
+/**
+ * 落地渠道视图。**内容无变化时零写入**（S3.5 V6：版本相同/服务端视图未变 → 不 setState，
+ * config 引用不变、subscriber 不触发 → 不会排任何 PUT）。
+ * @returns 是否真的写了一次 store
+ */
+function applyChannels(channels: ModelChannel[], mode: AiConfig["channelMode"]): boolean {
+    const current = useConfigStore.getState().config;
+    const next = buildConfigWithChannels(current, channels, mode);
+    if (channelDomainEqual(next, current)) return false;
     suspendAutoSave = true;
     try {
-        useConfigStore.setState((state) => ({ config: buildConfigWithChannels(state.config, channels, mode) }));
+        useConfigStore.setState({ config: next });
     } finally {
         suspendAutoSave = false;
     }
+    return true;
 }
 
 // ------------------------------------------------------------------ 变更回写
@@ -328,19 +720,31 @@ export async function flushChannelSync(): Promise<void> {
     }
     const channels = pendingChannels;
     pendingChannels = null;
-    const { savable, skipped } = splitSavableChannels(channels);
-    if (!savable.length) {
-        // 全部是仅本地/未填 key 的渠道：不发 PUT（发了必 422），只提示
-        setSync({ error: describeSkippedChannels(skipped) });
+    const { savable, skipped, unnamedSkipped } = splitSavableChannels(channels);
+    const { savable: savableUnique, duplicates, conflicts, caseVariants } = dedupeSavableChannels(savable);
+    // 重名且涉及服务端已有行：**整批一条都不发**（PUT 是整集全量替换，剔掉重名者＝删掉服务端那一行）。
+    // 本地编辑全部留在 store/pending 里不动，走错误通道点名——零删除 + 显式报错，恢复基线行为。
+    const conflictNotice = describeSaveConflict(conflicts);
+    if (conflictNotice) {
+        pendingChannels = channels;
+        setSync({ error: conflictNotice });
+        return;
+    }
+    // 防御断言（任务书 §2.3 第三道防线）：模板共享常量 id 严禁进 PUT —— 先 mint 换 id 再提交
+    const guarded = mintTemplateIdsBeforePut(savableUnique);
+    const skipNotice = joinNotices(describeSkippedChannels(skipped), describeSaveSkips(duplicates, unnamedSkipped), describeCaseVariants(caseVariants));
+    if (!guarded.length) {
+        // 全部是仅本地/未填 key/重名的渠道：不发 PUT（发了必 422），只提示
+        setSync({ error: skipNotice });
         return;
     }
     const run = (async () => {
         try {
-            const saved = await putServerChannels(savable, fetchImpl);
+            const saved = await putServerChannels(guarded, fetchImpl);
             rememberServerIds(saved);
-            // 回写服务端视图（masked key），未保存的草稿渠道原样留在本地继续编辑
-            applyChannels([...toModelChannels(saved), ...skipped], "remote");
-            setSync({ error: describeSkippedChannels(skipped) });
+            // 回写服务端视图（masked key），未保存的草稿/重名/无名渠道原样留在本地继续编辑
+            applyChannels([...toModelChannels(saved), ...skipped, ...unnamedSkipped, ...duplicates], "remote");
+            setSync({ error: skipNotice });
         } catch (error) {
             // 失败不丢本地数据：留着 pending 等下次变更/下一次 flush 重试，错误文案给配置页
             pendingChannels = pendingChannels || channels;
@@ -369,12 +773,18 @@ function byteLength(text: string): number {
 /**
  * 卸载回写的请求体（纯函数，便于探针断言）：
  *  * 先按 flushChannelSync 同一套规则分拣，未填 key 的新草稿 / 仅本地渠道不进 PUT；
+ *  * **重名且涉及服务端已有行 → `conflict`**：keepalive 这一发同样会静默删行，宁可不发
+ *    （本地缓存还在，下次打开走错误通道点名，用户改名后再保存）；
  *  * 体积超过 keepalive 上限 → `too-large`（连一个合法渠道都没有 → `empty`）。
  */
-export function buildUnloadPayload(channels: ModelChannel[]): { ok: true; body: string } | { ok: false; reason: "empty" | "too-large"; bytes: number } {
+export function buildUnloadPayload(channels: ModelChannel[]): { ok: true; body: string } | { ok: false; reason: "empty" | "too-large" | "conflict"; bytes: number } {
     const { savable } = splitSavableChannels(channels);
-    if (!savable.length) return { ok: false, reason: "empty", bytes: 0 };
-    const body = JSON.stringify({ channels: toPutPayload(savable) });
+    const { savable: unique, conflicts } = dedupeSavableChannels(savable);
+    if (conflicts.length) return { ok: false, reason: "conflict", bytes: 0 };
+    // 防御断言（§2.3）：卸载回写同样不许把模板共享 id 送进服务端表
+    const guarded = mintTemplateIdsBeforePut(unique);
+    if (!guarded.length) return { ok: false, reason: "empty", bytes: 0 };
+    const body = JSON.stringify({ channels: toPutPayload(guarded) });
     const bytes = byteLength(body);
     if (bytes > KEEPALIVE_BODY_LIMIT) return { ok: false, reason: "too-large", bytes };
     return { ok: true, body };
@@ -452,18 +862,28 @@ export async function bootstrapChannelSync(options: BootstrapOptions = {}): Prom
     }
 
     if (probe.kind !== "logged-in") {
-        // 单人模式：首启预置导入照旧（不 await，保持基线时序）；服务端模式登出态不拉 bootstrap
-        if (probe.kind === "single-user") void maybeImportBootstrapConfig();
+        // 单人模式：启动门里**每 boot 一次**预置同步（版本比对 → 零写 / 写盘 + reload，S3.5 V7）。
+        // 不 await：保持基线时序（单人 loading 门零改动，async 合并=接受一次闪现）；
+        // 预置拉取失败只是「本地照常起」，绝不进 withTimeout 的退 local 失败路径。
+        // 登出态不拉 bootstrap（B-09 既有判定不变）。
+        if (probe.kind === "single-user") {
+            void maybeImportBootstrapConfig(client);
+            startPresetWatch();
+        }
         setSync({ phase: "ready", mode: "local", username: "" });
         return channelSyncSnapshot();
     }
 
     // ---- 已登录：服务端权威 ----
+    // S3.5：预置文件与服务端渠道**并行**拉。presetPromise 永不 reject（失败=没有模板层，
+    // 本地照常起），所以它不进 withTimeout 的失败路径——那条路是「渠道链路读不到服务端」的语义。
+    const presetPromise = fetchPresetPayload(client);
     let server: ServerChannel[];
     try {
         server = await withTimeout(fetchServerChannels(client), timeoutMs, "服务端渠道读取");
     } catch (error) {
         // 读不到服务端渠道：不迁移、不动本地数据（避免误清空），退回本地模式并留错误文案
+        // （此路径**不写** lastPresetVersion——没合并成功就记版本=该浏览器永久错过本次模板）
         const message = error instanceof Error ? error.message : String(error);
         console.warn("[channel-sync] 服务端渠道读取失败，保持本地模式", error);
         setSync({ phase: "ready", mode: "local", username: probe.username, error: message });
@@ -471,6 +891,7 @@ export async function bootstrapChannelSync(options: BootstrapOptions = {}): Prom
     }
 
     rememberServerIds(server);
+    rememberPresetPayload(await presetPromise);
     const localChannels = useConfigStore.getState().config.channels;
     if (server.length) {
         // B3.3：服务端非空 → 丢弃本地缓存（服务端权威、不迁移），但「仅本地模式」渠道（wan / 无 key / 非 https）
@@ -478,9 +899,13 @@ export async function bootstrapChannelSync(options: BootstrapOptions = {}): Prom
         const serverView = toModelChannels(server);
         const merged = mergeLocalOnlyChannels(serverView, localChannels);
         const keptLocalOnly = merged.slice(serverView.length);
-        applyChannels(merged, "remote");
-        setSync({ phase: "ready", mode: "remote", username: probe.username, error: "", notice: localOnlyNotice(keptLocalOnly) });
+        // S3.5：预置层追加在最后（服务端视图 → localOnly → preset），版本相同=零写入
+        const layer = applyPresetLayer(merged, localOnlyNotice(keptLocalOnly));
+        applyChannels(layer.channels, "remote");
+        setSync({ phase: "ready", mode: "remote", username: probe.username, error: "", notice: layer.notice });
+        startPresetWatch();
         startChannelAutoSave({ ...options, fetchImpl: client });
+        commitPresetVersion(layer.version);
         return channelSyncSnapshot();
     }
 
@@ -491,22 +916,31 @@ export async function bootstrapChannelSync(options: BootstrapOptions = {}): Prom
     const retained = localChannels.filter((channel) => !migratedIds.has(channel.id) && isLocalOnlyChannel(channel));
     if (!eligible.length) {
         // 没有可迁候选（全是预置无 key 渠道 / wan 型 / http 地址）→ 服务端就是空的
-        applyChannels(retained, "remote");
-        setSync({ phase: "ready", mode: "remote", username: probe.username, error: "", notice: localOnlyNotice(retained) });
+        const layer = applyPresetLayer(retained, localOnlyNotice(retained));
+        applyChannels(layer.channels, "remote");
+        setSync({ phase: "ready", mode: "remote", username: probe.username, error: "", notice: layer.notice });
+        startPresetWatch();
         startChannelAutoSave({ ...options, fetchImpl: client });
+        commitPresetVersion(layer.version);
         return channelSyncSnapshot();
     }
 
     setSync({ migrating: true });
     try {
-        const saved = await withTimeout(putServerChannels(eligible, client), timeoutMs, "渠道迁移");
+        // 防御断言（§2.3 第三道防线）：迁移分支绕开了 splitSavableChannels —— 提交前先 mint，
+        // 模板共享常量 id 绝不进服务端全局主键表（否则撞 id → 409 整批回滚 → 死循环）。
+        const guardedEligible = mintTemplateIdsBeforePut(eligible);
+        const saved = await withTimeout(putServerChannels(guardedEligible, client), timeoutMs, "渠道迁移");
         rememberServerIds(saved);
-        const serverView = toModelChannels(saved.length ? saved : eligible);
-        applyChannels([...serverView, ...retained], "remote");
+        const serverView = toModelChannels(saved.length ? saved : guardedEligible);
+        const layer = applyPresetLayer([...serverView, ...retained], localOnlyNotice(retained));
+        applyChannels(layer.channels, "remote");
         // IMPL-4：迁移结果列出被跳过渠道清单（配置页可见）
-        setSync({ migrating: false, phase: "ready", mode: "remote", username: probe.username, error: "", notice: localOnlyNotice(retained) });
-        console.info(`[channel-sync] 已迁移 ${eligible.length} 个渠道到服务端账号${retained.length ? `；仅本地保留：${retained.map((channel) => channel.name).join("、")}` : ""}`);
+        setSync({ migrating: false, phase: "ready", mode: "remote", username: probe.username, error: "", notice: layer.notice });
+        console.info(`[channel-sync] 已迁移 ${guardedEligible.length} 个渠道到服务端账号${retained.length ? `；仅本地保留：${retained.map((channel) => channel.name).join("、")}` : ""}`);
+        startPresetWatch();
         startChannelAutoSave({ ...options, fetchImpl: client });
+        commitPresetVersion(layer.version);
     } catch (error) {
         // 迁移失败：绝不把用户本地 key 弄丢 —— 保持本地数据与本地模式（下次登录重试迁移）
         const message = error instanceof Error ? error.message : String(error);

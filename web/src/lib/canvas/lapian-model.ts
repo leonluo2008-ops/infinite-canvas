@@ -7,6 +7,7 @@
  * 渠道引用格式与 use-config-store 的 encodeChannelModel/decodeChannelModel 一致：`channelId::model`。
  */
 import type { ModelChannel } from "@/stores/use-config-store";
+import { resolvePresetAliasId } from "@/lib/config/preset-meta";
 
 const CHANNEL_MODEL_SEPARATOR = "::";
 
@@ -15,11 +16,15 @@ export function encodeChannelModelRef(channelId: string, model: string) {
     return `${channelId}${CHANNEL_MODEL_SEPARATOR}${model.trim()}`;
 }
 
-/** 渠道引用解码；无分隔符的裸值 → null（当作裸模型名处理，不猜渠道）。 */
+/**
+ * 渠道引用解码；无分隔符的裸值 → null（当作裸模型名处理，不猜渠道）。
+ * S3.5：解出的 channelId 过 preset_meta.aliases——模板渠道填 key 升格换 id 后，画布节点里
+ * 的旧 `templateId::model` 引用在这里**lazy 自愈**（换新 id 解析成功即用，不做全量项目重写）。
+ */
 export function decodeChannelModelRef(value: string) {
     const index = value.indexOf(CHANNEL_MODEL_SEPARATOR);
     if (index < 0) return null;
-    return { channelId: value.slice(0, index), model: value.slice(index + CHANNEL_MODEL_SEPARATOR.length) };
+    return { channelId: resolvePresetAliasId(value.slice(0, index)), model: value.slice(index + CHANNEL_MODEL_SEPARATOR.length) };
 }
 
 /** 引用是否仍指向真实存在的渠道模型（渠道还在且渠道内确有该模型）。 */

@@ -167,7 +167,8 @@ shim.setRoute(async (url, init) => {
 });
 let snap = await sync.bootstrapChannelSync({ timeoutMs: 2000, debounceMs: 10 });
 equal("1. 单人模式模式=local", snap.mode, "local");
-equal("1. 只探了一次 /api/auth/me", shim.calls.fetch.map((c) => c.url), ["/api/auth/me"]);
+// S3.5 白名单期望更新（任务书 V8）：单人模式每 boot 也会拉一次预置文件（版本比对，零写不零请求）
+equal("1. 单人序列=/api/auth/me → /api/bootstrap-config", shim.calls.fetch.map((c) => c.url), ["/api/auth/me", "/api/bootstrap-config"]);
 equal("1. 本地渠道一个不动", store.useConfigStore.getState().config.channels.map((c) => c.id), ["srv-ready", "preset", "wan-ch", "http-ch"]);
 equal("1. store 模式仍 local", store.useConfigStore.getState().config.channelMode, "local");
 equal("1. 本地 key 未被清", store.useConfigStore.getState().config.apiKey, "sk-live-12345678");

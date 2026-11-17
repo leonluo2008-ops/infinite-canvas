@@ -79,24 +79,41 @@ console.info = (...args) => {
     infoLogs.push(args.map(String).join(" "));
 };
 
+// S3.5：预置版本元数据是独立 localStorage 键（不进 persist 信封）
+const META = "infinite-canvas:preset_meta";
+const META_CASE1 = JSON.stringify({ lastPresetVersion: "v-case3", tombstones: [], aliases: {} });
+
 // 每个场景重置 shim 状态
-function reset({ existingKey = null, respond = null } = {}) {
+function reset({ existingKey = null, respond = null, metaVersion = null } = {}) {
     shim.storage.clear();
     shim.calls.fetch.length = 0;
     shim.calls.reload = 0;
     infoLogs.length = 0;
     globalThis.__nextFetchResponse = respond;
     if (existingKey !== null) shim.storage.set(KEY, existingKey);
+    if (metaVersion !== null) shim.storage.set(META, JSON.stringify({ lastPresetVersion: metaVersion, tombstones: [], aliases: {} }));
 }
 
 // ---------------------------------------------------------------------------
-// 1. 幂等：key 已存在 → 不 fetch、不写、不 reload
+// 1. 幂等（S3.5 语义更新：fetch 但不写）：版本相同 → 仍然 1 次 GET、零写入、零 reload
 // ---------------------------------------------------------------------------
-reset({ existingKey: '{"state":{"config":{"channels":[]}},"version":0}' });
+const EXISTING_ENVELOPE = '{"state":{"config":{"channels":[]}},"version":0}';
+reset({
+    existingKey: EXISTING_ENVELOPE,
+    metaVersion: "v-case3",
+    respond: {
+        ok: true,
+        json: async () => ({
+            channels: [{ id: "ch-alpha", name: "Preset A", baseUrl: "https://relay.example/v1/", apiFormat: "sdgf", models: ["video-s"] }],
+            presetVersion: "v-case3",
+        }),
+    },
+});
 await maybeImportBootstrapConfig();
-equal("1. key 存在时不 fetch", shim.calls.fetch, []);
-check("1. key 存在时不写", !shim.storage.has(KEY) || shim.storage.get(KEY).includes('"channels":[]'), "原值被改动");
-equal("1. key 存在时不 reload", shim.calls.reload, 0);
+equal("1. 版本相同仍发 1 次 GET（零写≠零请求）", shim.calls.fetch, ["/api/bootstrap-config"]);
+equal("1. 版本相同不写信封", shim.storage.get(KEY), EXISTING_ENVELOPE);
+equal("1. 版本相同不 reload", shim.calls.reload, 0);
+equal("1. 版本相同不重写 preset_meta", shim.storage.get(META), META_CASE1);
 
 // ---------------------------------------------------------------------------
 // 2. 404 / 网络失败 / 坏载荷 → 静默放弃
@@ -155,6 +172,7 @@ reset({
                 null,
                 "junk-entry",
             ],
+            presetVersion: "v-case3",
         }),
     },
 });
@@ -190,6 +208,7 @@ equal("3. audioModel 指向预置渠道", config.audioModel, "ch-beta::tts-s");
 equal("3. model 主选择回退 imageModel", config.model, "ch-alpha::image-s");
 check("3. defaultConfig 其余字段保留（videoSeconds）", config.videoSeconds === "6", String(config.videoSeconds));
 check("3. defaultConfig 其余字段保留（channelMode）", config.channelMode === "local", String(config.channelMode));
+equal("3. 版本落地 preset_meta（独立键，不进信封）", JSON.parse(shim.storage.get(META)).lastPresetVersion, "v-case3");
 equal("3. webdav 为默认结构", envelope.state.webdav, {
     url: "",
     username: "",
@@ -199,10 +218,12 @@ equal("3. webdav 为默认结构", envelope.state.webdav, {
 });
 
 // ---------------------------------------------------------------------------
-// 4. 导入后二次调用：不 fetch、不 reload（幂等闭环）
+// 4. 导入后二次调用（S3.5 语义更新：fetch 但不写）：版本相同 → 零写入、零 reload
 // ---------------------------------------------------------------------------
+const envelopeAfterImport = shim.storage.get(KEY);
 await maybeImportBootstrapConfig();
-equal("4. 二次调用不 fetch", shim.calls.fetch, ["/api/bootstrap-config"]);
+equal("4. 二次调用仍只各拉一次（每 boot 1 次 GET）", shim.calls.fetch, ["/api/bootstrap-config", "/api/bootstrap-config"]);
+equal("4. 二次调用不重写信封", shim.storage.get(KEY), envelopeAfterImport);
 equal("4. 二次调用不追加 reload", shim.calls.reload, 1);
 
 console.info = originalInfo;
