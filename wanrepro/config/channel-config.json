@@ -1,0 +1,72 @@
+{
+  "channels": [
+    {
+      "id": "default",
+      "name": "聚鑫",
+      "baseUrl": "https://api.jxinapi.com",
+      "apiFormat": "openai",
+      "models": [
+        {
+          "name": "gpt-4o-mini-tts",
+          "capability": "audio"
+        },
+        {
+          "name": "deepseek-v4-flash-0731",
+          "capability": "text"
+        },
+        {
+          "name": "gemini-3.1-flash-lite-image",
+          "capability": "image"
+        },
+        {
+          "name": "gemini-3.8-flash",
+          "capability": "multimodal"
+        }
+      ]
+    },
+    {
+      "id": "kXPsFLhz0hadRynalZN3E",
+      "name": "SDGF",
+      "baseUrl": "https://sdapi.jxinai.com",
+      "apiFormat": "sdgf",
+      "models": [
+        {
+          "name": "SD2.5-满血-GF-1080P",
+          "capability": "video"
+        },
+        {
+          "name": "SD2.5-满血-GF-480P",
+          "capability": "video"
+        },
+        {
+          "name": "SD2.5-满血-GF-720P",
+          "capability": "video"
+        },
+        {
+          "name": "sd2.0-720p-zh",
+          "capability": "video"
+        },
+        {
+          "name": "sd2.5-720p-ap",
+          "capability": "video"
+        }
+      ]
+    },
+    {
+      "id": "dlzkV3SjmTmlBwaFXVFGM",
+      "name": "Ollama Cloud",
+      "baseUrl": "https://ollama.com/v1",
+      "apiFormat": "openai",
+      "models": [
+        {
+          "name": "deepseek-v4.1-flash:1017",
+          "capability": "text"
+        },
+        {
+          "name": "glm-5.3-flash",
+          "capability": "text"
+        }
+      ]
+    }
+  ]
+}

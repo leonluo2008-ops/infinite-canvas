@@ -2371,7 +2371,17 @@ class Handler(BaseHTTPRequestHandler):
             preset = ROOT / "config" / "channel-config.json"
             if not preset.is_file():
                 raise ApiError(404, "no preset")
-            self.send_body(preset.read_bytes(), 200, "application/json")
+            # S3.5-B1：模板版本化——每次响应现算 sha1(文件字节) 前 8 位，改文件即变（零维护）；
+            # 响应从裸文件 JSON 改为 {…原顶层键, channels 原样, presetVersion}，老消费方只读 .channels 不受影响
+            raw = preset.read_bytes()
+            try:
+                body = json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                raise ApiError(500, "preset not valid json")
+            if not isinstance(body, dict) or not isinstance(body.get("channels"), list):
+                raise ApiError(500, "preset missing channels array")
+            body["presetVersion"] = hashlib.sha1(raw).hexdigest()[:8]
+            self.send_json(body)
             return
         # ---- 画布 bridge（M3）：三个只读 API，供画布前端（:3000）fetch -------
         if path == "/api/specs":

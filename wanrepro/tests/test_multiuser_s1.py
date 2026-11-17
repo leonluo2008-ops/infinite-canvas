@@ -1298,6 +1298,55 @@ def phase_s3_b1():
     return checks
 
 
+def phase_s3_5_b1():
+    """S3.5-B1：/api/bootstrap-config 响应加 presetVersion（文件字节 sha1 前 8 位现算）+ 模板文件入库。"""
+    import hashlib
+    checks=[]
+    preset = Path(server.ROOT)/'config'/'channel-config.json'
+    assert preset.is_file(), f'template must be committed to the repo at {preset}'
+    original = preset.read_bytes()
+    file_doc = json.loads(original.decode('utf-8'))
+    want_ver = hashlib.sha1(original).hexdigest()[:8]
+    srv,base=serve('0')
+    try:
+        st,body=req(base,'/api/bootstrap-config')
+        assert st==200, f'bootstrap-config must 200, got {st}'
+        data=json.loads(body)
+        assert set(data)==set(file_doc)|{'presetVersion'}, f'body keys must be template keys + presetVersion, got {sorted(data)}'
+        assert data['channels']==file_doc['channels'], 'channels must equal the repo template file (原样透出，老消费方只读 .channels)'
+        assert len(data['channels'])==3, f'template must hold the 3 channels (聚鑫/SDGF/Ollama Cloud), got {len(data["channels"])}'
+        ver=data['presetVersion']
+        assert isinstance(ver,str) and len(ver)==8 and all(c in '0123456789abcdef' for c in ver), f'presetVersion must be 8-char lowercase hex, got {ver!r}'
+        assert ver==want_ver, f'presetVersion must be sha1(file bytes)[:8]: want {want_ver}, got {ver}'
+        assert 'apiKey' not in body.decode('utf-8'), 'template response must carry zero apiKey (no key in repo or wire)'
+        assert json.loads(req(base,'/api/bootstrap-config')[1])['presetVersion']==ver, 'version must be stable for an unchanged file'
+        checks.append('bootstrap-config: 200 body = template channels (原样, 3 渠道) + presetVersion=sha1(file bytes)[:8] (8 位小写 hex, 稳定), 全响应零 apiKey')
+    finally: srv.shutdown(); srv.server_close()
+    srv,base=serve('0')
+    try:
+        # 现算口径：文件一改版本即变，零维护（临时改写后立即还原原字节）
+        mutated=dict(file_doc); mutated['channels']=file_doc['channels'][:1]
+        preset.write_text(json.dumps(mutated,ensure_ascii=False),encoding='utf-8')
+        try:
+            st,body=req(base,'/api/bootstrap-config')
+            assert st==200, f'mutated template must still 200, got {st}'
+            v2=json.loads(body)['presetVersion']
+            assert v2==hashlib.sha1(preset.read_bytes()).hexdigest()[:8] and v2!=want_ver, f'presetVersion must be recomputed per response: {v2} vs {want_ver}'
+        finally: preset.write_bytes(original)
+        checks.append('bootstrap-config: presetVersion 每次响应现算（改文件即变，无需维护版本号）')
+        # 文件缺失：404 「no preset」旧行为逐字保持
+        hidden=preset.with_name('channel-config.json.probe-hidden')
+        preset.rename(hidden)
+        try:
+            st,b=req(base,'/api/bootstrap-config')
+            assert st==404 and b'no preset' in b, f'missing template must stay 404 "no preset", got {st} {b[:80]}'
+        finally: hidden.rename(preset)
+        assert preset.read_bytes()==original, 'probe must restore the template file byte-exactly'
+        checks.append('bootstrap-config: 文件缺失仍 404「no preset」（旧行为不变）；探针按原字节还原模板')
+    finally: srv.shutdown(); srv.server_close()
+    return checks
+
+
 def main():
  checks=[]; srv,base=serve('0')
  try:
@@ -1438,6 +1487,7 @@ def main():
  checks += phase_s2_6()
  checks += phase_s2_7()
  checks += phase_s3_b1()
+ checks += phase_s3_5_b1()
  print('SUMMARY: PASS %d/%d'%(len(checks),len(checks)))
  for c in checks: print('PASS: '+c)
  return 0
