@@ -120,6 +120,23 @@ function setSync(patch: Partial<CanvasProjectSyncSnapshot>) {
     useCanvasProjectSyncStore.setState(patch);
 }
 
+/**
+ * 推送类错误（「登录状态可能已过期」/「保存失败」）的**自愈条件：dirty 见底**。
+ *
+ * 横幅的显示条件是 `mode==="remote" && (error || dirtyCount>0 || …)`（canvas-project-sync-status.tsx）。
+ * 而 error 过去只在「下一次推送成功」时才被清 —— 于是「dirty 被出列/清空，却再没有下一次推送」的路径
+ * （pushOne 的孤儿 id 出列、409 合并后本地项目已不存在、`syncDirty` 重算把某项掉掉）会把一句话挂到天荒地老：
+ * dirtyCount 变 0 之后没人再触发一次成功推送，error 就再也没有清除的时机。
+ *
+ * 所以推送错误与「启动门/离线/落盘」错误分开记（`runtime.pushErrorActive`）：只有前者会在 dirty 真空时
+ * 自动撤掉；后者（离线原因、缓存写失败、unit 不合约）必须留着，否则离线横幅会变成一句空话。
+ */
+function clearSyncErrorIfClean() {
+    if (!runtime.pushErrorActive || runtime.dirty.size) return;
+    runtime.pushErrorActive = false;
+    setSync({ error: "" });
+}
+
 export function canvasProjectSyncSnapshot(): CanvasProjectSyncSnapshot {
     return useCanvasProjectSyncStore.getState();
 }
@@ -156,6 +173,8 @@ type CanvasSyncRuntime = {
     quarantineKey: string;
     /** 服务端时钟与本机时钟的偏差（ms，仅观测/留痕，不参与判序）。 */
     serverSkew: number;
+    /** 当前 `error` 是否是「推送失败」类（可自愈）——dirty 见底时据此撤掉文案。 */
+    pushErrorActive: boolean;
     deadline: number;
     listenersBound: boolean;
     fetchImpl: typeof fetch;
@@ -173,6 +192,7 @@ const runtime: CanvasSyncRuntime = {
     conflictRetried: new Set(),
     quarantineKey: "",
     serverSkew: 0,
+    pushErrorActive: false,
     deadline: 0,
     listenersBound: false,
     fetchImpl: typeof fetch === "undefined" ? (undefined as unknown as typeof fetch) : fetch,
@@ -352,6 +372,8 @@ function syncDirty(state: PersistedCanvasState) {
     const next = recomputeDirty(state, runtime.serverVersion, runtime.serverTomb);
     runtime.dirty.clear();
     next.forEach((value, key) => runtime.dirty.set(key, value));
+    // 重算后待推集合可能直接见底（项目在别处被清掉）→ 推送类错误必须跟着撤，不能留在横幅上
+    clearSyncErrorIfClean();
 }
 
 function dirtyRecord(): Record<string, number> {
@@ -491,6 +513,9 @@ export async function pushOne(id: string): Promise<void> {
     }
     // 本地已经没有这个项目也没有墓碑（例如被别处清空）→ 无内容可推，出列
     runtime.dirty.delete(id);
+    // 出列就是「这件事结束了」：dirty 见底时那句「登录状态可能已过期」必须撤掉，
+    // 否则用户重新登录后横幅仍挂着（dirtyCount=0 + error 残留 = 永久横幅）
+    clearSyncErrorIfClean();
     await persistDirtyMarker();
 }
 
@@ -531,6 +556,7 @@ async function pushProject(project: CanvasProject): Promise<void> {
     }
     runtime.dirty.delete(project.id);
     runtime.conflictRetried.delete(project.id);
+    runtime.pushErrorActive = false;
     setSync({ error: "" });
     await persistDirtyMarker();
 }
@@ -568,6 +594,7 @@ async function pushDelete(tomb: CanvasDeletedProject): Promise<void> {
     runtime.serverVersion.set(tomb.id, meta?.version ?? Date.now());
     runtime.serverTomb.set(tomb.id, meta?.deletedAt ?? toMillis(tomb.deletedAt) ?? 0);
     runtime.dirty.delete(tomb.id);
+    runtime.pushErrorActive = false;
     setSync({ error: "" });
     await persistDirtyMarker();
 }
@@ -583,9 +610,13 @@ function handlePushFailure(id: string, status: number, message: string) {
     runtime.dirty.set(id, runtime.dirty.get(id) ?? Date.now());
     publish();
     if (status === 413) {
+        // 超体积走 lastFlush 通道（不是「待补推」），不占 error，也就没有可自愈的横幅
+        runtime.pushErrorActive = false;
         useCanvasStore.setState({ lastFlush: { at: new Date().toISOString(), ok: false, bytes: 0, error: message } });
         return;
     }
+    // 这两支都是「还有东西没上去」的推送错误：dirty 见底时必须自动撤（见 clearSyncErrorIfClean）
+    runtime.pushErrorActive = true;
     if (status === 401 || status === 0) {
         setSync({ error: i18n.t("canvasSync.sessionMaybeExpired") });
         return;
@@ -605,6 +636,7 @@ async function resolveConflict(id: string): Promise<void> {
     const local = useCanvasStore.getState().projects.find((item) => item.id === id);
     if (!local) {
         runtime.dirty.delete(id);
+        clearSyncErrorIfClean();
         await persistDirtyMarker();
         return;
     }
@@ -638,6 +670,7 @@ async function resolveConflict(id: string): Promise<void> {
             [...useCanvasStore.getState().deletedProjects.filter((item) => item.id !== id), { id, deletedAt: toIso(fetched.meta.deletedAt) }],
         );
         runtime.dirty.delete(id);
+        clearSyncErrorIfClean();
         await persistDirtyMarker();
         return;
     }
@@ -650,6 +683,7 @@ async function resolveConflict(id: string): Promise<void> {
             useCanvasStore.getState().deletedProjects.filter((item) => item.id !== id),
         );
         runtime.dirty.delete(id);
+        clearSyncErrorIfClean();
         await persistDirtyMarker();
         return;
     }
@@ -689,6 +723,7 @@ async function resolveDeleteConflict(tomb: CanvasDeletedProject): Promise<void> 
         runtime.serverVersion.set(tomb.id, Math.max(runtime.serverVersion.get(tomb.id) ?? 0, localTombMs));
         runtime.serverTomb.set(tomb.id, localTombMs);
         syncDirty({ projects: store.projects, deletedProjects: store.deletedProjects });
+        clearSyncErrorIfClean();
         publish();
         await persistDirtyMarker();
         return;
@@ -706,6 +741,8 @@ async function resolveDeleteConflict(tomb: CanvasDeletedProject): Promise<void> 
         const nextProjects = alive && fetched.project ? [...store.projects.filter((item) => item.id !== tomb.id), fetched.project] : store.projects.filter((item) => item.id !== tomb.id);
         store.replaceProjects(nextProjects, nextDeleted);
         syncDirty({ projects: nextProjects, deletedProjects: nextDeleted });
+        // 409 已经按服务端现状判定完（本次冲突算解决）→ 清掉推送错误；还有别的 id 待推时由 dirtyCount 继续显示
+        runtime.pushErrorActive = false;
         setSync({ error: "" });
         publish();
         await persistDirtyMarker();
@@ -734,6 +771,7 @@ function resetRuntime(client: typeof fetch, deadline: number) {
     runtime.conflictRetried.clear();
     runtime.quarantineKey = "";
     runtime.serverSkew = 0;
+    runtime.pushErrorActive = false;
 }
 
 function bindListeners() {
@@ -1181,6 +1219,8 @@ export async function bootstrapCanvasProjectSync(options: { deadline?: number; f
         runtime.gateDone = true;
         runtime.pushEnabled = false;
         publish();
+        // 缓存写失败不是推送错误：它不会因为 dirty 见底而自愈
+        runtime.pushErrorActive = false;
         setSync({
             phase: "ready",
             mode: "offline",
@@ -1204,6 +1244,7 @@ export async function bootstrapCanvasProjectSync(options: { deadline?: number; f
     publish();
     await persistDirtyMarker();
     scheduleAllDirty();
+    runtime.pushErrorActive = false;
     setSync({ phase: "ready", mode: "remote", owner: ownerName, importPrompt, error: "" });
     return canvasProjectSyncSnapshot();
 }
@@ -1216,6 +1257,8 @@ function enterOffline(message: string, ownerName: string): CanvasProjectSyncSnap
     runtime.gateDone = true;
     runtime.pushEnabled = false;
     publish();
+    // 启动门/离线原因不是「推送失败」：dirty 见底也不许自动撤（那时横幅说的是「为什么离线」）
+    runtime.pushErrorActive = false;
     setSync({ phase: "ready", mode: "offline", owner: ownerName, error: message, importPrompt: null });
     return canvasProjectSyncSnapshot();
 }

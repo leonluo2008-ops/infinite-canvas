@@ -942,6 +942,51 @@ const authBob = () => globalThis.__jsonResponse(200, { username: "bob" });
     equal("19b 导入 dave 的归档后只删它的键", [await lf.getItem(sync.FOREIGN_CACHE_PREFIX + "dave"), typeof (await lf.getItem(sync.FOREIGN_CACHE_PREFIX + "mallory"))], [null, "string"]);
 }
 
+// ----------------------------------------------------------------------------------------
+// 20. 横幅自愈：dirty 出列后「登录状态可能已过期」必须跟着撤（B2.8 回归）
+//
+// 线上现象：PUT 撞 401 → error=sessionMaybeExpired + dirty 保留（这是对的）；但用户重新登录后
+// dirty 那一条成了孤儿（本地 projects/deletedProjects 都找不到这个 id）→ pushOne 出列、
+// dirtyCount 归 0，而 error 只在「下一次推送成功」时才清 —— 再没有下一次了，横幅就永久挂着
+// （canvas-project-sync-status.tsx 的显示条件是 `mode==="remote" && (error || dirtyCount>0 || …)`）。
+// ----------------------------------------------------------------------------------------
+{
+    const orphan = project("ORPHAN1", "会被别处清掉的项目", T0 - 800, [{ id: "o1" }]);
+    await seed({ state: { projects: [orphan], deletedProjects: [] }, version: 0 }, [orphan]);
+    shim.calls.length = 0;
+    shim.setRoute(async (url, init) => {
+        if (url === "/api/auth/me") return authAlice();
+        if (url === "/api/user/projects" && !init?.method) return globalThis.__jsonResponse(200, { projects: [], owner: "alice", serverTime: Date.now(), unit: "ms" });
+        if (init?.method === "PUT") return globalThis.__jsonResponse(401, { error: "未登录" });
+        return globalThis.__jsonResponse(500, { error: `stub 不认：${url}` });
+    });
+    await sync.bootstrapCanvasProjectSync({ deadline: Date.now() + 4_000 });
+    await sleep(1_200); // 启动补推撞 401
+
+    const after401 = sync.canvasProjectSyncSnapshot();
+    check(
+        "20 401 后横幅两行都在（error + dirtyCount>0，复现线上状态）",
+        /过期/.test(after401.error) && after401.dirtyCount === 1,
+        JSON.stringify({ error: after401.error, dirtyCount: after401.dirtyCount }),
+    );
+
+    // 本地被别处清空（换账号 / 项目在别的窗口被移除的等效）：projects 与 deletedProjects 都没有这个 id
+    useCanvasStore.setState({ projects: [], deletedProjects: [] });
+    await sync.pushOne("ORPHAN1"); // 孤儿出列路径：无项目、无墓碑 → 不推、只出列
+    const afterDrain = sync.canvasProjectSyncSnapshot();
+    equal("20 孤儿 dirty 出列后 dirtyCount=0", afterDrain.dirtyCount, 0);
+    equal("20 孤儿出列后推送错误被撤掉（横幅文案不留残响）", afterDrain.error, "");
+    check(
+        "20 横幅显示条件不再成立（error || dirtyCount>0）",
+        !(afterDrain.error || afterDrain.dirtyCount > 0),
+        JSON.stringify({ error: afterDrain.error, dirtyCount: afterDrain.dirtyCount }),
+    );
+    // 落盘是 400ms 防抖：等这次 store 清空写进缓存后，dirtyIds 才是最终事实
+    await sleep(700);
+    equal("20 缓存载荷里的 dirtyIds 也清干净（下次启动不再重推）", Object.keys((await cacheState())?.dirtyIds || {}), []);
+    equal("20 出列不是靠「假装推过」：全程零 PUT 成功", PUTS().length, 1);
+}
+
 console.warn = warn;
 console.log(`=== S3-B2 画布项目同步探针：${passed} passed / ${failures.length} failed ===`);
 for (const item of failures) console.log(`FAIL | ${item}`);
