@@ -4,6 +4,8 @@
 
 <h1 align="center">wan-repro · 电商视频生产画布</h1>
 
+> ⚠️ **分支身份牌（2026-11-17）**：你正在看 **`dev` 分支 = 单人完整版 v1.2.0**（无账号系统，画布单用户全功能，已发 GitHub release）。**部署生产单人版用本分支**（Surface :3001 即此版本）。多用户 SaaS 版在 `feat/saas-multiuser` 分支（工作树 `E:/User/GitHub/infinite-canvas-saas`，部署 :8780）；文档/任务书在 `explore/saas-multiuser` 分支；分支模型详见 canvas-forge 仓 `docs/项目适配包.md`。本 README 其余段落是旧交付线（feat/sdgf-video-node）文案，部署 dev 时以本牌为准。
+
 > 基于无限画布（infinite-canvas）二次开发的视频生产工具：参考视频 → 九层拆解 → 提示词 → 生成出片。本分支（`feat/sdgf-video-node`）为交付主线。
 
 ## 快速开始
