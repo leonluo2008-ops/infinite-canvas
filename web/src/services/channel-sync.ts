@@ -277,21 +277,19 @@ export function mergeLocalOnlyChannels(serverChannels: ModelChannel[], localChan
     return [...serverChannels, ...(localChannels || []).filter((channel) => !ids.has(channel.id) && isLocalOnlyChannel(channel))];
 }
 
-/**
- * 没同步到账号的渠道提示（IMPL-3/IMPL-4：迁移后必须让人看见哪些渠道没上去）。
- * 只点名**服务端确实访问不到**的两类事实：wan 本地地址 / 非 https。
- * 没填 Key 的渠道不在这里点名——它没丢东西，卡片上的「未填 Key」徽标已经说清了，填了就会保存。
+/*
+ * 【已移除：启动门/保存链的「服务端访问不到」点名】unsavableNotice()
+ *
+ * 这里原来每次 boot 都把 wan 型 / 非 https 渠道点名进 notice，用户删掉万相后它又会被写回来
+ * （本地自建渠道每次启动都重新出现在视图里），于是那条黄色提示永远挂着——对「自己建这种渠道、
+ * 本来就知道它在干嘛」的用户纯属噪音，实测被体验成恐吓。
+ *
+ * 现在的口径：这类渠道**不再主动点名**。事实仍然可见但不骚扰——
+ *   · 渠道卡片上的「服务器不可达」徽标（channelBadgeFor）只在该渠道被点开时才看到，保留；
+ *   · 渠道确实没进 PUT（isLocalOnlyChannel 门控）不变，数据不会丢；
+ *   · 用户第一次建/第一次迁移时，卡片本身就是提示（wan 型在卡上写明走本地 bridge）。
+ * i18n 的 channelSync.wanUnreachable / insecureUnreachable 文案保留但不再被启动门调用，防外部引用。
  */
-function unsavableNotice(channels: ModelChannel[]): string {
-    const names = (list: ModelChannel[]) => list.map((channel) => channel.name).filter(Boolean).join("、");
-    const list = channels || [];
-    const wan = list.filter((channel) => channel.apiFormat === "wan");
-    const insecure = list.filter((channel) => channel.apiFormat !== "wan" && !/^https:\/\//i.test((channel.baseUrl || "").trim()));
-    const parts: string[] = [];
-    if (wan.length) parts.push(i18n.t("channelSync.wanUnreachable", { names: names(wan) }));
-    if (insecure.length) parts.push(i18n.t("channelSync.insecureUnreachable", { names: names(insecure) }));
-    return parts.join("；");
-}
 
 // ------------------------------------------------------------------ 预置模板层（S3.5）
 
@@ -713,22 +711,18 @@ export function describeSaveSkips(duplicates: ModelChannel[], unnamed: ModelChan
 }
 
 /**
- * 未提交渠道的提示文案：区分「还没填 key」（用户补上就保存）与「服务端访问不到」
- * （wan 本地地址 / 非 https，补 key 也没用）。
- * 两条都是配置页可见的提示，不能合成一句骗人的「没填 key」。
+ * 未提交渠道的提示文案：**只点名「还没填 key」**（用户补上就会保存，这条有用）。
+ *
+ * B2.7：wan 本地地址 / 非 https 两类渠道**不再在这里点名**。它们每次都进不了 PUT，
+ * 点名等于每次保存都弹一遍同一句警告；用户自己建这类渠道（万相走本地 bridge）本就知道它在干嘛，
+ * 渠道卡片上的「服务器不可达」徽标足以说明事实。i18n 的 wanUnreachable / insecureUnreachable
+ * 文案保留但不再被本函数引用（防外部引用）。
  */
 export function describeSkippedChannels(skipped: ModelChannel[]): string {
     const list = skipped || [];
     const missingKey = list.filter((channel) => !(channel.apiKey || "").trim()).map((channel) => channel.name).filter(Boolean);
-    const wan = list.filter((channel) => channel.apiFormat === "wan" && Boolean((channel.apiKey || "").trim())).map((channel) => channel.name).filter(Boolean);
-    const insecure = list
-        .filter((channel) => channel.apiFormat !== "wan" && Boolean((channel.apiKey || "").trim()) && !/^https:\/\//i.test((channel.baseUrl || "").trim()))
-        .map((channel) => channel.name)
-        .filter(Boolean);
     const parts: string[] = [];
     if (missingKey.length) parts.push(i18n.t("channelSync.missingKey", { names: missingKey.join("、") }));
-    if (wan.length) parts.push(i18n.t("channelSync.wanUnreachable", { names: wan.join("、") }));
-    if (insecure.length) parts.push(i18n.t("channelSync.insecureUnreachable", { names: insecure.join("、") }));
     return parts.join("；");
 }
 
@@ -962,9 +956,9 @@ export async function bootstrapChannelSync(options: BootstrapOptions = {}): Prom
         // 永远进不了服务端渠道表，丢掉就再也找不回来 → 合并保留（IMPL-3：可见、标仅本地、不可选、不清除）
         const serverView = toModelChannels(server);
         const merged = mergeLocalOnlyChannels(serverView, localChannels);
-        const keptLocalOnly = merged.slice(serverView.length);
         // S3.5：预置层追加在最后（服务端视图 → localOnly → preset），版本相同=零写入
-        const layer = applyPresetLayer(merged, unsavableNotice(keptLocalOnly));
+        // B2.7：仅本地渠道（wan/非 https）不再在启动时点名——用户自己建的，卡片徽标已说清
+        const layer = applyPresetLayer(merged);
         applyChannels(layer.channels, "remote");
         setSync({ phase: "ready", mode: "remote", username: probe.username, error: "", notice: layer.notice });
         startPresetWatch();
@@ -980,7 +974,7 @@ export async function bootstrapChannelSync(options: BootstrapOptions = {}): Prom
     const retained = localChannels.filter((channel) => !migratedIds.has(channel.id) && isLocalOnlyChannel(channel));
     if (!eligible.length) {
         // 没有可迁候选（全是预置无 key 渠道 / wan 型 / http 地址）→ 服务端就是空的
-        const layer = applyPresetLayer(retained, unsavableNotice(retained));
+        const layer = applyPresetLayer(retained);
         applyChannels(layer.channels, "remote");
         setSync({ phase: "ready", mode: "remote", username: probe.username, error: "", notice: layer.notice });
         startPresetWatch();
@@ -997,7 +991,7 @@ export async function bootstrapChannelSync(options: BootstrapOptions = {}): Prom
         const saved = await withTimeout(putServerChannels(guardedEligible, client), timeoutMs, "渠道迁移");
         rememberServerIds(saved);
         const serverView = toModelChannels(saved.length ? saved : guardedEligible);
-        const layer = applyPresetLayer([...serverView, ...retained], unsavableNotice(retained));
+        const layer = applyPresetLayer([...serverView, ...retained]);
         applyChannels(layer.channels, "remote");
         // IMPL-4：迁移结果列出被跳过渠道清单（配置页可见）
         setSync({ migrating: false, phase: "ready", mode: "remote", username: probe.username, error: "", notice: layer.notice });

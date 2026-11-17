@@ -403,8 +403,13 @@ resetAll();
     equal("V5 视图顺序=服务端视图 → localOnly → preset 队尾", after.channels.map((channel) => channel.id), ["own-1", "tpl-jx", "wan-ch", "tpl-sdgf", "tpl-ollama"]);
     check("V3 自建渠道原样保留（key 仍在）", after.channels[0].apiKey === "***1234", after.channels[0].apiKey);
     check("V5 模板渠道本地可见但模型不可选（仅本地）", !after.models.some((model) => model.startsWith("tpl-jx::") || model.startsWith("tpl-sdgf::")), JSON.stringify(after.models));
-    // 无 key 模板渠道不再进橙色警告名单（卡片徽标「未填 Key」即可）；警告只点名服务端访问不到的事实
-    check("V5 提示点名模板合入 + wan 本地地址事实（无 key 渠道不点名）", String(snap.notice).includes("已从预置模板合入") && String(snap.notice).includes("万相") && !String(snap.notice).includes("本地模式"), snap.notice);
+    // B2.7：wan/非 https 这类「服务端访问不到」的渠道**不再被启动门点名**（用户自己建的，卡片徽标已说清），
+    // 提示里只剩预置模板的合入事实——这是用户真需要知道的变化。
+    check("V5 提示只含模板合入事实（不再点名 wan 本地地址）", String(snap.notice).includes("已从预置模板合入") && !String(snap.notice).includes("万相") && !String(snap.notice).includes("本地地址") && !String(snap.notice).includes("本地模式"), snap.notice);
+    // B2.7 新增：wan 渠道存在也不许出现「指向本地地址」这句恐吓文案
+    check("V5 wan 渠道在视图里但 notice 不出现「指向本地地址」", after.channels.some((channel) => channel.apiFormat === "wan") && !String(snap.notice).includes("指向本地地址"), snap.notice);
+    // B2.7 新增：无预置变化时 notice 应为空（不因为存在仅本地渠道就自动生成警告）
+    equal("V5 notice 里没有「服务器无法代为访问」类警告", String(snap.notice).includes("服务器无法代为访问"), false);
     equal("V5 版本落地", readMeta().lastPresetVersion, V1_VERSION);
 }
 

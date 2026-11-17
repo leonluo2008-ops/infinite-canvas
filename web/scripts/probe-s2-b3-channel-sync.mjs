@@ -200,7 +200,8 @@ const after3 = store.useConfigStore.getState().config;
 equal("3. 模式=remote", snap.mode, "remote");
 // B3.5 IMPL-3：服务端权威（不迁移、不 PUT），但仅本地渠道（wan/无 key/非 https）保留可见、不清除
 equal("3. 渠道=服务端视图 + 仅本地保留", after3.channels.map((c) => c.id), ["srv-only", "preset", "wan-ch", "http-ch"]);
-check("3. 提示只点名服务器访问不到的事实（万相本地地址），无 key 渠道走徽标不点名", String(snap.notice).includes("万相") && String(snap.notice).includes("本地地址") && !String(snap.notice).includes("预置渠道") && !String(snap.notice).includes("本地模式"), snap.notice);
+// B2.7：wan/非 https 渠道不再被启动门点名（用户自己建的，卡片「服务器不可达」徽标足够）；提示不点名任何仅本地渠道
+check("3. 启动提示不再点名 wan 本地地址 / 非 https（无 key 渠道走徽标更不点名）", !String(snap.notice).includes("万相") && !String(snap.notice).includes("本地地址") && !String(snap.notice).includes("预置渠道") && !String(snap.notice).includes("本地模式") && !String(snap.notice).includes("服务器无法代为访问"), snap.notice);
 check("3. 仅本地渠道模型不进候选（remote 不可选）", !after3.models.some((m) => m.includes("wan-ch") || m.includes("preset")), JSON.stringify(after3.models));
 equal("3. key 只剩 masked", after3.channels[0].apiKey, "***abcd");
 equal("3. 顶层 apiKey 清空（V2 本地不留明文）", after3.apiKey, "");
@@ -232,7 +233,8 @@ check("4. wan 型未上服务端", !putBody.channels.some((c) => c.id === "wan-c
 check("4. http 渠道未上服务端（服务端只收 https）", !putBody.channels.some((c) => c.id === "http-ch"), JSON.stringify(putBody.channels.map((c) => c.id)));
 // B3.5 IMPL-3：迁移后被排除渠道仍在本地 store（wan / 预置无 key / 非 https），标仅本地、不进 PUT
 equal("4. 迁移后 store=服务端渠道+被排除渠道（仍在本地）", after4.channels.map((c) => c.id), ["srv-ready", "preset", "wan-ch", "http-ch"]);
-check("4. 迁移结果提示点名 wan/非 https 事实（无 key 渠道不在警告名单）", String(snap.notice).includes("万相") && String(snap.notice).includes("明文渠道") && !String(snap.notice).includes("预置渠道") && !String(snap.notice).includes("本地模式"), snap.notice);
+// B2.7：迁移结果也不再点名 wan/非 https（渠道仍在本地视图里，卡片徽标说明事实）
+check("4. 迁移提示不点名 wan/非 https（无 key 渠道不在警告名单）", !String(snap.notice).includes("万相") && !String(snap.notice).includes("明文渠道") && !String(snap.notice).includes("本地地址") && !String(snap.notice).includes("预置渠道") && !String(snap.notice).includes("本地模式") && !String(snap.notice).includes("服务器无法代为访问"), snap.notice);
 equal("4. isLocalOnlyChannel 判定", after4.channels.map((c) => sync.isLocalOnlyChannel(c)), [false, true, true, true]);
 check("4. 仅本地渠道模型不可选（remote）", !after4.models.some((m) => m.includes("wan-ch") || m.includes("preset") || m.includes("http-ch")), JSON.stringify(after4.models));
 check("4. 服务端渠道模型仍可选", after4.models.some((m) => m.includes("srv-ready")), JSON.stringify(after4.models));
@@ -348,10 +350,13 @@ equal("8b. 可提交渠道", split.savable.map((c) => c.id), ["keep-1", "keep-2"
 equal("8b. 被跳过渠道", split.skipped.map((c) => c.id), ["skip-wan", "skip-nokey", "skip-http"]);
 const skippedText = String(sync.describeSkippedChannels(split.skipped));
 check(
-    "8b. 跳过提示按事实分类（未填 key / 本地地址 / 非 https），不再出现「本地模式」",
-    skippedText.includes("还没填写 API Key") && skippedText.includes("指向本地地址") && skippedText.includes("不是 https") && !skippedText.includes("本地模式"),
+    "8b. 跳过提示只点名「未填 key」，不点名本地地址/非 https（B2.7 去噪）",
+    skippedText.includes("还没填写 API Key") && !skippedText.includes("指向本地地址") && !skippedText.includes("不是 https") && !skippedText.includes("本地模式"),
     skippedText,
 );
+// 8b-3. B2.7：只有 wan/非 https 被跳过时，保存链提示为空（不再每次保存都弹同一句警告）
+const onlyLocalText = String(sync.describeSkippedChannels([ch({ id: "w", name: "万相", apiFormat: "wan", baseUrl: "http://127.0.0.1:8779" }), ch({ id: "h", name: "明文渠道", baseUrl: "http://insecure.example.com" })]));
+equal("8b-3. 仅 wan/非 https 被跳过时保存链提示为空", onlyLocalText, "");
 // 8b-2. 橙色警告不再点名无 key 渠道：只有「未填 Key」这一句，没有服务端不可达的说法
 const onlyNoKey = String(sync.describeSkippedChannels([ch({ id: "nokey-only", name: "预置渠道", apiKey: "" })]));
 check("8b-2. 无 key 渠道只报未填 key（不进橙色警告名单）", onlyNoKey.includes("还没填写 API Key") && !onlyNoKey.includes("服务器无法") && !onlyNoKey.includes("本地模式"), onlyNoKey);
