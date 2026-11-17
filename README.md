@@ -4,6 +4,8 @@
 
 <h1 align="center">wan-repro · 电商视频生产画布</h1>
 
+> ⚠️ **分支身份牌（2026-11-17）**：你正在看 **`explore/saas-multiuser` 分支 = 文档/任务书线**——多用户 SaaS 的方案、任务书（docs/nodes/ 下 S1~S3.5）、审计报告都在这里。**虽然目录里有代码，但那只是分支底座的快照，永远不用它部署、不在它上面写代码**——写码去 `feat/saas-multiuser`（工作树 `E:/User/GitHub/infinite-canvas-saas`），部署测试 :8780、生产单人版 `dev` 分支 :3001。分支模型详见 canvas-forge 仓 `docs/项目适配包.md`。
+
 > 基于无限画布（infinite-canvas）二次开发的视频生产工具：参考视频 → 九层拆解 → 提示词 → 生成出片。本分支（`feat/sdgf-video-node`）为交付主线。
 
 ## 快速开始
