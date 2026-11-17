@@ -200,7 +200,7 @@ const after3 = store.useConfigStore.getState().config;
 equal("3. 模式=remote", snap.mode, "remote");
 // B3.5 IMPL-3：服务端权威（不迁移、不 PUT），但仅本地渠道（wan/无 key/非 https）保留可见、不清除
 equal("3. 渠道=服务端视图 + 仅本地保留", after3.channels.map((c) => c.id), ["srv-only", "preset", "wan-ch", "http-ch"]);
-check("3. 提示列出仅本地保留渠道", String(snap.notice).includes("预置渠道") && String(snap.notice).includes("万相"), snap.notice);
+check("3. 提示只点名服务器访问不到的事实（万相本地地址），无 key 渠道走徽标不点名", String(snap.notice).includes("万相") && String(snap.notice).includes("本地地址") && !String(snap.notice).includes("预置渠道") && !String(snap.notice).includes("本地模式"), snap.notice);
 check("3. 仅本地渠道模型不进候选（remote 不可选）", !after3.models.some((m) => m.includes("wan-ch") || m.includes("preset")), JSON.stringify(after3.models));
 equal("3. key 只剩 masked", after3.channels[0].apiKey, "***abcd");
 equal("3. 顶层 apiKey 清空（V2 本地不留明文）", after3.apiKey, "");
@@ -232,7 +232,7 @@ check("4. wan 型未上服务端", !putBody.channels.some((c) => c.id === "wan-c
 check("4. http 渠道未上服务端（服务端只收 https）", !putBody.channels.some((c) => c.id === "http-ch"), JSON.stringify(putBody.channels.map((c) => c.id)));
 // B3.5 IMPL-3：迁移后被排除渠道仍在本地 store（wan / 预置无 key / 非 https），标仅本地、不进 PUT
 equal("4. 迁移后 store=服务端渠道+被排除渠道（仍在本地）", after4.channels.map((c) => c.id), ["srv-ready", "preset", "wan-ch", "http-ch"]);
-check("4. 迁移结果提示列出被跳过渠道（配置页可见）", String(snap.notice).includes("预置渠道") && String(snap.notice).includes("万相") && String(snap.notice).includes("明文渠道"), snap.notice);
+check("4. 迁移结果提示点名 wan/非 https 事实（无 key 渠道不在警告名单）", String(snap.notice).includes("万相") && String(snap.notice).includes("明文渠道") && !String(snap.notice).includes("预置渠道") && !String(snap.notice).includes("本地模式"), snap.notice);
 equal("4. isLocalOnlyChannel 判定", after4.channels.map((c) => sync.isLocalOnlyChannel(c)), [false, true, true, true]);
 check("4. 仅本地渠道模型不可选（remote）", !after4.models.some((m) => m.includes("wan-ch") || m.includes("preset") || m.includes("http-ch")), JSON.stringify(after4.models));
 check("4. 服务端渠道模型仍可选", after4.models.some((m) => m.includes("srv-ready")), JSON.stringify(after4.models));
@@ -346,7 +346,31 @@ const split = sync.splitSavableChannels([
 ]);
 equal("8b. 可提交渠道", split.savable.map((c) => c.id), ["keep-1", "keep-2"]);
 equal("8b. 被跳过渠道", split.skipped.map((c) => c.id), ["skip-wan", "skip-nokey", "skip-http"]);
-check("8b. 跳过提示区分未填 key 与仅本地", String(sync.describeSkippedChannels(split.skipped)).includes("还没填写 API Key") && String(sync.describeSkippedChannels(split.skipped)).includes("仅本地模式"), sync.describeSkippedChannels(split.skipped));
+const skippedText = String(sync.describeSkippedChannels(split.skipped));
+check(
+    "8b. 跳过提示按事实分类（未填 key / 本地地址 / 非 https），不再出现「本地模式」",
+    skippedText.includes("还没填写 API Key") && skippedText.includes("指向本地地址") && skippedText.includes("不是 https") && !skippedText.includes("本地模式"),
+    skippedText,
+);
+// 8b-2. 橙色警告不再点名无 key 渠道：只有「未填 Key」这一句，没有服务端不可达的说法
+const onlyNoKey = String(sync.describeSkippedChannels([ch({ id: "nokey-only", name: "预置渠道", apiKey: "" })]));
+check("8b-2. 无 key 渠道只报未填 key（不进橙色警告名单）", onlyNoKey.includes("还没填写 API Key") && !onlyNoKey.includes("服务器无法") && !onlyNoKey.includes("本地模式"), onlyNoKey);
+
+// ---------------------------------------------------------------------------
+// 8f. 渠道徽标：用户可见判定与门控分离（界面上没有「本地模式」这个概念）
+// ---------------------------------------------------------------------------
+const badgeOf = (channel, options) => sync.channelBadgeFor(channel, options);
+const noKeyBadge = badgeOf(ch({ id: "ui-nokey", apiKey: "", baseUrl: "https://api.example.com" }));
+const wanBadge = badgeOf(ch({ id: "ui-wan", apiFormat: "wan", baseUrl: "http://127.0.0.1:8779", apiKey: "" }));
+const httpBadge = badgeOf(ch({ id: "ui-http", apiKey: "sk-probe-key", baseUrl: "http://insecure.example.com" }));
+const scriptBadge = badgeOf(ch({ id: "ui-script", apiKey: "sk-probe-key", models: [{ name: "m", capability: "image", script: "return 1;" }] }), { serverMode: true });
+const okBadge = badgeOf(ch({ id: "ui-ok", apiKey: "sk-probe-key" }));
+equal("8f. 徽标种类（未填 Key / 服务器不可达×2 / 脚本渠道 / 无徽标）", [noKeyBadge, wanBadge, httpBadge, scriptBadge, okBadge].map((badge) => (badge ? badge.kind : null)), ["missingKey", "serverUnreachable", "serverUnreachable", "script", null]);
+check("8f-2. 无 key https 渠道徽标=未填 Key 且不含「本地模式」", noKeyBadge.label === "未填 Key" && !`${noKeyBadge.label}${noKeyBadge.hint}`.includes("本地模式"), JSON.stringify(noKeyBadge));
+check("8f-3. wan 渠道徽标是事实陈述（服务器不可达 + 说明访问不到本地地址）", wanBadge.label === "服务器不可达" && wanBadge.hint.includes("服务器无法代为访问"), JSON.stringify(wanBadge));
+check("8f-4. 脚本渠道徽标说明服务端不下发 Key", scriptBadge.label === "脚本渠道" && scriptBadge.hint.includes("不会把 Key 下发给脚本"), JSON.stringify(scriptBadge));
+// 8f-5. 徽标不影响门控：无 key 渠道徽标=未填 Key，但内部判定仍为「不进 PUT」
+check("8f-5. 展示判定与路由门控各归各位", noKeyBadge.kind === "missingKey" && sync.isLocalOnlyChannel(ch({ id: "ui-nokey", apiKey: "", baseUrl: "https://api.example.com" })) === true, "徽标/门控耦合了");
 
 // 8c. 卸载回写：草稿不入 body；超大 models 体跳过并留痕（keepalive 64KB 上限）
 const unloadEmpty = sync.buildUnloadPayload([ch({ id: "draft", apiKey: "" })]);

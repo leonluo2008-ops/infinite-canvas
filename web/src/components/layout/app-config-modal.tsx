@@ -19,7 +19,7 @@ import { audioFormatOptions, audioVoiceOptions, normalizeAudioSpeedValue } from 
 import { computeMediaSize, inferMediaRatio, inferMediaScale, mediaScaleOptions, parseVideoResolution } from "@/lib/media-size";
 import { createModelChannel, modelOptionsFromChannels, normalizeModelOptionValue, selectableModelsByCapability, useConfigStore, type AiConfig, type ApiCallFormat, type ConfigTabKey, type ModelCapability, type ModelChannel } from "@/stores/use-config-store";
 import { normalizeLapianDefaultModel, normalizeLapianModelList } from "@/lib/canvas/lapian-model";
-import { isLocalOnlyChannel, useChannelSyncStore } from "@/services/channel-sync";
+import { channelBadgeFor, isScriptChannelBadge, useChannelSyncStore } from "@/services/channel-sync";
 
 type ModelGroup = {
     capability: ModelCapability;
@@ -217,27 +217,27 @@ export function AppConfigPanel({ showDoneButton = false, initialTab = "channels"
                                     {syncNotice ? <div className="mb-3 rounded-lg bg-amber-50 px-3 py-2 text-xs text-amber-700 dark:bg-amber-950/40 dark:text-amber-300">{syncNotice}</div> : null}
                                     <div className="space-y-2">
                                         {config.channels.map((channel) => {
-                                            // 自定义脚本渠道：脚本自己拿 key 发任意请求，服务端模式下无法代转发 → 置灰（B3.5③）
-                                            const scriptLocalOnly = serverMode && channel.models.some((model) => Boolean(model.script?.trim()));
-                                            // IMPL-3：仅本地模式渠道（wan / 无 key / 非 https）服务端收不了 → remote 下可见但不可选、不清除
-                                            const localOnly = isLocalOnlyChannel(channel);
+                                            // 徽标只陈述事实：未填 Key / 服务器不可达（wan、非 https）/ 脚本渠道（服务端不下发 Key）
+                                            const badge = channelBadgeFor(channel, { serverMode });
+                                            // 脚本渠道：脚本自己拿 key 发任意请求，服务端无法代转发 → 编辑入口停用（B3.5③）
+                                            const scriptChannel = isScriptChannelBadge(badge);
                                             return (
                                                 <div
                                                     key={channel.id}
-                                                    className={`flex items-center justify-between gap-3 rounded-lg border border-stone-200 px-4 py-3 dark:border-stone-800 ${scriptLocalOnly || localOnly ? "opacity-60" : ""}`}
+                                                    className={`flex items-center justify-between gap-3 rounded-lg border border-stone-200 px-4 py-3 dark:border-stone-800 ${scriptChannel ? "opacity-60" : ""}`}
                                                 >
                                                     <div className="min-w-0">
                                                         <div className="flex min-w-0 items-center gap-2">
                                                             <span className="truncate text-sm font-semibold">{channel.name || t("config.channels.unnamed")}</span>
-                                                            {scriptLocalOnly ? <Tag className="shrink-0">{t("config.channels.scriptLocalOnly")}</Tag> : null}
-                                                            {localOnly ? <Tag className="shrink-0">{t("config.channels.localOnly")}</Tag> : null}
+                                                            {badge ? <Tag className="shrink-0">{badge.label}</Tag> : null}
                                                         </div>
                                                         <div className="mt-1 truncate text-xs text-stone-500">
                                                             {apiFormatLabel(channel.apiFormat)} · {t("config.channels.modelCount", { count: channel.models.length })} · {channel.baseUrl || t("config.channels.missingUrl")}
                                                         </div>
+                                                        {badge ? <div className="mt-1 text-xs text-stone-400">{badge.hint}</div> : null}
                                                     </div>
                                                     <div className="flex shrink-0 gap-2">
-                                                        <Button size="small" disabled={scriptLocalOnly} icon={<Pencil className="size-3.5" />} onClick={() => setEditingChannelId(channel.id)}>
+                                                        <Button size="small" disabled={scriptChannel} icon={<Pencil className="size-3.5" />} onClick={() => setEditingChannelId(channel.id)}>
                                                             {t("common.edit")}
                                                         </Button>
                                                         <Button size="small" danger icon={<Trash2 className="size-3.5" />} onClick={() => deleteChannel(channel.id)} />

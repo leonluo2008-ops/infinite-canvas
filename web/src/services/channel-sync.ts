@@ -205,12 +205,13 @@ export function selectMigratableChannels(channels: ModelChannel[]): ModelChannel
 }
 
 /**
- * 「仅本地模式」渠道的运行时推导（B3.5 IMPL-3，**不加 store 字段**——store 结构不动）：
+ * 「进不了服务端渠道表」的**内部路由判定**（B3.5 IMPL-3，**不加 store 字段**——store 结构不动）：
  *  * wan 型：万相 CLI bridge 同源零 key，服务端明确 422；
  *  * 无 key：bootstrap 预置渠道 / 还没填 key 的草稿，服务端必 422；
  *  * 有真 key 但非 https：服务端 SSRF 收口只收 https；
- *  * 掩码 key → **不是**仅本地（那是服务端渠道的本地缓存视图，服务端权威）。
- * 它们永远进不了服务端渠道表，remote 模式下保留在本地：可见、标「仅本地模式」、不进 PUT、模型不可选，但**不清除**。
+ *  * 掩码 key → **不算**（那是服务端渠道的本地缓存视图，服务端权威）。
+ * 用在：remote 模式下这些渠道留在本地可见、不进 PUT、模型不进候选，但**不清除**。
+ * 这层是门控，用户看不见；用户可见徽标一律走 `channelBadgeFor`（说法是事实陈述，没有「本地模式」概念）。
  */
 export function isLocalOnlyChannel(channel: ModelChannel | null | undefined): boolean {
     if (!channel) return true;
@@ -222,6 +223,52 @@ export function isLocalOnlyChannel(channel: ModelChannel | null | undefined): bo
 }
 
 /**
+ * 渠道徽标（**只决定用户可见的文案与置灰，不参与任何路由/保存判定**）。
+ * 三种说法各自陈述事实，界面上不存在「本地模式」这个概念：
+ *  * 未填 Key —— 填了就能用，并且会保存到账号；
+ *  * 服务器不可达 —— wan / 非 https，服务端真的访问不到那个地址；
+ *  * 脚本渠道 —— 脚本自己带 Key 发请求，服务端不下发 Key。
+ */
+export type ChannelBadgeKind = "missingKey" | "serverUnreachable" | "script";
+
+export type ChannelBadge = {
+    kind: ChannelBadgeKind;
+    /** 徽标文字（中性灰，不是警告）。 */
+    label: string;
+    /** 卡片上的一行事实说明。 */
+    hint: string;
+};
+
+/**
+ * 渠道徽标的展示判定。与 `isLocalOnlyChannel`（门控）**刻意分开**：
+ * 门控回答「能不能进 PUT」，这里只回答「该跟用户说哪句实话」。
+ */
+export function channelBadgeFor(channel: ModelChannel | null | undefined, options: { serverMode?: boolean } = {}): ChannelBadge | null {
+    if (!channel) return null;
+    const apiKey = (channel.apiKey || "").trim();
+    const baseUrl = (channel.baseUrl || "").trim();
+    if (channel.apiFormat === "wan") {
+        return { kind: "serverUnreachable", label: i18n.t("config.channels.badgeServerUnreachable"), hint: i18n.t("config.channels.badgeWanHint") };
+    }
+    if (!apiKey) {
+        return { kind: "missingKey", label: i18n.t("config.channels.badgeMissingKey"), hint: i18n.t("config.channels.badgeMissingKeyHint") };
+    }
+    if (baseUrl && !/^https:\/\//i.test(baseUrl)) {
+        return { kind: "serverUnreachable", label: i18n.t("config.channels.badgeServerUnreachable"), hint: i18n.t("config.channels.badgeInsecureHint") };
+    }
+    const hasScript = (channel.models || []).some((model) => Boolean(model?.script?.trim()));
+    if (hasScript && options.serverMode) {
+        return { kind: "script", label: i18n.t("config.channels.badgeScript"), hint: i18n.t("config.channels.badgeScriptHint") };
+    }
+    return null;
+}
+
+/** 服务端模式下这条渠道的编辑入口是否停用（脚本渠道：服务端拿不到脚本要的 Key）。 */
+export function isScriptChannelBadge(badge: ChannelBadge | null): boolean {
+    return badge?.kind === "script";
+}
+
+/**
  * 服务端渠道 + 本地专有渠道合并（服务端在前=权威顺序，本地专有附在后面）。
  * id 已在服务端出现的一律以服务端视图为准，避免同一渠道出现两份。
  */
@@ -230,10 +277,20 @@ export function mergeLocalOnlyChannels(serverChannels: ModelChannel[], localChan
     return [...serverChannels, ...(localChannels || []).filter((channel) => !ids.has(channel.id) && isLocalOnlyChannel(channel))];
 }
 
-/** 「仅本地模式」保留渠道的配置页提示（IMPL-3/IMPL-4：迁移后必须让人看见哪些渠道没上去）。 */
-function localOnlyNotice(channels: ModelChannel[]): string {
-    const names = channels.map((channel) => channel.name).filter(Boolean);
-    return names.length ? i18n.t("channelSync.localOnlyKept", { names: names.join("、") }) : "";
+/**
+ * 没同步到账号的渠道提示（IMPL-3/IMPL-4：迁移后必须让人看见哪些渠道没上去）。
+ * 只点名**服务端确实访问不到**的两类事实：wan 本地地址 / 非 https。
+ * 没填 Key 的渠道不在这里点名——它没丢东西，卡片上的「未填 Key」徽标已经说清了，填了就会保存。
+ */
+function unsavableNotice(channels: ModelChannel[]): string {
+    const names = (list: ModelChannel[]) => list.map((channel) => channel.name).filter(Boolean).join("、");
+    const list = channels || [];
+    const wan = list.filter((channel) => channel.apiFormat === "wan");
+    const insecure = list.filter((channel) => channel.apiFormat !== "wan" && !/^https:\/\//i.test((channel.baseUrl || "").trim()));
+    const parts: string[] = [];
+    if (wan.length) parts.push(i18n.t("channelSync.wanUnreachable", { names: names(wan) }));
+    if (insecure.length) parts.push(i18n.t("channelSync.insecureUnreachable", { names: names(insecure) }));
+    return parts.join("；");
 }
 
 // ------------------------------------------------------------------ 预置模板层（S3.5）
@@ -327,12 +384,12 @@ function commitAliasClaims(claims: Array<{ from: string; to: string }> | undefin
  * 预置层 + 启动 normalize 升格一起算完：返回最终渠道视图、notice、模板版本。
  * @returns changed=false 时 channels 引用与入参一致（调用方据此零写入）
  */
-export function applyPresetLayer(channels: ModelChannel[], localOnlyNoticeText = ""): { channels: ModelChannel[]; notice: string; version: string; changed: boolean } {
+export function applyPresetLayer(channels: ModelChannel[], startupNoticeText = ""): { channels: ModelChannel[]; notice: string; version: string; changed: boolean } {
     const layer = mergePresetLayer(channels);
     const minted = mintPromotedOnBoot(layer.channels);
     return {
         channels: minted,
-        notice: joinNotices(localOnlyNoticeText, layer.notice),
+        notice: joinNotices(startupNoticeText, layer.notice),
         version: layer.version,
         changed: layer.changed || minted !== layer.channels,
     };
@@ -656,15 +713,22 @@ export function describeSaveSkips(duplicates: ModelChannel[], unnamed: ModelChan
 }
 
 /**
- * 未提交渠道的提示文案：区分「还没填 key」（用户要补）与「仅本地模式」（服务端根本不收）。
+ * 未提交渠道的提示文案：区分「还没填 key」（用户补上就保存）与「服务端访问不到」
+ * （wan 本地地址 / 非 https，补 key 也没用）。
  * 两条都是配置页可见的提示，不能合成一句骗人的「没填 key」。
  */
 export function describeSkippedChannels(skipped: ModelChannel[]): string {
-    const missingKey = skipped.filter((channel) => !(channel.apiKey || "").trim()).map((channel) => channel.name).filter(Boolean);
-    const localOnly = skipped.filter((channel) => Boolean((channel.apiKey || "").trim())).map((channel) => channel.name).filter(Boolean);
+    const list = skipped || [];
+    const missingKey = list.filter((channel) => !(channel.apiKey || "").trim()).map((channel) => channel.name).filter(Boolean);
+    const wan = list.filter((channel) => channel.apiFormat === "wan" && Boolean((channel.apiKey || "").trim())).map((channel) => channel.name).filter(Boolean);
+    const insecure = list
+        .filter((channel) => channel.apiFormat !== "wan" && Boolean((channel.apiKey || "").trim()) && !/^https:\/\//i.test((channel.baseUrl || "").trim()))
+        .map((channel) => channel.name)
+        .filter(Boolean);
     const parts: string[] = [];
     if (missingKey.length) parts.push(i18n.t("channelSync.missingKey", { names: missingKey.join("、") }));
-    if (localOnly.length) parts.push(i18n.t("channelSync.localOnlyKept", { names: localOnly.join("、") }));
+    if (wan.length) parts.push(i18n.t("channelSync.wanUnreachable", { names: wan.join("、") }));
+    if (insecure.length) parts.push(i18n.t("channelSync.insecureUnreachable", { names: insecure.join("、") }));
     return parts.join("；");
 }
 
@@ -900,7 +964,7 @@ export async function bootstrapChannelSync(options: BootstrapOptions = {}): Prom
         const merged = mergeLocalOnlyChannels(serverView, localChannels);
         const keptLocalOnly = merged.slice(serverView.length);
         // S3.5：预置层追加在最后（服务端视图 → localOnly → preset），版本相同=零写入
-        const layer = applyPresetLayer(merged, localOnlyNotice(keptLocalOnly));
+        const layer = applyPresetLayer(merged, unsavableNotice(keptLocalOnly));
         applyChannels(layer.channels, "remote");
         setSync({ phase: "ready", mode: "remote", username: probe.username, error: "", notice: layer.notice });
         startPresetWatch();
@@ -916,7 +980,7 @@ export async function bootstrapChannelSync(options: BootstrapOptions = {}): Prom
     const retained = localChannels.filter((channel) => !migratedIds.has(channel.id) && isLocalOnlyChannel(channel));
     if (!eligible.length) {
         // 没有可迁候选（全是预置无 key 渠道 / wan 型 / http 地址）→ 服务端就是空的
-        const layer = applyPresetLayer(retained, localOnlyNotice(retained));
+        const layer = applyPresetLayer(retained, unsavableNotice(retained));
         applyChannels(layer.channels, "remote");
         setSync({ phase: "ready", mode: "remote", username: probe.username, error: "", notice: layer.notice });
         startPresetWatch();
@@ -933,7 +997,7 @@ export async function bootstrapChannelSync(options: BootstrapOptions = {}): Prom
         const saved = await withTimeout(putServerChannels(guardedEligible, client), timeoutMs, "渠道迁移");
         rememberServerIds(saved);
         const serverView = toModelChannels(saved.length ? saved : guardedEligible);
-        const layer = applyPresetLayer([...serverView, ...retained], localOnlyNotice(retained));
+        const layer = applyPresetLayer([...serverView, ...retained], unsavableNotice(retained));
         applyChannels(layer.channels, "remote");
         // IMPL-4：迁移结果列出被跳过渠道清单（配置页可见）
         setSync({ migrating: false, phase: "ready", mode: "remote", username: probe.username, error: "", notice: layer.notice });

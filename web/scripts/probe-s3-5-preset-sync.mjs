@@ -403,7 +403,8 @@ resetAll();
     equal("V5 视图顺序=服务端视图 → localOnly → preset 队尾", after.channels.map((channel) => channel.id), ["own-1", "tpl-jx", "wan-ch", "tpl-sdgf", "tpl-ollama"]);
     check("V3 自建渠道原样保留（key 仍在）", after.channels[0].apiKey === "***1234", after.channels[0].apiKey);
     check("V5 模板渠道本地可见但模型不可选（仅本地）", !after.models.some((model) => model.startsWith("tpl-jx::") || model.startsWith("tpl-sdgf::")), JSON.stringify(after.models));
-    check("V5 提示点名模板合入/仅本地保留", String(snap.notice).includes("聚鑫"), snap.notice);
+    // 无 key 模板渠道不再进橙色警告名单（卡片徽标「未填 Key」即可）；警告只点名服务端访问不到的事实
+    check("V5 提示点名模板合入 + wan 本地地址事实（无 key 渠道不点名）", String(snap.notice).includes("已从预置模板合入") && String(snap.notice).includes("万相") && !String(snap.notice).includes("本地模式"), snap.notice);
     equal("V5 版本落地", readMeta().lastPresetVersion, V1_VERSION);
 }
 
