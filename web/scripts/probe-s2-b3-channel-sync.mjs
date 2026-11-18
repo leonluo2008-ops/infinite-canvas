@@ -287,8 +287,8 @@ check("6. 读失败记错误文案", String(snap.error).includes("503"), snap.er
 // 7. 请求层：路径拼接 + 鉴权头
 // ---------------------------------------------------------------------------
 const remoteConfig = { ...store.defaultConfig, channelMode: "remote", channelId: "ch-1", model: "ch-1::gpt-image-2", baseUrl: "https://api.example.com/v1", apiKey: "" };
-equal("7. remote 路径=baseUrl.path+/v1+path", proxy.channelApiUrl(remoteConfig, "/images/generations"), "/api/proxy/ch-1/v1/images/generations");
-equal("7. baseUrl 已带 /v1 不重复", proxy.channelApiUrl({ ...remoteConfig, baseUrl: "https://api.example.com/v1" }, "/models"), "/api/proxy/ch-1/v1/models");
+equal("7. remote 路径=相对 baseUrl 的 subpath（S3.7）", proxy.channelApiUrl(remoteConfig, "/images/generations"), "/api/proxy/ch-1/images/generations");
+equal("7. baseUrl 已带 /v1 不重复（S3.7 裁剪）", proxy.channelApiUrl({ ...remoteConfig, baseUrl: "https://api.example.com/v1" }, "/models"), "/api/proxy/ch-1/models");
 equal("7. 查询串透传", proxy.channelAbsoluteUrl(remoteConfig, "https://generativelanguage.googleapis.com/v1beta/models/gemini-3:streamGenerateContent?alt=sse"), "/api/proxy/ch-1/v1beta/models/gemini-3:streamGenerateContent?alt=sse");
 const remoteHeaders = proxy.channelAuthHeaders(remoteConfig, "application/json");
 check("7. remote 不带 Authorization", !("Authorization" in remoteHeaders), JSON.stringify(remoteHeaders));
@@ -300,7 +300,7 @@ equal("7. local 仍带 Authorization", proxy.channelAuthHeaders(localConfig).Aut
 equal("7. 模式缺省回落 store（未登录 local）", proxy.isServerChannelMode({}), false);
 
 // 7b. 缺 channelId 时按模型引用串兜底；两者都没有 → 明确报错
-equal("7b. 从 channelId::model 解出渠道", proxy.channelApiUrl({ ...remoteConfig, channelId: "", model: "ch-9::flux-pro" }, "/models"), "/api/proxy/ch-9/v1/models");
+equal("7b. 从 channelId::model 解出渠道", proxy.channelApiUrl({ ...remoteConfig, channelId: "", model: "ch-9::flux-pro" }, "/models"), "/api/proxy/ch-9/models");
 let threw = false;
 try {
     proxy.channelApiUrl({ ...remoteConfig, channelId: "", model: "flux-pro" }, "/models");

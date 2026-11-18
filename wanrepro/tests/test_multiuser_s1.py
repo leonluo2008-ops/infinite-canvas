@@ -111,7 +111,8 @@ def phase_b2():
         token = [c.value for c in jarA if c.name == 'wan_session'][0]
         st, b = req(base, CHANNELS, 'PUT', {'channels': [
             {'id': 'ch_p', 'name': '代理', 'baseUrl': PUB_IP, 'apiFormat': 'openai', 'models': ['m'], 'apiKey': PKEY},
-            {'id': 'ch_g', 'name': '双子', 'baseUrl': PUB_IP, 'apiFormat': 'gemini', 'apiKey': PKEY + 'g'}]}, opA)
+            {'id': 'ch_g', 'name': '双子', 'baseUrl': PUB_IP, 'apiFormat': 'gemini', 'apiKey': PKEY + 'g'},
+            {'id': 'ch_v', 'name': '带v1', 'baseUrl': PUB_IP + '/v1', 'apiFormat': 'openai', 'models': ['m'], 'apiKey': PKEY}]}, opA)
         assert st == 200, f'B2 setup channels failed: {st} {b}'
 
         def raw(path, method='GET', headers=None, body=None, timeout=20, send_len=True):
@@ -165,6 +166,25 @@ def phase_b2():
         assert r.status == 200 and 'key=' + PKEY + 'g' in rec['path'], f'gemini key not injected into query: {rec["path"]}'
         assert 'authorization' not in rec['headers'], 'gemini channel must not send Authorization header'
         checks.append('gemini-type channel injects ?key=<decrypted key> (no Authorization header)')
+
+        # --- S3.7：baseUrl 自带 /v1 时代理路径不得双拼 ---
+        # 断言 A：前端按「subpath 相对 baseUrl」合同只传 /models，服务端拼 base.path → 上游恰收一个 /v1
+        c, r = raw('/api/proxy/ch_v/models', 'GET', {'Cookie': 'wan_session=' + token})
+        r.read(); c.close()
+        rec = _Echo.seen[-1]
+        assert r.status == 200, f'baseUrl-with-/v1 proxy should 200, got {r.status}'
+        assert rec['path'] == '/v1/models' and rec['path'].count('/v1') == 1, \
+            f'baseUrl /v1 + subpath /models must reach upstream as exactly /v1/models, got: {rec["path"]}'
+        checks.append("S3.7-A: channel baseUrl '<ip>/v1' + proxy subpath /models -> upstream path exactly '/v1/models' (no double /v1)")
+
+        # 断言 B（锁定现状，防未来误加服务端去重）：旧前端形态 /v1/models 原样拼，上游收到 /v1/v1/models
+        c, r = raw('/api/proxy/ch_v/v1/models', 'GET', {'Cookie': 'wan_session=' + token})
+        r.read(); c.close()
+        rec = _Echo.seen[-1]
+        assert r.status == 200, f'legacy-form proxy should still 200, got {r.status}'
+        assert rec['path'] == '/v1/v1/models', \
+            f'server must NOT dedupe (audit R1): legacy subpath /v1/models forwards verbatim as /v1/v1/models, got: {rec["path"]}'
+        checks.append("S3.7-B: server forwarding contract stays 'base.path + subpath' verbatim (legacy form -> '/v1/v1/models', no dedupe)")
 
         # --- V10：日志零泄露（log_request/log_message 已覆写）---
         time.sleep(0.3)   # 先让前几个请求的日志行落盘，别混进本段捕获
@@ -278,7 +298,7 @@ def phase_b2():
         st_ia, body_ia = req(base, CHANNELS, opener=opA)
         rows = json.loads(body_ia)['channels'] if st_ia == 200 else []
         broken = [r for r in rows if r['id'] == 'ch_g']
-        assert st_ia == 200 and len(rows) == 2, f'one broken row must not 500 the whole list: {st_ia} {body_ia[:200]}'
+        assert st_ia == 200 and len(rows) == 3, f'one broken row must not 500 the whole list: {st_ia} {body_ia[:200]}'
         assert broken and broken[0]['apiKey'] == '***?' and broken[0].get('keyBroken') is True, f'broken row must degrade to ***?: {broken}'
         assert [r for r in rows if r['id'] == 'ch_p'][0]['apiKey'] == '***' + PKEY[-4:], 'healthy row must stay intact'
         checks.append('IF-A: a corrupted ciphertext row degrades to ***? (keyBroken) instead of 500-ing the whole GET')

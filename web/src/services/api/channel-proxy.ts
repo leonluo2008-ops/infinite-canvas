@@ -19,6 +19,8 @@ export type ChannelTarget = {
     /** resolveModelRequestConfig 注入的渠道 id；缺省时从 `channelId::model` 引用串里解。 */
     channelId?: string;
     model?: string;
+    /** 渠道 baseUrl（如 `https://ollama.com/v1`）；裁剪 subpath 前缀用，不回落 store。 */
+    baseUrl?: string;
 };
 
 export const CHANNEL_PROXY_PREFIX = "/api/proxy";
@@ -39,15 +41,37 @@ export function channelIdOf(config?: ChannelTarget | null): string {
 }
 
 /**
+ * 渠道 baseUrl 的路径前缀（去尾斜杠）。解析失败 / 无路径 / 非 http(s) → 空串（不裁剪）。
+ * 服务端合同是「subpath 相对 baseUrl」（channel_store._forward 拼 `base.path + "/" + subpath`），
+ * 所以前端必须剥掉 baseUrl 自带路径（如 `https://ollama.com/v1` 的 `/v1`），否则上游收到 `/v1/v1/…`。
+ */
+function stripBasePath(config: ChannelTarget | null | undefined, pathname: string): string {
+    // 不回落 store：回落会让不同调用点语义不一致，调用方（resolveModelRequestConfig）已自带 baseUrl
+    const raw = (config?.baseUrl || "").trim();
+    let basePath = "";
+    try {
+        basePath = new URL(raw, "https://channel.invalid").pathname.replace(/\/+$/, "");
+    } catch {
+        basePath = "";
+    }
+    if (!basePath || basePath === "/") return pathname;
+    const lower = pathname.toLowerCase();
+    const baseLower = basePath.toLowerCase();
+    if (lower === baseLower) return "/";
+    if (lower.startsWith(`${baseLower}/`)) return pathname.slice(basePath.length);
+    return pathname;
+}
+
+/**
  * 绝对上游地址 → 同域代转发地址。
- * `/api/proxy/<channelId>/<baseUrl.path + /v1… + path>` —— 服务端只做 baseUrl.path 拼接，
- * 其余路径（含 `/v1`、`?alt=sse` 之类 query）都由这里带过去。
+ * `/api/proxy/<channelId>/<相对 baseUrl 的 subpath>` —— 服务端做 `baseUrl.path + "/" + subpath` 拼接，
+ * 所以这里传「绝对地址 pathname 剥掉 baseUrl 路径前缀」的相对路径（query 原样保留）。
  */
 export function channelProxyUrl(config: ChannelTarget | null | undefined, absoluteUrl: string): string {
     const channelId = channelIdOf(config);
     if (!channelId) throw new Error(i18n.t("apiErrors.channelMissing"));
     const parsed = new URL(absoluteUrl, typeof window !== "undefined" ? window.location.origin : "https://channel.invalid");
-    const upstreamPath = `${parsed.pathname || "/"}${parsed.search}`;
+    const upstreamPath = `${stripBasePath(config, parsed.pathname || "/")}${parsed.search}`;
     return `${CHANNEL_PROXY_PREFIX}/${encodeURIComponent(channelId)}${upstreamPath.startsWith("/") ? "" : "/"}${upstreamPath}`;
 }
 
