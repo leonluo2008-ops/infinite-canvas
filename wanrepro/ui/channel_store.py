@@ -790,6 +790,12 @@ def _handle_channels(h: BaseHTTPRequestHandler, method: str, path: str) -> None:
         return
     try:
         if method == "GET":
+            # S4 种子化：名下渠道为 0 → 种入预置三渠道（无 key）。只播一次，用户删掉不回灌（PUT 即为真实意图）。
+            try:
+                import channel_seed
+                channel_seed.seed_if_empty(uid)
+            except Exception:
+                pass  # 种子失败不阻塞读取（下次 GET 再试）
             _send(h, {"channels": _list_channels(uid)})
         elif method == "PUT":
             channels = _replace_channels(h, uid)
