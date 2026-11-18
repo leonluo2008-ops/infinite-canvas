@@ -467,6 +467,86 @@ function consumeResponseStreamText(state: ResponseStreamState, text: string, onD
     }
 }
 
+type ChatStreamState = { buffer: string; text: string; error?: string };
+
+function consumeChatStreamBlock(block: string, state: ChatStreamState, onDelta?: (text: string) => void) {
+    const data = block
+        .split(/\r?\n/)
+        .filter((line) => line.startsWith("data:"))
+        .map((line) => line.slice(5).replace(/^ /, ""))
+        .join("\n")
+        .trim();
+    if (!data || data === "[DONE]") return;
+    const event = JSON.parse(data) as {
+        choices?: Array<{ delta?: { content?: string | null }; message?: { content?: string | null } }>;
+        error?: { message?: string };
+    };
+    const errorMessage = responseErrorMessage(event);
+    if (errorMessage) state.error = errorMessage;
+    const delta = event.choices?.[0]?.delta?.content || event.choices?.[0]?.message?.content || "";
+    if (delta) {
+        state.text += delta;
+        onDelta?.(state.text);
+    }
+}
+
+function consumeChatStreamText(state: ChatStreamState, text: string, onDelta?: (text: string) => void, flush = false) {
+    state.buffer += text;
+    for (;;) {
+        const match = state.buffer.match(/\r?\n\r?\n/);
+        if (!match) break;
+        const index = match.index ?? 0;
+        consumeChatStreamBlock(state.buffer.slice(0, index), state, onDelta);
+        state.buffer = state.buffer.slice(index + match[0].length);
+    }
+    if (flush && state.buffer.trim()) {
+        consumeChatStreamBlock(state.buffer, state, onDelta);
+        state.buffer = "";
+    }
+}
+
+/** 纯文本问答（无工具调用）：OpenAI chat/completions 流式。S2-FIX 已验证路线（含多图 200）。 */
+function toChatContent(content: ResponseMessageContent): string | Array<{ type: "text"; text: string } | { type: "image_url"; image_url: { url: string } }> {
+    if (!Array.isArray(content)) return String(content || "");
+    return content.map((item) => (item.type === "text" ? { type: "text" as const, text: item.text } : { type: "image_url" as const, image_url: { url: item.image_url.url } }));
+}
+
+async function requestChatCompletions(config: AiConfig, messages: AiTextMessage[], onDelta?: (text: string) => void, options?: RequestOptions): Promise<string> {
+    const systemPrompt = config.systemPrompt.trim();
+    const chatMessages: Array<{ role: string; content: ReturnType<typeof toChatContent> }> = [
+        ...(systemPrompt ? [{ role: "system", content: systemPrompt }] : []),
+        ...messages.map((message) => ({ role: message.role, content: toChatContent(message.content) })),
+    ];
+    const response = await fetch(aiApiUrl(config, "/chat/completions"), {
+        method: "POST",
+        headers: { ...aiHeaders(config, "application/json"), Accept: "text/event-stream" },
+        body: JSON.stringify({
+            model: config.model,
+            messages: chatMessages,
+            stream: true,
+            ...(config.reasoningEffort && config.reasoningEffort !== "auto" ? { reasoning_effort: config.reasoningEffort } : {}),
+        }),
+        signal: options?.signal,
+    });
+    if (!response.ok) throw new Error(await readFetchError(response, apiText("requestFailed")));
+    if (!response.body) {
+        const payload = (await response.json()) as { choices?: Array<{ message?: { content?: string } }> };
+        return payload.choices?.[0]?.message?.content || "";
+    }
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    const state: ChatStreamState = { buffer: "", text: "" };
+    for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        consumeChatStreamText(state, decoder.decode(value, { stream: true }), onDelta);
+        if (state.error) throw new Error(state.error);
+    }
+    consumeChatStreamText(state, decoder.decode(), onDelta, true);
+    if (state.error) throw new Error(state.error);
+    return state.text;
+}
+
 async function requestStreamingResponse(config: AiConfig, body: Record<string, unknown>, onDelta?: (text: string) => void, options?: RequestOptions): Promise<ToolResponseResult> {
     const response = await fetch(aiApiUrl(config, "/responses"), {
         method: "POST",
@@ -842,11 +922,10 @@ export async function requestImageQuestion(config: AiConfig, messages: AiTextMes
             if (answer === apiText("noContent")) onDelta(answer);
             return answer;
         }
-        const answer = (await requestStreamingResponse(requestConfig, {
-            model: requestConfig.model,
-            input: toResponseInput(withSystemMessage(requestConfig, messages)),
-            ...(requestConfig.reasoningEffort === "auto" ? {} : { reasoning: { effort: requestConfig.reasoningEffort } }),
-        }, onDelta, options)).content || apiText("noContent");
+        // S2-FIX：OpenAI 格式文本生成走 chat/completions（实测含多图 200）。
+        // 聚鑫等网关对 /v1/responses 协议整体拒收（纯文本也 503 channel:protocol_unsupported），
+        // 与图无关——已验证路线就是 chat/completions，不再走 responses。
+        const answer = (await requestChatCompletions(requestConfig, messages, onDelta, options)) || apiText("noContent");
         if (answer === apiText("noContent")) onDelta(answer);
         return answer;
     } catch (error) {
