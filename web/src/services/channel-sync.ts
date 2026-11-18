@@ -33,6 +33,7 @@ import {
     type PresetMeta,
 } from "@/lib/config/preset-meta";
 import { createModelChannel, modelOptionsFromChannels, normalizeModelOptionValue, useConfigStore, type AiConfig, type ModelChannel } from "@/stores/use-config-store";
+import { presetLayerComplete } from "@/services/preset-layer-complete";
 import { isMaskedKeyValue } from "./api/channel-proxy";
 
 // S3.5：预置层纯函数在 @/lib/config/preset-merge（探针直接 import 该模块断言）。
@@ -348,7 +349,11 @@ export function mergePresetLayer(channels: ModelChannel[]): { channels: ModelCha
     const payload = presetPayload;
     if (!payload) return { channels, notice: "", changed: false, version: "" };
     const meta: PresetMeta = readPresetMeta();
-    if (payload.presetVersion && payload.presetVersion === meta.lastPresetVersion) {
+    // 版本守卫不能只看版本号：守卫记在浏览器 localStorage（跨用户共享），换账号登录时本地配置已被
+    // 登出隔离清空（prepareCanvasLogout → removeItem canvas_store），此时必须重新合并预置，
+    // 否则新用户在「owner 用过的浏览器」上永远拿不到预置三渠道（只剩「默认渠道」占位，B3 实证）。
+    // 判据：预置里未被墓碑（tombstones=本浏览器用户主动删除记录）挡下的模板渠道是否都已在场。
+    if (payload.presetVersion && payload.presetVersion === meta.lastPresetVersion && presetLayerComplete(channels, payload.channels, meta)) {
         return { channels, notice: "", changed: false, version: payload.presetVersion };
     }
     const merged = mergePresetChannels(channels, payload.channels, {
