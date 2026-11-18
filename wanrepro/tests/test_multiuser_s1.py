@@ -1367,6 +1367,162 @@ def phase_s3_5_b1():
     return checks
 
 
+# ---------------- W0：wan 整链下线（MULTI_USER=1 → 404）+ sdgf 登录/归属隔离 ----------------
+def phase_w0():
+    """W0 安全前置。
+
+    判据：
+      * MULTI_USER=1 下 wan 视频整链不存在：run/job/state/file 全动词 404「没有这个地址」，
+        未登录与登录用户**同形**（不暴露 wan 功能存在性）——服务器版不做 wan（所有者裁定）；
+      * MULTI_USER=1 下 sdgf 视频提交必须登录：未登录 401「未登录」（与 /api/proxy 同文案）；
+      * sdgf job 归属隔离：A 建的 job，B 查与不存在**同形 404**；A 自己 200；
+      * MULTI_USER=0 单人模式零改动：wan run 未鉴权仍 200（旧行为逐字节不变）。
+
+    一律 confirm=false / dry：不真提交、不花钱、不出网。
+    sdgf 真提交分支用假 create 夹具（不落渠道请求），job 线程立即标记 done。
+    """
+    checks = []
+    multiuser.FAILURES.clear(); multiuser.REG_ATTEMPTS.clear()
+    os.environ['WANREPRO_CHANNEL_KEY'] = base64.b64encode(bytes(range(32))).decode()
+    srv, base = serve('1')
+    opA = build_opener(HTTPCookieProcessor(http.cookiejar.CookieJar()))
+    opB = build_opener(HTTPCookieProcessor(http.cookiejar.CookieJar()))
+    real_run_py = server.run_py
+    real_sdgf_create = server.sdgf_create
+    real_sdgf_query = server.sdgf_query
+    try:
+        assert req(base, '/api/auth/register', 'POST',
+                   {'username': 'wa', 'password': 'password1'}, opA)[0] == 200
+        assert req(base, '/api/auth/register', 'POST',
+                   {'username': 'wb', 'password': 'password1'}, opB)[0] == 200
+
+        # ---- T-W0-1/T-W0-2：MULTI_USER=1 下 wan 整链 404（未登录与登录同形）----
+        wan_run = {'prompt': '测试', 'duration': 5, 'ratio': '16:9', 'resolution': '480',
+                   'confirm': False}
+        wan_paths = ['/api/wan/video/run', '/api/wan/video/job/deadbeefdeadbeef',
+                     '/api/wan/video/state/wan-1700000000', '/api/wan/video/file/wan-1700000000']
+        anon_codes = []
+        for p in wan_paths:
+            method = 'POST' if p.endswith('/run') else 'GET'
+            st, body = req(base, p, method, wan_run if method == 'POST' else None)
+            assert st == 404, f'MULTI_USER=1 anon {method} {p} must 404, got {st} {body[:120]}'
+            assert f'没有这个地址：{p}'.encode() in body, f'404 body must be the generic route-missing copy: {body[:200]}'
+            anon_codes.append(st)
+        for p in wan_paths:
+            method = 'POST' if p.endswith('/run') else 'GET'
+            st, body = req(base, p, method, wan_run if method == 'POST' else None, opA)
+            assert st == 404, f'MULTI_USER=1 logged-in {method} {p} must 404, got {st}'
+            assert f'没有这个地址：{p}'.encode() in body, f'logged-in 404 must be同形: {body[:200]}'
+        checks.append('W0-T1 MULTI_USER=1: unauthenticated wan video run/job/state/file all 404 '
+                      '「没有这个地址」 (chain removed, not hidden behind 401)')
+        checks.append('W0-T2 MULTI_USER=1: logged-in wan video run/job/state/file 404 byte-identical '
+                      'to the anonymous 404 (no existence leak)')
+
+        # ---- T-W0-3：未登录 POST /api/sdgf/video/run → 401「未登录」----
+        st, body = req(base, '/api/sdgf/video/run', 'POST',
+                       {'prompt': '测试', 'confirm': False})
+        assert st == 401, f'MULTI_USER=1 anon sdgf run must 401, got {st} {body[:200]}'
+        assert '未登录' in body.decode(), f'401 copy must match /api/proxy: {body[:200]}'
+        checks.append('W0-T3 MULTI_USER=1: unauthenticated POST /api/sdgf/video/run -> 401 「未登录」(same copy as /api/proxy)')
+
+        # ---- T-W0-4：sdgf job 归属隔离（A 建 → B 404 同形 / A 200）----
+        # 假渠道提交：sdgf_create 只回一个任务号，不落任何出网请求；线程立刻把 job 标 done。
+        server.sdgf_create = lambda api_base, key, body: 'sdgf-w0-fake-task'
+        def fake_query(api_base, key, task_id):
+            return {'status': 'completed', 'url': 'about:blank#x', 'progress': 100, 'error': ''}
+        server.sdgf_query = fake_query
+        def fake_download(api_base, key, task_id, url, dest):
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(b'\x00\x00\x00\x18ftypmp42' + b'\x00' * 32)
+            return dest.stat().st_size
+        real_sdgf_download = server.sdgf_download
+        server.sdgf_download = fake_download
+        try:
+            # 登录态 + dry（confirm=false）先拿 200 dry 预演，再真提交走假渠道
+            st, body = req(base, '/api/sdgf/video/run', 'POST',
+                           {'prompt': '测试', 'confirm': False}, opA)
+            assert st == 200 and json.loads(body).get('dry') is True, \
+                f'dry run must 200: {st} {body[:200]}'
+            st, body = req(base, '/api/sdgf/video/run', 'POST',
+                           {'prompt': '测试', 'confirm': True, 'duration': 8, 'ratio': '9:16',
+                            'resolution': '720', 'audio': True, 'model': 'sd2.5-720p-ap',
+                            'channel': {'id': 'ch_w0', 'name': 'w0', 'baseUrl': PUB_IP,
+                                        'apiFormat': 'sdgf', 'apiKey': PKEY, 'model': 'sd2.5-720p-ap'}}, opA)
+            assert st == 200, f'sdgf real submit (fixture) failed: {st} {body[:300]}'
+            job_id = json.loads(body)['job']
+            end = time.time() + 20
+            while time.time() < end:
+                with server.JOBS_LOCK:
+                    rec = dict(server.JOBS.get(job_id) or {})
+                if rec.get('status') in ('done', 'failed', 'error'):
+                    break
+                time.sleep(0.05)
+            assert rec.get('status') == 'done', f'fixture job must finish: {rec}'
+            assert rec.get('owner') == 'wa', f'owner must be the initiator: {rec.get("owner")!r}'
+            # A 自己查 → 200
+            st, body = req(base, f'/api/sdgf/video/job/{job_id}', opener=opA)
+            assert st == 200 and json.loads(body).get('taskId') == 'sdgf-w0-fake-task', \
+                f'owner must read own job: {st} {body[:200]}'
+            # B 查他人 job 与不存在的 job **逐字节同形** 404
+            st_other, b_other = req(base, f'/api/sdgf/video/job/{job_id}', opener=opB)
+            st_ghost, b_ghost = req(base, '/api/sdgf/video/job/0123456789abcdef', opener=opB)
+            assert st_other == 404 and st_ghost == 404, \
+                f'other/ghost must both 404: {st_other}/{st_ghost}'
+            assert b_other == b_ghost, f'他人与不存在必须同形：{b_other!r} vs {b_ghost!r}'
+            assert b'wa' not in b_other, '404 body must not leak owner'
+            checks.append('W0-T4 sdgf job ownership: A reads own 200; B reads A\'s job 404 byte-identical '
+                          'to nonexistent job; owner field set to initiator')
+        finally:
+            server.sdgf_download = real_sdgf_download
+        server.sdgf_create = real_sdgf_create
+        server.sdgf_query = real_sdgf_query
+    finally:
+        server.run_py = real_run_py
+        srv.shutdown(); srv.server_close()
+
+    # ---- T-W0-5：MULTI_USER=0 单人模式 wan run 未鉴权仍 200（旧行为零改动）----
+    multiuser.FAILURES.clear()
+    os.environ['WANREPRO_ANALYSIS_ROOT'] = os.environ.get('WANREPRO_ANALYSIS_ROOT') or tempfile.mkdtemp(prefix='w0-solo-')
+    real_wan_prepare = server.wan_prepare_task
+    real_wan_argv = server.wan_argv
+    real_run_py = server.run_py
+    srv, base = serve('0')
+    try:
+        def fake_prepare(prompt, images):
+            d = server.ANALYSIS / 'wan-w0solo'
+            (d / '生成').mkdir(parents=True, exist_ok=True)
+            return 'wan-w0solo'
+        def fake_argv(task_id, duration, ratio, resolution, audio, confirm):
+            assert confirm is False, 'W0 probe must never submit for real'
+            return ['pipeline/gen/wan_video.py', '--id', task_id, '--dry-probe']
+        def fake_run_py(args, timeout):
+            return 0, 'plan ok', ''
+        server.wan_prepare_task = fake_prepare
+        server.wan_argv = fake_argv
+        server.run_py = fake_run_py
+        st, body = req(base, '/api/wan/video/run', 'POST', wan_run)
+        assert st == 200, f'MULTI_USER=0 anon wan run must stay 200 (legacy), got {st} {body[:200]}'
+        out = json.loads(body)
+        assert out.get('job') and out.get('taskId') == 'wan-w0solo', f'legacy response shape changed: {out}'
+        end = time.time() + 10
+        while time.time() < end:
+            with server.JOBS_LOCK:
+                rec = dict(server.JOBS.get(out['job']) or {})
+            if rec.get('status') in ('done', 'failed', 'error'):
+                break
+            time.sleep(0.05)
+        assert rec.get('status') == 'done', f'legacy job must finish: {rec}'
+        assert 'owner' not in rec, f'MULTI_USER=0 must not introduce owner field: {sorted(rec)}'
+        checks.append('W0-T5 MULTI_USER=0: anonymous POST /api/wan/video/run still 200 with legacy '
+                      'response shape and no owner field (single-user behavior untouched)')
+    finally:
+        server.wan_prepare_task = real_wan_prepare
+        server.wan_argv = real_wan_argv
+        server.run_py = real_run_py
+        srv.shutdown(); srv.server_close()
+    return checks
+
+
 def main():
  checks=[]; srv,base=serve('0')
  try:
@@ -1527,12 +1683,14 @@ def main():
   assert sum(1 for c in chans if c['isPreset'] is True)==3, f'the 3 presets must survive a PUT that omits them: {chans}'
   checks.append('S3.9-B0: user-added channel isPreset=False; presets survive a full-replacement PUT that omits them (un-deletable via API)')
  finally: srv.shutdown(); srv.server_close()
+
  checks += phase_b2()
  checks += phase_admin()
  checks += phase_s2_6()
  checks += phase_s2_7()
  checks += phase_s3_b1()
  checks += phase_s3_5_b1()
+ checks += phase_w0()
  print('SUMMARY: PASS %d/%d'%(len(checks),len(checks)))
  for c in checks: print('PASS: '+c)
  return 0

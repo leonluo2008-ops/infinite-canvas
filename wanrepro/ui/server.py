@@ -748,6 +748,7 @@ def gen_plan(task_id: str, template: str, duration: int, ratio: str, resolution:
 WAN_TEMPLATE = "canvas"                     # bridge 专用模板：提示词-canvas.md → 成片-canvas.mp4
 WAN_RATIOS = ("16:9", "9:16", "1:1")        # 画布端只暴露这三个画幅
 WAN_RESOLUTIONS = {"480": "480P", "720": "720P", "1080": "1080P"}   # 画布端给数字；引擎 argparse 要 P 后缀（RESOLUTIONS=480P/720P/1080P，见 wan_submit.py:31）
+WAN_ROUTE_RE = re.compile(r"/api/wan/video/(?:run|job/[^/]+|state/[^/]+|file/[^/]+)")   # W0：多用户模式整链下线的路由面
 WAN_JOB_TIMEOUT = 3600                      # 引擎内部预演+提交+等待合计可到 ~45 分钟，这里兜底
 WAN_BUSY = threading.Lock()                 # 同时最多 1 条万相 job（CLI 限制；并发会重复扣费）
 DATAURL_RE = re.compile(r"^data:image/([\w.+-]+);base64,(.*)$", re.S)
@@ -1638,9 +1639,21 @@ def sdgf_job_update(job_id: str, **fields) -> None:
             rec.update(fields)
 
 
-def sdgf_run_job(job_id: str, task_id: str, api_base: str, key: str, meta: dict) -> None:
-    """后台线程：轮询渠道 → 下载成片 → 落记录。凭证只在内存里，线程结束即随栈释放。"""
+def sdgf_run_job(job_id: str, task_id: str, api_base: str, key: str, meta: dict,
+                 owner: str = "") -> None:
+    """后台线程：轮询渠道 → 下载成片 → 落记录。凭证只在内存里，线程结束即随栈释放。
+
+    W0：`owner` 非空（多账户下登录的提交人）时，成片目录落一枚 `.owner` 侧车，
+    serve 端据此做归属隔离；空串（单人/历史口径）不落盘、行为不变。
+    """
     try:
+        if owner:
+            try:
+                d = sdgf_task_dir(task_id)
+                d.mkdir(parents=True, exist_ok=True)
+                (d / ".owner").write_text(owner, encoding="utf-8")
+            except OSError:
+                pass    # 归属是附加信息：写不出来不影响生成主链（零兜底口径同 request_username）
         sdgf_write_record(task_id, {"job": job_id, "taskId": task_id, "status": "running",
                                     "stage": "生成中", **meta})
         failed_streak = 0
@@ -1686,13 +1699,20 @@ def sdgf_run_job(job_id: str, task_id: str, api_base: str, key: str, meta: dict)
         SDGF_JOBS.release()
 
 
-def sdgf_job_state(job_id: str) -> dict:
-    """/api/sdgf/video/job/<job>：JOBS 记录 → 轮询状态（progress 只在 running 且是 0–100 数字时透出）。"""
+def sdgf_job_state(job_id: str, h: BaseHTTPRequestHandler | None = None) -> dict:
+    """/api/sdgf/video/job/<job>：JOBS 记录 → 轮询状态（progress 只在 running 且是 0–100 数字时透出）。
+
+    W0 归属隔离：与 wan_video_job_state 同款——带 owner 的记录，非发起人与不存在同形 404。
+    """
     with JOBS_LOCK:
         rec = JOBS.get(job_id)
         rec = dict(rec) if rec else None
     if rec is None or rec.get("kind") != "sdgf-video":
         raise ApiError(404, "没有这个 SDGF 视频任务号（可能服务重启过，重新发起一次生成即可）")
+    if h is not None:
+        owner = str(rec.get("owner") or "")
+        if owner and multiuser.enabled() and request_username(h) != owner:
+            raise ApiError(404, "没有这个 SDGF 视频任务号（可能服务重启过，重新发起一次生成即可）")
     status = str(rec.get("status") or "running")
     out: dict = {"status": status, "stage": str(rec.get("stage") or ""),
                  "elapsed": round(time.time() - float(rec.get("started") or time.time()), 1),
@@ -2305,6 +2325,8 @@ class Handler(BaseHTTPRequestHandler):
             return
         if project_store.handle(self, "GET", path):
             return
+        if multiuser.enabled() and WAN_ROUTE_RE.fullmatch(path):
+            raise ApiError(404, f"没有这个地址：{path}")       # W0：多用户模式整链下线 wan 视频（不暴露存在性）
         if multiuser.route_missing(path):
             raise ApiError(404, f"没有这个地址：{path}")
         if multiuser.login_guard(self, "GET", path):
@@ -2442,7 +2464,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         m = re.fullmatch(r"/api/sdgf/video/job/([^/]+)", path)
         if m:
-            self.send_json(sdgf_job_state(urllib.parse.unquote(m.group(1))))
+            self.send_json(sdgf_job_state(urllib.parse.unquote(m.group(1)), self))
             return
         m = re.fullmatch(r"/api/sdgf/video/file/([^/]+)", path)
         if m:
@@ -2519,6 +2541,8 @@ class Handler(BaseHTTPRequestHandler):
             return
         if multiuser.route_missing(path):
             raise ApiError(404, f"没有这个地址：{path}")
+        if multiuser.enabled() and WAN_ROUTE_RE.fullmatch(path):
+            raise ApiError(404, f"没有这个地址：{path}")       # W0：服务器版不提供 wan 链（不暴露存在性）
         if path == "/api/asset/upload":
             self.do_asset_upload()
             return
@@ -3027,6 +3051,8 @@ class Handler(BaseHTTPRequestHandler):
         confirm 必须**是布尔 true** 才真提交（字符串 "false"/"1" 一律当 dry——AT-5 判据）；
         dry 只做本地预演与结构化核对，不发任何请求、不花钱。
         """
+        if multiuser.enabled() and not request_username(self):
+            raise ApiError(401, "未登录")
         payload = self.read_json()
         prompt = str(payload.get("prompt") or "")
         if not prompt.strip():
@@ -3061,14 +3087,17 @@ class Handler(BaseHTTPRequestHandler):
             raise
         job_id = secrets.token_hex(8)
         now = time.time()
+        owner = request_username(self)      # W0：归属（单人模式空串，旧行为）
         with JOBS_LOCK:
             for stale, old in list(JOBS.items()):         # 过期任务记录随手清（与万相同款）
                 if now - float(old.get("started") or now) > JOB_TTL:
                     JOBS.pop(stale, None)
             JOBS[job_id] = {"status": "running", "started": now, "kind": "sdgf-video",
-                            "task_id": task_id, "stage": "已提交", "progress": None}
+                            "task_id": task_id, "stage": "已提交", "progress": None,
+                            "owner": owner}
         threading.Thread(target=sdgf_run_job,
-                         args=(job_id, task_id, plan["channel"]["baseUrl"], plan["key"], plan["request"]),
+                         args=(job_id, task_id, plan["channel"]["baseUrl"], plan["key"], plan["request"],
+                               owner),
                          daemon=True, name=f"sdgf-video-{sdgf_safe_id(task_id)}").start()
         self.send_json({"job": job_id, "taskId": task_id, "dry": False,
                         "imageSources": sources})   # AT-14 B3 A5：装配来源如实透传（dry 分支不带）
@@ -3077,9 +3106,21 @@ class Handler(BaseHTTPRequestHandler):
         """GET /api/sdgf/video/file/<taskId> —— 本地成片（bridge 代下，凭证不出服务端）。
 
         目录名就是渠道任务 id：服务重启后仍能按 id 找到已下完的成片（AT-6 归档依赖这一点）。
+
+        W0 归属隔离：多用户模式下，成片目录落盘时带了 .owner（提交人是登录用户），
+        非发起人取片与「还没有成片」**同形 404**（不泄露存在性）；无 .owner（单人/
+        历史任务）不设防，旧行为逐字节不变。
         """
         if not task_id or ".." in task_id or not ID_RE.match(task_id):
             raise ApiError(400, f"任务 id 不合法：{task_id!r}")
+        if multiuser.enabled():
+            owner_file = sdgf_task_dir(task_id) / ".owner"
+            try:
+                owner = owner_file.read_text(encoding="utf-8").strip()
+            except OSError:
+                owner = ""
+            if owner and request_username(self) != owner:
+                raise ApiError(404, f"{task_id} 还没有成片（渠道没跑完，或没提交成功）")
         final = sdgf_task_dir(task_id) / SDGF_FINAL
         if not final.is_file():
             raise ApiError(404, f"{task_id} 还没有成片（渠道没跑完，或没提交成功）")
