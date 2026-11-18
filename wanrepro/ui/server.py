@@ -983,7 +983,31 @@ def host_image_detailed(data: bytes, raw_name: str) -> dict:
                       "reason": f"直链验活失败（{why}）"})
         return None
 
-    # ① local（第一图源）：自托管图床 /vc/<key> 直链（走 Cloudflare 隧道出公网）。
+    # ⓪ tencent（国内自托管直链·第一优先）：腾讯云上的 videocache 图床，走备案域名 + LE 证书。
+    # 实测同一张 1MB 图：PUT 0.26s / 回取 1.22s；同尺寸经 Cloudflare 隧道是 7–26s 且会 502。
+    # 只有同时给出 base 与 token 才启用；都未配置时这一段整块不存在，行为逐字节不变。
+    tv_base = (os.environ.get("WANREPRO_TENCENT_VC_BASE") or "").strip().rstrip("/")
+    tv_token = (os.environ.get("WANREPRO_TENCENT_VC_TOKEN") or "").strip()
+    if tv_base and tv_token:
+        tv_url = tv_base + "/vc/" + key
+        try:
+            req = urllib.request.Request(
+                tv_base + "/upload/" + key, data=data, method="PUT",
+                headers={"X-Token": tv_token, "Content-Type": "application/octet-stream"})
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                ok = 200 <= resp.status < 300
+        except Exception as exc:                      # 网络/403/5xx 一律回落，逐源点名
+            ok = False
+            tv_error = str(exc)[:120]
+        else:
+            tv_error = ""
+        if ok:
+            _bump_asset_counter("tencent")
+            return {"url": tv_url, "source": "tencent", "tried": tried, "skipped": skipped}
+        tried.append({"source": "tencent", "label": "腾讯云图床", "url": tv_url,
+                      "reason": f"上传失败（{tv_error or '服务未接受该请求'}）"})
+
+    # ① local（第二图源）：自托管图床 /vc/<key> 直链（走 Cloudflare 隧道出公网）。
     # 只有设了 WANREPRO_PUBLIC_BASE 才启用；未设置时这一段整块不存在，行为逐字节不变。
     # 验活用**磁盘校验**（文件已落盘 + 字节数一致），不回拉公网 URL：这条路径要跨境往返一次，
     # 回拉会让每次上传多等一个太平洋往返（2026-11-18 实测隧道边缘在 lax）。
