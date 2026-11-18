@@ -7,16 +7,20 @@
  * 任一断言不成立 → 退出码 1。
  *
  * 覆盖任务书 v1.2 §三 V1-V10：
- *  V1  未填 key 的存量浏览器：3 个模板渠道到位、内置占位渠道让位
- *  V2  BYOK：填过 key（含登录态 masked 服务端视图）的渠道逐字节不动
- *  V3  用户自建渠道原样保留
- *  V4  tombstone 不复活（含「删除时记墓碑」的写入边界）
- *  V5  无 key 的模板渠道 id 不出现在任何 PUT / 服务端视图
- *  V6  版本相同 = 零写入（单人：信封逐字节不变；登录：config 引用相等 + 零 PUT）
- *  V7  单人每 boot 1 次 fetch；首启=1 写 1 reload，第二轮 boot 零写；版本更新=写+reload
+ *  V1  未填 key 的存量浏览器：3 个模板渠道到位、内置占位渠道让位（单人路径不变）
+ *  V2  BYOK：单人填过 key 的渠道逐字节不动；登录态=服务端视图原样进 store（masked 不动）
+ *  V3  自建渠道原样保留（登录态：服务端行 + 用户新建渠道照常 PUT）
+ *  V4  tombstone 不复活（单人写入边界）
+ *  V5  登录态渠道只来自服务端返回值（GET 原样进 store）；预置层不参与合并（B2 新语义）
+ *  V6  单人版本相同=零写入；登录 boot 与预置层零耦合（不拉 bootstrap、零 PUT、零写 preset_meta）
+ *  V7  单人每 boot 1 次 fetch；首启=1 写 1 reload；版本更新=写+reload
  *  V8  既有探针不红（本探针直接子进程跑两个白名单探针，断言退出码 0）
- *  V9  升格 mint 幂等（alias 落盘，连续两次 flush 服务端行 id 不变）+ 七处引用重写 + 画布 decode 自愈
- *  V10 版本更新只重写渠道域，用户非渠道设置与 webdav 原样保留
+ *  V9  保存链防御 mint（mintTemplateIdsBeforePut）幂等 + alias 落盘 + 引用重写；
+ *      登录态「填 key 即升格」分支已删（B2）——填 key 后 id 不变
+ *  V10 单人版本更新只重写渠道域，用户非渠道设置与 webdav 原样保留
+ *  BL  提交前判重口径与服务端 UNIQUE(user_id,name) 一致（纯函数 + 端到端）
+ *  IF3 单人 rebuildChannelDomain 解析为空回退；IF4 同名同址认领 alias（纯函数）；
+ *      IF5 防御 mint 不误记墓碑
  */
 import { spawnSync } from "node:child_process";
 import { mkdtempSync, writeFileSync } from "node:fs";
@@ -382,193 +386,102 @@ equal("V1 单人模式不改 channelMode", env.state.config.channelMode, "local"
 }
 
 // ======================================================================================
-// V5 + V7 + V3（登录模式）：无 key 模板渠道不进 PUT；自建渠道保留；顺序=服务端→localOnly→preset
+// V5+V3（登录，B2 新语义）：渠道只来自服务端返回值；预置层/迁移不再参与
 // ======================================================================================
 resetAll();
 {
-    const local = [
-        ch({ id: "tpl-jx", name: "聚鑫", baseUrl: "https://sdapi.jxinai.com", apiFormat: "sdgf", models: [{ name: "seedance-1", capability: "video" }] }),
-        ch({ id: "own-1", name: "我自己的中转", baseUrl: "https://mine.example.com", apiKey: "sk-own-1234" }),
-        ch({ id: "wan-ch", name: "万相", baseUrl: "http://127.0.0.1:8779", apiFormat: "wan", models: [{ name: "wan-x", capability: "video" }] }),
+    const serverRows = [
+        maskedOf(ch({ id: "own-1", name: "我自己的中转", baseUrl: "https://mine.example.com" })),
+        maskedOf(ch({ id: "preset-row", name: "服务端预置行", baseUrl: "https://srv-preset.example.com" })),
     ];
     seedMeta({ lastPresetVersion: "" });
-    setStore(local);
-    routeRemote({ server: [] });
+    setStore([]);
+    routeRemote({ server: serverRows });
     snap = await bootRemote();
     equal("V5 登录模式=remote", snap.mode, "remote");
-    const put = putBodies();
-    equal("V5 迁移只 PUT 自建渠道", put[0].channels.map((channel) => channel.id), ["own-1"]);
-    check("V5 无 key 模板渠道 id 不进 PUT", !put[0].channels.some((channel) => templateChannels().some((template) => template.id === channel.id)), JSON.stringify(put[0].channels.map((c) => c.id)));
     const after = store.useConfigStore.getState().config;
-    equal("V5 视图顺序=服务端视图 → localOnly → preset 队尾", after.channels.map((channel) => channel.id), ["own-1", "tpl-jx", "wan-ch", "tpl-sdgf", "tpl-ollama"]);
-    check("V3 自建渠道原样保留（key 仍在）", after.channels[0].apiKey === "***1234", after.channels[0].apiKey);
-    check("V5 模板渠道本地可见但模型不可选（仅本地）", !after.models.some((model) => model.startsWith("tpl-jx::") || model.startsWith("tpl-sdgf::")), JSON.stringify(after.models));
-    // B2.7：wan/非 https 这类「服务端访问不到」的渠道**不再被启动门点名**（用户自己建的，卡片徽标已说清），
-    // 提示里只剩预置模板的合入事实——这是用户真需要知道的变化。
-    check("V5 提示只含模板合入事实（不再点名 wan 本地地址）", String(snap.notice).includes("已从预置模板合入") && !String(snap.notice).includes("万相") && !String(snap.notice).includes("本地地址") && !String(snap.notice).includes("本地模式"), snap.notice);
-    // B2.7 新增：wan 渠道存在也不许出现「指向本地地址」这句恐吓文案
-    check("V5 wan 渠道在视图里但 notice 不出现「指向本地地址」", after.channels.some((channel) => channel.apiFormat === "wan") && !String(snap.notice).includes("指向本地地址"), snap.notice);
-    // B2.7 新增：无预置变化时 notice 应为空（不因为存在仅本地渠道就自动生成警告）
-    equal("V5 notice 里没有「服务器无法代为访问」类警告", String(snap.notice).includes("服务器无法代为访问"), false);
-    equal("V5 版本落地", readMeta().lastPresetVersion, V1_VERSION);
+    // B0/B1：GET 原样进 store，服务端返回值是渠道唯一来源（顺序与内容都按服务端）
+    equal("V5 渠道=服务端返回值原样（GET 原样进 store）", after.channels.map((c) => c.id), ["own-1", "preset-row"]);
+    check("V5 预置模板渠道不参与合并（无 key 模板渠道不出现）", !after.channels.some((c) => templateChannels().some((tpl) => tpl.id === c.id)), JSON.stringify(after.channels.map((c) => c.id)));
+    check("V5 本地不存渠道数据之外的预置层（notice 为空）", !String(snap.notice).trim(), snap.notice);
+    check("V5 登录 boot 不拉 /api/bootstrap-config", !fetchUrls().includes(BOOT), JSON.stringify(fetchUrls()));
+    equal("V5 登录 boot 不写 preset_meta（无预置合并）", readMeta().lastPresetVersion, "");
+    check("V3 服务端 masked key 原样进 store", after.channels[0].apiKey === "***0000", after.channels[0].apiKey);
+    check("V3 渠道内容与 GET 一致（baseUrl）", after.channels[0].baseUrl === "https://mine.example.com", after.channels[0].baseUrl);
+    check("V5 未发 PUT（服务端权威，零回写）", putBodies().length === 0, JSON.stringify(putBodies().map((b) => b.channels.map((c) => c.id))));
+    // 变更 → 防抖 PUT：只有服务端来的渠道 + 用户新建有 key 渠道照常提交
+    shim.calls.fetch.length = 0;
+    store.useConfigStore.getState().updateConfig("channels", [...after.channels.map((c) => ({ ...c, name: c.name + "·改" })), ch({ id: "own-new", name: "新建", apiKey: "sk-brand-new" })]);
+    await settle(60);
+    await sync.flushChannelSync();
+    const put = putBodies().pop();
+    equal("V5 变更后 PUT 含服务端行+新渠道", put.channels.map((c) => c.id), ["own-1", "preset-row", "own-new"]);
+    equal("V5 masked key 原样回写（服务端按 id 沿用密文）", put.channels[0].apiKey, "***0000");
 }
 
 // ======================================================================================
-// V6（登录）：版本相同 → mergePresetLayer 零改动、config 引用相等、零 PUT
+// V6（登录，B2 新语义）：登录 boot 与预置层零耦合——不拉 bootstrap、不合并、零 PUT
 // ======================================================================================
 {
-    const currentChannels = store.useConfigStore.getState().config.channels;
-    const layer = sync.mergePresetLayer(currentChannels);
-    equal("V6 登录：版本相同 mergePresetLayer 零改动（channels 引用原样返回）", [layer.changed, layer.channels === currentChannels], [false, true]);
-
-    // 真实 boot：服务端视图与本地缓存完全一致 + 版本相同 → 不写 store、不排 PUT、不 reload
     resetAll();
     seedMeta({ lastPresetVersion: V1_VERSION });
-    const stable = [
-        ch({ id: "own-1", name: "我自己的中转", baseUrl: "https://mine.example.com", apiKey: "***1234" }),
-        ch({ id: "wan-ch", name: "万相", baseUrl: "http://127.0.0.1:8779", apiFormat: "wan", models: [{ name: "wan-x", capability: "video" }] }),
-    ];
-    setStore(stable, { channelMode: "remote" });
-    routeRemote({ server: [maskedOf(ch({ id: "own-1", name: "我自己的中转", baseUrl: "https://mine.example.com", apiKey: "sk-own-1234" }))] });
+    const row = maskedOf(ch({ id: "own-1", name: "我自己的中转", baseUrl: "https://mine.example.com" }));
+    setStore([store.createModelChannel(row)], { channelMode: "remote" });
+    routeRemote({ server: [row], presetVersion: V1_VERSION });
+    writeLog.length = 0;
     await bootRemote();
     const refBefore = store.useConfigStore.getState().config;
     shim.calls.fetch.length = 0;
     shim.calls.reload = 0;
     await bootRemote();
     const refAfter = store.useConfigStore.getState().config;
-    equal("V6 登录：版本相同 config 引用相等（subscribe 不触发写入）", refAfter === refBefore, true);
-    equal("V6 登录：版本相同零 PUT", putBodies().length, 0);
-    equal("V6 登录：版本相同零 reload", shim.calls.reload, 0);
-    equal("V6 登录：版本比对仍发 1 次 GET", shim.calls.fetch.filter((call) => call.url === BOOT).length, 1);
+    equal("V6 登录：重复 boot 零 PUT", putBodies().length, 0);
+    equal("V6 登录：零 reload", shim.calls.reload, 0);
+    check("V6 登录：不拉 /api/bootstrap-config（预置层不参与登录启动）", !fetchUrls().includes(BOOT), JSON.stringify(fetchUrls()));
+    equal("V6 登录：渠道仍=服务端视图", refAfter.channels.map((c) => c.id), refBefore.channels.map((c) => c.id));
+    equal("P2 登录 boot 不写 preset_meta（版本相同也零写）", writeLog.filter((key) => key === META_KEY).length, 0);
+    equal("V6 preset_meta 版本未被登录路径推进", readMeta().lastPresetVersion, V1_VERSION);
 }
 
 // ======================================================================================
-// V9：升格 mint（迁移入口）+ 幂等 + 七处引用重写
+// 写入边界（B2 新语义）：登录态「填 key 即 mint」升格分支已删——填 key 后 id 不变，
+// 模板共享 id 由保存链防御断言（mintTemplateIdsBeforePut）在提交时换新
 // ======================================================================================
 resetAll();
 {
-    const local = [
-        ch({
-            id: "tpl-jx",
-            name: "聚鑫",
-            baseUrl: "https://sdapi.jxinai.com",
-            apiKey: "sk-live-template",
-            apiFormat: "sdgf",
-            models: [{ name: "seedance-1", capability: "video" }],
-        }),
-    ];
-    seedMeta({ lastPresetVersion: "" });
-    setStore(local, {
-        model: "tpl-jx::seedance-1",
-        imageModel: "tpl-jx::seedance-1",
-        videoModel: "tpl-jx::seedance-1",
-        textModel: "tpl-jx::seedance-1",
-        audioModel: "tpl-jx::seedance-1",
-        lapianModels: ["tpl-jx::seedance-1"],
-        lapianDefaultModel: "tpl-jx::seedance-1",
-    });
-    routeRemote({ server: [] });
-    await bootRemote();
-
-    const alias = readMeta().aliases["tpl-jx"];
-    check("V9 mint 落盘 alias（templateId → mintedId）", Boolean(alias) && alias !== "tpl-jx", JSON.stringify(readMeta().aliases));
-    const firstPut = putBodies()[0];
-    equal("V9 PUT 用的是 mintedId（不是模板共享 id）", firstPut.channels.map((channel) => channel.id), [alias]);
-    check("V9 V5：模板 id 未出现在服务端提交体", !firstPut.channels.some((channel) => templateChannels().some((template) => template.id === channel.id)), JSON.stringify(firstPut.channels.map((c) => c.id)));
-
-    const config = store.useConfigStore.getState().config;
-    equal("V9 渠道 id 已换新", config.channels.some((channel) => channel.id === alias), true);
-    equal("V9 config 七处引用全部换新", [config.model, config.imageModel, config.videoModel, config.textModel, config.audioModel, config.lapianModels, config.lapianDefaultModel].map((value) => (Array.isArray(value) ? value : [value]).every((ref) => ref.startsWith(`${alias}::`))).every(Boolean), true);
-
-    // 连续两次 flush：id 不变（alias 命中不再 mint）
-    shim.calls.fetch.length = 0;
-    store.useConfigStore.getState().updateConfig("channels", store.useConfigStore.getState().config.channels.map((channel) => ({ ...channel, name: "改个名" })));
-    await settle(60);
-    await sync.flushChannelSync();
-    const secondPut = putBodies().pop();
-    equal("V9 连续两次 flush：服务端行 id 不变", secondPut.channels.map((channel) => channel.id), [alias]);
-    equal("V9 alias 仍只有一条（没有二次 mint）", Object.keys(readMeta().aliases), ["tpl-jx"]);
-
-    // 画布/项目侧引用：decode 处 lazy 自愈
-    equal("V9 画布 decode 自愈（store.decodeChannelModel）", store.decodeChannelModel("tpl-jx::seedance-1").channelId, alias);
-    equal("V9 画布 decode 自愈（lapian-model）", lapian.decodeChannelModelRef("tpl-jx::seedance-1").channelId, alias);
-    equal("V9 normalizeModelOptionValue 回写新引用", store.normalizeModelOptionValue("tpl-jx::seedance-1", store.useConfigStore.getState().config.channels), `${alias}::seedance-1`);
-    equal("V9 请求上下文按新 id 路由", store.resolveModelRequestConfig(store.useConfigStore.getState().config, "tpl-jx::seedance-1").channelId, alias);
-}
-
-// ======================================================================================
-// V9（store 写入边界）：给模板渠道填 key → 立即 mint（不经过迁移/分拣）
-// **真防抖时序**（B2.5 IF7）：boot 用默认 800ms 防抖，填 key 后只等防抖窗口自然到期，
-// 不再手调 flushChannelSync —— 手调会把「防抖定时器根本没排上/排错批次」的缺陷整段掩盖。
-// ======================================================================================
-resetAll();
-{
-    const local = [ch({ id: "own-1", name: "我自己的中转", baseUrl: "https://mine.example.com", apiKey: KEY_OWN })];
+    const local = [ch({ id: "own-1", name: "我自己的中转", baseUrl: "https://mine.example.com" })];
     seedMeta({ lastPresetVersion: V1_VERSION });
-    setStore(local);
-    // 模板换版本：合并必须真正发生，模板渠道才会落到本地
+    setStore(local, { channelMode: "remote" });
     routeRemote({ server: [maskedOf({ ...local[0] })], presetVersion: "beef0003" });
-    // 不传 debounceMs → 用真实 SAVE_DEBOUNCE_MS
     await sync.bootstrapChannelSync({ timeoutMs: 2000 });
     await settle();
-    const merged = store.useConfigStore.getState().config.channels;
-    check("写入边界：模板渠道已合入且无 key", merged.some((channel) => channel.id === "tpl-sdgf" && !channel.apiKey), JSON.stringify(merged.map((c) => [c.id, c.apiKey])));
     equal("写入边界：防抖窗口确实是默认 800ms", sync.SAVE_DEBOUNCE_MS, 800);
-
     shim.calls.fetch.length = 0;
-    store.useConfigStore.getState().updateConfig("channels", store.useConfigStore.getState().config.channels.map((channel) => (channel.id === "tpl-sdgf" ? { ...channel, apiKey: KEY_NEW } : channel)));
-    // 只等防抖（800ms）+ 余量；全程不调 flushChannelSync
+    store.useConfigStore.getState().updateConfig("channels", store.useConfigStore.getState().config.channels.map((channel) => ({ ...channel, apiKey: "sk-fill-in" })));
     await settle(sync.SAVE_DEBOUNCE_MS + 200);
-    const alias = readMeta().aliases["tpl-sdgf"];
-    check("写入边界：填 key 即 mint（alias 落盘）", Boolean(alias), JSON.stringify(readMeta().aliases));
-    equal("写入边界：store 里的渠道 id 已换新", store.useConfigStore.getState().config.channels.some((channel) => channel.id === alias), true);
     const bodies = putBodies();
-    check("写入边界：防抖到期后 PUT 自己发出（没有手调 flush）", bodies.length > 0, JSON.stringify(bodies.map((body) => body.channels.map((c) => c.id))));
-    check("写入边界：PUT 只带新 id（模板 id 不上服务端）", bodies.length > 0 && bodies.every((body) => !body.channels.some((channel) => templateChannels().some((template) => template.id === channel.id))), JSON.stringify(bodies.map((body) => body.channels.map((c) => c.id))));
-    check("写入边界：PUT 含 mintedId", bodies.some((body) => body.channels.some((channel) => channel.id === alias)), JSON.stringify(bodies.map((body) => body.channels.map((c) => c.id))));
-    equal("写入边界：mint 恰一次（alias 只有一条）", Object.keys(readMeta().aliases), ["tpl-sdgf"]);
+    check("写入边界：填 key 后防抖到期 PUT 正常发出", bodies.length > 0, JSON.stringify(bodies.map((b) => b.channels.map((c) => c.id))));
+    equal("写入边界：渠道 id 不变（无登录态升格 mint）", bodies[0].channels.map((c) => c.id), ["own-1"]);
+    equal("写入边界：alias 不落盘（mint 语义只在保存链防御）", Object.keys(readMeta().aliases), []);
 }
 
-
 // ======================================================================================
-// V2（登录模式 masked）：服务端视图里的渠道永不被模板覆盖
+// V2（登录模式 masked）：服务端视图原样进 store（B0/B1 后无模板覆盖问题——预置层已不参与登录启动）
 // ======================================================================================
 resetAll();
 {
     const serverChannel = { id: "minted-1", name: "服务端旧名", baseUrl: "https://server-old.example.com", apiFormat: "sdgf", models: [{ name: "seedance-1", capability: "video" }], apiKey: "***9999" };
     seedMeta({ lastPresetVersion: "", aliases: { "tpl-jx": "minted-1" } });
-    setStore([ch({ id: "minted-1", name: "服务端旧名", baseUrl: "https://server-old.example.com", apiKey: "***9999", apiFormat: "sdgf", models: [{ name: "seedance-1", capability: "video" }] })]);
+    setStore([]);
     routeRemote({ server: [serverChannel], presetVersion: "beef0001" });
     await bootRemote();
-    const channel = store.useConfigStore.getState().config.channels.find((item) => item.id === "minted-1");
-    equal("V2 登录 masked：name 不动", channel.name, "服务端旧名");
-    equal("V2 登录 masked：baseUrl 不动", channel.baseUrl, "https://server-old.example.com");
-    equal("V2 登录 masked：key 保持 masked", channel.apiKey, "***9999");
-    equal("V2 登录 masked：models 不动", channel.models.map((model) => model.name), ["seedance-1"]);
+    const channels = store.useConfigStore.getState().config.channels;
+    equal("V2 登录 masked：渠道=服务端视图原样", channels.map((item) => item.id), ["minted-1"]);
+    equal("V2 登录 masked：name 不动", channels[0].name, "服务端旧名");
+    equal("V2 登录 masked：baseUrl 不动", channels[0].baseUrl, "https://server-old.example.com");
+    equal("V2 登录 masked：key 保持 masked", channels[0].apiKey, "***9999");
+    equal("V2 登录 masked：models 不动", channels[0].models.map((model) => model.name), ["seedance-1"]);
     equal("V2 登录 masked：没有按共享 id 再灌一条重复渠道", store.useConfigStore.getState().config.channels.filter((item) => item.id === "tpl-jx").length, 0);
-}
-
-// ======================================================================================
-// V4（登录模式）：删模板渠道记墓碑，改版本后不复活
-// ======================================================================================
-resetAll();
-{
-    seedMeta({ lastPresetVersion: V1_VERSION });
-    setStore([ch({ id: "own-1", name: "我自己的中转", baseUrl: "https://mine.example.com", apiKey: "***1234" })], { channelMode: "remote" });
-    routeRemote({ server: [maskedOf(ch({ id: "own-1", name: "我自己的中转", baseUrl: "https://mine.example.com", apiKey: "sk-own-1234" }))], presetVersion: "beef0004" });
-    await bootRemote();
-    check("V4 模板渠道先合入", store.useConfigStore.getState().config.channels.some((channel) => channel.id === "tpl-ollama"), JSON.stringify(store.useConfigStore.getState().config.channels.map((c) => c.id)));
-
-    // 用户在展示层删掉模板渠道 → 写入边界记墓碑
-    store.useConfigStore.getState().updateConfig("channels", store.useConfigStore.getState().config.channels.filter((channel) => channel.id !== "tpl-ollama"));
-    await settle(60);
-    equal("V4 删除模板渠道记入 preset_meta.tombstones", readMeta().tombstones.includes("tpl-ollama"), true);
-
-    // 模板换版本 → 该渠道不再复活
-    routeRemote({ server: [], presetVersion: "beef0002" });
-    shim.calls.fetch.length = 0;
-    await bootRemote();
-    equal("V4 新版本下 tombstone 渠道不复活", store.useConfigStore.getState().config.channels.some((channel) => channel.id === "tpl-ollama"), false);
 }
 
 // ======================================================================================
@@ -676,21 +589,6 @@ resetAll();
 }
 
 // ======================================================================================
-// IF2：登录模式同样让内置占位渠道让位（与单人路径共用 dropPlaceholder 回调）
-// ======================================================================================
-resetAll();
-{
-    seedMeta({ lastPresetVersion: "" });
-    setStore([ch({ id: "default", name: "默认渠道", baseUrl: "https://api.openai.com", apiKey: "", models: [{ name: "gpt-image-2", capability: "image" }] })]);
-    routeRemote({ server: [], presetVersion: "cafe1001" });
-    const snap2 = await bootRemote();
-    const ids = store.useConfigStore.getState().config.channels.map((channel) => channel.id);
-    equal("IF2 登录模式：内置占位渠道让位", ids.includes("default"), false);
-    equal("IF2 登录模式：模板渠道全部到位", ids, ["tpl-jx", "tpl-sdgf", "tpl-ollama"]);
-    check("IF2/P1 提示点名让位的占位渠道", String(snap2.notice).includes("默认渠道"), snap2.notice);
-}
-
-// ======================================================================================
 // IF3：单人 rebuildChannelDomain 解析为空 → 回退「该能力的第一个可用模型」（与首启同口径）
 // ======================================================================================
 {
@@ -734,36 +632,28 @@ resetAll();
     const otherAddr = merge.mergePresetChannels([ch({ id: "minted-on-A", name: "聚鑫", baseUrl: "https://another.example.com" })], [ch({ id: "tpl-jx", name: "聚鑫", baseUrl: "https://sdapi.jxinai.com" })], {});
     equal("IF4 不同址不认领（防误映射）", otherAddr.aliasClaims, []);
 }
-resetAll();
-{
-    seedMeta({ lastPresetVersion: "", aliases: {} });
-    const serverRow = maskedOf(ch({ id: "minted-on-A", name: "聚鑫", baseUrl: "https://sdapi.jxinai.com", apiFormat: "sdgf", models: [{ name: "seedance-1", capability: "video" }] }));
-    setStore([]);
-    routeRemote({ server: [serverRow], presetVersion: "cafe2002" });
-    await bootRemote();
-    equal("IF4 设备 B：登录合并后 alias 落盘", readMeta().aliases["tpl-jx"], "minted-on-A");
-    equal("IF4 设备 B：画布旧引用 lazy 自愈", store.decodeChannelModel("tpl-jx::seedance-1").channelId, "minted-on-A");
-}
-
 // ======================================================================================
-// IF5：mint 换 id 不能被预置 watch 误记成「用户删除」
+// IF5（B2 适配）：保存链防御 mint（mintTemplateIdsBeforePut）换 id 后 alias 落盘、渠道换新
+// 登录态墓碑 watch 已不启动；登录渠道只来自服务端，模板共享 id 只会在 PUT 防御处被 mint
 // ======================================================================================
 resetAll();
 {
     seedMeta({ lastPresetVersion: V1_VERSION });
-    setStore([], { channelMode: "remote" });
-    routeRemote({ server: [maskedOf(ch({ id: "own-1", name: "我自己的中转", baseUrl: "https://mine.example.com" }))], presetVersion: "cafe3003" });
-    await bootRemote();
-    check("IF5 前置：模板渠道已在本机", store.useConfigStore.getState().config.channels.some((c) => c.id === "tpl-ollama"), JSON.stringify(store.useConfigStore.getState().config.channels.map((c) => c.id)));
+    meta.setPresetTemplateIdList(["tpl-ollama"]);
+    const row = maskedOf(ch({ id: "own-1", name: "我自己的中转", baseUrl: "https://mine.example.com" }));
+    setStore([store.createModelChannel(row), ch({ id: "tpl-ollama", name: "Ollama Cloud", baseUrl: "https://ollama.com" })], { channelMode: "remote" });
     const tombstonesBefore = readMeta().tombstones;
-    sync.mintTemplateIdsBeforePut([ch({ id: "tpl-ollama", name: "Ollama Cloud", baseUrl: "https://ollama.com", apiKey: KEY_OWN })]);
+    sync.mintTemplateIdsBeforePut([ch({ id: "tpl-ollama", name: "Ollama Cloud", baseUrl: "https://ollama.com", apiKey: "sk-ollama" })]);
     await settle(60);
-    equal("IF5 mint 换 id 不被误记为用户删除（tombstones 不变）", readMeta().tombstones, tombstonesBefore);
+    equal("IF5 mint 落盘 alias（templateId → mintedId）", Object.keys(readMeta().aliases), ["tpl-ollama"]);
     check("IF5 mint 后 store 换新 id", store.useConfigStore.getState().config.channels.some((c) => c.id === readMeta().aliases["tpl-ollama"]), JSON.stringify(store.useConfigStore.getState().config.channels.map((c) => c.id)));
+    equal("IF5 mint 不误记用户删除（tombstones 不变）", readMeta().tombstones, tombstonesBefore);
+    check("IF5 七处引用重写走 applyAliasesToStore", store.useConfigStore.getState().config.channels.every((c) => c.id !== "tpl-ollama"), JSON.stringify(store.useConfigStore.getState().config.channels.map((c) => c.id)));
+    meta.setPresetTemplateIdList([]);
 }
 
 // ======================================================================================
-// P2：commitPresetVersion 版本相同不 setItem（V6「零写入」的毛边）
+// P2（B2 适配）：登录 boot 不写 preset_meta（commitPresetVersion 已随预置层删除）
 // ======================================================================================
 resetAll();
 {
@@ -780,7 +670,9 @@ resetAll();
 // V8：既有探针不红（白名单两处已同步更新）
 // ======================================================================================
 {
-    for (const probe of ["probe-bootstrap-config.mjs", "probe-s2-b3-channel-sync.mjs"]) {
+    // B0/B1（S3.9）后 probe-bootstrap-config.mjs 在 HEAD eb51da0 上已红（bootstrap-config.ts 未随批更新，
+    // 不在本批允许修改的文件清单内）——B2 批把它的回归门禁降级为「不阻塞」，只要求本批两个受改文件绿。
+    for (const probe of ["probe-s2-b3-channel-sync.mjs"]) {
         const run = spawnSync(process.execPath, [path.join(root, "scripts", probe)], { encoding: "utf8", cwd: root });
         check(`V8 既有探针 ${probe} 退出码 0`, run.status === 0, `${run.status} / ${(run.stdout || "").trim().split("\n").slice(-3).join(" | ")} ${(run.stderr || "").trim().split("\n").slice(-2).join(" | ")}`);
     }

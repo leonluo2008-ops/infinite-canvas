@@ -349,7 +349,8 @@ export function createModelChannel(channel?: Partial<ModelChannel>): ModelChanne
         apiKey: channel?.apiKey || "",
         apiFormat,
         models: normalizeChannelModels(channel?.models),
-        isPreset: Boolean(channel?.isPreset),
+        // isPreset 是服务端派生字段：只在 true 时出现，避免改变单人版落盘信封的形状
+        ...(channel?.isPreset ? { isPreset: true } : {}),
     };
 }
 

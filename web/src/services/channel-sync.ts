@@ -18,22 +18,17 @@ import { create } from "zustand";
 
 import i18n from "@/i18n";
 import { normalizeLapianDefaultModel, normalizeLapianModelList } from "@/lib/canvas/lapian-model";
-import { fetchPresetPayload, maybeImportBootstrapConfig, PRESET_PLACEHOLDER_ID, type BootstrapPresetPayload } from "@/lib/config/bootstrap-config";
-import { channelNameKey, hasAnyKey, hasUsableKey, mergePresetChannels, mintPromotedChannels, rewriteChannelRefs, serverNameKey } from "@/lib/config/preset-merge";
+import { maybeImportBootstrapConfig } from "@/lib/config/bootstrap-config";
+import { channelNameKey, rewriteChannelRefs, serverNameKey } from "@/lib/config/preset-merge";
 import {
     isPresetTemplateId,
     presetAliases,
     presetTemplateIdList,
-    readPresetMeta,
     recordAlias,
     recordTombstone,
-    setLastPresetVersion,
-    setPresetTemplateIdList,
     templateIdOfMinted,
-    type PresetMeta,
 } from "@/lib/config/preset-meta";
 import { createModelChannel, modelOptionsFromChannels, normalizeModelOptionValue, useConfigStore, type AiConfig, type ModelChannel } from "@/stores/use-config-store";
-import { presetLayerComplete } from "@/services/preset-layer-complete";
 import { isMaskedKeyValue } from "./api/channel-proxy";
 
 // S3.5：预置层纯函数在 @/lib/config/preset-merge（探针直接 import 该模块断言）。
@@ -167,46 +162,7 @@ export function toModelChannels(serverChannels: ServerChannel[]): ModelChannel[]
     );
 }
 
-// ------------------------------------------------------------------ 迁移筛选
-
-/**
- * 一次性迁移的候选筛选（V6 的硬规则集中在这一个纯函数里，便于探针直接断言）：
- *  * 必须有 id / name / baseUrl
- *  * 必须带**非空且非 masked** 的 key（bootstrap 预置渠道无 key → 不上服务端）
- *  * 不能是 wan 型（万相同源零 key，服务端 422 拒收，标 localOnly）
- *  * baseUrl 必须 https（服务端 SSRF 收口只接受 https）
- *  * 渠道名唯一（服务端 (user_id,name) 唯一约束，重复整批 422）
- */
-export function selectMigratableChannels(channels: ModelChannel[]): ModelChannel[] {
-    const names = new Set<string>();       // 服务端重名判定（大小写敏感口径，与 _replace_channels 一致）
-    const lowerNames = new Set<string>();  // 大小写探测（IMPL-4 预检：仅大小写不同的名字在部分库排序规则下会撞 UNIQUE(user_id,name)）
-    const result: ModelChannel[] = [];
-    for (const channel of channels || []) {
-        const id = (channel?.id || "").trim();
-        const name = (channel?.name || "").trim();
-        const baseUrl = (channel?.baseUrl || "").trim();
-        const apiKey = (channel?.apiKey || "").trim();
-        if (!id || !name || !baseUrl || !apiKey) continue;
-        if (isMaskedKeyValue(apiKey)) {
-            // IMPL-4 告警：masked 值被静默过滤过一次，用户很可能以为这条渠道已经「迁过去了」
-            console.warn(`[channel-sync] 渠道「${name}」的 API Key 是掩码值（${apiKey.slice(0, 3)}…），不是明文——迁移时跳过，请重新输入完整 API Key`);
-            continue;
-        }
-        if (channel.apiFormat === "wan") continue;
-        if (!/^https:\/\//i.test(baseUrl)) continue;
-        if (names.has(name)) continue;
-        const lower = name.toLowerCase();
-        if (lowerNames.has(lower)) {
-            // IMPL-4：重名大小写探测（迁移前预检）——重名会让服务端整批 422，先跳过并在结果里点名
-            console.warn(`[channel-sync] 渠道「${name}」与已选渠道仅大小写不同，迁移时跳过（服务端重名整批 422）`);
-            continue;
-        }
-        names.add(name);
-        lowerNames.add(lower);
-        result.push(channel);
-    }
-    return result;
-}
+// ------------------------------------------------------------------ （已删除：一次性迁移筛选）
 
 /**
  * 「进不了服务端渠道表」的**内部路由判定**（B3.5 IMPL-3，**不加 store 字段**——store 结构不动）：
@@ -272,14 +228,17 @@ export function isScriptChannelBadge(badge: ChannelBadge | null): boolean {
     return badge?.kind === "script";
 }
 
-/**
- * 服务端渠道 + 本地专有渠道合并（服务端在前=权威顺序，本地专有附在后面）。
- * id 已在服务端出现的一律以服务端视图为准，避免同一渠道出现两份。
+/*
+ * 【已删除：预置模板层（S3.5 登录态部分）】
+ *
+ * B0/B1（S3.9）上线后，登录态渠道只来自服务端返回值（GET 原样进 store，见 bootstrapChannelSync），
+ * 本地不存渠道、预置不可删——因此登录分支的预置层合并/升格/迁移整层无调用点，B2 批删除：
+ *   presetTemplateIds / isTemplateChannelId / presetPayloadVersion / rememberPresetPayload /
+ *   presetChannelNames / presetMergeNotice / mergePresetLayer / commitAliasClaims / applyPresetLayer /
+ *   commitPresetVersion / mintPromotedOnBoot / selectMigratableChannels / mergeLocalOnlyChannels。
+ * 单机版路径仍在用：preset-meta.ts 全文件、preset-layer-complete.ts、maybeImportBootstrapConfig、
+ * startPresetWatch（仅保留墓碑分支）。
  */
-export function mergeLocalOnlyChannels(serverChannels: ModelChannel[], localChannels: ModelChannel[]): ModelChannel[] {
-    const ids = new Set(serverChannels.map((channel) => channel.id));
-    return [...serverChannels, ...(localChannels || []).filter((channel) => !ids.has(channel.id) && isLocalOnlyChannel(channel))];
-}
 
 /*
  * 【已移除：启动门/保存链的「服务端访问不到」点名】unsavableNotice()
@@ -295,145 +254,10 @@ export function mergeLocalOnlyChannels(serverChannels: ModelChannel[], localChan
  * i18n 的 channelSync.wanUnreachable / insecureUnreachable 文案保留但不再被启动门调用，防外部引用。
  */
 
-// ------------------------------------------------------------------ 预置模板层（S3.5）
-
-/** 启动时拉到的预置载荷（每次 boot 一份；失败 null = 本地照常起，不进 withTimeout 失败路径）。 */
-let presetPayload: BootstrapPresetPayload | null = null;
-/** 当前模板渠道 id 集合（探针/测试读）：真源在 preset-meta（单人/登录两条启动路径共用）。 */
-export function presetTemplateIds(): string[] {
-    return presetTemplateIdList();
-}
-
-/** id 是否属于当前模板（用户删它要记墓碑；填了 key 要升格换 id）。 */
-export function isTemplateChannelId(id: string | undefined | null): boolean {
-    return isPresetTemplateId(id);
-}
-
-/** 最近一次拉到的模板版本（空 = 端点没给版本，按「版本未知」处理）。 */
-export function presetPayloadVersion(): string {
-    return presetPayload?.presetVersion || "";
-}
-
-function rememberPresetPayload(payload: BootstrapPresetPayload | null) {
-    presetPayload = payload;
-    // 拉取成功才更新模板 id 集合（失败不动上一份，别让一次网络抖动把墓碑/升格判定清空）
-    if (payload) setPresetTemplateIdList(payload.channels.map((channel) => channel.id));
-}
-
-function presetChannelNames(channels: ModelChannel[], ids: string[]): string {
-    const lookup = new Map((channels || []).map((channel) => [channel.id, channel.name]));
-    return ids.map((id) => lookup.get(id) || id).filter(Boolean).join("、");
-}
-
-/**
- * 预置合并的可见提示（复用 localOnly 的 notice 单通道，配置页只读展示）。
- * `localChannels` 是合并**前**的本地视图——让位的占位渠道已经不在 merged.channels 里，点名要从这里查。
- */
-function presetMergeNotice(merged: ReturnType<typeof mergePresetChannels>, preset: ModelChannel[], localChannels: ModelChannel[]): string {
-    const parts: string[] = [];
-    if (merged.added.length) parts.push(i18n.t("channelSync.presetMerged", { count: merged.added.length, names: presetChannelNames(preset, merged.added) }));
-    if (merged.updated.length) parts.push(i18n.t("channelSync.presetRefreshed", { count: merged.updated.length, names: presetChannelNames(preset, merged.updated) }));
-    if (merged.skippedSameName.length) parts.push(i18n.t("channelSync.presetSameNameSkipped", { names: presetChannelNames(preset, merged.skippedSameName) }));
-    if (merged.skippedEmptyName.length) parts.push(i18n.t("channelSync.presetEmptyNameSkipped", { count: merged.skippedEmptyName.length }));
-    if (merged.droppedPlaceholder.length) parts.push(i18n.t("channelSync.presetPlaceholderDropped", { names: presetChannelNames(localChannels, merged.droppedPlaceholder) }));
-    return parts.join("；");
-}
-
+/* 【已删除：S3.5 登录态预置层函数（见上文删除清单注释）。 */
 
 function joinNotices(...parts: string[]): string {
     return parts.filter(Boolean).join("；");
-}
-
-/**
- * 登录模式预置层：`服务端视图 → localOnly → preset 队尾`（任务书 §2.4）。
- * **版本相同 → 零写入**：直接返回原数组（调用方据此跳过 applyChannels，config 引用不变、subscribe 不触发）。
- */
-export function mergePresetLayer(channels: ModelChannel[]): { channels: ModelChannel[]; notice: string; changed: boolean; version: string } {
-    const payload = presetPayload;
-    if (!payload) return { channels, notice: "", changed: false, version: "" };
-    const meta: PresetMeta = readPresetMeta();
-    // 版本守卫不能只看版本号：守卫记在浏览器 localStorage（跨用户共享），换账号登录时本地配置已被
-    // 登出隔离清空（prepareCanvasLogout → removeItem canvas_store），此时必须重新合并预置，
-    // 否则新用户在「owner 用过的浏览器」上永远拿不到预置三渠道（只剩「默认渠道」占位，B3 实证）。
-    // 判据：预置里未被墓碑（tombstones=本浏览器用户主动删除记录）挡下的模板渠道是否都已在场。
-    if (payload.presetVersion && payload.presetVersion === meta.lastPresetVersion && presetLayerComplete(channels, payload.channels, meta)) {
-        return { channels, notice: "", changed: false, version: payload.presetVersion };
-    }
-    const merged = mergePresetChannels(channels, payload.channels, {
-        tombstones: meta.tombstones,
-        aliases: meta.aliases,
-        // 内置占位渠道让位（V1「旧占位消失」）与单人路径**共用同一个回调**——登录模式漏传时
-        // 存量浏览器的旧「默认渠道」会永远留在配置页（B2.5 IF2）。
-        dropPlaceholder: (channel) => channel.id === PRESET_PLACEHOLDER_ID,
-    });
-    commitAliasClaims(merged.aliasClaims);
-    return { channels: merged.changed ? merged.channels : channels, notice: presetMergeNotice(merged, payload.channels, channels), changed: merged.changed, version: payload.presetVersion };
-}
-
-/**
- * 同名跳过分支认领的 alias 落盘（跨设备：设备 B 没有 A 的 alias，靠这条让画布旧引用 lazy 自愈）。
- * 写盘失败不致命（下次启动再认领一次），绝不让它打断启动门。
- */
-function commitAliasClaims(claims: Array<{ from: string; to: string }> | undefined) {
-    if (!claims || !claims.length) return;
-    for (const claim of claims) {
-        try {
-            recordAlias(claim.from, claim.to);
-        } catch {
-            // 配额/隐私模式：alias 记不下只会让下次启动再认领一遍（幂等）
-        }
-    }
-}
-
-
-/**
- * 预置层 + 启动 normalize 升格一起算完：返回最终渠道视图、notice、模板版本。
- * @returns changed=false 时 channels 引用与入参一致（调用方据此零写入）
- */
-export function applyPresetLayer(channels: ModelChannel[], startupNoticeText = ""): { channels: ModelChannel[]; notice: string; version: string; changed: boolean } {
-    const layer = mergePresetLayer(channels);
-    const minted = mintPromotedOnBoot(layer.channels);
-    return {
-        channels: minted,
-        notice: joinNotices(startupNoticeText, layer.notice),
-        version: layer.version,
-        changed: layer.changed || minted !== layer.channels,
-    };
-}
-
-/** 模板版本落地：合并路径真正走完（没有退回 local 模式）后才记，写失败不致命。 */
-export function commitPresetVersion(version: string) {
-    if (!version) return;
-    try {
-        // 版本没变就不 setItem（V6「零写入」的毛边：内容相同也算一次写盘，配额紧张时白耗）
-        if (readPresetMeta().lastPresetVersion === version) return;
-        setLastPresetVersion(version);
-    } catch {
-        // 记不下版本只会让下次启动再评估一遍（幂等无副作用）
-    }
-}
-
-/**
- * 启动 normalize 的升格（任务书 §2.3）：`templateId ∧ hasKey → 立即 mint`。
- * 只处理**明文** key（masked 是服务端视图缓存，换 id 需服务端行迁移，交给两处 PUT 入口的防御）。
- */
-function mintPromotedOnBoot(channels: ModelChannel[]): ModelChannel[] {
-    const templateIds = presetTemplateIdList();
-    if (!templateIds.length) return channels;
-    const { channels: minted, minted: promotions } = mintPromotedChannels(channels, {
-        templateIds,
-        aliases: presetAliases(),
-        mintId: () => nanoid(),
-    });
-    if (!promotions.length) return channels;
-    for (const item of promotions) recordAlias(item.from, item.to);
-    return minted;
-}
-
-function aliasMapOf(promotions: Array<{ from: string; to: string }>): Record<string, string> {
-    const map: Record<string, string> = {};
-    for (const item of promotions) map[item.from] = item.to;
-    return map;
 }
 
 /**
@@ -520,33 +344,9 @@ export function startPresetWatch() {
                 if (templateId) recordTombstone(templateId);
             }
         }
-        // ② 升格 mint：只在登录态（有服务端渠道表=有全局主键约束）做
-        if (state.config.channelMode !== "remote" || !presetTemplateIdList().length) return;
-        const beforeById = new Map(before.map((channel) => [channel.id, channel]));
-        const promotions = after.filter((channel) => channel && isPresetTemplateId(channel.id) && hasUsableKey(channel) && !hasAnyKey(beforeById.get(channel.id)));
-        if (!promotions.length) return;
-        // 推迟一轮：本次 setState 的监听器快照里还有自动回写（它拿的是旧 channels），
-        // 同步 setState 会让自动回写用旧模板 id 排一次 PUT。
-        const run = () => {
-            if (mintingGuard) return;
-            const current = useConfigStore.getState().config;
-            const { channels: minted, minted: aliases } = mintPromotedChannels(current.channels, {
-                templateIds: presetTemplateIdList(),
-                aliases: presetAliases(),
-                mintId: () => nanoid(),
-            });
-            if (!aliases.length) return;
-            for (const item of aliases) recordAlias(item.from, item.to);
-            mintingGuard = true;
-            try {
-                applyAliasesToStore(aliasMapOf(aliases));
-            } finally {
-                mintingGuard = false;
-            }
-            void minted;
-        };
-        if (typeof queueMicrotask === "function") queueMicrotask(run);
-        else setTimeout(run, 0);
+        // 【已删除：升格 mint 分支】B0/B1 后登录态渠道只来自服务端（本地不存渠道、预置不可删），
+        // 登录态「模板渠道 key 空→非空即 mint」的升格路径无触发条件，B2 批删除。单机版不需要它
+        // （单机渠道不上服务端，无全局主键约束）。
     });
 }
 
