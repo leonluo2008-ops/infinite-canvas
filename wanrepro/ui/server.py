@@ -985,11 +985,20 @@ def host_image_detailed(data: bytes, raw_name: str) -> dict:
 
     # ① local（第一图源）：自托管图床 /vc/<key> 直链（走 Cloudflare 隧道出公网）。
     # 只有设了 WANREPRO_PUBLIC_BASE 才启用；未设置时这一段整块不存在，行为逐字节不变。
+    # 验活用**磁盘校验**（文件已落盘 + 字节数一致），不回拉公网 URL：这条路径要跨境往返一次，
+    # 回拉会让每次上传多等一个太平洋往返（2026-11-18 实测隧道边缘在 lax）。
     public_base = (os.environ.get("WANREPRO_PUBLIC_BASE") or "").strip().rstrip("/")
     if public_base:
-        got = accept("local", "自托管直链", public_base + "/vc/" + key)
-        if got:
-            return got
+        local_url = public_base + "/vc/" + key
+        try:
+            on_disk = dest.is_file() and dest.stat().st_size == len(data)
+        except OSError:
+            on_disk = False
+        if on_disk:
+            _bump_asset_counter("local")
+            return {"url": local_url, "source": "local", "tried": tried, "skipped": skipped}
+        tried.append({"source": "local", "label": "自托管直链", "url": local_url,
+                      "reason": "本地备份落盘校验失败（文件缺失或大小不一致）"})
 
     uguu_url = upload_litterbox_bytes(data, ascii_name)     # ② litterbox（主源，72h）
     if uguu_url:
