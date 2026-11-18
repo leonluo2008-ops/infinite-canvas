@@ -107,12 +107,24 @@ export function AppConfigPanel({ showDoneButton = false, initialTab = "channels"
     const updateChannels = (channels: ModelChannel[]) => saveConfig(withChannels(config, channels));
 
     const addChannel = () => {
-        const channel = createModelChannel({ name: t("config.channels.numberedName", { count: config.channels.length + 1 }) });
+        const presetNames = config.channels.filter((channel) => channel.isPreset).map((channel) => channel.name.trim());
+        const nextName = t("config.channels.numberedName", { count: config.channels.length + 1 });
+        // B1：系统预置名称保留——新渠道默认名撞上预置名时直接阻止（用户改名后可再建）
+        if (presetNames.includes(nextName.trim())) {
+            message.warning(t("config.channels.presetNameTaken"));
+            return;
+        }
+        const channel = createModelChannel({ name: nextName });
         updateChannels([...config.channels, channel]);
         setEditingChannelId(channel.id);
     };
 
     const deleteChannel = (id: string) => {
+        // B1：预置行不可删（服务端 PUT 也会拒，这里在前端先行拦截）
+        if (config.channels.find((channel) => channel.id === id)?.isPreset) {
+            message.warning(t("config.channels.presetUndeletable"));
+            return;
+        }
         if (config.channels.length <= 1) {
             message.warning(t("config.channels.keepOne"));
             return;
@@ -229,6 +241,7 @@ export function AppConfigPanel({ showDoneButton = false, initialTab = "channels"
                                                     <div className="min-w-0">
                                                         <div className="flex min-w-0 items-center gap-2">
                                                             <span className="truncate text-sm font-semibold">{channel.name || t("config.channels.unnamed")}</span>
+                                                            {channel.isPreset ? <Tag className="shrink-0">{t("config.channels.presetBadge")}</Tag> : null}
                                                             {badge ? <Tag className="shrink-0">{badge.label}</Tag> : null}
                                                         </div>
                                                         <div className="mt-1 truncate text-xs text-stone-500">
@@ -240,7 +253,9 @@ export function AppConfigPanel({ showDoneButton = false, initialTab = "channels"
                                                         <Button size="small" disabled={scriptChannel} icon={<Pencil className="size-3.5" />} onClick={() => setEditingChannelId(channel.id)}>
                                                             {t("common.edit")}
                                                         </Button>
-                                                        <Button size="small" danger icon={<Trash2 className="size-3.5" />} onClick={() => deleteChannel(channel.id)} />
+                                                        {channel.isPreset ? null : (
+                                                            <Button size="small" danger icon={<Trash2 className="size-3.5" />} onClick={() => deleteChannel(channel.id)} />
+                                                        )}
                                                     </div>
                                                 </div>
                                             );

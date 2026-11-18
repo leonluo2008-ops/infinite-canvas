@@ -24,6 +24,8 @@ export type ModelChannel = {
     apiKey: string;
     apiFormat: ApiCallFormat;
     models: ChannelModel[];
+    /** B1：服务端预置渠道标记（预置名保留、不可删、不可改名）。本地新建渠道恒缺省。 */
+    isPreset?: boolean;
 };
 
 export type AiConfig = {
@@ -261,7 +263,12 @@ export const useConfigStore = create<ConfigStore>()(
         }),
         {
             name: CONFIG_STORE_KEY,
-            partialize: (state) => ({ config: state.config, webdav: state.webdav }),
+            partialize: (state) => ({
+                config:
+                    // B1：登录态本地不存渠道——服务端模式下持久化键里的 channels 恒为空（数据只存服务器）
+                    state.config.channelMode === "remote" ? { ...state.config, channels: [] as ModelChannel[] } : state.config,
+                webdav: state.webdav,
+            }),
             merge: (persisted, current) => {
                 const persistedState = (persisted || {}) as Partial<ConfigStore>;
                 const persistedConfig = (persistedState.config || {}) as Partial<AiConfig>;
@@ -342,6 +349,7 @@ export function createModelChannel(channel?: Partial<ModelChannel>): ModelChanne
         apiKey: channel?.apiKey || "",
         apiFormat,
         models: normalizeChannelModels(channel?.models),
+        isPreset: Boolean(channel?.isPreset),
     };
 }
 

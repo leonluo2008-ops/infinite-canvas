@@ -55,6 +55,8 @@ export type ServerChannel = {
     models?: unknown;
     apiKey?: string;
     keyBroken?: boolean;
+    /** B0：服务端对预置行下发 isPreset 布尔（预置名保留、不可删的判定来源）。 */
+    isPreset?: boolean;
 };
 
 export type SessionProbe = { kind: "logged-in"; username: string } | { kind: "logged-out" } | { kind: "single-user" };
@@ -160,6 +162,7 @@ export function toModelChannels(serverChannels: ServerChannel[]): ModelChannel[]
             apiFormat: channel.apiFormat as ModelChannel["apiFormat"],
             models: Array.isArray(channel.models) ? (channel.models as ModelChannel["models"]) : [],
             apiKey: channel.apiKey || "",
+            isPreset: Boolean(channel.isPreset),
         }),
     );
 }
@@ -743,10 +746,11 @@ function channelDomainEqual(a: AiConfig, b: AiConfig): boolean {
  * config 引用不变、subscriber 不触发 → 不会排任何 PUT）。
  * @returns 是否真的写了一次 store
  */
-function applyChannels(channels: ModelChannel[], mode: AiConfig["channelMode"]): boolean {
+function applyChannels(channels: ModelChannel[], mode: AiConfig["channelMode"], options: { force?: boolean } = {}): boolean {
     const current = useConfigStore.getState().config;
     const next = buildConfigWithChannels(current, channels, mode);
-    if (channelDomainEqual(next, current)) return false;
+    // B1：force=true 跳过内容等价早退（启动门重放服务端视图时必须真实落一次 store）
+    if (!options.force && channelDomainEqual(next, current)) return false;
     suspendAutoSave = true;
     try {
         useConfigStore.setState({ config: next });
@@ -772,6 +776,13 @@ function scheduleSave(channels: ModelChannel[]) {
         saveTimer = null;
         void flushChannelSync();
     }, debounceMs);
+}
+
+/** B1：清掉待写渠道（启动门拿到服务端权威视图后调用，避免把启动前的本地残差 PUT 上去）。 */
+export function resetPendingChannels() {
+    pendingChannels = null;
+    if (saveTimer) clearTimeout(saveTimer);
+    saveTimer = null;
 }
 
 /** 立刻把待写渠道推给服务端（防抖窗口结束 / beforeunload 都会调）。 */
@@ -938,15 +949,13 @@ export async function bootstrapChannelSync(options: BootstrapOptions = {}): Prom
     }
 
     // ---- 已登录：服务端权威 ----
-    // S3.5：预置文件与服务端渠道**并行**拉。presetPromise 永不 reject（失败=没有模板层，
-    // 本地照常起），所以它不进 withTimeout 的失败路径——那条路是「渠道链路读不到服务端」的语义。
-    const presetPromise = fetchPresetPayload(client);
+    // B1（S3.9）：登录态本地不存渠道——渠道数据只存服务器。直接拉服务端视图落地，
+    // 不再做预置层合并 / 本地迁移 / 预置 watch；预置行的 isPreset 由服务端下发（B0）。
     let server: ServerChannel[];
     try {
         server = await withTimeout(fetchServerChannels(client), timeoutMs, "服务端渠道读取");
     } catch (error) {
         // 读不到服务端渠道：不迁移、不动本地数据（避免误清空），退回本地模式并留错误文案
-        // （此路径**不写** lastPresetVersion——没合并成功就记版本=该浏览器永久错过本次模板）
         const message = error instanceof Error ? error.message : String(error);
         console.warn("[channel-sync] 服务端渠道读取失败，保持本地模式", error);
         setSync({ phase: "ready", mode: "local", username: probe.username, error: message });
@@ -954,61 +963,9 @@ export async function bootstrapChannelSync(options: BootstrapOptions = {}): Prom
     }
 
     rememberServerIds(server);
-    rememberPresetPayload(await presetPromise);
-    const localChannels = useConfigStore.getState().config.channels;
-    if (server.length) {
-        // B3.3：服务端非空 → 丢弃本地缓存（服务端权威、不迁移），但「仅本地模式」渠道（wan / 无 key / 非 https）
-        // 永远进不了服务端渠道表，丢掉就再也找不回来 → 合并保留（IMPL-3：可见、标仅本地、不可选、不清除）
-        const serverView = toModelChannels(server);
-        const merged = mergeLocalOnlyChannels(serverView, localChannels);
-        // S3.5：预置层追加在最后（服务端视图 → localOnly → preset），版本相同=零写入
-        // B2.7：仅本地渠道（wan/非 https）不再在启动时点名——用户自己建的，卡片徽标已说清
-        const layer = applyPresetLayer(merged);
-        applyChannels(layer.channels, "remote");
-        setSync({ phase: "ready", mode: "remote", username: probe.username, error: "", notice: layer.notice });
-        startPresetWatch();
-        startChannelAutoSave({ ...options, fetchImpl: client });
-        commitPresetVersion(layer.version);
-        return channelSyncSnapshot();
-    }
-
-    // 服务端为空 → 一次性迁移
-    const eligible = selectMigratableChannels(localChannels);
-    const migratedIds = new Set(eligible.map((channel) => channel.id));
-    // 迁移不上去的本地渠道：仅本地口径的留着（可见、不清除），其余（有真 key 的 https 渠道）视为下次再迁
-    const retained = localChannels.filter((channel) => !migratedIds.has(channel.id) && isLocalOnlyChannel(channel));
-    if (!eligible.length) {
-        // 没有可迁候选（全是预置无 key 渠道 / wan 型 / http 地址）→ 服务端就是空的
-        const layer = applyPresetLayer(retained);
-        applyChannels(layer.channels, "remote");
-        setSync({ phase: "ready", mode: "remote", username: probe.username, error: "", notice: layer.notice });
-        startPresetWatch();
-        startChannelAutoSave({ ...options, fetchImpl: client });
-        commitPresetVersion(layer.version);
-        return channelSyncSnapshot();
-    }
-
-    setSync({ migrating: true });
-    try {
-        // 防御断言（§2.3 第三道防线）：迁移分支绕开了 splitSavableChannels —— 提交前先 mint，
-        // 模板共享常量 id 绝不进服务端全局主键表（否则撞 id → 409 整批回滚 → 死循环）。
-        const guardedEligible = mintTemplateIdsBeforePut(eligible);
-        const saved = await withTimeout(putServerChannels(guardedEligible, client), timeoutMs, "渠道迁移");
-        rememberServerIds(saved);
-        const serverView = toModelChannels(saved.length ? saved : guardedEligible);
-        const layer = applyPresetLayer([...serverView, ...retained]);
-        applyChannels(layer.channels, "remote");
-        // IMPL-4：迁移结果列出被跳过渠道清单（配置页可见）
-        setSync({ migrating: false, phase: "ready", mode: "remote", username: probe.username, error: "", notice: layer.notice });
-        console.info(`[channel-sync] 已迁移 ${guardedEligible.length} 个渠道到服务端账号${retained.length ? `；仅本地保留：${retained.map((channel) => channel.name).join("、")}` : ""}`);
-        startPresetWatch();
-        startChannelAutoSave({ ...options, fetchImpl: client });
-        commitPresetVersion(layer.version);
-    } catch (error) {
-        // 迁移失败：绝不把用户本地 key 弄丢 —— 保持本地数据与本地模式（下次登录重试迁移）
-        const message = error instanceof Error ? error.message : String(error);
-        console.warn("[channel-sync] 渠道迁移失败，保持本地模式", error);
-        setSync({ migrating: false, phase: "ready", mode: "local", username: probe.username, error: message, notice: "" });
-    }
+    applyChannels(toModelChannels(server), "remote", { force: true });
+    resetPendingChannels();
+    startChannelAutoSave({ ...options, fetchImpl: client });
+    setSync({ phase: "ready", mode: "remote", username: probe.username, error: "", notice: "" });
     return channelSyncSnapshot();
 }

@@ -1,9 +1,9 @@
-import { Button, Drawer, Input, Segmented, Select, Space } from "antd";
+import { App, Button, Drawer, Input, Segmented, Select, Space, Tag } from "antd";
 import { ListPlus, Trash2 } from "lucide-react";
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 
-import { defaultBaseUrlForApiFormat, guessCapability, normalizeChannelModels, type ApiCallFormat, type ChannelModel, type ModelCapability, type ModelChannel } from "@/stores/use-config-store";
+import { useConfigStore, defaultBaseUrlForApiFormat, guessCapability, normalizeChannelModels, type ApiCallFormat, type ChannelModel, type ModelCapability, type ModelChannel } from "@/stores/use-config-store";
 import { ModelScriptEditor } from "./model-script-editor";
 import { ModelSelectModal } from "./model-select-modal";
 
@@ -11,6 +11,7 @@ type ScriptTarget = { name: string; capability: ModelCapability; value: string }
 
 export function ChannelEditorDrawer({ open, channel, onSave, onClose, serverMode = false }: { open: boolean; channel: ModelChannel | null; onSave: (channel: ModelChannel) => void; onClose: () => void; serverMode?: boolean }) {
     const { t } = useTranslation();
+    const { message } = App.useApp();
     const [draft, setDraft] = useState<ModelChannel | null>(channel);
     const [selectOpen, setSelectOpen] = useState(false);
     const [scriptTarget, setScriptTarget] = useState<ScriptTarget | null>(null);
@@ -49,7 +50,19 @@ export function ChannelEditorDrawer({ open, channel, onSave, onClose, serverMode
     const removeModel = (name: string) => setModels(draft.models.filter((model) => model.name !== name));
 
     const save = () => {
-        onSave({ ...draft, name: draft.name.trim() || t("config.channels.unnamed"), models: normalizeChannelModels(draft.models) });
+        // B1 保存层守卫（只读输入框不够，状态可能被并发改动）：
+        // ① 预置渠道不许改名；② 任何渠道不许把名字改成别的预置渠道名（预置名保留）
+        const nextName = draft.name.trim() || t("config.channels.unnamed");
+        if (channel?.isPreset && nextName !== channel.name) {
+            message.warning(t("config.channels.presetUndeletable"));
+            return;
+        }
+        const presetNames = useConfigStore.getState().config.channels.filter((item) => item.isPreset).map((item) => item.name.trim());
+        if (presetNames.includes(nextName.trim()) && nextName.trim() !== channel?.name?.trim()) {
+            message.warning(t("config.channels.presetNameTaken"));
+            return;
+        }
+        onSave({ ...draft, name: nextName, models: normalizeChannelModels(draft.models) });
         onClose();
     };
 
@@ -73,7 +86,8 @@ export function ChannelEditorDrawer({ open, channel, onSave, onClose, serverMode
             <div className="grid gap-4 md:grid-cols-2">
                 <label className="block">
                     <span className="mb-1 block text-sm font-medium">{t("config.channelEditor.name")}</span>
-                    <Input value={draft.name} onChange={(event) => patch({ name: event.target.value })} />
+                    <Input value={draft.name} readOnly={Boolean(channel?.isPreset)} onChange={(event) => patch({ name: event.target.value })} />
+                    {channel?.isPreset ? <Tag className="mt-1">{t("config.channels.presetBadge")}</Tag> : null}
                 </label>
                 <label className="block">
                     <span className="mb-1 block text-sm font-medium">{t("config.channelEditor.protocol")}</span>
