@@ -816,8 +816,15 @@ export async function flushChannelSync(): Promise<void> {
         try {
             const saved = await putServerChannels(guarded, fetchImpl);
             rememberServerIds(saved);
-            // 回写服务端视图（masked key），未保存的草稿/重名/无名渠道原样留在本地继续编辑
-            applyChannels([...toModelChannels(saved), ...skipped, ...unnamedSkipped, ...duplicates], "remote");
+            // 服务端视图是权威（B0 起 PUT 会连「未提交的预置行」一起返回），
+            // 未保存的草稿/重名/无名渠道按 id 与名称双重去重后再并入，避免预置卡重复出现两次。
+            const savedView = toModelChannels(saved);
+            const savedIds = new Set(savedView.map((channel) => channel.id));
+            const savedNames = new Set(savedView.map((channel) => (channel.name || "").trim()));
+            const leftover = [...skipped, ...unnamedSkipped, ...duplicates].filter(
+                (channel) => !savedIds.has(channel.id) && !savedNames.has((channel.name || "").trim()),
+            );
+            applyChannels([...savedView, ...leftover], "remote");
             setSync({ error: skipNotice });
         } catch (error) {
             // 失败不丢本地数据：留着 pending 等下次变更/下一次 flush 重试，错误文案给配置页
