@@ -172,7 +172,8 @@ const SDGF_ASSET_BRIDGE = "/api/asset/upload";
 // 因此 >1MB 的字节先按最长边 1600 压成 JPEG 再传；失败自动重试一次（换连接，不改语义）。
 const UPLOAD_SHRINK_THRESHOLD = 1_000_000;
 const UPLOAD_MAX_EDGE = 1600;
-const UPLOAD_RETRY_DELAY_MS = 1200;
+const UPLOAD_ATTEMPTS = 3;
+const UPLOAD_RETRY_BASE_MS = 900;
 
 async function shrinkForUpload(blob: Blob): Promise<Blob> {
     if (blob.size <= UPLOAD_SHRINK_THRESHOLD) return blob;
@@ -209,15 +210,21 @@ async function postAssetWithRetry(blob: Blob, name: string, options?: RequestOpt
             headers: { "X-Filename": name, "Content-Type": "application/octet-stream" },
             signal: options?.signal,
         });
-    try {
-        return (await attempt()).data;
-    } catch (err) {
-        // 只重试一次，且只在「没有拿到响应」（网络/网关 5xx）时重试——4xx 是确定性错误，重试无意义
-        const status = axios.isAxiosError(err) ? err.response?.status : undefined;
-        if (status && status < 500) throw err;
-        await new Promise((resolve) => setTimeout(resolve, UPLOAD_RETRY_DELAY_MS));
-        return (await attempt()).data;
+    let lastError: unknown;
+    for (let i = 0; i < UPLOAD_ATTEMPTS; i += 1) {
+        try {
+            return (await attempt()).data;
+        } catch (err) {
+            lastError = err;
+            // 只在「没拿到确定性答复」时重试：网络中断 / 网关 5xx（含 CF 边缘掐断回 502）。
+            // 4xx 是确定性错误，重试只会让用户多等。
+            const status = axios.isAxiosError(err) ? err.response?.status : undefined;
+            if (status && status < 500) throw err;
+            if (i === UPLOAD_ATTEMPTS - 1) break;
+            await new Promise((resolve) => setTimeout(resolve, UPLOAD_RETRY_BASE_MS * 2 ** i));
+        }
     }
+    throw lastError;
 }
 
 // 卡F3 提前探测：taskId → 连续 pending 次数（≥90 进度）。completed/failed 即删，不随任务完成永久膨胀。
