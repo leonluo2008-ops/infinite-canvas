@@ -638,11 +638,54 @@ def _find_channel(uid: int, cid: str) -> sqlite3.Row | None:
         conn.close()
 
 
+def _read_chunked_body(h: BaseHTTPRequestHandler, limit: int = BODY_LIMIT) -> bytes:
+    """读 `Transfer-Encoding: chunked` 请求体（Cloudflare / HTTP/2 转发时常无 Content-Length）。
+
+    2026-11-18 所有者真机：浏览器经隧道发出的请求带了 chunked，服务端直接 411，
+    界面只看到「代转发需要 Content-Length」——那是实现缺口，不是用户的错误。
+    这里按 RFC 7230 收块，累计超限时 413（与 Content-Length 分支同一上限）。
+    """
+    CRLF = b"\r\n"
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        line = h.rfile.readline(65536)
+        if not line:
+            raise Reject(400, "分块请求体不完整。")
+        token = line.split(b";", 1)[0].strip()
+        try:
+            size = int(token, 16)
+        except ValueError:
+            h.close_connection = True
+            raise Reject(400, "分块请求体格式非法。") from None
+        if size == 0:
+            while True:                       # 吃掉 trailer 直到空行
+                trailer = h.rfile.readline(65536)
+                if not trailer or trailer in (CRLF, b"\n"):
+                    break
+            break
+        total += size
+        if total > limit:
+            h.close_connection = True
+            raise Reject(413, f"请求体超过 {limit // (1024 * 1024)}MB 上限。")
+        chunk = h.rfile.read(size)
+        if len(chunk) != size:
+            h.close_connection = True
+            raise Reject(400, "分块请求体不完整。")
+        chunks.append(chunk)
+        if h.rfile.read(2) not in (CRLF, b"\n"):
+            h.close_connection = True
+            raise Reject(400, "分块请求体格式非法。")
+    return b"".join(chunks)
+
+
 def _read_request_body(h: BaseHTTPRequestHandler) -> bytes:
     te = (h.headers.get("Transfer-Encoding") or "").strip().lower()
     if te:
+        if "chunked" in te:
+            return _read_chunked_body(h)
         h.close_connection = True     # 请求体没读，keep-alive 会错帧
-        raise Reject(411, "代转发需要 Content-Length（不支持分块请求体）。")
+        raise Reject(411, f"代转发不支持该传输编码（{te}）。")
     raw_len = (h.headers.get("Content-Length") or "").strip()
     if not raw_len:
         return b""
