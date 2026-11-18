@@ -698,9 +698,9 @@ export default {
             defaultName: "Default provider",
             newName: "New provider",
             indexedName: "Provider {{index}}",
-            serverModeHint: "Provider settings are stored in your account (server mode): sign in on another device to see them. API keys are encrypted on the server only and shown masked here; generation requests are proxied by the server.",
+            serverModeHint: "Provider settings are stored in your account (server mode): sign in on another device to see them. API keys are encrypted on the server only and shown masked here; generation requests are proxied by the server. To fetch the model list, click Save first — an unsaved API key is not in effect yet, so model discovery will fail.",
             // Provider card badges: state the facts only, no "local mode" concept
-            badgeMissingKey: "No API key",
+            badgeMissingKey: "API key not configured",
             badgeMissingKeyHint: "Add an API key to use this provider; it is then saved to your account",
             badgeServerUnreachable: "Server can't reach it",
             badgeWanHint: "Points at a local address (127.0.0.1); the server cannot reach it",

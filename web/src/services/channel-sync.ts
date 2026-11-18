@@ -606,7 +606,10 @@ export async function flushChannelSync(): Promise<void> {
     }
     // 防御断言（任务书 §2.3 第三道防线）：模板共享常量 id 严禁进 PUT —— 先 mint 换 id 再提交
     const guarded = mintTemplateIdsBeforePut(savableUnique);
-    const skipNotice = joinNotices(describeSkippedChannels(skipped), describeSaveSkips(duplicates, unnamedSkipped), describeCaseVariants(caseVariants));
+    // 未填 key 的渠道**不再进红色错误位**（所有者 2026-11-18：「只需要在徽标里显示未配置 API Key」）。
+    // 它们本来就进不了 PUT，事实由渠道卡片上的 `missingKey` 徽标承载；这里只留真正的阻塞项：
+    // 重名冲突 / 无名跳过 / 大小写变体。
+    const skipNotice = joinNotices(describeSaveSkips(duplicates, unnamedSkipped), describeCaseVariants(caseVariants));
     if (!guarded.length) {
         // 全部是仅本地/未填 key/重名的渠道：不发 PUT（发了必 422），只提示
         setSync({ error: skipNotice });

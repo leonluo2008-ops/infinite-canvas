@@ -698,10 +698,10 @@ export default {
             defaultName: "默认渠道",
             newName: "新渠道",
             indexedName: "渠道 {{index}}",
-            serverModeHint: "渠道配置保存在你的账号下（服务端模式）：换设备登录即可看到；API Key 只在服务端加密保存、前端只显示掩码，生成请求由服务端代转发。",
+            serverModeHint: "渠道配置保存在你的账号下（服务端模式）：换设备登录即可看到；API Key 只在服务端加密保存、前端只显示掩码，生成请求由服务端代转发。要拉取模型列表，请先点「保存」把这条渠道存一次——没保存的 API Key 不会生效，拉取模型会失败。",
             // 渠道卡片徽标：只陈述事实，不引入「本地模式」概念
-            badgeMissingKey: "未填 Key",
-            badgeMissingKeyHint: "填写 API Key 后即可使用，并会保存到你的账号",
+            badgeMissingKey: "未配置 API Key",
+            badgeMissingKeyHint: "填上 API Key 就能用；保存后会加密存在你的账号里",
             badgeServerUnreachable: "服务器不可达",
             badgeWanHint: "指向本地地址（127.0.0.1），服务器无法代为访问",
             badgeInsecureHint: "接口地址不是 https，服务器无法代为访问",

@@ -247,7 +247,9 @@ await sync.flushChannelSync();
 const draftPuts = shim.calls.fetch.filter((c) => c.method === "PUT");
 equal("4c. 只提交有 key 的渠道", JSON.parse(draftPuts[0].body).channels.map((c) => c.id), ["new-1"]);
 check("4c. 草稿渠道留在本地继续编辑", store.useConfigStore.getState().config.channels.some((c) => c.id === "draft-new"), "草稿渠道被丢弃");
-check("4c. 提示草稿渠道未保存", String(sync.channelSyncSnapshot().error).includes("新渠道草稿"), sync.channelSyncSnapshot().error);
+// 所有者 2026-11-18：未填 key 的事实只走渠道卡片徽标，不再占用红色错误位（否则红条永不消失）
+equal("4c. 未填 key 的草稿不进红色错误位（改为徽标承载）", String(sync.channelSyncSnapshot().error), "");
+check("4c-2. 草稿渠道卡片徽标=未配置 API Key", sync.channelBadgeFor({ id: "draft-new", name: "新渠道草稿", baseUrl: "https://draft.example.com", apiKey: "", apiFormat: "openai", models: [] })?.label === "未配置 API Key", "徽标缺失");
 sync.stopChannelAutoSave();
 
 // ---------------------------------------------------------------------------
@@ -355,7 +357,7 @@ const httpBadge = badgeOf(ch({ id: "ui-http", apiKey: "sk-probe-key", baseUrl: "
 const scriptBadge = badgeOf(ch({ id: "ui-script", apiKey: "sk-probe-key", models: [{ name: "m", capability: "image", script: "return 1;" }] }), { serverMode: true });
 const okBadge = badgeOf(ch({ id: "ui-ok", apiKey: "sk-probe-key" }));
 equal("8f. 徽标种类（未填 Key / 服务器不可达×2 / 脚本渠道 / 无徽标）", [noKeyBadge, wanBadge, httpBadge, scriptBadge, okBadge].map((badge) => (badge ? badge.kind : null)), ["missingKey", "serverUnreachable", "serverUnreachable", "script", null]);
-check("8f-2. 无 key https 渠道徽标=未填 Key 且不含「本地模式」", noKeyBadge.label === "未填 Key" && !`${noKeyBadge.label}${noKeyBadge.hint}`.includes("本地模式"), JSON.stringify(noKeyBadge));
+check("8f-2. 无 key https 渠道徽标=未配置 API Key 且不含「本地模式」", noKeyBadge.label === "未配置 API Key" && !`${noKeyBadge.label}${noKeyBadge.hint}`.includes("本地模式"), JSON.stringify(noKeyBadge));
 check("8f-3. wan 渠道徽标是事实陈述（服务器不可达 + 说明访问不到本地地址）", wanBadge.label === "服务器不可达" && wanBadge.hint.includes("服务器无法代为访问"), JSON.stringify(wanBadge));
 check("8f-4. 脚本渠道徽标说明服务端不下发 Key", scriptBadge.label === "脚本渠道" && scriptBadge.hint.includes("不会把 Key 下发给脚本"), JSON.stringify(scriptBadge));
 // 8f-5. 徽标不影响门控：无 key 渠道徽标=未填 Key，但内部判定仍为「不进 PUT」
