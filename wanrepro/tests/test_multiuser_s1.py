@@ -1523,6 +1523,88 @@ def phase_w0():
     return checks
 
 
+# ---------------- B0：自托管图床接回生成链路（local 第一图源 + /vc/ 免登录） ----------------
+def phase_b0():
+    """B0 三判据：
+      * B0-T1 未设 WANREPRO_PUBLIC_BASE：host_image_detailed 行为逐字节不变
+        （monkeypatch 两个上传函数返回空 → 抛 ImageHostError，tried 里没有 local）；
+      * B0-T2 设了 WANREPRO_PUBLIC_BASE 且直链验活通过 → source=local、url 前缀正确、
+        litterbox/uguu 未被调用（计数器断言）。验活用 monkeypatch image_url_alive=True
+        的替代口径——不是真实网络验活（真实取图由 B0-T3 的 /vc/ 200 覆盖）；
+      * B0-T3 MULTI_USER=1 未登录 GET /vc/<已存在 key> → 200；路径穿越 → 404。
+    """
+    checks = []
+    real_litter, real_uguu, real_alive = (server.upload_litterbox_bytes,
+                                          server.upload_uguu_bytes, server.image_url_alive)
+    had_base = os.environ.pop('WANREPRO_PUBLIC_BASE', None)
+    try:
+        # ---- B0-T1：未设 env → 行为不变 ----
+        calls = {'litter': 0, 'uguu': 0}
+        server.upload_litterbox_bytes = lambda d, n: calls.__setitem__('litter', calls['litter'] + 1) or ''
+        server.upload_uguu_bytes = lambda d, n: calls.__setitem__('uguu', calls['uguu'] + 1) or ''
+        try:
+            server.host_image_detailed(b'\x89PNG' + bytes([13, 10, 26, 10]), 'ref.png')
+            raise AssertionError('no env + both uploads empty must raise ImageHostError')
+        except server.ImageHostError as e:
+            assert not any(r.get('source') == 'local' for r in e.sources), \
+                f'env unset must not try local: {e.sources}'
+        assert calls == {'litter': 1, 'uguu': 1}, f'baseline upload chain must be unchanged: {calls}'
+        checks.append('B0-T1 env unset: host_image_detailed raises ImageHostError with both uploads '
+                      'tried, no local in tried (behavior byte-identical to baseline)')
+
+        # ---- B0-T2：设 env + 验活通过 → local 第一图源，外网上传零调用 ----
+        os.environ['WANREPRO_PUBLIC_BASE'] = 'http://127.0.0.1:9/'
+        calls = {'litter': 0, 'uguu': 0}
+        server.image_url_alive = lambda url, timeout=0: (True, 'HTTP 200')  # 验活替代口径，非真实网络
+        got = server.host_image_detailed(b'\x89PNG' + bytes([13, 10, 26, 10]), 'ref.png')
+        assert got['source'] == 'local' and got['url'].startswith('http://127.0.0.1:9/vc/m4/'), got
+        assert got['url'].endswith('/ref.png'), got['url']
+        assert calls == {'litter': 0, 'uguu': 0}, f'litterbox/uguu must not be called: {calls}'
+        # 尾斜杠 / 空白也要归一
+        os.environ['WANREPRO_PUBLIC_BASE'] = '  http://127.0.0.1:9///  '
+        got2 = server.host_image_detailed(b'x', 'ref.png')
+        assert got2['source'] == 'local' and got2['url'].startswith('http://127.0.0.1:9/vc/m4/'), got2
+        checks.append('B0-T2 env set + alive: source=local, url=<BASE>/vc/m4/<hex>/ref.png (strip+尾斜杠归一), '
+                      'litterbox/uguu call counts 0 (monkeypatched image_url_alive=True — 替代口径, 非真实网络验活)')
+
+        # ---- B0-T3：MULTI_USER=1 未登录 /vc/ 200（不再 302）+ 路径穿越 404 ----
+        real_up = server.UPLOADS
+        tmp_up = Path(tempfile.mkdtemp(prefix='b0-uploads-'))
+        (tmp_up / 'vc').mkdir(parents=True, exist_ok=True)
+        (tmp_up / 'vc' / 'deadbeef').write_bytes(b'\x89PNG-backing')
+        server.UPLOADS = tmp_up
+        multiuser.FAILURES.clear(); multiuser.REG_ATTEMPTS.clear()
+        srv, base = serve('1')
+        try:
+            try:
+                st, body = build_opener(NoRedirect()).open(Request(base + '/vc/deadbeef')).status, b''
+                rd = None
+            except HTTPError as e:
+                st, body, rd = e.code, e.read(), e.headers.get('Location')
+            assert st == 200, f'anon GET /vc/<key> must 200 (no 302), got {st} loc={rd}'
+            assert body in (b'', b'\x89PNG-backing'), body[:80]
+            st2, body2 = req(base, '/vc/deadbeef')
+            assert st2 == 200, f'anon /vc/<key> plain opener must also 200, got {st2} {body2[:120]}'
+            checks.append('B0-T3 MULTI_USER=1: unauthenticated GET /vc/<existing key> -> 200 (no 302 to login)')
+            for evil in ('/vc/..%2F..%2Fsecret.png', '/vc/%2e%2e/deadbeef', '/vc/a/b/../../../etc/passwd'):
+                st3, _ = req(base, evil)
+                assert st3 == 404, f'path traversal {evil} must 404, got {st3}'
+            st4, _ = req(base, '/vc/no-such-key')
+            assert st4 == 404, f'missing key must 404, got {st4}'
+            checks.append('B0-T3 traversal/missing: /vc/..%2F.., %2e%2e, a/b/../../../ → 404; unknown key → 404')
+        finally:
+            srv.shutdown(); srv.server_close()
+            server.UPLOADS = real_up
+    finally:
+        server.upload_litterbox_bytes, server.upload_uguu_bytes, server.image_url_alive = \
+            real_litter, real_uguu, real_alive
+        if had_base is not None:
+            os.environ['WANREPRO_PUBLIC_BASE'] = had_base
+        else:
+            os.environ.pop('WANREPRO_PUBLIC_BASE', None)
+    return checks
+
+
 def main():
  checks=[]; srv,base=serve('0')
  try:
@@ -1691,6 +1773,7 @@ def main():
  checks += phase_s3_b1()
  checks += phase_s3_5_b1()
  checks += phase_w0()
+ checks += phase_b0()
  print('SUMMARY: PASS %d/%d'%(len(checks),len(checks)))
  for c in checks: print('PASS: '+c)
  return 0

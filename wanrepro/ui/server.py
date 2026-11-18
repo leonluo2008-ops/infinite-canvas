@@ -983,7 +983,15 @@ def host_image_detailed(data: bytes, raw_name: str) -> dict:
                       "reason": f"直链验活失败（{why}）"})
         return None
 
-    uguu_url = upload_litterbox_bytes(data, ascii_name)     # ① litterbox（主源，72h）
+    # ① local（第一图源）：自托管图床 /vc/<key> 直链（走 Cloudflare 隧道出公网）。
+    # 只有设了 WANREPRO_PUBLIC_BASE 才启用；未设置时这一段整块不存在，行为逐字节不变。
+    public_base = (os.environ.get("WANREPRO_PUBLIC_BASE") or "").strip().rstrip("/")
+    if public_base:
+        got = accept("local", "自托管直链", public_base + "/vc/" + key)
+        if got:
+            return got
+
+    uguu_url = upload_litterbox_bytes(data, ascii_name)     # ② litterbox（主源，72h）
     if uguu_url:
         got = accept("litterbox", "litterbox(72h)", uguu_url)
         if got:
@@ -992,7 +1000,7 @@ def host_image_detailed(data: bytes, raw_name: str) -> dict:
         tried.append({"source": "litterbox", "label": "litterbox(72h)",
                       "reason": f"上传失败（{_LITTERBOX_LAST_ERROR or '服务不可用'}）"})
 
-    uguu_url = upload_uguu_bytes(data, ascii_name)          # ② uguu（备源，3h）
+    uguu_url = upload_uguu_bytes(data, ascii_name)          # ③ uguu（备源，3h）
     if uguu_url:
         got = accept("uguu", "uguu(3h)", uguu_url)
         if got:

@@ -217,8 +217,10 @@ def route_missing(path: str) -> bool:
 
 def login_guard(h: BaseHTTPRequestHandler, method: str, path: str) -> bool:
     """MULTI_USER=1 时：未登录访问任何页面路径（非 /api、非 /multiuser）一律 302 跳登录页；
-    已登录返回 False 交回既有链路——画布静态产物由 server 既有 web-dist 机制负责（复用，不另造）。"""
-    if method != "GET" or path.startswith("/api/") or path.startswith("/multiuser/") or path.startswith("/assets/"):
+    已登录返回 False 交回既有链路——画布静态产物由 server 既有 web-dist 机制负责（复用，不另造）。
+    /vc/ 是自托管图床直链，随机 key、只读、故意免登录。"""
+    if method != "GET" or path.startswith("/api/") or path.startswith("/multiuser/") \
+            or path.startswith("/assets/") or path.startswith("/vc/"):
         return False
     if _session_user(h) is not None:
         return False
