@@ -1,5 +1,6 @@
 import { normalizeLapianDefaultModel, normalizeLapianModelList } from "@/lib/canvas/lapian-model";
 import { mergePresetChannels } from "@/lib/config/preset-merge";
+import { presetLayerComplete } from "@/services/preset-layer-complete";
 import { readPresetMeta, recordAlias, setLastPresetVersion, setPresetTemplateIdList } from "@/lib/config/preset-meta";
 import {
     CONFIG_STORE_KEY,
@@ -185,9 +186,18 @@ export async function maybeImportBootstrapConfig(fetchImpl: typeof fetch = fetch
             return;
         }
 
-        // ---- 版本比对：相同 = 零写入（V6）----
+        // ---- 版本比对：相同 = 零写入（V6）——但守卫记在浏览器 localStorage（跨用户共享），
+        // 登出隔离清掉本地配置后换账号登录时不能只看版本号；预置渠道缺席时必须照常合并（B3 实证）。
         const meta = readPresetMeta();
-        if (payload.presetVersion && payload.presetVersion === meta.lastPresetVersion) return;
+        const envelopeEarly = readEnvelope(raw);
+        const configEarly = envelopeEarly?.state?.config;
+        if (
+            payload.presetVersion &&
+            payload.presetVersion === meta.lastPresetVersion &&
+            presetLayerComplete(configEarly ? { ...defaultConfig, ...configEarly }.channels || [] : [], payload.channels, meta)
+        ) {
+            return;
+        }
 
         const envelope = readEnvelope(raw);
         const persistedConfig = envelope?.state?.config;
