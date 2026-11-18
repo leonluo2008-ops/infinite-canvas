@@ -267,6 +267,20 @@ def _body(h: BaseHTTPRequestHandler) -> dict:
 
 BROKEN_MASK = "***?"
 
+_PRESET_NAMES_CACHE: set[str] | None = None
+
+
+def _preset_names() -> set[str]:
+    """预置渠道名称集合（进程内缓存，模板变更需重启）。失败时不写缓存，下次重读。"""
+    global _PRESET_NAMES_CACHE
+    if _PRESET_NAMES_CACHE is None:
+        try:
+            from wanrepro.ui import channel_seed  # 仓根包形态（探针/测试导入）
+        except ImportError:
+            import channel_seed  # type: ignore[no-redef]  # 脚本直跑形态：ui/ 平级导入
+        _PRESET_NAMES_CACHE = channel_seed.preset_names()
+    return _PRESET_NAMES_CACHE
+
 
 def _view(key: bytes, row: sqlite3.Row) -> dict:
     """对外视图：key 只出 masked，零回显。
@@ -292,6 +306,7 @@ def _view(key: bytes, row: sqlite3.Row) -> dict:
         "models": models if isinstance(models, list) else [],
         "apiKey": masked,
         "updatedAt": row["updated_at"] or 0,
+        "isPreset": (row["name"] or "").strip() in _preset_names(),
     }
     if broken:
         view["keyBroken"] = True
@@ -372,14 +387,30 @@ def _replace_channels(h: BaseHTTPRequestHandler, uid: int) -> list[dict]:
                     keep = True
                     old = fallback
             if keep:
-                if old is None or not old["api_key_enc"]:
+                if old is None:
                     raise Reject(422, f"渠道「{name}」需要重新输入完整 API Key"
                                       f"（服务端没有可沿用的密文，请重新输入完整 API Key）。")
-                enc = bytes(old["api_key_enc"])
+                # 预置渠道出厂无 key（密文 b""）：空 key 行回写属正常（未填 Key 的中性状态），
+                # 只要服务端已有该行就沿用原密文，不因为「没有密文可沿用」而整批 422。
+                enc = bytes(old["api_key_enc"] or b"")
             else:
                 enc = encrypt(key, submitted)
 
             rows.append((cid, uid, name, base_url, enc, api_format, models_json, now))
+        # 预置渠道不可删：全量替换语义下，payload 里没带的预置行（按名称判定）原样保留，
+        # 否则「前端不提交无 key 渠道 → PUT 整集替换 → 三条预置被删」会让所有者规则失效。
+        incoming = {row[2] for row in rows}          # row[2] = name
+        incoming_ids = {row[0] for row in rows}      # row[0] = id（同 id 改名不算「缺失」）
+        preset = _preset_names()
+        if preset:
+            keep_rows = []
+            for old_row in existing.values():
+                nm = (old_row["name"] or "").strip()
+                if nm in preset and nm not in incoming and old_row["id"] not in incoming_ids:
+                    keep_rows.append((old_row["id"], uid, old_row["name"], old_row["base_url"],
+                                      bytes(old_row["api_key_enc"] or b""), old_row["api_format"],
+                                      old_row["models_json"], old_row["updated_at"]))
+            rows.extend(keep_rows)
         conn.execute("DELETE FROM user_channels WHERE user_id=?", (uid,))
         if rows:
             conn.executemany(
@@ -792,7 +823,10 @@ def _handle_channels(h: BaseHTTPRequestHandler, method: str, path: str) -> None:
         if method == "GET":
             # S4 种子化：名下渠道为 0 → 种入预置三渠道（无 key）。只播一次，用户删掉不回灌（PUT 即为真实意图）。
             try:
-                import channel_seed
+                try:
+                    from wanrepro.ui import channel_seed  # 仓根包形态（探针/测试导入）
+                except ImportError:
+                    import channel_seed  # type: ignore[no-redef]  # 脚本直跑形态：ui/ 平级导入
                 channel_seed.seed_if_empty(uid)
             except Exception:
                 pass  # 种子失败不阻塞读取（下次 GET 再试）

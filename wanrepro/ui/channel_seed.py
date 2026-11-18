@@ -9,10 +9,14 @@ S4 种子化：用户首次访问渠道时名下渠道为 0 → 从 config/chann
 """
 import json
 import sqlite3
+import sys
 import time
 from pathlib import Path
 
-import multiuser
+try:  # 仓根包形态（探针/测试导入）
+    from wanrepro.ui import multiuser
+except ImportError:  # 脚本直跑形态（ui/ 在 sys.path[0]）
+    import multiuser  # type: ignore[no-redef]
 
 
 def _connect() -> sqlite3.Connection:
@@ -21,11 +25,28 @@ def _connect() -> sqlite3.Connection:
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(path), timeout=5)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=5000")
+    conn.execute("PRAGMA foreign_keys=ON")
+    try:  # 复用 channel_store 的建表脚本（同一套 SCHEMA；双形态导入与 multiuser 同口径）
+        from wanrepro.ui import channel_store
+    except ImportError:
+        import channel_store  # type: ignore[no-redef]
+    conn.executescript(channel_store.SCHEMA)
+    conn.commit()
     conn.isolation_level = None
     return conn
 
 PRESET_PATH = Path(__file__).resolve().parent.parent / "config" / "channel-config.json"
+
+
+def preset_names() -> set[str]:
+    """预置渠道名称集合（channel_store._view 下发 isPreset 的唯一依据）。"""
+    items = _load_preset()
+    if not items:
+        print("[channel_seed] 预置模板不可读或为空，isPreset 判定降级为全 false", file=sys.stderr)
+        return set()
+    return {str(c["name"]).strip() for c in items if str(c.get("name") or "").strip()}
 
 
 def _load_preset() -> list[dict]:

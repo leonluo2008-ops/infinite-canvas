@@ -1477,10 +1477,35 @@ def main():
   # 方法/登录态语义复位：匿名 PUT/DELETE 仍 401，登录态 POST 405
   assert req(base,CHANNELS,'PUT',{'channels':[]})[0]==401 and req(base,CHANNELS,'DELETE')[0]==401
   assert req(base,CHANNELS,'POST',{'channels':[]},opA)[0]==405
-  # DELETE 清空该用户渠道集
+  # DELETE 清空该用户渠道集；紧随其后的 GET 会触发 S4 懒播种（0 条 → 种回三条预置，无 key）
   st,_=req(base,CHANNELS,'DELETE',opener=opA)
-  assert st==200 and json.loads(req(base,CHANNELS,opener=opA)[1])['channels']==[], 'DELETE must clear the channel set'
-  checks.append('DELETE clears the user channel set; POST -> 405; anon PUT/DELETE still 401')
+  assert st==200, f'DELETE must 200, got {st}'
+  after=json.loads(req(base,CHANNELS,opener=opA)[1])['channels']
+  assert len(after)==3 and all(c.get('isPreset') is True for c in after), \
+      f'after DELETE the set must be exactly the 3 seeded presets, got {[c.get("name") for c in after]}'
+  assert 'ch_1' not in {c['id'] for c in after}, 'DELETE must physically remove the user-created channels'
+  checks.append('DELETE clears the user channel set (subsequent GET re-seeds the 3 presets only; user channels physically gone); POST -> 405; anon PUT/DELETE still 401')
+ finally: srv.shutdown(); srv.server_close()
+
+ # ---------------- S3.9-B0：isPreset 探针（惰性播种 GET 下发 isPreset，自建渠道 False） ----------------
+ srv,base=serve('1')
+ opP=build_opener(HTTPCookieProcessor(http.cookiejar.CookieJar()))
+ try:
+  assert req(base,'/api/auth/register','POST',{'username':'preset_probe','password':'password1'},opP)[0]==200
+  # ① 新用户首 GET 触发播种：恰好 3 条，全 isPreset=True，apiKey 空串
+  st,body=req(base,CHANNELS,opener=opP); chans=json.loads(body)['channels']
+  assert st==200 and len(chans)==3, f'seed GET should yield 3 preset channels, got {st} {len(chans)}'
+  assert all(c['isPreset'] is True for c in chans), f'all seeded channels must be isPreset=True: {chans}'
+  assert all(c['apiKey']=='' for c in chans), f'seeded channels must have empty apiKey: {chans}'
+  checks.append('S3.9-B0: fresh-user GET seeds exactly 3 preset channels, all isPreset=True with empty apiKey')
+  # ② 同一用户 PUT 一条自建渠道（PUT 为整集全量替换；预置行不可删 → 服务端保留 payload 里没带的预置）
+  st,b=req(base,CHANNELS,'PUT',{'channels':[{'id':'ch_mine','name':'自建一号','baseUrl':PUB,'apiFormat':'openai','apiKey':KEY}]},opP)
+  assert st==200, f'PUT own channel failed: {st} {b}'
+  chans=json.loads(req(base,CHANNELS,opener=opP)[1])['channels']
+  mine=[c for c in chans if c['name']=='自建一号']
+  assert len(mine)==1 and mine[0]['isPreset'] is False, f'own channel must be isPreset=False: {mine}'
+  assert sum(1 for c in chans if c['isPreset'] is True)==3, f'the 3 presets must survive a PUT that omits them: {chans}'
+  checks.append('S3.9-B0: user-added channel isPreset=False; presets survive a full-replacement PUT that omits them (un-deletable via API)')
  finally: srv.shutdown(); srv.server_close()
  checks += phase_b2()
  checks += phase_admin()
