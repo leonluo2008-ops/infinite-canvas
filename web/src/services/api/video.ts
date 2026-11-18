@@ -167,6 +167,59 @@ function videoPluginResult(result: unknown): VideoGenerationResult {
 
 const SDGF_ASSET_BRIDGE = "/api/asset/upload";
 
+// 上传瘦身 + 重试（2026-11-18）：服务端在图床路由上要经 Cloudflare 隧道往返一次，
+// 大图（数 MB）在这条国际路径上会拖到几十秒甚至被边缘打成 502。参考图只需要够生成用，
+// 因此 >1MB 的字节先按最长边 1600 压成 JPEG 再传；失败自动重试一次（换连接，不改语义）。
+const UPLOAD_SHRINK_THRESHOLD = 1_000_000;
+const UPLOAD_MAX_EDGE = 1600;
+const UPLOAD_RETRY_DELAY_MS = 1200;
+
+async function shrinkForUpload(blob: Blob): Promise<Blob> {
+    if (blob.size <= UPLOAD_SHRINK_THRESHOLD) return blob;
+    try {
+        const bitmap = await createImageBitmap(blob);
+        const edge = Math.max(bitmap.width, bitmap.height);
+        const scale = edge > UPLOAD_MAX_EDGE ? UPLOAD_MAX_EDGE / edge : 1;
+        if (scale >= 1) {
+            bitmap.close?.();
+            return blob;
+        }
+        const width = Math.max(1, Math.round(bitmap.width * scale));
+        const height = Math.max(1, Math.round(bitmap.height * scale));
+        const canvas = document.createElement("canvas");
+        canvas.width = width;
+        canvas.height = height;
+        const ctx = canvas.getContext("2d");
+        if (!ctx) {
+            bitmap.close?.();
+            return blob;
+        }
+        ctx.drawImage(bitmap, 0, 0, width, height);
+        bitmap.close?.();
+        const shrunk = await new Promise<Blob | null>((resolve) => canvas.toBlob((out) => resolve(out), "image/jpeg", 0.85));
+        return shrunk && shrunk.size > 0 && shrunk.size < blob.size ? shrunk : blob;
+    } catch {
+        return blob; // 解码失败就按原字节走，绝不因此阻断生成
+    }
+}
+
+async function postAssetWithRetry(blob: Blob, name: string, options?: RequestOptions): Promise<{ url?: string; error?: string }> {
+    const attempt = () =>
+        axios.post<{ url?: string; error?: string }>(SDGF_ASSET_BRIDGE, blob, {
+            headers: { "X-Filename": name, "Content-Type": "application/octet-stream" },
+            signal: options?.signal,
+        });
+    try {
+        return (await attempt()).data;
+    } catch (err) {
+        // 只重试一次，且只在「没有拿到响应」（网络/网关 5xx）时重试——4xx 是确定性错误，重试无意义
+        const status = axios.isAxiosError(err) ? err.response?.status : undefined;
+        if (status && status < 500) throw err;
+        await new Promise((resolve) => setTimeout(resolve, UPLOAD_RETRY_DELAY_MS));
+        return (await attempt()).data;
+    }
+}
+
 // 卡F3 提前探测：taskId → 连续 pending 次数（≥90 进度）。completed/failed 即删，不随任务完成永久膨胀。
 const SDGF_EARLY_PROBE_STREAK_LIMIT = 5;
 const sdgfEarlyProbeStreaks = new Map<string, number>();
@@ -186,14 +239,16 @@ async function sdgfImageUrls(references: ReferenceImage[], options?: RequestOpti
         const stripped = stripReferenceToken(rawUrl || rawData);
         if (/^https:\/\//.test(stripped)) { urls.push(stripped); continue; }
         const dataUrl = await imageToDataUrl(image);
-        const blob = await (await fetch(dataUrl)).blob();
-        if (!blob.size) throw new Error("参考图字节为空：" + (image.name || "未命名"));
+        const raw = await (await fetch(dataUrl)).blob();
+        if (!raw.size) throw new Error("参考图字节为空：" + (image.name || "未命名"));
+        // 大图先瘦身（最长边 1600 / JPEG 0.85）：这条上传要走 Cloudflare 国际隧道，数 MB 会拖到超时
+        const blob = await shrinkForUpload(raw);
         const ext = (blob.type.split("/")[1] || "png").replace("jpeg", "jpg");
-        const name = encodeURIComponent(image.name || `ref-${urls.length + 1}.${ext}`);
+        const name = encodeURIComponent(image.name ? image.name.replace(/\.[a-z0-9]+$/i, `.${ext}`) : `ref-${urls.length + 1}.${ext}`);
         let url = "";
         try {
-            const res = await axios.post<{ url?: string; error?: string }>(SDGF_ASSET_BRIDGE, blob, { headers: { "X-Filename": name, "Content-Type": "application/octet-stream" }, signal: options?.signal });
-            url = res.data?.url || "";
+            const data = await postAssetWithRetry(blob, name, options);
+            url = data?.url || "";
         } catch (err) {
             // 图床失败必须当场明文顶到界面（桥在 host 阶段已前置拒绝、零渠道请求零扣费），
             // 绝不带病放行到视频网关吃模糊 502（2026-11-15 所有者拍板）。
