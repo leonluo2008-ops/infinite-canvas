@@ -71,6 +71,10 @@ try:
 except ImportError:  # noqa: E402
     import project_store  # type: ignore[no-redef]  # noqa: E402
 try:
+    from wanrepro.ui import media_host_store  # noqa: E402  S3.12-B1 图床偏好 + 连通测试（MULTI_USER=0 时整条路由不存在）
+except ImportError:  # noqa: E402
+    import media_host_store  # type: ignore[no-redef]  # noqa: E402
+try:
     from wanrepro.ui import lapian_timing  # noqa: E402  S2.7 拆解耗时分解（server 侧包装，引擎零改动）
 except ImportError:  # noqa: E402
     import lapian_timing  # type: ignore[no-redef]  # noqa: E402
@@ -2366,6 +2370,8 @@ class Handler(BaseHTTPRequestHandler):
             return
         if project_store.handle(self, "GET", path):
             return
+        if media_host_store.handle(self, "GET", path):   # S3.12-B1 图床偏好清单（多人模式）
+            return
         if multiuser.enabled() and WAN_ROUTE_RE.fullmatch(path):
             raise ApiError(404, f"没有这个地址：{path}")       # W0：多用户模式整链下线 wan 视频（不暴露存在性）
         if multiuser.route_missing(path):
@@ -2579,6 +2585,8 @@ class Handler(BaseHTTPRequestHandler):
         if channel_store.handle(self, self.command, path):
             return
         if project_store.handle(self, self.command, path):
+            return
+        if media_host_store.handle(self, self.command, path):   # S3.12-B1 写偏好 / 连通测试（多人模式）
             return
         if multiuser.route_missing(path):
             raise ApiError(404, f"没有这个地址：{path}")
