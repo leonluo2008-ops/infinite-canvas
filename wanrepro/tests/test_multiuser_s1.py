@@ -1,5 +1,5 @@
 from __future__ import annotations
-import base64, contextlib, http.client, http.cookiejar, io, json, os, socket, sqlite3, sys, tempfile, threading, time
+import base64, contextlib, http.client, http.cookiejar, io, json, os, pathlib, socket, sqlite3, sys, tempfile, threading, time
 import urllib.request
 from urllib.error import HTTPError
 from urllib.request import Request, build_opener, HTTPCookieProcessor
@@ -1766,7 +1766,179 @@ def main():
   checks.append('S3.9-B0: user-added channel isPreset=False; presets survive a full-replacement PUT that omits them (un-deletable via API)')
  finally: srv.shutdown(); srv.server_close()
 
+  # ---------------- S3.12-B2：用户首选图床源接进上传链路（prefer 先试 + 失败回落 + 旧路读偏好） ----------------
+ def phase_s3_12_b2():
+    """五判据（全部可证伪）：
+      * B2-T1 全挂 + 缺省 prefer：tried 的 source 序列恰为 tencent,local,litterbox,uguu，
+        两个外网上传函数各恰调 1 次（默认顺序回归）；
+      * B2-T2 只让 tencent 可用：source=tencent，litterbox/uguu 零调用；
+      * B2-T3 全挂 + prefer='uguu'：调用次序列表首个是 uguu，且 uguu 先于 litterbox 被调；
+      * B2-T4 uguu 失败 + litterbox 可用 + prefer='uguu'：最终 source=litterbox（回落合法）；
+      * B2-T5 旧路传参形状：get_pref=None → store_public_image 以两参被调（k 为空）；
+        get_pref='uguu' → k['prefer']=='uguu'；匿名（request_username 空）→ 上传 200 且 k 为空。
+    """
+    checks = []
+    real_litter, real_uguu = server.upload_litterbox_bytes, server.upload_uguu_bytes
+    real_pub = dict(os.environ)
+    for k in ('WANREPRO_PUBLIC_BASE', 'WANREPRO_TENCENT_VC_BASE', 'WANREPRO_TENCENT_VC_TOKEN'):
+        os.environ.pop(k, None)                     # tencent/local 源靠清 env 使其不可用
+    png = b'\x89PNG' + bytes([13, 10, 26, 10])
+    try:
+        # ---- B2-T1 四源全失败：tried 序列恰为 tencent,local,litterbox,uguu，各上传恰 1 次 ----
+        # tencent/local 不是「清 env」——清了它们整块跳过、不进 tried（B0-T1 已固化该行为）；
+        # 让它们**真实尝试并失败**：tencent 指向回环死端口（连接拒绝），local 用 os.stat 抛
+        # OSError 使落盘校验失败（不是真实网络验活，替代口径）。
+        os.environ['WANREPRO_TENCENT_VC_BASE'] = 'http://127.0.0.1:1'
+        os.environ['WANREPRO_TENCENT_VC_TOKEN'] = 'tok'
+        os.environ['WANREPRO_PUBLIC_BASE'] = 'http://127.0.0.1:1'
+        calls = []
+        server.upload_litterbox_bytes = lambda d, n: calls.append('litterbox') or ''
+        server.upload_uguu_bytes = lambda d, n: calls.append('uguu') or ''
+        real_stat = pathlib.Path.stat
+        def _stat_boom(self, *a, **k):
+            raise OSError('probe: force disk-check failure')
+        pathlib.Path.stat = _stat_boom
+        try:
+            try:
+                server.host_image_detailed(png, 'ref.png')
+                raise AssertionError('all sources down must raise ImageHostError')
+            except server.ImageHostError as e:
+                assert [r.get('source') for r in e.sources] == ['tencent', 'local', 'litterbox', 'uguu'], \
+                    f'default order must be tencent,local,litterbox,uguu: {e.sources}'
+        finally:
+            pathlib.Path.stat = real_stat
+        os.environ.pop('WANREPRO_TENCENT_VC_BASE', None)
+        os.environ.pop('WANREPRO_TENCENT_VC_TOKEN', None)
+        os.environ.pop('WANREPRO_PUBLIC_BASE', None)
+        assert calls == ['litterbox', 'uguu'], f'each remote upload exactly once in order: {calls}'
+        checks.append('S3.12-B2 T1: four-sources-failing (tencent dead endpoint / local disk-check OSError / '
+                      'both uploads empty) raises ImageHostError with tried order exactly '
+                      '[tencent,local,litterbox,uguu]; litterbox/uguu uploads each called exactly once')
+
+        # ---- B2-T2 只让 tencent 可用：source=tencent，外网上传零调用 ----
+        os.environ['WANREPRO_TENCENT_VC_BASE'] = 'http://127.0.0.1:1'
+        os.environ['WANREPRO_TENCENT_VC_TOKEN'] = 'tok'
+        calls = []
+        server.upload_litterbox_bytes = lambda d, n: calls.append('litterbox') or ''
+        server.upload_uguu_bytes = lambda d, n: calls.append('uguu') or ''
+        real_urlopen = server.urllib.request.urlopen
+        class _Fake2xx:
+            status = 200
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+        server.urllib.request.urlopen = lambda req, timeout=0: _Fake2xx()
+        try:
+            got = server.host_image_detailed(png, 'ref.png')
+        finally:
+            server.urllib.request.urlopen = real_urlopen
+        assert got['source'] == 'tencent', f'tencent must win when only it is up: {got}'
+        assert calls == [], f'litterbox/uguu must be zero-called: {calls}'
+        checks.append('S3.12-B2 T2: only tencent up (env + fake urlopen 2xx) -> source=tencent, '
+                      'litterbox/uguu call counts 0')
+
+        # ---- B2-T3 全挂 + prefer='uguu'：调用次序 uguu 首位，先于 litterbox ----
+        for k in ('WANREPRO_TENCENT_VC_BASE', 'WANREPRO_TENCENT_VC_TOKEN'):
+            os.environ.pop(k, None)
+        calls = []
+        server.upload_litterbox_bytes = lambda d, n: calls.append('litterbox') or ''
+        server.upload_uguu_bytes = lambda d, n: calls.append('uguu') or ''
+        try:
+            server.host_image_detailed(png, 'ref.png', prefer='uguu')
+            raise AssertionError('prefer=uguu all-down must raise ImageHostError')
+        except server.ImageHostError as e:
+            assert [r.get('source') for r in e.sources][0] == 'uguu', \
+                f"prefer='uguu' must put uguu first in tried: {e.sources}"
+        assert calls == ['uguu', 'litterbox'], f'call order must be uguu before litterbox: {calls}'
+        checks.append("S3.12-B2 T3: prefer='uguu' (all down) -> tried[0]=uguu; call order ['uguu','litterbox'] "
+                      "(order assertion, not just counts)")
+
+        # ---- B2-T4 prefer 源失败仍回落：source=litterbox ----
+        server.upload_litterbox_bytes = lambda d, n: 'https://lb.example/x.png'
+        server.upload_uguu_bytes = lambda d, n: ''
+        server.image_url_alive_real = server.image_url_alive
+        server.image_url_alive = lambda url, timeout=0: (True, 'HTTP 200')  # 验活替代口径，非真实网络
+        try:
+            got = server.host_image_detailed(png, 'ref.png', prefer='uguu')
+        finally:
+            server.image_url_alive = server.image_url_alive_real
+            del server.image_url_alive_real
+        assert got['source'] == 'litterbox', f'uguu fail must fall back to litterbox: {got}'
+        checks.append("S3.12-B2 T4: prefer='uguu' with uguu down + litterbox up -> source=litterbox "
+                      "(fallback after preferred source failure is legal)")
+
+        # ---- B2-T5 旧路传参形状：None→两参 / 'uguu'→prefer 关键字 / 匿名→两参且不 401 ----
+        server.image_url_alive = lambda url, timeout=0: (True, 'HTTP 200')  # 替代口径，非真实网络
+        real_store, real_alive = server.store_public_image, server.image_url_alive
+        real_get_pref, real_uid_for = server.media_host_store.get_pref, server.multiuser.user_id_for_username
+        seen = []
+        def fake_store(*a, **k):
+            seen.append((a, k))
+            return ('https://mock.host/ref.png', 'uguu')
+        server.store_public_image = fake_store
+        try:
+            server.UPLOADS = Path(tempfile.mkdtemp(prefix='s312b2-uploads-'))  # 隔离本地备份落盘
+            # (a) get_pref=None → 两参调用（k 为空，没传 prefer）
+            server.multiuser.user_id_for_username = lambda u: 42
+            server.media_host_store.get_pref = lambda uid: None
+            srv, base = serve('0')
+            try:
+                r = urllib.request.Request(base + '/api/asset/upload', data=png, method='POST',
+                                           headers={'X-Filename': 'ref.png'})
+                st = build_opener().open(r).status
+                assert st == 200, f'anon legacy upload must stay 200, got {st}'
+                assert len(seen) == 1 and seen[0][1] == {}, \
+                    f'get_pref=None must call store_public_image with 2 positional args only: {seen}'
+                assert len(seen[0][0]) == 2, f'positional shape (data, raw_name): {seen[0][0]}'
+            finally:
+                srv.shutdown(); srv.server_close()
+            checks.append('S3.12-B2 T5a: legacy upload with get_pref=None calls store_public_image(data, name) '
+                          'two-positional only (k empty — probe lambda contract kept)')
+
+            # (b) get_pref='uguu' → k['prefer']=='uguu'。多人模式 + 真登录会话
+            # （MULTI_USER=0 时 request_username 恒空，prefer 分支根本走不到——这不是 bug 而是语义）。
+            server.media_host_store.get_pref = lambda uid: 'uguu'
+            multiuser.FAILURES.clear(); multiuser.REG_ATTEMPTS.clear()
+            srv, base = serve('1')
+            opC = build_opener(HTTPCookieProcessor(http.cookiejar.CookieJar()))
+            try:
+                assert req(base, '/api/auth/register', 'POST', {'username': 'prefu', 'password': 'password1'}, opC)[0] == 200
+                r = urllib.request.Request(base + '/api/asset/upload', data=png, method='POST',
+                                           headers={'X-Filename': 'ref.png'})
+                st = opC.open(r).status
+                assert st == 200, f'logged-in legacy upload with pref must stay 200, got {st}'
+                assert seen[-1][1] == {'prefer': 'uguu'}, \
+                    f"get_pref='uguu' must pass prefer kwarg: {seen[-1]}"
+            finally:
+                srv.shutdown(); srv.server_close()
+            checks.append("S3.12-B2 T5b: legacy upload with get_pref='uguu' -> store_public_image "
+                          "(data, name, prefer='uguu')")
+
+            # (c) 匿名（request_username 空）→ 上传仍成功且 k 为空（绝不 401）
+            server.media_host_store.get_pref = lambda uid: 'uguu'   # 即便库里存了偏好
+            srv, base = serve('1')                                   # 多人模式，但不带会话
+            try:
+                r = urllib.request.Request(base + '/api/asset/upload', data=png, method='POST',
+                                           headers={'X-Filename': 'ref.png'})
+                st = build_opener().open(r).status
+                assert st == 200, f'anonymous legacy upload must not 401, got {st}'
+                assert seen[-1][1] == {}, f'anonymous must call two-positional only: {seen[-1]}'
+            finally:
+                srv.shutdown(); srv.server_close()
+            checks.append('S3.12-B2 T5c: anonymous (MULTI_USER=1, no session) legacy upload stays 200 and '
+                          'store_public_image called two-positional (pref never blocks upload)')
+        finally:
+            server.store_public_image = real_store
+            server.image_url_alive = real_alive
+            server.media_host_store.get_pref = real_get_pref
+            server.multiuser.user_id_for_username = real_uid_for
+    finally:
+        server.upload_litterbox_bytes, server.upload_uguu_bytes = real_litter, real_uguu
+        os.environ.clear(); os.environ.update(real_pub)
+    return checks
+
+
  checks += phase_b2()
+ checks += phase_s3_12_b2()
  checks += phase_admin()
  checks += phase_s2_6()
  checks += phase_s2_7()

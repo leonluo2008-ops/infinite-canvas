@@ -955,12 +955,15 @@ def _host_failure_message(tried: list[dict], skipped: list[dict]) -> str:
             "本地已拒绝提交：这次没有向渠道发任何请求、不会扣费；图床修好后直接重试即可。")
 
 
-def host_image_detailed(data: bytes, raw_name: str) -> dict:
+def host_image_detailed(data: bytes, raw_name: str, prefer: str | None = None) -> dict:
     """参考图字节 → 公网 https 直链，**每个候选直链逐一验活** → {url, source, tried, skipped}。
 
     图源仅 uguu（腾讯云 videocache 兜底已废弃移除——所有者确认不可用）；
     出站隧道降级已废弃移除（AT-16 B12f）。
     本地一律留一份备份（uploads/vc/）——M4 直链路由靠它出图。
+    S3.12-B2：prefer 是用户首选源 id（tencent/local/litterbox/uguu）——**先试它**，
+    失败后按原顺序补齐剩余源（已试过的不重复试）；None / 不在四源 id 内 → 今天的原顺序，
+    行为零差异。tried 的内容与形状不变，只是顺序可能被 prefer 提前。
     全部不可用抛 ImageHostError：本地前置拒绝，参考图没有公网地址就不发任何渠道请求。
     """
     safe_name = re.sub(r"[^\w.\-]", "_", raw_name or "ref.png")
@@ -977,6 +980,7 @@ def host_image_detailed(data: bytes, raw_name: str) -> dict:
 
     tried: list[dict] = []
     skipped: list[dict] = []
+    call_order: list[str] = []                          # S3.12-B2：实际调用次序（探针断言用）
 
     def accept(source: str, label: str, url: str) -> dict | None:
         ok, why = image_url_alive(url)
@@ -987,12 +991,17 @@ def host_image_detailed(data: bytes, raw_name: str) -> dict:
                       "reason": f"直链验活失败（{why}）"})
         return None
 
-    # ⓪ tencent（国内自托管直链·第一优先）：腾讯云上的 videocache 图床，走备案域名 + LE 证书。
-    # 实测同一张 1MB 图：PUT 0.26s / 回取 1.22s；同尺寸经 Cloudflare 隧道是 7–26s 且会 502。
-    # 只有同时给出 base 与 token 才启用；都未配置时这一段整块不存在，行为逐字节不变。
-    tv_base = (os.environ.get("WANREPRO_TENCENT_VC_BASE") or "").strip().rstrip("/")
-    tv_token = (os.environ.get("WANREPRO_TENCENT_VC_TOKEN") or "").strip()
-    if tv_base and tv_token:
+    # 每个源各自封装成「尝试一次」：内部实现与原线性版逐字一致，只是被调用的先后可变
+    # （S3.12-B2：prefer 先试，失败按原顺序补齐剩余源，已试过的不重复试）。
+
+    def _try_tencent() -> dict | None:
+        # ⓪ tencent（国内自托管直链·第一优先）：腾讯云上的 videocache 图床，走备案域名 + LE 证书。
+        # 实测同一张 1MB 图：PUT 0.26s / 回取 1.22s；同尺寸经 Cloudflare 隧道是 7–26s 且会 502。
+        # 只有同时给出 base 与 token 才启用；都未配置时这一段整块不存在，行为逐字节不变。
+        tv_base = (os.environ.get("WANREPRO_TENCENT_VC_BASE") or "").strip().rstrip("/")
+        tv_token = (os.environ.get("WANREPRO_TENCENT_VC_TOKEN") or "").strip()
+        if not (tv_base and tv_token):
+            return None
         tv_url = tv_base + "/vc/" + key
         try:
             req = urllib.request.Request(
@@ -1010,13 +1019,16 @@ def host_image_detailed(data: bytes, raw_name: str) -> dict:
             return {"url": tv_url, "source": "tencent", "tried": tried, "skipped": skipped}
         tried.append({"source": "tencent", "label": "腾讯云图床", "url": tv_url,
                       "reason": f"上传失败（{tv_error or '服务未接受该请求'}）"})
+        return None
 
-    # ① local（第二图源）：自托管图床 /vc/<key> 直链（走 Cloudflare 隧道出公网）。
-    # 只有设了 WANREPRO_PUBLIC_BASE 才启用；未设置时这一段整块不存在，行为逐字节不变。
-    # 验活用**磁盘校验**（文件已落盘 + 字节数一致），不回拉公网 URL：这条路径要跨境往返一次，
-    # 回拉会让每次上传多等一个太平洋往返（2026-11-18 实测隧道边缘在 lax）。
-    public_base = (os.environ.get("WANREPRO_PUBLIC_BASE") or "").strip().rstrip("/")
-    if public_base:
+    def _try_local() -> dict | None:
+        # ① local（第二图源）：自托管图床 /vc/<key> 直链（走 Cloudflare 隧道出公网）。
+        # 只有设了 WANREPRO_PUBLIC_BASE 才启用；未设置时这一段整块不存在，行为逐字节不变。
+        # 验活用**磁盘校验**（文件已落盘 + 字节数一致），不回拉公网 URL：这条路径要跨境往返一次，
+        # 回拉会让每次上传多等一个太平洋往返（2026-11-18 实测隧道边缘在 lax）。
+        public_base = (os.environ.get("WANREPRO_PUBLIC_BASE") or "").strip().rstrip("/")
+        if not public_base:
+            return None
         local_url = public_base + "/vc/" + key
         try:
             on_disk = dest.is_file() and dest.stat().st_size == len(data)
@@ -1027,35 +1039,47 @@ def host_image_detailed(data: bytes, raw_name: str) -> dict:
             return {"url": local_url, "source": "local", "tried": tried, "skipped": skipped}
         tried.append({"source": "local", "label": "自托管直链", "url": local_url,
                       "reason": "本地备份落盘校验失败（文件缺失或大小不一致）"})
+        return None
 
-    uguu_url = upload_litterbox_bytes(data, ascii_name)     # ② litterbox（主源，72h）
-    if uguu_url:
-        got = accept("litterbox", "litterbox(72h)", uguu_url)
-        if got:
-            return got
-    else:
+    def _try_litterbox() -> dict | None:
+        uguu_url = upload_litterbox_bytes(data, ascii_name)     # ② litterbox（主源，72h）
+        if uguu_url:
+            return accept("litterbox", "litterbox(72h)", uguu_url)
         tried.append({"source": "litterbox", "label": "litterbox(72h)",
                       "reason": f"上传失败（{_LITTERBOX_LAST_ERROR or '服务不可用'}）"})
+        return None
 
-    uguu_url = upload_uguu_bytes(data, ascii_name)          # ③ uguu（备源，3h）
-    if uguu_url:
-        got = accept("uguu", "uguu(3h)", uguu_url)
-        if got:
-            return got
-    else:
+    def _try_uguu() -> dict | None:
+        uguu_url = upload_uguu_bytes(data, ascii_name)          # ③ uguu（备源，3h）
+        if uguu_url:
+            return accept("uguu", "uguu(3h)", uguu_url)
         tried.append({"source": "uguu", "label": "uguu(3h)",
                       "reason": f"上传失败（{_UGUU_LAST_ERROR or '服务不可用'}）"})
+        return None
+
+    _ATTEMPTS = {"tencent": _try_tencent, "local": _try_local,
+                 "litterbox": _try_litterbox, "uguu": _try_uguu}
+    default_order = ["tencent", "local", "litterbox", "uguu"]
+    order = list(default_order)
+    if prefer in _ATTEMPTS:                     # prefer 不在四源 id 内 / None → 原顺序
+        order = [prefer] + [s for s in default_order if s != prefer]
+    for source in order:
+        call_order.append(source)
+        got = _ATTEMPTS[source]()
+        if got:
+            return got
 
     raise ImageHostError(_host_failure_message(tried, skipped), sources=tried, skipped=skipped)
 
 
-def store_public_image(data: bytes, raw_name: str) -> tuple[str, str]:
+def store_public_image(data: bytes, raw_name: str, prefer: str | None = None) -> tuple[str, str]:
     """参考图字节 → (公网 https 直链, 来源)。本地落 uploads/vc/ 作备份。
 
     拿到的每条 URL 都验活；全不可用抛 ImageHostError（502，可修复后重试），
     **不再把格式对但拉不到的死链交给调用方**。
+    S3.12-B2：prefer 透传 host_image_detailed（用户首选源先试，失败按原顺序回落）。
     """
-    got = host_image_detailed(data, raw_name)
+    got = host_image_detailed(data, raw_name, **({"prefer": prefer} if prefer is not None else {}))
     return str(got["url"]), str(got["source"])
 
 
@@ -2756,7 +2780,22 @@ class Handler(BaseHTTPRequestHandler):
         suffix = Path(raw_name).suffix.lower()
         if suffix not in {".png", ".jpg", ".jpeg", ".webp"}:
             raise ApiError(400, f"参考图只收 png/jpg/webp（收到 {suffix or '无扩展名'}）")
-        url, source = store_public_image(data, raw_name)
+        # S3.12-B2：旧路也认用户首选图床源。读不到（匿名/单人模式/库异常）一律静默 None——
+        # 图床偏好绝不能把上传打成 401/500。prefer=None 仍以两参调用 store_public_image
+        # （probe-sdgf-endpoints.py 的两参 lambda 替身合同），只有非 None 才追加关键字参数。
+        prefer = None
+        try:
+            username = request_username(self)
+            if username:
+                uid = multiuser.user_id_for_username(username)
+                if uid is not None:
+                    prefer = media_host_store.get_pref(uid) or None
+        except Exception:                           # noqa: BLE001 —— 偏好读不到 = 没有偏好
+            prefer = None
+        if prefer is None:
+            url, source = store_public_image(data, raw_name)
+        else:
+            url, source = store_public_image(data, raw_name, prefer=prefer)
         self.send_json({"url": url, "bytes": length, "source": source})
 
     def do_video_upload(self) -> None:
