@@ -1,8 +1,7 @@
-import { Modal } from "antd";
 import { AlertTriangle, CloudOff, RefreshCw } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
-import { acceptForeignCanvasImport, declineForeignCanvasImport, useCanvasProjectSyncStore } from "@/services/canvas-project-sync";
+import { useCanvasProjectSyncStore } from "@/services/canvas-project-sync";
 
 /**
  * S3-B2 画布同步状态（全局挂一次，位置在 AppProviders 内、路由外）。
@@ -12,10 +11,11 @@ import { acceptForeignCanvasImport, declineForeignCanvasImport, useCanvasProject
  *  2. 同步状态入口：「N 项改动待同步 / 同步失败：<原因> / N 个项目时间戳异常」——
  *     `mode=remote` 时也要能看见「还有东西没上去」（②：`setSync({error})` 以前没有任何人消费，
  *     用户在正常联网状态下完全看不到推送失败；③：时间戳非法、永远进不了 dirty 的行也在这里露头）；
- *  3. 跨账号确认弹窗：「检测到本机 N 个项目来自其他账号，导入到当前账号？」——**绝不自动迁移**，
- *     用户点「导入」才并入当前账号并上推；点「不导入」则隔离留档 + 记住不再询问这一对账号。
+ *  3. **没有跨账号弹窗**（所有者 2026-11-19 裁定删除）：SaaS 下项目与渠道都以服务端为唯一真源，
+ *     本机只是缓存；换账号登录时本机其他账号的残留由 `purgeForeignArchivesExcept()` 直接清掉，
+ *     不询问、不导入、不产生"本机有别的账号"这种说法。
  *
- * 单人模式（mode=local、dirtyCount=0、invalidCount=0、无错误、无弹窗）不渲染任何东西 —— 零改动。
+ * 单人模式（mode=local、dirtyCount=0、invalidCount=0、无错误）不渲染任何东西 —— 零改动。
  */
 export function CanvasProjectSyncStatus() {
     const { t } = useTranslation();
@@ -24,7 +24,6 @@ export function CanvasProjectSyncStatus() {
     const invalidCount = useCanvasProjectSyncStore((state) => state.invalidCount);
     const error = useCanvasProjectSyncStore((state) => state.error);
     const brokenArchiveCount = useCanvasProjectSyncStore((state) => state.brokenArchiveCount);
-    const importPrompt = useCanvasProjectSyncStore((state) => state.importPrompt);
 
     /**
      * residual#2（S3-B2.6）：offline 分支以前只显示通用文案，`enterOffline` 传进来的**具体原因**
@@ -64,24 +63,6 @@ export function CanvasProjectSyncStatus() {
                 </div>
             ) : null}
 
-            <Modal
-                open={Boolean(importPrompt)}
-                title={t("canvasSync.crossAccountTitle", { count: importPrompt?.count ?? 0 })}
-                okText={t("canvasSync.crossAccountImport")}
-                cancelText={t("canvasSync.crossAccountSkip")}
-                closable={false}
-                maskClosable={false}
-                onOk={() => void acceptForeignCanvasImport()}
-                onCancel={() => void declineForeignCanvasImport()}
-            >
-                <p className="text-sm leading-6">
-                    {t("canvasSync.crossAccountBody", {
-                        owner: importPrompt?.fromOwner ?? "",
-                        target: importPrompt?.toOwner ?? "",
-                        count: importPrompt?.count ?? 0,
-                    })}
-                </p>
-            </Modal>
         </>
     );
 }

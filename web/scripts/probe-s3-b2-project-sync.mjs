@@ -13,7 +13,7 @@
  *  4. §2.2 防抖分桶：不同项目互不牵连，同一项目连改只发一次
  *  5. §2.1 CAS 409 → 重拉 GET 单项目 → mergeCanvasData：服务端胜则落服务端、本地胜则带 baseUpdatedAt 重试
  *  6. §2.2 / V8 离线 dirty 补推：PUT 网络失败保留 dirty，重启后补推成功
- *  7. §2.4 owner 三分支：本地无 owner（自动迁移）/ owner 不一致（弹窗、零自动迁移）/ 接受+拒绝两路
+ *  7. §2.4 owner 三分支：本地无 owner（自动迁移）/ owner 不一致（**直接清理、零弹窗零导入**）/ 本账号留档自动并回
  *  8. §2.1 ISO↔ms 往返 + 删除 clamp `deletedAt = max(now, updatedAt)`
  *  9. 顺手①：PUT 401（体可能被 RST 吞掉 → 前端只见网络错误）→ 进 dirty 重试、不报死错
  */
@@ -440,16 +440,18 @@ const authBob = () => globalThis.__jsonResponse(200, { username: "bob" });
         return globalThis.__jsonResponse(500, { error: `stub 不认：${url}` });
     });
     const snapA = await sync.bootstrapCanvasProjectSync({ deadline: Date.now() + 4_000 });
-    equal("7a 本地无 owner → 无弹窗（自动迁移）", snapA.importPrompt, null);
+    equal("7a 本地无 owner → 无弹窗（自动迁移）", snapA.importPrompt, undefined);
     await sleep(1_200);
     equal("7a 迁移：项目 PUT + 墓碑 DELETE 都上推", [PUTS().map((call) => call.url), DELETES().map((call) => call.url)], [["/api/user/projects/M1"], ["/api/user/projects/MD1"]]);
     const migrated = await cacheState();
     equal("7a 迁移后缓存载荷带 owner", migrated.owner, "alice");
     check("7a 迁移后记录 migratedAt", typeof migrated.migratedAt === "string" && migrated.migratedAt.length > 0, JSON.stringify(migrated.migratedAt));
 
-    // (b) owner 不一致 → 隔离 + 弹窗，绝不自动迁
+    // (b) owner 不一致 → 直接清理，绝不弹窗、绝不导入（所有者 2026-11-19 裁定：删除跨账号导入）
     const aliceProjects = [project("A1", "A 的项目一", T0 - 2_000, [{ id: "a1" }]), project("A2", "A 的项目二", T0 - 1_000, [{ id: "a2" }])];
     await seed({ state: { projects: aliceProjects, deletedProjects: [], owner: "alice", migratedAt: iso(T0) }, version: 0 }, aliceProjects);
+    // 顺带造一份 alice 的历史留档键：新逻辑必须一并清掉
+    await lf.setItem(sync.FOREIGN_CACHE_PREFIX + "alice", JSON.stringify({ state: { projects: aliceProjects, deletedProjects: [], owner: "alice" }, version: 0 }));
     shim.calls.length = 0;
     shim.setRoute(async (url, init) => {
         if (url === "/api/auth/me") return authBob();
@@ -462,37 +464,26 @@ const authBob = () => globalThis.__jsonResponse(200, { username: "bob" });
         return globalThis.__jsonResponse(500, { error: `stub 不认：${url}` });
     });
     const snapB = await sync.bootstrapCanvasProjectSync({ deadline: Date.now() + 4_000 });
-    equal("7b owner 不一致 → 弹窗（含数量与来源账号）", [snapB.importPrompt?.count, snapB.importPrompt?.fromOwner, snapB.importPrompt?.toOwner], [2, "alice", "bob"]);
-    equal("7b 绝不自动迁移：A 的项目不出现在当前账号", useCanvasStore.getState().projects.map((item) => item.id), ["B1"]);
+    equal("7b 无跨账号弹窗状态（字段已删除，恒 undefined）", snapB.importPrompt, undefined);
+    equal("7b 绝不串号：A 的项目不出现在当前账号", useCanvasStore.getState().projects.map((item) => item.id), ["B1"]);
     const bobCache = await cacheState();
-    equal("7b 隔离：共享主键归属改成当前账号且不含 A 的项目", [bobCache.owner, bobCache.projects.map((item) => item.id)], ["bob", ["B1"]]);
-    const quarantinedRaw = await lf.getItem(sync.FOREIGN_CACHE_PREFIX + "alice");
-    check("7b A 的数据被隔离存档（不删、不上传）", typeof quarantinedRaw === "string" && quarantinedRaw.includes("A1"), String(quarantinedRaw).slice(0, 80));
+    equal("7b 共享缓存归属当前账号且不含 A 的项目", [bobCache.owner, bobCache.projects.map((item) => item.id)], ["bob", ["B1"]]);
+    check("7b A 在本机的缓存与历史留档被删除（不询问、不导入）", (await lf.getItem(sync.FOREIGN_CACHE_PREFIX + "alice")) === null, "alice 留档还在");
     await sleep(1_200);
-    equal("7b 弹窗未决时零 PUT", PUTS().length, 0, JSON.stringify(PUTS().map((call) => call.url)));
+    equal("7b 零 PUT（不会把别人的项目推上去）", PUTS().length, 0, JSON.stringify(PUTS().map((call) => call.url)));
 
-    // (c) 用户点「不导入」→ 不推送、隔离键保留、记住「不再询问」（⑤）
-    await sync.declineForeignCanvasImport();
-    equal("7c 拒绝后仍零 PUT", PUTS().length, 0);
-    check("7c 拒绝后隔离键保留（同账号再登录可恢复）", typeof (await lf.getItem(sync.FOREIGN_CACHE_PREFIX + "alice")) === "string");
-    equal("7c 拒绝后弹窗关闭", sync.canvasProjectSyncSnapshot().importPrompt, null);
-    check("7c 拒绝写入「不再询问」标记", typeof (await lf.getItem(sync.FOREIGN_IGNORE_KEY)) === "string");
+    // (c) 幂等：再走一次启动门，仍无弹窗、仍只有当前账号的项目
+    const snapC = await sync.bootstrapCanvasProjectSync({ deadline: Date.now() + 4_000 });
+    equal("7c 重启门仍无弹窗", snapC.importPrompt, undefined);
+    equal("7c 仍只有当前账号项目", useCanvasStore.getState().projects.map((item) => item.id), ["B1"]);
 
-    // (c2) ⑤：同一对账号不再弹窗（隔离载荷仍在，但用户已明确表态）
-    await sync.bootstrapCanvasProjectSync({ deadline: Date.now() + 4_000 });
-    equal("7c2 「不再询问」生效：重启门不再弹同一个窗", sync.canvasProjectSyncSnapshot().importPrompt, null);
-    check("7c2 不弹窗也不删归档（数据仍在本机）", typeof (await lf.getItem(sync.FOREIGN_CACHE_PREFIX + "alice")) === "string");
-
-    // (d) 用户改主意：清掉「不再询问」标记 → 又给弹窗 → 点「导入到当前账号」→ 并入并上推
-    await lf.removeItem(sync.FOREIGN_IGNORE_KEY);
-    await sync.bootstrapCanvasProjectSync({ deadline: Date.now() + 4_000 }); // 重新拉出弹窗
-    check("7d 清掉「不再询问」后重新启动门又给出弹窗（隔离载荷仍在）", Boolean(sync.canvasProjectSyncSnapshot().importPrompt), JSON.stringify(sync.canvasProjectSyncSnapshot().importPrompt));
-    shim.calls.length = 0;
-    await sync.acceptForeignCanvasImport();
-    await sleep(1_200);
-    equal("7d 导入后 A 的项目进入当前账号", useCanvasStore.getState().projects.map((item) => item.id).sort(), ["A1", "A2", "B1"]);
-    equal("7d 导入后逐项目上推", PUTS().map((call) => call.url).sort(), ["/api/user/projects/A1", "/api/user/projects/A2"]);
-    check("7d 导入后隔离键删除", (await lf.getItem(sync.FOREIGN_CACHE_PREFIX + "alice")) === null, "隔离键还在");
+    // (d) 本账号自己的留档仍能恢复（删的是「跨账号导入」，不是「断网草稿」）
+    await sync.prepareCanvasLogout();
+    check("7d 登出把本账号载荷留档", typeof (await lf.getItem(sync.FOREIGN_CACHE_PREFIX + "bob")) === "string");
+    const snapD = await sync.bootstrapCanvasProjectSync({ deadline: Date.now() + 4_000 });
+    equal("7d 同账号回来草稿自动并回（无需确认）", useCanvasStore.getState().projects.map((item) => item.id).sort(), ["B1"]);
+    check("7d 并回落盘后本账号留档键被清掉", (await lf.getItem(sync.FOREIGN_CACHE_PREFIX + "bob")) === null, "bob 留档还在");
+    equal("7d 全程无弹窗", snapD.importPrompt, undefined);
 
     // (e) logout：留档 + 清空主键（V9）
     await sync.prepareCanvasLogout();
@@ -666,7 +657,7 @@ const authBob = () => globalThis.__jsonResponse(200, { username: "bob" });
 }
 
 // ----------------------------------------------------------------------------------------
-// 13. ⑤：decline 记「不再询问」+ 隔离区多条目队列（不吞掉第二个账号的留档）
+// 13. 其他账号留在本机的留档一律清理（多条目也不询问、不串号）
 // ----------------------------------------------------------------------------------------
 {
     const bobProject = project("NB1", "bob 自己的", T0 - 1_000, [{ id: "nb1" }]);
@@ -680,28 +671,13 @@ const authBob = () => globalThis.__jsonResponse(200, { username: "bob" });
         if (init?.method === "PUT") return globalThis.__jsonResponse(200, { ok: true, project: meta(JSON.parse(init.body).content) });
         return globalThis.__jsonResponse(500, { error: `stub 不认：${url}` });
     });
-    const snapA = await sync.bootstrapCanvasProjectSync({ deadline: Date.now() + 4_000 });
-    const firstOwner = snapA.importPrompt?.fromOwner;
-    check("13 多条目隔离队列：先问第一条（确定性顺序）", firstOwner === "alice", String(firstOwner));
-    equal("13 只问一条（队列不一次弹多个窗）", snapA.importPrompt?.toOwner, "bob");
-
-    await sync.declineForeignCanvasImport();
-    equal("13 拒绝后弹窗关闭", sync.canvasProjectSyncSnapshot().importPrompt, null);
-    check("13 拒绝后 alice 归档保留（数据不丢）", typeof (await lf.getItem(sync.FOREIGN_CACHE_PREFIX + "alice")) === "string");
-    check("13 拒绝写入「不再询问」标记", typeof (await lf.getItem(sync.FOREIGN_IGNORE_KEY)) === "string");
-
-    const snapB = await sync.bootstrapCanvasProjectSync({ deadline: Date.now() + 4_000 });
-    check("13a 同一对账号不再问，但队列递进到第二条（carol）", snapB.importPrompt?.fromOwner === "carol", JSON.stringify(snapB.importPrompt));
-    equal("13a 第二条的数据不进当前账号（仍要确认）", useCanvasStore.getState().projects.map((item) => item.id), ["NB1"]);
-
-    // 导入第二条 → 并入并上推，归档删除
-    shim.calls.length = 0;
-    await sync.acceptForeignCanvasImport();
+    const snap13 = await sync.bootstrapCanvasProjectSync({ deadline: Date.now() + 4_000 });
+    equal("13 多条目也不询问（无弹窗字段）", snap13.importPrompt, undefined);
+    equal("13 其他账号的项目一个都不进当前账号", useCanvasStore.getState().projects.map((item) => item.id), ["NB1"]);
+    check("13 alice 留档被清理", (await lf.getItem(sync.FOREIGN_CACHE_PREFIX + "alice")) === null, "alice 留档还在");
+    check("13 carol 留档被清理", (await lf.getItem(sync.FOREIGN_CACHE_PREFIX + "carol")) === null, "carol 留档还在");
     await sleep(1_200);
-    equal("13b 导入 carol 的项目进当前账号", useCanvasStore.getState().projects.map((item) => item.id).sort(), ["NB1", "Y1"]);
-    equal("13b 导入后逐项目上推", PUTS().map((call) => call.url).sort(), ["/api/user/projects/Y1"]);
-    check("13b 导入后 carol 归档删除", (await lf.getItem(sync.FOREIGN_CACHE_PREFIX + "carol")) === null, "carol 归档还在");
-    check("13b 已拒绝的 alice 归档仍然保留", typeof (await lf.getItem(sync.FOREIGN_CACHE_PREFIX + "alice")) === "string");
+    equal("13 清理过程零 PUT", PUTS().length, 0, JSON.stringify(PUTS().map((call) => call.url)));
 }
 
 // ----------------------------------------------------------------------------------------
@@ -899,7 +875,7 @@ const authBob = () => globalThis.__jsonResponse(200, { username: "bob" });
 }
 
 // ----------------------------------------------------------------------------------------
-// 19. S3-B2.6 ③：坏归档「保留 + 可见」——不删键、不弹窗、但计入 sync.brokenArchiveCount + warn
+// 19. 坏归档：本账号的「保留 + 可见」，别的账号的一律随跨账号清理删掉（不弹窗）
 // ----------------------------------------------------------------------------------------
 {
     const daveProject = project("D_GOOD", "dave 的正常归档", T0 - 2_000, [{ id: "d1" }]);
@@ -928,18 +904,13 @@ const authBob = () => globalThis.__jsonResponse(200, { username: "bob" });
     }
 
     equal("19 坏归档不妨碍启动（照常 remote）", brokenSnap.mode, "remote");
-    equal("19 坏归档不计入待确认弹窗", brokenSnap.importPrompt?.fromOwner, "dave");
-    equal("19 坏归档份数可见（brokenArchiveCount）", brokenSnap.brokenArchiveCount, 2);
-    check("19 坏归档保留在盘上（保守策略：不删）", typeof (await lf.getItem(sync.FOREIGN_CACHE_PREFIX + "mallory")) === "string" && typeof (await lf.getItem(sync.FOREIGN_CACHE_PREFIX + "alice")) === "string");
-    equal("19 坏归档内容一个字节都没动", await lf.getItem(sync.FOREIGN_CACHE_PREFIX + "mallory"), "{ this is not json");
-    check("19 console.warn 留痕（mallory）", warnLines.some((line) => line.includes("mallory")), JSON.stringify(warnLines.slice(0, 4)));
+    equal("19 无跨账号弹窗（机制已删除）", brokenSnap.importPrompt, undefined);
+    check("19 别的账号的归档（含坏的）被清理", (await lf.getItem(sync.FOREIGN_CACHE_PREFIX + "dave")) === null && (await lf.getItem(sync.FOREIGN_CACHE_PREFIX + "mallory")) === null, "dave/mallory 还在");
+    check("19 本账号的坏归档保留在盘上（保守策略：不删）", typeof (await lf.getItem(sync.FOREIGN_CACHE_PREFIX + "alice")) === "string", "alice 坏档被删了");
+    equal("19 坏归档内容一个字节都没动", await lf.getItem(sync.FOREIGN_CACHE_PREFIX + "alice"), "[[[ broken");
+    equal("19 brokenArchiveCount 只算清理后剩下的本账号坏档", brokenSnap.brokenArchiveCount, 1);
     check("19 console.warn 留痕（本账号 alice 的 takeQuarantine 路径）", warnLines.some((line) => line.includes("alice") && /无法解析/.test(line)), JSON.stringify(warnLines.slice(0, 4)));
-    equal("19 坏归档不污染当前账号数据", useCanvasStore.getState().projects.map((item) => item.id), ["E3"]);
-
-    // 19b：坏归档不影响「健康归档」的处理（导入 dave 后只删 dave 的键）
-    await sync.acceptForeignCanvasImport();
-    await sleep(800);
-    equal("19b 导入 dave 的归档后只删它的键", [await lf.getItem(sync.FOREIGN_CACHE_PREFIX + "dave"), typeof (await lf.getItem(sync.FOREIGN_CACHE_PREFIX + "mallory"))], [null, "string"]);
+    equal("19 别的账号数据不污染当前账号", useCanvasStore.getState().projects.map((item) => item.id), ["E3"]);
 }
 
 // ----------------------------------------------------------------------------------------

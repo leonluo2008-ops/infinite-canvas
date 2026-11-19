@@ -77,8 +77,6 @@ export type ServerProjectList = {
     unit?: string;
 };
 
-export type CanvasImportPrompt = { count: number; fromOwner: string; toOwner: string };
-
 export type CanvasProjectSyncSnapshot = {
     phase: "idle" | "loading" | "ready";
     mode: CanvasSyncMode;
@@ -96,13 +94,11 @@ export type CanvasProjectSyncSnapshot = {
      * 解析不出来的隔离归档（`…:foreign:<owner>`）份数（S3-B2.6 ③）。
      *
      * 策略是**保守**的：坏归档**保留不删**（删了就真的没了，用户以后也许能用别的版本/工具救回来），
-     * 但绝不允许它静默滞留——旧实现里 `takeQuarantine` 吞掉解析异常、`listPendingForeign` 直接
+     * 但绝不允许它静默滞留——旧实现里 `takeQuarantine` 吞掉解析异常、跨账号扫描直接
      * `continue`，结果是「盘上有一份数据，用户永远不知道」。这个计数就是它的可见入口（顶栏据此提示）。
      */
     brokenArchiveCount: number;
     error: string;
-    /** 跨账号确认弹窗（用户拍板保留）：非空即必须显式确认，绝不自动迁移。 */
-    importPrompt: CanvasImportPrompt | null;
 };
 
 export const useCanvasProjectSyncStore = create<CanvasProjectSyncSnapshot>(() => ({
@@ -113,7 +109,6 @@ export const useCanvasProjectSyncStore = create<CanvasProjectSyncSnapshot>(() =>
     invalidCount: 0,
     brokenArchiveCount: 0,
     error: "",
-    importPrompt: null,
 }));
 
 function setSync(patch: Partial<CanvasProjectSyncSnapshot>) {
@@ -169,8 +164,6 @@ type CanvasSyncRuntime = {
     timers: Map<string, ReturnType<typeof setTimeout>>;
     /** 409 后已重试过的 id（避免无限对撞）。 */
     conflictRetried: Set<string>;
-    /** 跨账号隔离键（弹窗未决时有效）。 */
-    quarantineKey: string;
     /** 服务端时钟与本机时钟的偏差（ms，仅观测/留痕，不参与判序）。 */
     serverSkew: number;
     /** 当前 `error` 是否是「推送失败」类（可自愈）——dirty 见底时据此撤掉文案。 */
@@ -190,7 +183,6 @@ const runtime: CanvasSyncRuntime = {
     dirty: new Map(),
     timers: new Map(),
     conflictRetried: new Set(),
-    quarantineKey: "",
     serverSkew: 0,
     pushErrorActive: false,
     deadline: 0,
@@ -769,7 +761,6 @@ function resetRuntime(client: typeof fetch, deadline: number) {
     runtime.serverTomb.clear();
     runtime.dirty.clear();
     runtime.conflictRetried.clear();
-    runtime.quarantineKey = "";
     runtime.serverSkew = 0;
     runtime.pushErrorActive = false;
 }
@@ -802,30 +793,6 @@ function loadDirtyFromCache(cache: PersistedCanvasValue | null) {
         const ms = toMillis(value);
         if (ms !== null) runtime.dirty.set(id, ms);
     }
-}
-
-/** 跨账号「不再询问」标记键（⑤）。**不以 `FOREIGN_CACHE_PREFIX` 开头**：它不是一份载荷归档。 */
-export const FOREIGN_IGNORE_KEY = "infinite-canvas:canvas_store:foreign_ignore";
-
-type ForeignIgnoreRecord = Record<string, string>;
-
-async function readForeignIgnore(): Promise<ForeignIgnoreRecord> {
-    const raw = await canvasLocal.getItem<string>(FOREIGN_IGNORE_KEY);
-    if (typeof raw !== "string" || !raw) return {};
-    try {
-        const parsed = JSON.parse(raw) as ForeignIgnoreRecord;
-        return parsed && typeof parsed === "object" ? parsed : {};
-    } catch {
-        return {};
-    }
-}
-
-/** ⑤：用户点「不导入」→ 记住「这一对账号不再询问」（隔离载荷继续留档，不删、不上传）。 */
-async function markForeignIgnored(fromOwner: string, toOwner: string): Promise<void> {
-    if (!fromOwner || !toOwner) return;
-    const record = await readForeignIgnore();
-    record[`${fromOwner}>${toOwner}`] = new Date().toISOString();
-    await canvasLocal.setItem(FOREIGN_IGNORE_KEY, JSON.stringify(record));
 }
 
 /**
@@ -883,28 +850,12 @@ async function writeForeignArchive(key: string, raw: string): Promise<void> {
     await canvasLocal.setItem(key, JSON.stringify({ state, ...(typeof version === "number" ? { version } : {}) }));
 }
 
-/** 跨账号：把不属于当前账号的载荷挪到隔离键，返回其内容（用于弹窗计数）。**绝不并入当前账号**。 */
-async function quarantineForeign(fromOwner: string, raw: string | null): Promise<PersistedCanvasState | null> {
-    if (!raw) return null;
-    let parsed: PersistedCanvasValue;
-    try {
-        parsed = JSON.parse(raw) as PersistedCanvasValue;
-    } catch {
-        return null;
-    }
-    const key = FOREIGN_CACHE_PREFIX + fromOwner;
-    await writeForeignArchive(key, raw);
-    await canvasLocal.removeItem(CANVAS_STORE_KEY);
-    runtime.quarantineKey = key;
-    return parsed.state ?? emptyState();
-}
-
 /**
  * 取回**本账号**的登出留档。
  *
  * ③（S3-B2.6）：解析失败时返回 null 但**不清键**（保守：坏归档保留，用户也许能救回来），
  * 并且必须 `console.warn` 留痕——旧实现只在 `catch { return null }` 里静默吞掉，配合同账号分支
- * 的「不弹窗」（`listPendingForeign` 跳过 `fromOwner === ownerName`），坏归档就永久滞留且
+ * 的「不弹窗」，坏归档就永久滞留且
  * 无人知晓。可见性由 `scanBrokenArchives()` 汇总进 `sync.brokenArchiveCount`（顶栏提示）。
  */
 async function takeQuarantine(ownerName: string): Promise<PersistedCanvasState | null> {
@@ -949,50 +900,34 @@ async function scanBrokenArchives(): Promise<string[]> {
 }
 
 /**
- * 扫描隔离区里**属于其他账号**的载荷（登出留档 / 上次弹窗未决），返回全部待确认项。
+ * 清理本机不属于当前账号的画布残留（所有者 2026-11-19 裁定：SaaS 下本地只是缓存）。
  *
- * 为什么是**队列**而不是第一个命中就返回（⑤）：同一台机器上可能躺着多个账号的留档
- * （A 登出、C 登出、现在 B 登录）。只取第一条时，用户对第一条点了「不导入」后，第二条永远不会被问到。
- * 这里按 owner 名排序（确定性：`keys()` 的顺序在不同浏览器/IDB 实现下不保证），由启动门取第一条，
- * 用户处理完（接受/拒绝）下一次启动门自然递进到下一条。
- *
- * ③（S3-B2.6）：解析不出来的归档**不删、不弹窗**，但要 `console.warn` 留痕——坏归档的可见性由
- * `scanBrokenArchives()` 统一汇总进 `sync.brokenArchiveCount`（这里只是同一策略的第二处落点，
- * 免得「跳过」变成静默）。
+ * 换账号登录时，本机共享缓存与 `foreign:<别的账号>` 留档**直接删除**，不询问、不导入——
+ * 服务端才是项目真源；把上一个账号的数据「导入当前账号」既多余又是数据串号口子。
+ * **本账号自己的留档（`foreign:<当前账号>`）不动**：那是断网未推成功的草稿，由登录流程自行并回。
  */
-async function listPendingForeign(ownerName: string): Promise<Array<{ fromOwner: string; state: PersistedCanvasState }>> {
+async function purgeForeignArchivesExcept(ownerName: string): Promise<number> {
     let keys: string[] = [];
     try {
         keys = await canvasLocal.keys();
     } catch {
-        return [];
+        return 0;
     }
-    const ignored = await readForeignIgnore();
-    const pending: Array<{ fromOwner: string; state: PersistedCanvasState }> = [];
-    for (const key of keys.slice().sort()) {
+    const keep = FOREIGN_CACHE_PREFIX + ownerName;
+    let removed = 0;
+    for (const key of keys) {
         if (!key.startsWith(FOREIGN_CACHE_PREFIX)) continue;
-        const fromOwner = key.slice(FOREIGN_CACHE_PREFIX.length);
-        if (!fromOwner || fromOwner === ownerName) continue;
-        if (ignored[`${fromOwner}>${ownerName}`]) continue;
-        const raw = await canvasLocal.getItem<string>(key);
-        if (typeof raw !== "string" || !raw) continue;
-        try {
-            const parsed = JSON.parse(raw) as PersistedCanvasValue;
-            const state = parsed.state ?? emptyState();
-            if (!localProjects(state).length && !localDeleted(state).length) continue;
-            pending.push({ fromOwner, state });
-        } catch (error) {
-            console.warn(`[canvas-project-sync] 隔离归档无法解析，跳过弹窗但保留在盘上：${key}`, errorText(error));
-            continue;
-        }
+        if (key === keep) continue;
+        await canvasLocal.removeItem(key);
+        removed += 1;
     }
-    return pending;
+    if (removed) console.info(`[canvas-project-sync] 已清理本机其他账号的画布残留 ${removed} 份（服务端数据不受影响）`);
+    return removed;
 }
 
 async function dropQuarantine(key: string) {
     if (!key) return;
     await canvasLocal.removeItem(key);
-    if (runtime.quarantineKey === key) runtime.quarantineKey = "";
 }
 
 /** 合并本地（缓存）与服务端清单；需要时按需拉单项目 content（并发 4，受启动门预算约束）。 */
@@ -1074,7 +1009,7 @@ export async function bootstrapCanvasProjectSync(options: { deadline?: number; f
     const memoryAtGate: PersistedCanvasState = { projects: useCanvasStore.getState().projects, deletedProjects: useCanvasStore.getState().deletedProjects };
     resetRuntime(client, deadline);
     bindListeners();
-    setSync({ phase: "loading", mode: "local", error: "", importPrompt: null, brokenArchiveCount: 0 });
+    setSync({ phase: "loading", mode: "local", error: "", brokenArchiveCount: 0 });
 
     /**
      * ③（S3-B2.6）：坏归档的可见性在这里就建立（纯本地、零网络），所以**离线态也看得到**。
@@ -1153,7 +1088,7 @@ export async function bootstrapCanvasProjectSync(options: { deadline?: number; f
      *
      * 旧实现在 `localOwner === ownerName` 分支里才 `takeQuarantine`；而 `prepareCanvasLogout()` 会把共享
      * 主键整条删掉 → 下次登录 `localOwner === ""` → 走「本地无 owner → 首次迁移」分支 → 留档**永远不恢复**
-     * （且 `listPendingForeign` 会跳过 `fromOwner === ownerName`，连弹窗都不会出现 = 静默丢画布）。
+     * （且跨账号扫描会跳过本账号同名归档，连恢复机会都不会出现 = 静默丢画布）。
      * 现在改成先读留档（与本机缓存 owner 无关），再按归属分支决定 baseline。
      */
     const ownArchive = await takeQuarantine(ownerName);
@@ -1167,12 +1102,13 @@ export async function bootstrapCanvasProjectSync(options: { deadline?: number; f
      */
     const ownArchiveKey = ownArchive ? FOREIGN_CACHE_PREFIX + ownerName : "";
     let baseline: PersistedCanvasState = gateState;
-    let importPrompt: CanvasImportPrompt | null = null;
     if (localOwner && localOwner !== ownerName) {
-        const foreign = await quarantineForeign(localOwner, rawCache);
-        // 隔离的载荷**绝不能**留在 baseline 里（无论解析是否成功）：当前账号从空开始
+        /**
+         * 本机缓存属于**别的账号**：SaaS 下本地只是缓存、服务端才是真源 → 直接丢弃，不问不导入。
+         * （所有者 2026-11-19 裁定：渠道配置与画布项目都在服务端按用户隔离，本机不存在"是否导入"这回事。）
+         */
+        await canvasLocal.removeItem(CANVAS_STORE_KEY);
         baseline = emptyState();
-        if (foreign) importPrompt = { count: localProjects(foreign).length, fromOwner: localOwner, toOwner: ownerName };
     } else if (!localOwner) {
         // 本机无 owner 标记 → 首次迁移（§2.4「迁移仅当本地无 owner 标记」）：合并后自然 dirty → 上推
         runtime.migratedAt = new Date().toISOString();
@@ -1186,14 +1122,11 @@ export async function bootstrapCanvasProjectSync(options: { deadline?: number; f
         baseline = { projects: mergedRestore.projects, deletedProjects: mergedRestore.deleted };
     }
 
-    if (!importPrompt) {
-        // 隔离区里还有别的账号的载荷（上次「不导入」/ 上次登出留档）：继续给确认入口，绝不自动并入
-        const pending = await listPendingForeign(ownerName);
-        const first = pending[0];
-        if (first) {
-            runtime.quarantineKey = FOREIGN_CACHE_PREFIX + first.fromOwner;
-            importPrompt = { count: localProjects(first.state).length, fromOwner: first.fromOwner, toOwner: ownerName };
-        }
+    // 别的账号留在本机的画布残留一律清掉（本账号自己的留档在上面已并回，不动）
+    const purged = await purgeForeignArchivesExcept(ownerName);
+    if (purged) {
+        // 启动门开头扫到的坏归档数可能包含刚被清理的别的账号的键 → 清理后重算一次，别让计数虚高
+        setSync({ brokenArchiveCount: (await scanBrokenArchives()).length });
     }
 
     const merged = await mergeWithServer(baseline, list, client);
@@ -1225,7 +1158,6 @@ export async function bootstrapCanvasProjectSync(options: { deadline?: number; f
             phase: "ready",
             mode: "offline",
             owner: ownerName,
-            importPrompt,
             error: i18n.t("canvasSync.cacheWriteFailed", { message: errorText(error) }),
         });
         return canvasProjectSyncSnapshot();
@@ -1245,7 +1177,7 @@ export async function bootstrapCanvasProjectSync(options: { deadline?: number; f
     await persistDirtyMarker();
     scheduleAllDirty();
     runtime.pushErrorActive = false;
-    setSync({ phase: "ready", mode: "remote", owner: ownerName, importPrompt, error: "" });
+    setSync({ phase: "ready", mode: "remote", owner: ownerName, error: "" });
     return canvasProjectSyncSnapshot();
 }
 
@@ -1259,63 +1191,8 @@ function enterOffline(message: string, ownerName: string): CanvasProjectSyncSnap
     publish();
     // 启动门/离线原因不是「推送失败」：dirty 见底也不许自动撤（那时横幅说的是「为什么离线」）
     runtime.pushErrorActive = false;
-    setSync({ phase: "ready", mode: "offline", owner: ownerName, error: message, importPrompt: null });
+    setSync({ phase: "ready", mode: "offline", owner: ownerName, error: message });
     return canvasProjectSyncSnapshot();
-}
-
-// ----------------------------------------------------------------- 跨账号弹窗动作
-
-/** 用户点「导入到当前账号」：把隔离载荷并进当前账号并排推（**唯一**的迁移入口，必须显式确认）。 */
-export async function acceptForeignCanvasImport(): Promise<void> {
-    const prompt = currentImportPrompt();
-    if (!prompt) return;
-    const key = runtime.quarantineKey || FOREIGN_CACHE_PREFIX + prompt.fromOwner;
-    const raw = await canvasLocal.getItem<string>(key);
-    let restored: PersistedCanvasState | null = null;
-    if (typeof raw === "string" && raw) {
-        try {
-            restored = (JSON.parse(raw) as PersistedCanvasValue).state ?? null;
-        } catch {
-            restored = null;
-        }
-    }
-    setSync({ importPrompt: null });
-    if (!restored) {
-        await dropQuarantine(key);
-        return;
-    }
-    // 并入：服务端没有这些 id → 自然 dirty（迁移载荷含 deletedProjects，墓碑一并上推，防软删复活）
-    runtime.migratedAt = new Date().toISOString();
-    const merged = mergeCanvasData(
-        { projects: useCanvasStore.getState().projects, deleted: useCanvasStore.getState().deletedProjects },
-        { projects: localProjects(restored), deleted: localDeleted(restored) },
-    );
-    useCanvasStore.getState().replaceProjects(merged.projects, merged.deleted);
-    syncDirty({ projects: merged.projects, deletedProjects: merged.deleted });
-    canvasPersistQueue.rehydrate(await writeCanvasCacheNow());
-    await canvasPersistQueue.flush("跨账号导入");
-    await persistDirtyMarker();
-    scheduleAllDirty();
-    await dropQuarantine(key);
-}
-
-/** 用户点「不导入」：隔离载荷留档（同账号再登录时自动恢复），当前账号保持干净（V9）。 */
-export async function declineForeignCanvasImport(): Promise<void> {
-    const prompt = currentImportPrompt();
-    setSync({ importPrompt: null });
-    if (!prompt) return;
-    /**
-     * ⑤：记住「这一对账号不再询问」。
-     *
-     * 隔离载荷**不删**（删了就真的丢了，同账号再登录还要靠它恢复），只是不再每次启动都弹同一个窗
-     * （那是噪声，用户已经明确表态过）。`listPendingForeign` 读这个标记跳过已表态的条目，
-     * 队列里**其他账号**的留档照旧会被问到。
-     */
-    await markForeignIgnored(prompt.fromOwner, prompt.toOwner);
-}
-
-function currentImportPrompt(): CanvasImportPrompt | null {
-    return useCanvasProjectSyncStore.getState().importPrompt;
 }
 
 // ----------------------------------------------------------------- logout
@@ -1340,7 +1217,7 @@ export async function prepareCanvasLogout(): Promise<void> {
          * 因为没有 owner），旧实现直接「全量删 + 清空内存」= 一次登出静默抹掉单人用户的全部画布。
          * 这里什么都不动（连 transport 都不换）：下次启动照旧走单人零改动分支。
          */
-        setSync({ phase: "ready", mode: getCanvasSyncMode(), owner: "", dirtyCount: 0, error: "", importPrompt: null });
+        setSync({ phase: "ready", mode: getCanvasSyncMode(), owner: "", dirtyCount: 0, error: "" });
         publish();
         return;
     }
@@ -1355,7 +1232,7 @@ export async function prepareCanvasLogout(): Promise<void> {
     runtime.serverTomb.clear();
     runtime.owner = "";
     setCanvasSyncMode("local");
-    setSync({ phase: "ready", mode: "local", owner: "", dirtyCount: 0, error: "", importPrompt: null });
+    setSync({ phase: "ready", mode: "local", owner: "", dirtyCount: 0, error: "" });
     useCanvasStore.getState().replaceProjects([], []);
 }
 
