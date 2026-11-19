@@ -10,7 +10,9 @@ import { ChannelEditorDrawer } from "@/components/layout/channel-editor-drawer";
 import { ConfigLocalProxy } from "@/components/layout/config-local-proxy";
 import { ConfigPromptSources } from "@/components/layout/config-prompt-sources";
 import { ConfigLapianModels } from "@/components/layout/config-lapian-models";
+import { ConfigMediaHost } from "@/components/layout/config-media-host";
 import { ConfigLocalStorage } from "@/components/layout/config-local-storage";
+import { useSessionRole } from "@/services/session-role";
 import type { AppLocale } from "@/i18n";
 import { exportAppConfig, importAppConfig } from "@/services/config-file";
 import { syncAppDataToWebdav, type AppSyncDomainKey, type AppSyncProgressEvent } from "@/services/app-sync";
@@ -75,6 +77,9 @@ export function AppConfigPanel({ showDoneButton = false, initialTab = "channels"
     const setConfigDialogOpen = useConfigStore((state) => state.setConfigDialogOpen);
     const clearPromptContinue = useConfigStore((state) => state.clearPromptContinue);
     const webdavReady = Boolean(webdav.url.trim());
+    // S3.12 B3 门控：媒体出口 tab 只在登录态（user / admin）显示；单人模式后端路由本就是 404，不渲染死 tab
+    const sessionRole = useSessionRole();
+    const mediaHostVisible = sessionRole === "user" || sessionRole === "admin";
     const editingChannel = config.channels.find((channel) => channel.id === editingChannelId) || null;
     const locale = i18n.resolvedLanguage as AppLocale;
     const imageResolutionOptions = mediaScaleOptions.map((value) => ({ value, label: value === "auto" ? t("settingsPanels.common.auto") : value.toUpperCase() }));
@@ -404,6 +409,15 @@ export function AppConfigPanel({ showDoneButton = false, initialTab = "channels"
                         label: t("config.tabs.localStorage"),
                         children: <ConfigLocalStorage active={activeTab === "local-storage"} />,
                     },
+                    ...(mediaHostVisible
+                        ? [
+                              {
+                                  key: "media-host",
+                                  label: t("config.tabs.mediaHost"),
+                                  children: <ConfigMediaHost active={activeTab === "media-host"} />,
+                              },
+                          ]
+                        : []),
                 ]}
             />
             {showDoneButton ? (

@@ -574,6 +574,7 @@ export default {
             preferences: "偏好设置",
             promptSources: "提示词来源",
             localStorage: "本地存储",
+            mediaHost: "媒体出口",
         },
         lapianModels: {
             title: "拉片模型",
@@ -614,6 +615,18 @@ export default {
             refresh: "刷新统计",
             readFailed: "读取本地存储失败",
             stores: { appState: "应用状态", images: "图片文件", imagePreviews: "图片缩略图", media: "音视频文件", imageLogs: "生图记录", videoLogs: "视频记录", agentMessages: "Agent 消息", promptCache: "提示词缓存" },
+        },
+        mediaHost: {
+            title: "媒体出口",
+            description: "选择上传参考图时优先使用的媒体出口；首选失败会按默认顺序继续尝试其它出口，未选择时按服务端默认顺序。",
+            followDefault: "按默认顺序（不指定首选）",
+            configured: "已配置",
+            notConfigured: "需设置环境变量",
+            test: "测试",
+            testing: "测试中",
+            ok: "连通正常 · 耗时{{ms}}ms",
+            failed: "失败：",
+            saveFailed: "保存失败：",
         },
         promptSources: {
             add: "新增来源",

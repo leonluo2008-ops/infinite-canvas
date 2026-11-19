@@ -574,6 +574,7 @@ export default {
             preferences: "Preferences",
             promptSources: "Prompt sources",
             localStorage: "Local storage",
+            mediaHost: "Media egress",
         },
         lapianModels: {
             title: "Breakdown models",
@@ -614,6 +615,18 @@ export default {
             refresh: "Refresh usage",
             readFailed: "Failed to read local storage",
             stores: { appState: "App state", images: "Image files", imagePreviews: "Image thumbnails", media: "Audio and video files", imageLogs: "Image history", videoLogs: "Video history", agentMessages: "Agent messages", promptCache: "Prompt cache" },
+        },
+        mediaHost: {
+            title: "Media egress",
+            description: "Pick the preferred media egress used first when uploading reference images; if it fails, the remaining egresses are tried in the default order. No selection means the server-side default order.",
+            followDefault: "Default order (no preference)",
+            configured: "Configured",
+            notConfigured: "Environment variable required",
+            test: "Test",
+            testing: "Testing",
+            ok: "Reachable · {{ms}}ms",
+            failed: "Failed: ",
+            saveFailed: "Save failed: ",
         },
         promptSources: {
             add: "Add source",
